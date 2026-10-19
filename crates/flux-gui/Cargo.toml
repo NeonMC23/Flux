@@ -1,0 +1,16 @@
+[package]
+name = "flux-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native Iced GUI for Flux"
+publish = false
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"
+
+[dependencies]
+flux-core.workspace = true
+iced.workspace = true

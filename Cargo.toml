@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/flux-core",
+    "crates/flux-library",
+    "crates/flux-audio",
+    "crates/flux-providers",
+    "crates/flux-platform",
+    "crates/flux-gui",
+    "crates/flux-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Floor set by iced 0.14.0, whose crates.io metadata declares rust_version 1.88.
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+flux-core = { path = "crates/flux-core" }
+iced = "0.14.0"

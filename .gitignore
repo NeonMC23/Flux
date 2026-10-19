@@ -1,0 +1,8 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Editor / OS temporary files
+.DS_Store
+*.swp
+.idea/

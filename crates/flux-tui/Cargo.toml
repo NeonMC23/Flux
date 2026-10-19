@@ -1,0 +1,15 @@
+[package]
+name = "flux-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal interface for Flux"
+publish = false
+
+[[bin]]
+name = "flux-tui"
+path = "src/main.rs"
+
+[dependencies]
+flux-core.workspace = true

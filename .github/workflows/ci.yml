@@ -1,0 +1,126 @@
+# Continuous integration for Flux (Milestone M0 foundations).
+#
+# Runs formatting, Clippy, dependency-license checks, tests, and builds.
+# This workflow never publishes, packages, signs, or uploads artifacts.
+#
+# The Rust toolchain is pinned by rust-toolchain.toml at the repository
+# root; rustup (preinstalled on GitHub-hosted runners) installs exactly
+# that toolchain. Tests execute natively on every matrix entry below
+# except the macOS x86_64 job, which is a compile-only cross-check
+# because GitHub provides no standard macOS x86_64 runner.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Format and Clippy (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  licenses:
+    name: Dependency licenses (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+      - name: Install cargo-deny 0.20.2 (checksum-verified)
+        run: |
+          curl -fsSL -o /tmp/cargo-deny.tar.gz \
+            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  /tmp/cargo-deny.tar.gz" | sha256sum --check
+          tar -xzf /tmp/cargo-deny.tar.gz -C /tmp
+          install -m755 /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.cargo/bin/cargo-deny"
+          cargo-deny --version
+      - name: Check dependency licenses
+        run: cargo deny check licenses
+
+  test-build:
+    name: Test and build (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - label: Linux ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - label: Windows x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - label: Windows ARM64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - label: macOS ARM64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
+      - name: Install pinned Rust toolchain and target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
+      - name: Test workspace (native)
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+      - name: Build workspace (native)
+        run: cargo build --workspace --locked --target ${{ matrix.target }}
+
+  macos-x86_64-cross-check:
+    name: Compile-only cross-check (macOS x86_64)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain and target
+        run: |
+          rustup show
+          rustup target add x86_64-apple-darwin
+          rustc --version
+      # Compile-only: binaries for x86_64-apple-darwin are not executed on
+      # this ARM64 runner, so no test or run step is claimed here.
+      - name: Check workspace for x86_64-apple-darwin
+        run: cargo check --workspace --locked --target x86_64-apple-darwin

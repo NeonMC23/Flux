@@ -1,0 +1,6 @@
+[toolchain]
+# Exact stable release verified locally at M0 implementation time.
+# Local development and CI must resolve this same toolchain.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,8 @@
+[package]
+name = "flux-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Future audio-engine abstraction and playback for Flux"
+publish = false

@@ -1,0 +1,8 @@
+[package]
+name = "flux-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared domain types and application-level abstractions for Flux"
+publish = false
