@@ -4,5 +4,5 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Future operating-system integration for Flux"
+description = "Operating-system integration for Flux"
 publish = false

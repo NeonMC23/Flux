@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Future audio-engine abstraction and playback for Flux"
+description = "Playback-control model for Flux (no audio output yet)"
 publish = false
+
+[dependencies]
+flux-core.workspace = true

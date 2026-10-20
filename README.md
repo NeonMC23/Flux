@@ -6,34 +6,41 @@ ideas and dark visual identity while replacing the implementation with a
 native Rust architecture: an Iced graphical application and a dedicated
 terminal application sharing the same core logic.
 
-**Status: Milestone M0 — project foundations only.** This repository
-currently contains the Cargo workspace skeleton, crate boundaries,
-licensing policy, and continuous-integration configuration. It does **not**
-play music yet.
+**Status: Milestone M2 — local library scanning and persistence.** This
+repository contains the Cargo workspace, a backend-independent domain
+model, a working local-library layer (recursive scanning with embedded
+metadata reading, an in-memory collection, and a versioned JSON index
+with stable track IDs), licensing policy, and continuous-integration
+configuration. It still does **not** play music: there is no audio
+output yet, and neither interface is wired to the library yet.
 
-## What exists at M0
+## What exists at M2
 
 | Crate | Kind | Responsibility |
 |---|---|---|
-| `flux-core` | library | Shared domain vocabulary and application-level abstractions. No UI, filesystem, database, audio-device, or network implementation. |
-| `flux-library` | library | Future home of local library scanning, metadata, and indexing. Documentation-only placeholder. |
-| `flux-audio` | library | Future home of the playback engine boundary. Documentation-only placeholder. |
-| `flux-providers` | library | Future home of integrations with legally supported streaming providers. Documentation-only placeholder. |
-| `flux-platform` | library | Future home of OS integration (paths, credentials, media controls). Documentation-only placeholder. |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application. M0 shows a static startup view only. |
-| `flux-tui` | binary `flux-tui` | Terminal application. M0 prints a startup message and exits. |
+| `flux-core` | library | Backend-independent domain model: tracks, IDs, sources, play queue, repeat/playback states, and the shared error type. No UI, filesystem, database, audio-device, or network implementation. |
+| `flux-library` | library | Local library: recursive folder scanning (tags via lofty, filename fallback, symlinks never followed) into an in-memory, insertion-ordered collection with path deduplication and search, plus save/load of a versioned JSON index with stable IDs. |
+| `flux-audio` | library | Pure playback-control state machine (play/pause/stop/skips/repeat) over the queue. No decoding or audio output yet. |
+| `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. No traits, networking, or integrations yet. |
+| `flux-platform` | library | OS integration: per-user data/config directory resolution for Linux/XDG, macOS, and Windows (standard library only). |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application. Currently shows a static startup view only. |
+| `flux-tui` | binary `flux-tui` | Terminal application. Currently prints a startup message and exits. |
 
-Dependency direction at M0: `flux-gui → flux-core`, `flux-tui → flux-core`,
-and `flux-gui → iced`. The future boundary crates have no dependencies and
-no public API yet; they will be wired in when their milestones implement
-them.
+Dependency direction: `flux-gui → flux-core + iced`, `flux-tui → flux-core`,
+`flux-library → flux-core + lofty + walkdir + serde/serde_json`, and
+`flux-audio → flux-core`. `flux-core`, `flux-providers`, and
+`flux-platform` have no dependencies. `flux-library` never chooses OS
+directories itself — the persistence path is injected by the caller
+(typically resolved via `flux-platform`), and scanning never prunes
+tracks whose files have disappeared.
 
 ## What does not exist yet
 
-Music-library scanning, metadata reading, playback, playlists, streaming
+Actual audio output, folder watching, artwork, playlists, streaming
 providers, accounts, lyrics, installers, and updaters are all future
-milestones. Nothing in this repository makes network requests, collects
-telemetry, or requires an account.
+milestones, and the GUI/TUI do not browse or control the library yet.
+Nothing in this repository makes network requests, collects telemetry,
+or requires an account.
 
 ## Building
 
