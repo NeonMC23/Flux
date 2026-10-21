@@ -18,10 +18,12 @@
 //! # What actually plays
 //!
 //! Playable formats are exactly those in
-//! [`decode::PLAYABLE_EXTENSIONS`] (WAV via `hound`, FLAC via
-//! `claxon`). Being *indexed* by `flux-library` does not make a file
-//! playable; opening anything else fails with a typed
-//! [`decode::DecodeError::UnsupportedFormat`].
+//! [`decode::PLAYABLE_EXTENSIONS`], with the container/codec matrix
+//! documented in [`decode`]: WAV, FLAC, MP3, AAC (ADTS and MP4/M4A),
+//! Ogg Vorbis, and Opus. Being *indexed* by `flux-library` does not
+//! make a file playable; opening anything else fails with a typed
+//! [`decode::DecodeError::UnsupportedFormat`], and corrupt files fail
+//! with [`decode::DecodeError::Malformed`] — never a silent skip.
 //!
 //! # The `cpal` feature (off by default)
 //!

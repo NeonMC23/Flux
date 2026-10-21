@@ -36,7 +36,7 @@
 //!
 //! The engine knows nothing about libraries, queues, or scanning: the
 //! caller hands it a [`TrackId`] (echoed back in events) and a file
-//! path. [`Player`] remains the single authority for queue/playback
+//! path. [`crate::Player`] remains the single authority for queue/playback
 //! *decisions*; the engine is the mechanism that makes them audible.
 
 use std::collections::VecDeque;
@@ -129,7 +129,7 @@ pub enum EngineEvent {
     },
     /// Something failed. `id` is the track concerned, when applicable.
     /// After a decode error the engine is stopped with nothing playing;
-    /// the caller (via [`Player`]) decides what happens next.
+    /// the caller (via [`crate::Player`]) decides what happens next.
     Error {
         /// The track concerned, if any.
         id: Option<TrackId>,
@@ -952,10 +952,11 @@ mod tests {
             })
         ));
 
-        // Unsupported format (file exists, extension not playable).
-        let mp3 = dir.0.join("song.mp3");
-        fs::write(&mp3, b"whatever").expect("write");
-        engine.load(TrackId::new(5), mp3);
+        // Unsupported format (file exists, extension not playable:
+        // AIFF is indexed by the library but has no decoder).
+        let aif = dir.0.join("song.aif");
+        fs::write(&aif, b"whatever").expect("write");
+        engine.load(TrackId::new(5), aif);
         let events = drive_until(&engine, &control, |e| {
             matches!(e, EngineEvent::Error { .. })
         });
@@ -967,20 +968,27 @@ mod tests {
             })
         ));
 
-        // Malformed WAV.
-        let bad = dir.0.join("bad.wav");
-        fs::write(&bad, b"not a wav").expect("write");
-        engine.load(TrackId::new(6), bad);
-        let events = drive_until(&engine, &control, |e| {
-            matches!(e, EngineEvent::Error { .. })
-        });
-        assert!(matches!(
-            events.last(),
-            Some(EngineEvent::Error {
-                error: EngineError::Decode(DecodeError::Malformed { .. }),
-                ..
-            })
-        ));
+        // Malformed contents under decodable extensions (WAV, MP3,
+        // M4A): each is a typed Decode(Malformed) engine error, never
+        // a silent skip or a crash.
+        for (id, name) in [(6, "bad.wav"), (60, "bad.mp3"), (61, "bad.m4a")] {
+            let bad = dir.0.join(name);
+            fs::write(&bad, b"not the format the extension promises").expect("write");
+            engine.load(TrackId::new(id), bad);
+            let events = drive_until(&engine, &control, |e| {
+                matches!(e, EngineEvent::Error { .. })
+            });
+            assert!(
+                matches!(
+                    events.last(),
+                    Some(EngineEvent::Error {
+                        error: EngineError::Decode(DecodeError::Malformed { .. }),
+                        ..
+                    })
+                ),
+                "{name}: {events:?}"
+            );
+        }
 
         // Missing file.
         engine.load(TrackId::new(7), dir.0.join("missing.flac"));
@@ -994,6 +1002,168 @@ mod tests {
                 ..
             })
         ));
+        engine.shutdown();
+    }
+
+    /// Committed format fixtures (same files the decoder tests use;
+    /// see tests/fixtures/README.md for provenance).
+    const OGG_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/tone.ogg");
+    const OPUS_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/tone.opus");
+    const AAC_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/tone.aac");
+    const M4A_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/tone.m4a");
+    const MP3_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/silence.mp3");
+
+    #[test]
+    fn compressed_formats_play_through_engine_with_audible_content() {
+        let dir = TempDir::new("formats");
+        // (name, bytes, expected Loaded rate/channels, min nonzero frames
+        // at the 44.1 kHz mono null device)
+        let cases: [(&str, &[u8], u32, u16, usize); 4] = [
+            ("tone.ogg", OGG_FIXTURE, 44_100, 2, 18_000),
+            ("tone.opus", OPUS_FIXTURE, 48_000, 1, 9_500),
+            ("tone.aac", AAC_FIXTURE, 44_100, 2, 11_500),
+            ("tone.m4a", M4A_FIXTURE, 44_100, 2, 11_500),
+        ];
+        for (name, bytes, rate, channels, min_nonzero) in cases {
+            let path = dir.0.join(name);
+            fs::write(&path, bytes).expect("write fixture");
+            let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+            let id = TrackId::new(42);
+            engine.load(id, path);
+            let events = drive_until(&engine, &control, |e| {
+                matches!(e, EngineEvent::Loaded { .. } | EngineEvent::Error { .. })
+            });
+            assert!(
+                matches!(events.last(), Some(EngineEvent::Loaded { id: got, info })
+                    if *got == id && info.sample_rate == rate && info.channels == channels),
+                "{name}: unexpected load outcome {events:?}"
+            );
+            engine.play();
+            let events = drive_until(&engine, &control, |e| {
+                matches!(
+                    e,
+                    EngineEvent::TrackEnded { .. } | EngineEvent::Error { .. }
+                )
+            });
+            assert!(
+                matches!(events.last(), Some(EngineEvent::TrackEnded { id: got }) if *got == id),
+                "{name}: expected TrackEnded, got {events:?}"
+            );
+            let nonzero = nonzero_frames(&control, 1);
+            assert!(
+                nonzero >= min_nonzero,
+                "{name}: only {nonzero} nonzero frames reached the device"
+            );
+            let peak = control
+                .captured()
+                .iter()
+                .fold(0.0f32, |m, s| m.max(s.abs()));
+            assert!((0.15..0.5).contains(&peak), "{name}: peak {peak}");
+            engine.shutdown();
+        }
+    }
+
+    #[test]
+    fn mp3_silence_advances_to_track_end_and_replacing_formats_is_clean() {
+        let dir = TempDir::new("mp3-replace");
+        let ogg_path = dir.0.join("tone.ogg");
+        fs::write(&ogg_path, OGG_FIXTURE).expect("write");
+        let mp3_path = dir.0.join("silence.mp3");
+        fs::write(&mp3_path, MP3_FIXTURE).expect("write");
+        let (engine, control) = EngineHandle::spawn_null(44_100, 2);
+        let ogg_id = TrackId::new(1);
+        let mp3_id = TrackId::new(2);
+
+        engine.load(ogg_id, ogg_path);
+        drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::Loaded { .. })
+        });
+        engine.play();
+        for _ in 0..6 {
+            control.drain_frames(512);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Replace mid-playback with the (silent) MP3: the Ogg track
+        // must never report TrackEnded, the MP3 must play its full
+        // 20-frame span and end cleanly despite being digital silence.
+        engine.load(mp3_id, mp3_path);
+        let events = drive_until(
+            &engine,
+            &control,
+            |e| matches!(e, EngineEvent::Loaded { id, .. } if *id == mp3_id),
+        );
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Loaded { info, .. })
+                if info.sample_rate == 44_100 && info.channels == 2),
+            "{events:?}"
+        );
+        engine.play();
+        let events = drive_until(&engine, &control, |e| {
+            matches!(
+                e,
+                EngineEvent::TrackEnded { .. } | EngineEvent::Error { .. }
+            )
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id }) if *id == mp3_id),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, EngineEvent::TrackEnded { id } if *id == ogg_id)),
+            "replaced track must not report TrackEnded: {events:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn pause_and_resume_work_on_a_vorbis_track() {
+        let dir = TempDir::new("Vorbis-pause");
+        let path = dir.0.join("tone.ogg");
+        fs::write(&path, OGG_FIXTURE).expect("write");
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.load(TrackId::new(1), path);
+        drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::Loaded { .. })
+        });
+        engine.play();
+        drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::Started { .. })
+        });
+        for _ in 0..8 {
+            control.drain_frames(512);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(nonzero_frames(&control, 1) > 0);
+
+        engine.pause();
+        drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::Paused { .. })
+        });
+        let at_pause = nonzero_frames(&control, 1);
+        for _ in 0..8 {
+            control.drain_frames(512);
+        }
+        assert_eq!(
+            nonzero_frames(&control, 1),
+            at_pause,
+            "paused Vorbis playback must emit silence only"
+        );
+
+        engine.play();
+        let events = drive_until(&engine, &control, |e| {
+            matches!(
+                e,
+                EngineEvent::TrackEnded { .. } | EngineEvent::Error { .. }
+            )
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::TrackEnded { .. })),
+            "{events:?}"
+        );
+        assert!(nonzero_frames(&control, 1) > at_pause);
         engine.shutdown();
     }
 
