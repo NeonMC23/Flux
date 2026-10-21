@@ -33,8 +33,8 @@ Dependency direction: `flux-gui → flux-app + flux-core + iced`,
 `flux-tui → flux-app + flux-core + crossterm`,
 `flux-app → flux-core + flux-library + flux-audio + flux-platform`,
 `flux-library → flux-core + lofty + walkdir + serde/serde_json`, and
-`flux-audio → flux-core + claxon + hound + ringbuf` (plus optional
-`cpal`). `flux-core`, `flux-providers`, and `flux-platform` have no
+`flux-audio → flux-core + claxon + hound + rmp3 + lewton + ogg +
+opus-pure + rusty_aac + mp4 + ringbuf` (plus optional `cpal`). `flux-core`, `flux-providers`, and `flux-platform` have no
 dependencies. The engine never scans or persists the library, the
 library never knows about queues, and `Player` remains the only
 playback-decision authority — the controller just keeps the engine in
@@ -89,24 +89,37 @@ and macOS need no extra packages. If no device is available (or the
 build lacks the feature), the apps still run for browsing/scanning
 and say exactly why playback is unavailable.
 
+One build prerequisite joined with MP3 support: the minimp3 decoder
+is C (bundled by the `rmp3` crate) and is compiled at build time, so
+building `flux-audio` needs the platform C toolchain (gcc/clang on
+Linux/macOS, MSVC on Windows) that a normal Rust development setup
+already has. All other decoders are pure Rust. The C code runs only
+on the engine's worker thread, never in the audio callback, and is
+driven through a thin checked FFI wrapper of our own (see
+`crates/flux-audio/src/decode.rs` for why).
+
 **Manual hardware verification** (compilation is not playback): on a
 machine with working audio, build either app with `--features cpal`,
-scan a folder containing a known-good FLAC and WAV (ideally including
-a 44.1 kHz file on a 48 kHz device), play each fully — expect correct
-pitch/speed, no dropouts, position reaching the track duration, and
-automatic advancement. Also verify an `.mp3` shows the
-unsupported-format error with no sound, and that with all output
-devices disabled the app reports the missing device. A minimal
-no-UI check is also available:
-`cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.flac`.
+scan a folder containing one known-good file per format — FLAC, WAV,
+MP3, M4A (iTunes/ffmpeg AAC), Ogg Vorbis, Opus, and an ADTS `.aac` if
+you have one — ideally including 44.1 kHz files on a 48 kHz device and
+a stereo Opus at 48 kHz. Play each fully: expect correct pitch/speed,
+no dropouts, position reaching the track duration, and automatic
+advancement at end of track. Also verify an ALAC `.m4a` and an `.aif`
+produce the unsupported-format error with no sound, that a renamed
+file (e.g. an MP3 named `.ogg`) errors instead of crashing, and that
+with all output devices disabled the app reports the missing device.
+A minimal no-UI check is also available:
+`cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.mp3`.
 
 ## What does not exist yet
 
 Seeking, playlists, artwork, gapless playback, crossfade, EQ,
-visualizers, additional audio formats, folder watching, streaming
-providers, accounts, lyrics, installers, and updaters are future
-milestones. Nothing in this repository makes network requests,
-collects telemetry, or requires an account.
+visualizers, still-more formats/codecs (AIFF, APE, WavPack, ALAC,
+surround Opus), folder watching, streaming providers, accounts,
+lyrics, installers, and updaters are future milestones. Nothing in
+this repository makes network requests, collects telemetry, or
+requires an account.
 
 ## Building
 
