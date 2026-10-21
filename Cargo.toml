@@ -26,3 +26,8 @@ lofty = "0.24"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 walkdir = "2.5.0"
+# Audio (M3). All verified permissive on crates.io; see deny.toml policy.
+claxon = "0.4" # FLAC decoding. Apache-2.0, zero dependencies.
+hound = "3.5" # WAV decoding. Apache-2.0, zero dependencies.
+ringbuf = "0.5" # SPSC ring buffer between decoder and output. MIT OR Apache-2.0.
+cpal = "0.18" # Audio output (WASAPI/CoreAudio/ALSA). Apache-2.0. Optional; see flux-audio.

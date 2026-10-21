@@ -1,6 +1,9 @@
-# Continuous integration for Flux (Milestone M0 foundations).
+# Continuous integration for Flux.
 #
 # Runs formatting, Clippy, dependency-license checks, tests, and builds.
+# The optional CPAL audio backend (flux-audio `cpal` feature) is
+# compile-checked on every platform; CI runners provide no usable audio
+# device, so compilation here is never evidence of audible playback.
 # This workflow never publishes, packages, signs, or uploads artifacts.
 #
 # The Rust toolchain is pinned by rust-toolchain.toml at the repository
@@ -124,3 +127,5 @@ jobs:
       # this ARM64 runner, so no test or run step is claimed here.
       - name: Check workspace for x86_64-apple-darwin
         run: cargo check --workspace --locked --target x86_64-apple-darwin
+      - name: Check CPAL feature for x86_64-apple-darwin
+        run: cargo check -p flux-audio --features cpal --all-targets --locked --target x86_64-apple-darwin

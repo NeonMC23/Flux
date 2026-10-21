@@ -1,12 +1,48 @@
-//! Playback-control model for Flux.
+//! Playback for Flux: control state, decoding, and device output.
 //!
-//! [`Player`] is a pure, synchronous state machine that coordinates a
-//! [`Queue`], a [`PlaybackState`], and a [`RepeatMode`] from `flux-core`.
-//! It decides *which* track is current and whether the model considers it
-//! playing — nothing more. This crate deliberately contains **no** audio
-//! output, decoding, threading, async machinery, or backend selection, and
-//! `Playing` never means that sound is actually being produced. A future
-//! milestone will drive a real backend from this model's decisions.
+//! This crate has two layers that stay strictly separate:
+//!
+//! - [`Player`] — a pure, synchronous state machine that coordinates a
+//!   [`Queue`], a [`PlaybackState`], and a [`RepeatMode`] from
+//!   `flux-core`. It decides *which* track is current and whether the
+//!   model considers it playing — nothing more. It remains the
+//!   **single authority** for playback decisions and produces no sound
+//!   itself; `Playing` in the model never by itself means that sound
+//!   is being produced.
+//! - [`engine`] — a threaded playback engine that executes intent: it
+//!   decodes files ([`decode`]) on a worker thread and feeds an
+//!   [`output`] backend through a lock-free ring buffer. Front-ends
+//!   drive [`Player`] and forward its decisions to an
+//!   [`engine::EngineHandle`]; they never touch audio threads.
+//!
+//! # What actually plays
+//!
+//! Playable formats are exactly those in
+//! [`decode::PLAYABLE_EXTENSIONS`] (WAV via `hound`, FLAC via
+//! `claxon`). Being *indexed* by `flux-library` does not make a file
+//! playable; opening anything else fails with a typed
+//! [`decode::DecodeError::UnsupportedFormat`].
+//!
+//! # The `cpal` feature (off by default)
+//!
+//! Real device output through CPAL lives behind the non-default
+//! `cpal` Cargo feature (the `cpal_output` module and
+//! `EngineHandle::spawn_cpal_default`). Default builds are
+//! device-independent, compile anywhere, and exercise the engine
+//! through [`output::NullOutput`] — a manually driven null backend
+//! that never pretends to be a real device. On Linux, the `cpal`
+//! feature additionally requires system ALSA development files (e.g.
+//! `libasound2-dev`) to compile; Windows and macOS need no extra
+//! system packages. **Compilation is not playback**: audible output
+//! can only be verified on a physical device (see the manual hardware
+//! checklist in the repository README).
+
+pub mod decode;
+pub mod engine;
+pub mod output;
+
+#[cfg(feature = "cpal")]
+pub mod cpal_output;
 
 use flux_core::{Error, PlaybackState, Queue, RepeatMode, Result, TrackId};
 

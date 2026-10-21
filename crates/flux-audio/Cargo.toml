@@ -4,8 +4,25 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Playback-control model for Flux (no audio output yet)"
+description = "Playback control model and local audio engine for Flux"
 publish = false
+
+[features]
+default = []
+# Real audio output through CPAL (WASAPI/CoreAudio/ALSA). Deliberately
+# NOT a default feature: the default build must never silently imply that
+# device playback is available, and Linux builds of this feature require
+# the ALSA development library (libasound2-dev). Enable it explicitly in
+# application builds and CI compile-checks.
+cpal = ["dep:cpal"]
 
 [dependencies]
 flux-core.workspace = true
+claxon.workspace = true
+hound.workspace = true
+ringbuf.workspace = true
+cpal = { workspace = true, optional = true }
+
+[[example]]
+name = "play_file"
+required-features = ["cpal"]
