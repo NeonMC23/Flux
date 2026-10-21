@@ -27,15 +27,16 @@ pub use track::{Track, TrackId, TrackSource};
 pub const APP_NAME: &str = "Flux";
 
 /// Latest milestone whose implementation is complete and validated.
-pub const MILESTONE: &str = "M3";
+pub const MILESTONE: &str = "M4";
 
 /// Startup text shared by the GUI and TUI binaries.
 ///
-/// The wording is deliberately explicit: the applications still provide no
-/// library management or audio playback features, even though the
-/// underlying domain model is being built milestone by milestone.
+/// Kept deliberately factual: as of M4 both applications are working
+/// local music players (library scanning plus WAV/FLAC playback);
+/// what is still missing (more formats, playlists, seeking, …) is
+/// listed in the README rather than hinted at here.
 pub fn startup_message() -> String {
-    format!("{APP_NAME} — {MILESTONE} foundations. Library and playback are not implemented yet.")
+    format!("{APP_NAME} — {MILESTONE}. A local music player for your own library.")
 }
 
 #[cfg(test)]
@@ -47,6 +48,6 @@ mod tests {
         let message = startup_message();
         assert!(message.contains(APP_NAME));
         assert!(message.contains(MILESTONE));
-        assert!(message.contains("not implemented yet"));
+        assert!(message.contains("local music player"));
     }
 }

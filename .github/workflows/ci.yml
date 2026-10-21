@@ -39,7 +39,7 @@ jobs:
       - name: Install Linux system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev libasound2-dev
       - name: Install pinned Rust toolchain
         run: |
           rustup show
@@ -49,6 +49,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy — CPAL features (warnings denied)
+        run: cargo clippy -p flux-audio -p flux-app -p flux-gui -p flux-tui --features cpal --all-targets --locked -- -D warnings
 
   licenses:
     name: Dependency licenses (cargo-deny)
@@ -100,7 +102,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev libasound2-dev
       - name: Install pinned Rust toolchain and target
         run: |
           rustup show
@@ -111,6 +113,10 @@ jobs:
         run: cargo test --workspace --locked --target ${{ matrix.target }}
       - name: Build workspace (native)
         run: cargo build --workspace --locked --target ${{ matrix.target }}
+      # Compile-check only: runners have no usable audio device, so this
+      # step never constitutes a playback test.
+      - name: Compile-check CPAL features
+        run: cargo check -p flux-audio -p flux-app -p flux-gui -p flux-tui --features cpal --all-targets --locked --target ${{ matrix.target }}
 
   macos-x86_64-cross-check:
     name: Compile-only cross-check (macOS x86_64)
@@ -127,5 +133,5 @@ jobs:
       # this ARM64 runner, so no test or run step is claimed here.
       - name: Check workspace for x86_64-apple-darwin
         run: cargo check --workspace --locked --target x86_64-apple-darwin
-      - name: Check CPAL feature for x86_64-apple-darwin
-        run: cargo check -p flux-audio --features cpal --all-targets --locked --target x86_64-apple-darwin
+      - name: Check CPAL features for x86_64-apple-darwin
+        run: cargo check -p flux-audio -p flux-app -p flux-gui -p flux-tui --features cpal --all-targets --locked --target x86_64-apple-darwin

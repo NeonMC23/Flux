@@ -1,0 +1,24 @@
+[package]
+name = "flux-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared application controller for Flux: coordinates library, playback model, and audio engine"
+publish = false
+
+[features]
+default = []
+# Pass-through to flux-audio's real-device CPAL backend. Non-default for
+# the same reason as in flux-audio: default builds stay device-independent
+# and never silently imply audio output is available.
+cpal = ["flux-audio/cpal"]
+
+[dependencies]
+flux-core.workspace = true
+flux-library.workspace = true
+flux-audio.workspace = true
+flux-platform.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
