@@ -40,3 +40,14 @@ claxon = "0.4" # FLAC decoding. Apache-2.0, zero dependencies.
 hound = "3.5" # WAV decoding. Apache-2.0, zero dependencies.
 ringbuf = "0.5" # SPSC ring buffer between decoder and output. MIT OR Apache-2.0.
 cpal = "0.18" # Audio output (WASAPI/CoreAudio/ALSA). Apache-2.0. Optional; see flux-audio.
+# Audio (M5 format decoders). All permissive per crates.io metadata and
+# verified with `cargo deny check licenses` (see README for the support
+# matrix and the reasons this hybrid was chosen over a single framework).
+# rmp3: minimp3 (public domain/CC0-1.0) compiled via the `cc` build
+# dependency, scalar (no SIMD) for portability, f32 PCM output.
+rmp3 = { version = "0.3", default-features = false, features = ["float"] }
+lewton = { version = "0.10", default-features = false } # Vorbis decoding. MIT OR Apache-2.0. (Ogg demuxing is ours via `ogg`.)
+ogg = "0.9" # Ogg container demuxing. BSD-3-Clause.
+opus-pure = "0.2" # Opus decoding, pure Rust. BSD-3-Clause, zero dependencies.
+rusty_aac = "1.1" # AAC decoding, pure Rust. Apache-2.0, zero dependencies.
+mp4 = "0.14" # MP4/M4A container demuxing. MIT.
