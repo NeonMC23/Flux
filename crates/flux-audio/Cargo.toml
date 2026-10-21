@@ -20,6 +20,12 @@ cpal = ["dep:cpal"]
 flux-core.workspace = true
 claxon.workspace = true
 hound.workspace = true
+rmp3.workspace = true
+lewton.workspace = true
+ogg.workspace = true
+opus-pure.workspace = true
+rusty_aac.workspace = true
+mp4.workspace = true
 ringbuf.workspace = true
 cpal = { workspace = true, optional = true }
 

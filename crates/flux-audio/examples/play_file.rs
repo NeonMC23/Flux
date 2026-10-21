@@ -1,10 +1,11 @@
-//! Development example: plays one local WAV/FLAC file through the
+//! Development example: plays one local audio file through the
 //! default CPAL output device and prints engine events until the track
-//! ends.
+//! ends. Any file `flux_audio::decode::open_decoder` supports works
+//! (WAV, FLAC, MP3, AAC, Ogg Vorbis, Opus, M4A/MP4-AAC).
 //!
-//! This is the manual hardware-verification entry point for milestone
-//! M3; it is not part of either application. It only builds with the
-//! `cpal` feature enabled:
+//! This is the manual hardware-verification entry point; it is not
+//! part of either application. It only builds with the `cpal` feature
+//! enabled:
 //!
 //! ```sh
 //! cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.flac
@@ -18,7 +19,7 @@ use flux_core::TrackId;
 
 fn main() -> std::process::ExitCode {
     let Some(path) = std::env::args_os().nth(1) else {
-        eprintln!("usage: play_file <audio-file.wav|audio-file.flac>");
+        eprintln!("usage: play_file <audio-file (wav|flac|mp3|aac|ogg|oga|opus|m4a|m4b|mp4)>");
         return std::process::ExitCode::FAILURE;
     };
     let path = PathBuf::from(path);

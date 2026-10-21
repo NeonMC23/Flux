@@ -38,12 +38,16 @@
 //!
 //! # Playable vs. indexed
 //!
-//! The library scanner indexes 16 file extensions, but the engine can
-//! decode only WAV and FLAC. The controller checks
+//! The library scanner indexes 16 file extensions, but the engine
+//! decodes a subset of them (see `flux_audio::decode` for the exact
+//! container/codec matrix: WAV, FLAC, MP3, AAC/ADTS, Ogg Vorbis,
+//! Opus, and AAC in M4A/MP4). The controller checks
 //! `flux_audio::decode::is_playable` before asking the engine to load
 //! anything and surfaces a clear error for the rest; indexed tracks are
 //! never presented as playable by implication (see
-//! [`is_track_playable`], which front-ends use for display).
+//! [`is_track_playable`], which front-ends use for display). Even for
+//! a playable extension the engine still validates the contents, and
+//! corrupt files fail with a typed error — never a silent skip.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -161,9 +165,10 @@ pub fn default_index_path() -> Option<PathBuf> {
     flux_platform::app_dirs("flux").map(|dirs| dirs.data_dir().join("library-index.json"))
 }
 
-/// Whether the engine can actually decode this track's file (WAV/FLAC
-/// today). Front-ends use this to mark indexed-but-not-yet-playable
-/// tracks instead of letting users discover it by failure.
+/// Whether the engine can actually decode this track's file, by
+/// extension (the contents are validated when the track is opened).
+/// Front-ends use this to mark indexed-but-unplayable tracks instead
+/// of letting users discover it by failure.
 #[must_use]
 pub fn is_track_playable(track: &Track) -> bool {
     flux_audio::decode::is_playable(track.source().path())
@@ -667,8 +672,8 @@ impl Controller {
         let title = track.title().to_owned();
         if !flux_audio::decode::is_playable(&path) {
             return Err(format!(
-                "\"{title}\" cannot be played yet: only WAV and FLAC files are playable. \
-                 The file stays in the library, indexed."
+                "\"{title}\" cannot be played: Flux plays WAV, FLAC, MP3, AAC, Ogg Vorbis, \
+                 Opus, and M4A/MP4 (AAC) files. The file stays in the library, indexed."
             ));
         }
         self.engine.load(id, path);
@@ -865,7 +870,7 @@ mod tests {
     }
 
     /// Standard fixture set: two playable WAVs, one indexed-but-not-
-    /// playable MP3, one corrupt WAV, in `<dir>/music`.
+    /// playable AIFF, one corrupt WAV, in `<dir>/music`.
     struct Fixtures {
         root: PathBuf,
         a: PathBuf,
@@ -877,7 +882,7 @@ mod tests {
         fs::create_dir_all(&root).expect("music dir");
         let a = write_dc_wav(&root, "a.wav", 11_025, 0.4);
         let b = write_dc_wav(&root, "b.wav", 11_025, 0.3);
-        fs::write(root.join("c.mp3"), b"not really mp3").expect("mp3 bytes");
+        fs::write(root.join("c.aif"), b"not really aiff").expect("aiff bytes");
         fs::write(root.join("d.wav"), b"not really wav").expect("corrupt wav");
         Fixtures { root, a, b }
     }
@@ -1059,7 +1064,7 @@ mod tests {
         let b = id_of(&controller, &fx.b);
 
         // From A, the queue's next playable-advance target is B
-        // (library order: a, b, c.mp3, d.wav follow scan order).
+        // (library order: a, b, c.aif, d.wav follow scan order).
         controller.play_track(a);
         drive(&mut controller, &control, |c, _| {
             c.current_id() == Some(b) && c.player_state() == PlaybackState::Playing
@@ -1070,7 +1075,7 @@ mod tests {
             "end of A must advance to B"
         );
 
-        // B ends → next in queue is the MP3 → clear error, stopped,
+        // B ends → next in queue is the AIFF → clear error, stopped,
         // consistent (no silent skip, no stuck Playing).
         let events = drive(&mut controller, &control, |c, ev| {
             c.player_state() == PlaybackState::Stopped
@@ -1080,9 +1085,70 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, ControllerEvent::Error(m) if m.contains("WAV and FLAC"))),
-            "auto-advance onto an MP3 must error clearly: {events:?}"
+                .any(|e| matches!(e, ControllerEvent::Error(m) if m.contains("cannot be played"))),
+            "auto-advance onto an unplayable format must error clearly: {events:?}"
         );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn compressed_formats_play_and_advance_through_the_controller() {
+        // Real encoded fixtures from the flux-audio test suite
+        // (provenance: crates/flux-audio/tests/fixtures/README.md).
+        const OGG: &[u8] = include_bytes!("../../flux-audio/tests/fixtures/tone.ogg");
+        const M4A: &[u8] = include_bytes!("../../flux-audio/tests/fixtures/tone.m4a");
+        const MP3: &[u8] = include_bytes!("../../flux-audio/tests/fixtures/silence.mp3");
+        let dir = TempDir::new("formats");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        fs::write(root.join("tone.ogg"), OGG).expect("ogg fixture");
+        fs::write(root.join("tone.m4a"), M4A).expect("m4a fixture");
+        fs::write(root.join("silence.mp3"), MP3).expect("mp3 fixture");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+
+        // Play each compressed track in library order: every one must
+        // reach Playing with a real stream info and produce no error,
+        // then end and auto-advance (or stop after the last).
+        let order: Vec<TrackId> = controller.tracks().iter().map(|(id, _)| *id).collect();
+        assert_eq!(order.len(), 3, "all three fixtures indexed");
+        for track in controller.tracks() {
+            assert!(
+                super::is_track_playable(&track.1),
+                "{} playable",
+                track.1.title()
+            );
+        }
+        for (i, id) in order.iter().enumerate() {
+            controller.play_track(*id);
+            let events = drive(&mut controller, &control, |c, _| {
+                c.current_id() == Some(*id)
+                    && c.player_state() == PlaybackState::Playing
+                    && c.stream_info().is_some()
+            });
+            assert!(
+                events
+                    .iter()
+                    .all(|e| !matches!(e, ControllerEvent::Error(_))),
+                "no playback errors expected: {events:?}"
+            );
+            // Let it run to completion.
+            let is_last = i + 1 == order.len();
+            let events = drive(&mut controller, &control, |c, _| {
+                if is_last {
+                    c.player_state() == PlaybackState::Stopped
+                } else {
+                    c.current_id() == Some(order[i + 1])
+                }
+            });
+            assert!(
+                events
+                    .iter()
+                    .all(|e| !matches!(e, ControllerEvent::Error(_))),
+                "EOF advancement must not error: {events:?}"
+            );
+        }
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
         controller.shutdown();
     }
 
@@ -1145,15 +1211,15 @@ mod tests {
         let fx = fixtures(&dir);
         let (mut controller, control) = boot(&dir);
         scanned(&mut controller, &control, fx.root.clone());
-        let mp3 = id_of(&controller, &fx.root.join("c.mp3"));
+        let aif = id_of(&controller, &fx.root.join("c.aif"));
 
-        controller.play_track(mp3);
+        controller.play_track(aif);
         let events = controller.poll();
         assert_eq!(controller.player_state(), PlaybackState::Stopped);
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, ControllerEvent::Error(m) if m.contains("WAV and FLAC"))),
+                .any(|e| matches!(e, ControllerEvent::Error(m) if m.contains("cannot be played"))),
             "{events:?}"
         );
         let a = id_of(&controller, &fx.a);
