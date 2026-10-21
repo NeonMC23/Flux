@@ -11,6 +11,17 @@ publish = false
 name = "flux"
 path = "src/main.rs"
 
+[features]
+default = []
+# Real audio output (via flux-app → flux-audio's CPAL backend).
+# Non-default so ordinary builds stay device-independent; applications
+# intended to actually play sound are built with `--features cpal`.
+cpal = ["flux-app/cpal"]
+
 [dependencies]
 flux-core.workspace = true
-iced.workspace = true
+flux-app.workspace = true
+# The `tokio` feature selects iced's tokio-backed runtime, which is
+# what provides `iced::time::every` (the default thread-pool backend
+# has no timer). It also gives Tasks a multi-threaded executor.
+iced = { workspace = true, features = ["tokio"] }

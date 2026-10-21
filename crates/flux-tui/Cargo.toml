@@ -11,5 +11,14 @@ publish = false
 name = "flux-tui"
 path = "src/main.rs"
 
+[features]
+default = []
+# Real audio output (via flux-app → flux-audio's CPAL backend).
+# Non-default so ordinary builds stay device-independent; applications
+# intended to actually play sound are built with `--features cpal`.
+cpal = ["flux-app/cpal"]
+
 [dependencies]
 flux-core.workspace = true
+flux-app.workspace = true
+crossterm.workspace = true
