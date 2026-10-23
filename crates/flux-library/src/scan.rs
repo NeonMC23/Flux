@@ -18,6 +18,9 @@
 //!   malformed, or unreadable tags fall back to a filename-derived
 //!   title — tag problems never fail an import. Empty/whitespace tag
 //!   fields count as missing.
+//! - If the metadata reader itself crashes (panics) on a file, the
+//!   panic is contained per file: that file alone is reported *failed*
+//!   and the scan continues with the next one.
 //! - Reconciliation is by path identity (see the crate-level docs): new
 //!   paths are *added*, unchanged paths are *deduplicated*, and paths
 //!   whose metadata changed are *updated in place*, keeping their
@@ -127,8 +130,9 @@ impl Library {
     /// policies (symlinks, fallback titles, determinism, no pruning).
     ///
     /// This method never fails as a whole: a missing root, an unreadable
-    /// directory, or a malformed file is reported in the returned
-    /// [`ScanReport`] and the scan continues.
+    /// directory, a malformed file, or a metadata-reader crash on an
+    /// individual file is reported in the returned [`ScanReport`] and
+    /// the scan continues.
     pub fn scan(&mut self, roots: &[&Path]) -> ScanReport {
         let mut report = ScanReport::default();
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -184,8 +188,29 @@ impl Library {
 
     /// Reconciles one candidate file into the library, updating `report`.
     fn import_candidate(&mut self, path: &Path, report: &mut ScanReport) {
-        match read_track(path) {
-            Ok(track) => {
+        self.import_candidate_with(path, report, read_track);
+    }
+
+    /// The workhorse behind `import_candidate`, with the per-file
+    /// metadata reader injected — the seam the panic-containment test
+    /// uses to simulate a crashing tag reader.
+    ///
+    /// The read runs inside `catch_unwind`: the tag reader processes
+    /// untrusted bytes, and a panic inside it must degrade to one
+    /// *failed* report entry — never kill the scan (potentially a
+    /// background thread) and lose every other file's result. The
+    /// guard is deliberately per-file, not one wrapper around the
+    /// whole scan, so partial progress always survives. The process
+    /// panic hook is left alone (it belongs to the application — the
+    /// TUI installs one); a contained crash still prints its single
+    /// diagnostic line there, and the panic payload is not surfaced.
+    fn import_candidate_with<F>(&mut self, path: &Path, report: &mut ScanReport, read: F)
+    where
+        F: FnOnce(&Path) -> Result<Track, String>,
+    {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(path)));
+        match outcome {
+            Ok(Ok(track)) => {
                 if let Some(id) = self.id_for_path(path) {
                     if self.get(id) == Some(&track) {
                         report.deduplicated += 1;
@@ -200,9 +225,13 @@ impl Library {
                     report.added += 1;
                 }
             }
-            Err(reason) => report
+            Ok(Err(reason)) => report
                 .failed
                 .push(ScanIssue::new(path.to_path_buf(), reason)),
+            Err(_) => report.failed.push(ScanIssue::new(
+                path.to_path_buf(),
+                "metadata reader crashed on this file (contained)".to_owned(),
+            )),
         }
     }
 }
@@ -433,6 +462,49 @@ mod tests {
         assert_eq!(report.added(), 1);
         assert_eq!(report.failed().len(), 1);
         assert_eq!(report.failed()[0].path(), missing.as_path());
+    }
+
+    #[test]
+    fn panicking_metadata_read_is_contained_per_file() {
+        // The production scan loop reaches each file through
+        // `import_candidate`, which delegates to `import_candidate_with`
+        // with the real `read_track`. Injecting a reader that panics on
+        // the middle file exercises that exact containment boundary
+        // without needing a tag file that reliably crashes lofty. (The
+        // injected panic still prints via the ambient panic hook; in
+        // tests that output is captured by the harness.)
+        let dir = TempDir::new("panic-containment");
+        let first = dir.write("a-first.flac", &flac_bytes(&[("TITLE", "First")]));
+        let boom = dir.write("b-boom.flac", &flac_bytes(&[]));
+        let last = dir.write("c-last.flac", &flac_bytes(&[("TITLE", "Last")]));
+
+        fn reader(path: &Path) -> Result<Track, String> {
+            if path.ends_with("b-boom.flac") {
+                panic!("injected metadata-reader crash");
+            }
+            super::read_track(path)
+        }
+
+        let mut library = Library::new();
+        let mut report = super::ScanReport::default();
+        // Same sorted order `Library::scan` would process them in.
+        for path in [&first, &boom, &last] {
+            library.import_candidate_with(path, &mut report, reader);
+        }
+
+        // The panicking file became an ordinary itemized failure, and
+        // the files before and after it imported normally.
+        assert_eq!(report.added(), 2);
+        assert_eq!(report.failed().len(), 1);
+        assert_eq!(report.failed()[0].path(), boom.as_path());
+        assert!(
+            report.failed()[0].reason().contains("crashed"),
+            "reason should name the crash: {}",
+            report.failed()[0].reason()
+        );
+        let titles: Vec<&str> = library.iter().map(|(_, t)| t.title()).collect();
+        assert_eq!(titles, ["First", "Last"]);
+        assert!(library.id_for_path(&boom).is_none());
     }
 
     #[test]
