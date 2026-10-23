@@ -26,7 +26,10 @@
 //!   SPSC ring buffer and fills silence on underrun — no allocation,
 //!   locking, or I/O on the real-time thread.
 //! - Every load/stop bumps a **generation counter**. The callback
-//!   discards buffered samples when the generation changes, and the
+//!   discards buffered samples when the generation changes and then
+//!   *acknowledges* the new generation; the worker pushes no samples
+//!   for a generation until it has been acknowledged, so the flush
+//!   can never discard the beginning of a just-loaded track. The
 //!   worker only emits end-of-track for the current generation, so
 //!   rapid track changes can never leak stale samples or stale
 //!   `TrackEnded` events.
@@ -156,6 +159,13 @@ struct Shared {
     gain_bits: AtomicU32,
     /// Bumped on every load/stop; the callback flushes on change.
     generation: AtomicU64,
+    /// Callback → worker: the newest generation whose ring flush the
+    /// callback has completed. Invariant: the worker pushes samples
+    /// for a generation only after the callback has acknowledged that
+    /// generation, so the flush-on-generation-change can only ever
+    /// discard *previous*-generation samples — never the head of the
+    /// track that was just loaded.
+    acked_generation: AtomicU64,
     /// Worker → callback: decoder reached EOF and all converted
     /// samples have been pushed to the ring.
     decoder_eof: AtomicBool,
@@ -171,6 +181,7 @@ impl Shared {
             gate_open: AtomicBool::new(false),
             gain_bits: AtomicU32::new(1.0f32.to_bits()),
             generation: AtomicU64::new(0),
+            acked_generation: AtomicU64::new(0),
             decoder_eof: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             played_frames: AtomicU64::new(0),
@@ -202,10 +213,20 @@ impl FillCallback for SampleSource {
         let generation = self.shared.generation.load(Ordering::Acquire);
         if generation != self.seen_generation {
             // Track changed or stopped: discard everything buffered
-            // from the old generation before producing any sound.
+            // from the old generation before producing any sound. The
+            // worker never pushes samples for a generation until it is
+            // acknowledged below, so this flush cannot discard samples
+            // belonging to the new generation (see
+            // `Shared::acked_generation`).
             self.seen_generation = generation;
             self.consumer.clear();
             self.shared.played_frames.store(0, Ordering::Release);
+            // Acknowledge only *after* the flush: from this store on,
+            // the worker may push this generation's samples and they
+            // are guaranteed to survive.
+            self.shared
+                .acked_generation
+                .store(generation, Ordering::Release);
             out.fill(0.0);
             return;
         }
@@ -461,11 +482,14 @@ fn run_worker<F>(
     let mut playing = false;
     let mut eof_reached = false;
     let mut ended_sent = false;
+    // The generation this worker's decoder/pending state belongs to.
+    // Only the worker bumps generations, so this mirror is exact.
+    let mut current_generation = shared.generation.load(Ordering::Acquire);
 
     'worker: loop {
         match commands.recv_timeout(WORKER_TICK) {
             Ok(Command::Load { id, path }) => {
-                shared.bump_generation();
+                current_generation = shared.bump_generation();
                 decoder = None;
                 current = None;
                 converter = None;
@@ -497,7 +521,7 @@ fn run_worker<F>(
                     if decoder.is_none() {
                         // The track previously ended (or errored):
                         // pressing play restarts it from the beginning.
-                        shared.bump_generation();
+                        current_generation = shared.bump_generation();
                         pending.clear();
                         pending_sent = 0;
                         eof_reached = false;
@@ -531,7 +555,7 @@ fn run_worker<F>(
                 }
             }
             Ok(Command::Stop) => {
-                shared.bump_generation();
+                current_generation = shared.bump_generation();
                 decoder = None;
                 current = None;
                 converter = None;
@@ -546,16 +570,26 @@ fn run_worker<F>(
             Err(RecvTimeoutError::Timeout) => {}
         }
 
-        // Pump converted samples into the ring. Decoding continues
-        // while paused (the bounded ring applies backpressure), so
-        // resuming is instant; only an absent/exhausted decoder idles.
-        if pending_sent < pending.len() {
+        // Pump converted samples into the ring — but only once the
+        // callback has flushed and acknowledged the current generation
+        // (`Shared::acked_generation`): anything pushed before that
+        // acknowledgement could still be wiped by the pending flush.
+        // Command handling above is deliberately *not* gated, so
+        // load/stop/shutdown stay responsive even if a backend never
+        // calls back. Decoding continues while paused (the bounded
+        // ring applies backpressure), so resuming is instant; only an
+        // absent/exhausted decoder idles.
+        let generation_live = shared.acked_generation.load(Ordering::Acquire) == current_generation;
+        if generation_live && pending_sent < pending.len() {
             pending_sent += producer.push_slice(&pending[pending_sent..]);
             if pending_sent == pending.len() {
                 pending.clear();
                 pending_sent = 0;
             }
-        } else if !eof_reached && let Some(dec) = decoder.as_mut() {
+        } else if generation_live
+            && !eof_reached
+            && let Some(dec) = decoder.as_mut()
+        {
             let chunk_samples = DECODE_CHUNK_FRAMES * usize::from(config.channels);
             if producer.vacant_len() >= chunk_samples {
                 match dec.next_chunk(DECODE_CHUNK_FRAMES) {
@@ -929,6 +963,136 @@ mod tests {
                 .iter()
                 .all(|s| s.abs() < 0.001 || (*s - 0.8).abs() < 0.02),
             "only silence or track B's DC level after replacement"
+        );
+        assert_eq!(nonzero_frames(&control, 1), 11_025);
+        engine.shutdown();
+    }
+
+    /// Collects engine events **without draining the null device**
+    /// until `done` matches one. Unlike `drive_until`, the audio
+    /// callback never runs here — the point of the two generation-race
+    /// regression tests below, which let the worker run ahead of the
+    /// callback and know exactly how far it got from command/event
+    /// ordering alone (the worker runs its pump section before
+    /// receiving the next command, so a later command's event happens
+    /// after every earlier iteration's pump). The iteration cap is a
+    /// hang guard, not a timing assertion.
+    fn collect_events_until(
+        engine: &EngineHandle,
+        done: impl Fn(&EngineEvent) -> bool,
+    ) -> Vec<EngineEvent> {
+        let mut seen = Vec::new();
+        for _ in 0..2_000 {
+            if let Ok(event) = engine.events().recv_timeout(Duration::from_millis(5)) {
+                let finished = done(&event);
+                seen.push(event);
+                if finished {
+                    return seen;
+                }
+            }
+        }
+        seen
+    }
+
+    /// Regression test for the generation-flush race (M6-1): the
+    /// callback discards the ring contents the first time it observes
+    /// a generation change, so if the worker gets to push
+    /// new-generation samples before that first post-load callback,
+    /// those samples must not be thrown away.
+    ///
+    /// This is forced deterministically, without sleeps: `load`,
+    /// `play` and `pause` are sent back-to-back and the device is
+    /// never drained during setup. Receiving `Paused` proves the
+    /// worker completed the `Play` iteration — including its pump
+    /// section — while the callback has never run. Before the fix,
+    /// that pump pushed the first decoded chunk of the new track into
+    /// the ring and the first drain after resuming wiped it with the
+    /// generation flush (the 44_100-frame total below fell short);
+    /// with the fix the worker holds its pushes until the callback
+    /// acknowledges the generation, so every frame arrives.
+    #[test]
+    fn generation_flush_never_discards_new_track_samples() {
+        let dir = TempDir::new("generation-race");
+        let path = write_dc_wav(&dir, "dc.wav", 44_100, 44_100, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let id = TrackId::new(1);
+
+        engine.load(id, path);
+        engine.play();
+        engine.pause();
+        let events = collect_events_until(&engine, |e| matches!(e, EngineEvent::Paused { .. }));
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Paused { id: got }) if *got == id),
+            "expected Paused, got {events:?}"
+        );
+        assert_eq!(
+            control.captured_frames(),
+            0,
+            "the callback must not have run during setup"
+        );
+
+        // Resume and drain to completion: the full track, including
+        // its first chunk, must reach the device.
+        engine.play();
+        let events = drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got }) if *got == id),
+            "expected TrackEnded, got {events:?}"
+        );
+        assert_eq!(nonzero_frames(&control, 1), 44_100);
+        engine.shutdown();
+    }
+
+    /// M6-1 companion case: rapid consecutive loads with no callback
+    /// activity in between. Only the newest track may be heard, and it
+    /// must arrive complete. Same ordering argument as above: waiting
+    /// for `Paused` proves the worker finished the `Play` iteration's
+    /// pump for track B before the callback's first run.
+    #[test]
+    fn rapid_loads_without_callback_still_deliver_newest_track_fully() {
+        let dir = TempDir::new("rapid-loads");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 44_100, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 11_025, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+
+        engine.load(id_a, a);
+        engine.load(id_b, b);
+        engine.play();
+        engine.pause();
+        let events = collect_events_until(&engine, |e| matches!(e, EngineEvent::Paused { .. }));
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Paused { id: got }) if *got == id_b),
+            "expected Paused for track B, got {events:?}"
+        );
+        assert_eq!(
+            control.captured_frames(),
+            0,
+            "the callback must not have run during setup"
+        );
+
+        engine.play();
+        let events = drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got }) if *got == id_b),
+            "expected TrackEnded for track B, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, EngineEvent::TrackEnded { id } if *id == id_a)),
+            "track A must never report TrackEnded: {events:?}"
+        );
+        let captured = control.captured();
+        assert!(
+            captured
+                .iter()
+                .all(|s| s.abs() < 0.001 || (*s - 0.8).abs() < 0.02),
+            "only silence or track B's DC level may appear"
         );
         assert_eq!(nonzero_frames(&control, 1), 11_025);
         engine.shutdown();
