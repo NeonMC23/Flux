@@ -1728,6 +1728,109 @@ mod tests {
         assert_eq!(info.frame_bytes, 100);
     }
 
+    /// DIAGNOSTIC (not a fixture test): compares the production
+    /// windowed/refilling MP3 decode against a reference decode of
+    /// the same bytes presented to minimp3 as one whole in-memory
+    /// buffer, sample for sample. The committed fixtures are digital
+    /// silence, which cannot exhibit reservoir/MDCT state corruption;
+    /// this test exists to make that class of defect observable on
+    /// any real MP3. It is inert unless run with a file supplied:
+    ///
+    /// ```sh
+    /// FLUX_DIAG_MP3=/path/to/real.mp3 cargo test -p flux-audio --locked \
+    ///     diag_mp3_windowed_matches_whole_buffer -- --nocapture
+    /// ```
+    ///
+    /// Only the buffer presentation differs between the two paths
+    /// (both use the same clamped FFI wrapper), so any mismatch
+    /// isolates the windowing/refill logic as the corruptor; a match
+    /// exonerates it for that file's content, not just its sample
+    /// count.
+    #[test]
+    fn diag_mp3_windowed_matches_whole_buffer_reference() {
+        let Some(path) = std::env::var_os("FLUX_DIAG_MP3") else {
+            eprintln!("FLUX_DIAG_MP3 unset: diagnostic skipped");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let bytes = std::fs::read(&path).expect("diagnostic MP3 readable");
+
+        // Production path, at two different caller chunk sizes.
+        let (info, windowed) = decode_all(&path);
+        let (_, windowed_4096) = {
+            let mut decoder = open_decoder(&path).expect("decoder opens");
+            let info = *decoder.info();
+            let mut all = Vec::new();
+            loop {
+                let chunk = decoder.next_chunk(4096).expect("chunk decodes");
+                if chunk.is_empty() {
+                    break;
+                }
+                all.extend(chunk);
+            }
+            (info, all)
+        };
+
+        // Reference path: same wrapper, whole file always resident,
+        // advancing by each call's reported consumption.
+        let mut reference = Vec::new();
+        let mut scratch = [0.0f32; rmp3::MAX_SAMPLES_PER_FRAME];
+        let mut decoder = super::Minimp3::new();
+        let (mut offset, mut decoded_frames, mut stepped_over) = (0usize, 0usize, 0usize);
+        while offset < bytes.len() {
+            let frame = decoder.decode_frame(&bytes[offset..], &mut scratch);
+            assert!(
+                frame.consumed > 0,
+                "reference decode made no progress at byte {offset}"
+            );
+            if frame.samples_per_channel > 0 {
+                assert_eq!(
+                    frame.sample_rate, info.sample_rate,
+                    "rate (frame {decoded_frames})"
+                );
+                assert_eq!(
+                    frame.channels, info.channels,
+                    "channels (frame {decoded_frames})"
+                );
+                let count = frame.samples_per_channel * usize::from(frame.channels);
+                reference.extend_from_slice(&scratch[..count]);
+                decoded_frames += 1;
+            } else {
+                stepped_over += 1;
+            }
+            offset += frame.consumed;
+        }
+        eprintln!(
+            "{}: {} bytes, {} Hz/{} ch, {decoded_frames} frames decoded, \
+             {stepped_over} stepped over without samples, {} samples",
+            path.display(),
+            bytes.len(),
+            info.sample_rate,
+            info.channels,
+            reference.len()
+        );
+
+        let first_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b.iter())
+                .position(|(x, y)| x != y)
+                .or_else(|| (a.len() != b.len()).then_some(a.len().min(b.len())))
+        };
+        assert_eq!(
+            first_diff(&windowed, &windowed_4096),
+            None,
+            "production decode depends on caller chunk size"
+        );
+        assert_eq!(
+            first_diff(&windowed, &reference),
+            None,
+            "windowed decode diverges from whole-buffer reference \
+             (windowed {} samples, reference {} samples)",
+            windowed.len(),
+            reference.len()
+        );
+    }
+
     #[test]
     fn vorbis_fixture_decodes_with_tone() {
         let dir = TempDir::new("Vorbis");
