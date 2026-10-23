@@ -428,10 +428,29 @@ fn map_claxon_error(err: claxon::Error, path: &Path) -> DecodeError {
 /// Bytes read from the file per refill for the byte-stream backends.
 const READ_CHUNK_BYTES: usize = 32 * 1024;
 
+/// Do not present minimp3 with fewer bytes than this while more input
+/// may exist. minimp3 only preserves its decoder state across a call
+/// when the buffer holds a whole frame plus the following frame's
+/// 4-byte header; the largest standard Layer III frame is 1,441 bytes
+/// and minimp3 caps free-format frames at 2,304 bytes, so 8 KiB
+/// leaves generous margin. See `Mp3Decoder::step`.
+const MP3_DECODE_WATERMARK: usize = 8 * 1024;
+
+/// When minimp3 can confirm no frame in the window it reports the
+/// whole window as skippable, but the tail may still hold an
+/// incomplete frame, or a complete frame whose confirming next
+/// header has not been read yet. Keep this many tail bytes (more
+/// than the largest possible frame plus a header) and drop only the
+/// scanned prefix. See `Mp3Decoder::step`.
+const MP3_TAIL_KEEP_BYTES: usize = 4 * 1024;
+
 /// MP3 (MPEG Layer III) over the minimp3 decoder. minimp3 is fed a
-/// sliding window of compressed bytes; its state (including the bit
-/// reservoir) lives in the decoder struct, so frames split across
-/// window refills decode cleanly.
+/// sliding window of compressed bytes. Its state (bit reservoir,
+/// MDCT overlap, QMF) lives in the decoder struct, but only survives
+/// calls made under the presentation rules documented on
+/// `Mp3Decoder::step` — present it with an unaligned or truncated
+/// tail and it silently resets that state and reports the tail as
+/// skippable, destroying the frame at the window boundary.
 ///
 /// The C entry points are called through `rmp3::ffi` directly instead
 /// of rmp3's high-level `RawDecoder`: rmp3 0.3.1's convenience layer
@@ -452,8 +471,12 @@ struct Mp3Frame {
     /// PCM samples per channel written to the output buffer (0 = no
     /// complete Layer III frame was decoded).
     samples_per_channel: usize,
-    /// Bytes the caller may advance past (leading junk/tags plus the
-    /// frame itself). 0 means "need more data".
+    /// `info.frame_bytes`, clamped: for a decoded or stepped-over
+    /// frame, the exact advance past leading junk/tags plus the
+    /// frame. With zero samples and `consumed` covering the whole
+    /// buffer handed in, it instead means "no frame could be
+    /// confirmed in these bytes" — which says nothing about an
+    /// incomplete frame at the tail; see `Mp3Decoder::step`.
     consumed: usize,
     channels: u16,
     sample_rate: u32,
@@ -579,12 +602,41 @@ impl Mp3Decoder {
     /// Decodes one frame into `pending`, skipping any non-audio
     /// regions on the way. Returns false once the stream is
     /// exhausted.
+    ///
+    /// The windowing rules below are dictated by minimp3's actual
+    /// `mp3dec_decode_frame` contract (rmp3 0.3.1's bundled
+    /// `minimp3.h`; also pinned by the
+    /// `minimp3_ffi_contract_matches_window_assumptions` test):
+    ///
+    /// * Decoder state survives a call only when the buffer starts
+    ///   exactly at a frame and also holds that whole frame plus the
+    ///   next frame's 4-byte header (or exactly one frame). Anything
+    ///   less takes minimp3's resynchronising path, which first wipes
+    ///   all decoder state — after which a frame needing bit-reservoir
+    ///   data yields no samples at all.
+    /// * When no frame can be confirmed, minimp3 reports the *whole*
+    ///   buffer as skippable: an incomplete tail is indistinguishable
+    ///   from junk. So while more bytes may still arrive, a tail is
+    ///   neither presented alone nor drained whole.
+    ///
+    /// Bytes are only ever drained by the exact amounts minimp3
+    /// reports for decoded or stepped-over frames, which keeps the
+    /// window front frame-aligned in steady state — the precondition
+    /// for the state-preserving path above.
     fn step(&mut self) -> Result<bool, DecodeError> {
         if self.done {
             return Ok(false);
         }
         loop {
-            if self.window.is_empty() && !self.fill_window()? {
+            // Top up before decoding so a frame at the front of the
+            // window is always presented together with the header
+            // that confirms it, unless the file is over.
+            while self.window.len() < MP3_DECODE_WATERMARK && !self.file_eof {
+                if !self.fill_window()? {
+                    break;
+                }
+            }
+            if self.window.is_empty() {
                 self.done = true;
                 return Ok(false);
             }
@@ -622,24 +674,52 @@ impl Mp3Decoder {
                 self.window.drain(..frame.consumed);
                 return Ok(true);
             }
-            if frame.consumed > 0 {
-                // Junk, a tag, or a non-Layer-III frame that minimp3
-                // skipped: drop it and look at what follows.
+            if frame.consumed == 0 {
+                // Defensive: every path traced in the vendored
+                // minimp3 reports a positive advance, but if it ever
+                // asks for more data by reporting none (its
+                // free-format sizing probe is the plausible route),
+                // refill instead of spinning — unless the stream is
+                // over or this grows without bound.
+                if self.file_eof {
+                    self.window.clear();
+                    self.done = true;
+                    return Ok(false);
+                }
+                if self.window.len() > 1024 * 1024 {
+                    return Err(malformed(
+                        &self.path,
+                        "over 1 MiB of data without a complete MP3 frame".to_string(),
+                    ));
+                }
+                self.fill_window()?;
+                continue;
+            }
+            if frame.consumed < self.window.len() {
+                // A frame was located and stepped over but produced
+                // no audio (corrupt payload, or a non-Layer-III
+                // frame), possibly preceded by skipped junk/tags. The
+                // advance is exact, so dropping precisely these bytes
+                // cannot eat into a later frame.
                 self.window.drain(..frame.consumed);
                 continue;
             }
-            // More bytes are needed to complete (or rule out) a frame.
+            // `consumed` covers the whole window: no frame could be
+            // confirmed anywhere in it. At end of file whatever
+            // remains is a truncated frame or trailing tags/junk, and
+            // the stream simply ends. Mid-stream, the tail may hold
+            // an incomplete frame (or one whose confirming header is
+            // still unread), so drop only the prefix that provably
+            // cannot start such a frame — a frame beginning there
+            // would have to extend past the kept tail, beyond the
+            // largest possible frame size — and read more.
             if self.file_eof {
                 self.window.clear();
                 self.done = true;
                 return Ok(false);
             }
-            if self.window.len() > 1024 * 1024 {
-                return Err(malformed(
-                    &self.path,
-                    "over 1 MiB of data without a complete MP3 frame".to_string(),
-                ));
-            }
+            let keep = MP3_TAIL_KEEP_BYTES.min(self.window.len());
+            self.window.drain(..self.window.len() - keep);
             self.fill_window()?;
         }
     }
@@ -1481,6 +1561,171 @@ mod tests {
             samples.iter().all(|s| *s == 0.0),
             "silent MP3 frames must decode to exact silence"
         );
+    }
+
+    /// Byte length of the MP3 fixture's ID3v2 tag; audio frames start
+    /// at this offset (frame sync `ff fb 90 00` at byte 36, and
+    /// 36 + 20*417 = 8,376 = the fixture's size).
+    const MP3_FIXTURE_ID3_LEN: usize = 36;
+
+    /// The fixture's 20 MPEG audio frames without the ID3v2 tag.
+    /// Repeating *these* keeps frames contiguous, as in a real stream;
+    /// repeating the whole fixture would insert a tag-sized junk gap
+    /// at every copy boundary.
+    fn silence_frames() -> &'static [u8] {
+        &MP3_FIXTURE[MP3_FIXTURE_ID3_LEN..]
+    }
+
+    /// A stream of `copies * 20` contiguous silent frames behind one
+    /// ID3v2 tag. 8 copies = 66,756 bytes, crossing the decoder's
+    /// 32 KiB read-window boundary twice.
+    fn long_silence_mp3(copies: usize) -> Vec<u8> {
+        let mut bytes = MP3_FIXTURE[..MP3_FIXTURE_ID3_LEN].to_vec();
+        bytes.extend_from_slice(&silence_frames().repeat(copies));
+        bytes
+    }
+
+    #[test]
+    fn mp3_decoding_is_sample_exact_across_window_refills() {
+        // Regression test for MP3 frame-boundary integrity: decoding
+        // must neither drop nor duplicate frames when the internal
+        // 32 KiB byte window refills. The short fixture alone never
+        // refills, so it cannot observe this class of bug.
+        let dir = TempDir::new("mp3-long");
+        let path = dir.write("long-silence.mp3", &long_silence_mp3(8));
+        let (info, samples) = decode_all(&path);
+        assert_eq!(info.sample_rate, 44_100);
+        assert_eq!(info.channels, 2);
+        assert_eq!(
+            samples.len(),
+            8 * 20 * 1152 * 2,
+            "every frame must decode exactly once across window refills"
+        );
+        assert!(samples.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn mp3_truncated_final_frame_keeps_all_complete_frames() {
+        // 80 frames with the last one cut short: the 79 complete
+        // frames decode; the incomplete tail ends the stream cleanly.
+        let dir = TempDir::new("mp3-truncated");
+        let mut bytes = long_silence_mp3(4);
+        bytes.truncate(bytes.len() - 100);
+        let path = dir.write("truncated.mp3", &bytes);
+        let (_, samples) = decode_all(&path);
+        assert_eq!(samples.len(), 79 * 1152 * 2);
+    }
+
+    #[test]
+    fn mp3_leading_junk_is_skipped_without_losing_frames() {
+        // Non-audio bytes ahead of the first frame (on top of the
+        // ID3v2 tag every fixture already carries) are skipped; the
+        // contiguous frames behind the junk all decode exactly once.
+        // Zero bytes can never contain a frame sync, so this is
+        // deterministic.
+        let dir = TempDir::new("mp3-leading-junk");
+        let mut bytes = vec![0u8; 37];
+        bytes.extend_from_slice(MP3_FIXTURE);
+        bytes.extend_from_slice(silence_frames());
+        let path = dir.write("leading-junk.mp3", &bytes);
+        let (_, samples) = decode_all(&path);
+        assert_eq!(samples.len(), 2 * 20 * 1152 * 2);
+        assert!(samples.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn mp3_frame_before_a_junk_gap_is_skipped_by_minimp3() {
+        // Pins a verified minimp3 limitation (see
+        // `minimp3_ffi_contract_matches_window_assumptions`): a frame
+        // is only accepted when another frame header immediately
+        // follows it, so the last frame before a junk gap is reported
+        // as skippable prefix and cannot be recovered through this
+        // API. All other frames decode. Real MP3 streams keep frames
+        // contiguous, so this affects only pathological files (and
+        // potentially the final ~26 ms ahead of a trailing ID3v1 tag).
+        let dir = TempDir::new("mp3-junk-gap");
+        let mut bytes = MP3_FIXTURE.to_vec();
+        bytes.extend_from_slice(&[0u8; 100]);
+        bytes.extend_from_slice(silence_frames());
+        let path = dir.write("junk-gap.mp3", &bytes);
+        let (_, samples) = decode_all(&path);
+        assert_eq!(samples.len(), 39 * 1152 * 2);
+    }
+
+    /// Pins the vendored minimp3 `mp3dec_decode_frame` contract that
+    /// `Mp3Decoder`'s window logic is written against, calling the C
+    /// entry point directly (bypassing our clamped wrapper). Verified
+    /// against rmp3 0.3.1's bundled `minimp3.h`
+    /// (`mp3dec_decode_frame`, `mp3d_find_frame`); if a future
+    /// rmp3/minimp3 update changes these semantics, this test fails
+    /// before the behavior silently breaks.
+    #[test]
+    fn minimp3_ffi_contract_matches_window_assumptions() {
+        fn fresh_state() -> Box<rmp3::ffi::mp3dec_t> {
+            // SAFETY: same construction as `Minimp3::new` (POD type,
+            // zeroed, then `mp3dec_init`).
+            let mut state: Box<rmp3::ffi::mp3dec_t> = Box::new(unsafe { std::mem::zeroed() });
+            unsafe { rmp3::ffi::mp3dec_init(&mut *state) };
+            state
+        }
+        fn decode_raw(
+            state: &mut rmp3::ffi::mp3dec_t,
+            src: &[u8],
+        ) -> (i32, rmp3::ffi::mp3dec_frame_info_t) {
+            let mut info: rmp3::ffi::mp3dec_frame_info_t = unsafe { std::mem::zeroed() };
+            let mut pcm = [0.0f32; rmp3::MAX_SAMPLES_PER_FRAME];
+            // SAFETY: `src` and `pcm` outlive the call with the sizes
+            // the FFI contract requires; `state` and `info` are
+            // exclusively borrowed.
+            let samples = unsafe {
+                rmp3::ffi::mp3dec_decode_frame(
+                    state,
+                    src.as_ptr(),
+                    src.len() as std::ffi::c_int,
+                    pcm.as_mut_ptr(),
+                    &mut info,
+                )
+            };
+            (samples, info)
+        }
+
+        let frames = silence_frames();
+
+        // The fixture's ID3v2 tag is reported as skipped prefix:
+        // frame_offset counts it, and frame_bytes is the total advance
+        // (offset + frame size).
+        let (samples, info) = decode_raw(&mut fresh_state(), &MP3_FIXTURE[..4096]);
+        assert_eq!(samples, 1152);
+        assert_eq!(info.frame_offset, MP3_FIXTURE_ID3_LEN as i32);
+        assert_eq!(info.hz, 44_100);
+        assert_eq!(info.channels, 2);
+        let frame_size = info.frame_bytes - info.frame_offset;
+        assert!((400..440).contains(&frame_size), "frame size {frame_size}");
+
+        // Complete frame at offset 0 with more frames behind it.
+        let (samples, info) = decode_raw(&mut fresh_state(), &frames[..4096]);
+        assert_eq!(samples, 1152);
+        assert_eq!(info.frame_offset, 0);
+        assert_eq!(info.frame_bytes, frame_size);
+
+        // Junk prefix: offset counts it; frame_bytes remains the
+        // total advance past junk + frame.
+        let mut junked = vec![0u8; 37];
+        junked.extend_from_slice(&frames[..4096]);
+        let (samples, info) = decode_raw(&mut fresh_state(), &junked);
+        assert_eq!(samples, 1152);
+        assert_eq!(info.frame_offset, 37);
+        assert_eq!(info.frame_bytes, 37 + frame_size);
+
+        // Truncated frame (a real frame's first 100 bytes): zero
+        // samples, and frame_bytes reports the ENTIRE input length.
+        // minimp3 cannot distinguish this from junk — which is why the
+        // production window must never present it with an incomplete
+        // tail it may still need (and why its fast path needs the
+        // *next* frame's header present, as the source shows).
+        let (samples, info) = decode_raw(&mut fresh_state(), &frames[..100]);
+        assert_eq!(samples, 0);
+        assert_eq!(info.frame_bytes, 100);
     }
 
     #[test]
