@@ -613,7 +613,10 @@ fn run_worker<F>(
                         decoder = None;
                         playing = false;
                         shared.gate_open.store(false, Ordering::Release);
-                        // Let already-queued samples drain, but do not
+                        // Output stops here: with the gate closed the
+                        // callback emits silence, so samples still
+                        // buffered are never played (the next
+                        // generation change discards them). Never
                         // report a clean TrackEnded after an error.
                         ended_sent = true;
                         eof_reached = true;

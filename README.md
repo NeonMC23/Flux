@@ -6,15 +6,17 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: Milestone M4 — first usable player.** Both applications now
-work end to end: scan a local music folder, browse/search the library,
-and play WAV and FLAC files with play/pause/stop, next/previous,
-volume, repeat modes, and automatic advancement, all coordinated by one
-shared controller. The library index (with stable track IDs) persists
-between runs. Real-device **audible** playback has still not been
-verified by the developers on physical hardware — the development
-sandbox and CI have no audio device; see the verification checklist
-below and judge the claim accordingly.
+**Status: Milestone M5 — broad local format support; M6 reliability
+work in progress.** Both applications work end to end: scan a local
+music folder, browse/search the library, and play WAV, FLAC, MP3, AAC
+(ADTS streams and MP4/M4A files), Ogg Vorbis, and Opus with
+play/pause/stop, next/previous, volume, repeat modes, and automatic
+advancement, all coordinated by one shared controller. The library
+index (with stable track IDs) persists between runs. The project owner
+has confirmed that real-device playback works on Nobara Linux; that is
+one machine and setup, not a claim that every codec or device has been
+independently verified — the development sandbox and CI have no audio
+device, so see the verification checklist below and judge accordingly.
 
 ## Crates
 
@@ -22,7 +24,7 @@ below and judge the claim accordingly.
 |---|---|---|
 | `flux-core` | library | Backend-independent domain model: tracks, IDs, sources, play queue, repeat/playback states, and the shared error type. No UI, filesystem, database, audio-device, or network implementation. |
 | `flux-library` | library | Local library: recursive folder scanning (tags via lofty, filename fallback, symlinks never followed) into an in-memory, insertion-ordered collection with path deduplication and search, plus save/load of a versioned JSON index with stable IDs. Scanning never prunes missing files. |
-| `flux-audio` | library | Playback, in two strictly separate layers: `Player`, the pure playback-control state machine and single authority for playback decisions; and a threaded engine that decodes WAV (hound) and FLAC (claxon) on a worker thread and feeds an output backend (device-free `NullOutput`, or CPAL behind the non-default `cpal` feature) through a lock-free ring buffer. |
+| `flux-audio` | library | Playback, in two strictly separate layers: `Player`, the pure playback-control state machine and single authority for playback decisions; and a threaded engine that decodes WAV (hound), FLAC (claxon), MP3 (rmp3/minimp3), AAC in ADTS streams and MP4/M4A files (rusty_aac with the mp4 demuxer), and Ogg Vorbis and Opus (lewton and opus-pure over the ogg demuxer) on a worker thread and feeds an output backend (device-free `NullOutput`, or CPAL behind the non-default `cpal` feature) through a lock-free ring buffer. |
 | `flux-app` | library | The shared application controller: owns the library, `Player`, engine, volume, and index path; syncs the engine to the player's decisions; runs scans on a background thread; turns unsupported/missing/corrupt files into clear user-facing errors. Both front-ends drive this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution for Linux/XDG, macOS, and Windows (standard library only). |
@@ -72,8 +74,14 @@ and trying to play one is a clear error, not silence.
 
 | | Extensions |
 |---|---|
-| **Playable** | `flac`, `wav` |
-| **Indexed, not yet playable** | `aac`, `aif`, `aiff`, `ape`, `m4a`, `m4b`, `mp3`, `mp4`, `mpc`, `oga`, `ogg`, `opus`, `spx`, `wv` |
+| **Playable** | `aac`, `flac`, `m4a`, `m4b`, `mp3`, `mp4`, `oga`, `ogg`, `opus`, `wav` |
+| **Indexed, not yet playable** | `aif`, `aiff`, `ape`, `mpc`, `spx`, `wv` |
+
+Playability is decided by content, not extension alone: `.m4a`/`.mp4`
+files must contain an AAC track (ALAC does not play), `.aac` must be an
+ADTS stream, and Opus support covers mono/stereo (channel mapping
+family 0), not surround layouts. The `flux_audio::decode` module docs
+carry the exact container/codec matrix.
 
 Files that disappear or turn out corrupt produce an error message and
 a clean stop; they are never silently pruned from the library.
@@ -158,8 +166,10 @@ playback test.
 Flux's own code is MIT-licensed (see `LICENSE`). Dependencies are
 governed by `deny.toml`, which allows only permissive licenses (MIT,
 Apache-2.0, Zlib, BSD, ISC, BSL-1.0, CC0-1.0, Unlicense,
-Unicode-3.0); the stack — Iced, CPAL, claxon, hound, ringbuf, lofty,
-crossterm — is MIT/Apache-2.0 throughout. Verify with
+Unicode-3.0); the stack — Iced, CPAL, the format decoders (claxon,
+hound, rmp3, lewton, ogg, opus-pure, rusty_aac, mp4), ringbuf, lofty,
+crossterm — stays within that permissive set (MIT, Apache-2.0, and,
+among the decoders, BSD-3-Clause and CC0-1.0). Verify with
 `cargo deny check licenses`.
 
 No assets from the Flow prototype (recordings, artwork, photographs,

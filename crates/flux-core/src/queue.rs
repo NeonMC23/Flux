@@ -23,9 +23,10 @@ pub enum RepeatMode {
 
 /// The state of the playback-control model.
 ///
-/// This describes the *model's* state only. In this milestone no real audio
-/// is produced, so `Playing` means "the model considers a track to be
-/// playing", not that sound is coming out of a device.
+/// This describes the *model's* state only: `Playing` means "the model
+/// considers a track to be playing". Turning that intent into actual
+/// sound is the playback engine's job, elsewhere; the model state alone
+/// never implies that a device is sounding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PlaybackState {
     /// Nothing is playing. The queue's current selection may still be set.

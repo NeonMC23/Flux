@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// File extensions [`open_decoder`] dispatches on (compared ASCII
-/// case-insensitively). Membership only means " Flux will *try* this
+/// case-insensitively). Membership only means "Flux will *try* this
 /// file"; the contents still have to parse.
 pub const PLAYABLE_EXTENSIONS: &[&str] = &[
     "wav", "flac", "mp3", "aac", "ogg", "oga", "opus", "m4a", "m4b", "mp4",
