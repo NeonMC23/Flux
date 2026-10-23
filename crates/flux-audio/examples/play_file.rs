@@ -10,9 +10,15 @@
 //! ```sh
 //! cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.flac
 //! ```
+//!
+//! For playback-glitch diagnosis it also reports the engine's
+//! callback-underrun count (fills that ran dry mid-track and had to
+//! emit silence) — both periodically and at the end. That number
+//! separates "the device was starved" from "the samples themselves
+//! were wrong", which no amount of listening can do reliably.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_audio::engine::{EngineEvent, EngineHandle};
 use flux_core::TrackId;
@@ -43,6 +49,7 @@ fn main() -> std::process::ExitCode {
     engine.load(id, path);
     engine.play();
 
+    let mut last_report = Instant::now();
     loop {
         match engine.events().recv_timeout(Duration::from_millis(250)) {
             Ok(EngineEvent::Loaded { id, info }) => {
@@ -57,13 +64,27 @@ fn main() -> std::process::ExitCode {
             }
             Ok(EngineEvent::Error { id, error }) => {
                 eprintln!("engine error (track {id:?}): {error}");
+                eprintln!("callback underruns so far: {}", engine.underrun_count());
                 return std::process::ExitCode::FAILURE;
             }
             Ok(_) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if last_report.elapsed() >= Duration::from_secs(5) {
+                    println!(
+                        "position {:?}, callback underruns {}",
+                        engine.position(),
+                        engine.underrun_count()
+                    );
+                    last_report = Instant::now();
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    println!(
+        "callback underruns (mid-track silence fills): {}",
+        engine.underrun_count()
+    );
     engine.shutdown();
     std::process::ExitCode::SUCCESS
 }
