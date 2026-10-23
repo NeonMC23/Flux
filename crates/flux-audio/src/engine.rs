@@ -173,6 +173,14 @@ struct Shared {
     drained: AtomicBool,
     /// Device frames actually delivered for the current generation.
     played_frames: AtomicU64,
+    /// Diagnostic: callback fills that found fewer samples in the
+    /// ring than requested while the stream was live (gate open,
+    /// decoder not yet at EOF). This is the only place a starved
+    /// callback is observable at all — the fill itself must degrade
+    /// to silence, which is otherwise indistinguishable from valid
+    /// silent samples. Incremented with one relaxed atomic add on
+    /// the shortfall branch only; the sample path is unaffected.
+    underruns: AtomicU64,
 }
 
 impl Shared {
@@ -185,6 +193,7 @@ impl Shared {
             decoder_eof: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             played_frames: AtomicU64::new(0),
+            underruns: AtomicU64::new(0),
         }
     }
 
@@ -235,6 +244,16 @@ impl FillCallback for SampleSource {
             return;
         }
         let popped = self.consumer.pop_slice(out);
+        if popped < out.len() && !self.shared.decoder_eof.load(Ordering::Relaxed) {
+            // Mid-stream starvation: the device asked for more than
+            // the ring held and the remainder becomes silence. (The
+            // final drain after decoder EOF is exempt — shortfalls
+            // there are the stream ending, not the supply failing.
+            // A count of one or two right after pressing play is
+            // likewise benign: the gate opens before the worker's
+            // first push lands.)
+            self.shared.underruns.fetch_add(1, Ordering::Relaxed);
+        }
         out[popped..].fill(0.0);
         let gain = f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed));
         if gain != 1.0 {
@@ -396,6 +415,17 @@ impl EngineHandle {
         }
         let frames = self.shared.played_frames.load(Ordering::Relaxed);
         Duration::from_secs_f64(frames as f64 / f64::from(self.config.sample_rate))
+    }
+
+    /// Diagnostic: how many times the audio callback asked for more
+    /// samples than the ring buffer held while a track was live
+    /// (see `Shared::underruns`). Each counted fill emitted silence
+    /// for the missing remainder — an audible cut if it happens
+    /// mid-track. Intended for playback-glitch diagnosis (the
+    /// `play_file` example prints it); it never influences playback.
+    #[must_use]
+    pub fn underrun_count(&self) -> u64 {
+        self.shared.underruns.load(Ordering::Relaxed)
     }
 
     /// Stops the backend and joins the worker thread.
@@ -736,9 +766,9 @@ mod tests {
 
     use flux_core::TrackId;
 
-    use super::{EngineError, EngineEvent, EngineHandle, FormatConverter};
-    use crate::decode::{DecodeError, StreamInfo};
-    use crate::output::{NullControl, OutputConfig};
+    use super::{EngineError, EngineEvent, EngineHandle, FormatConverter, SampleSource, Shared};
+    use crate::decode::{DecodeError, StreamInfo, open_decoder};
+    use crate::output::{FillCallback, NullControl, OutputConfig};
 
     struct TempDir(PathBuf);
 
@@ -1372,6 +1402,301 @@ mod tests {
         engine.shutdown();
         let (engine, _control) = EngineHandle::spawn_null(44_100, 2);
         drop(engine); // Drop must join the worker promptly.
+    }
+
+    /// A stereo 16-bit WAV of two distinct tones (L: 440 Hz cosine,
+    /// R: 330 Hz sine). Unlike the DC fixtures, dropped, duplicated
+    /// or reordered samples change the *content*, so exact-sequence
+    /// comparisons can see them.
+    fn write_tone_wav(dir: &TempDir, name: &str, rate: u32, frames: usize) -> PathBuf {
+        let path = dir.0.join(name);
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        for n in 0..frames {
+            let t = n as f64 / f64::from(rate);
+            let l = 0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).cos();
+            let r = 0.4 * (2.0 * std::f64::consts::PI * 330.0 * t).sin();
+            writer
+                .write_sample((l * 32_767.0) as i32)
+                .expect("write sample");
+            writer
+                .write_sample((r * 32_767.0) as i32)
+                .expect("write sample");
+        }
+        writer.finalize().expect("finalize");
+        path
+    }
+
+    /// The exact sample sequence the engine *should* deliver for a
+    /// file: direct decode through the same converter, chunked
+    /// exactly as the worker chunks (`DECODE_CHUNK_FRAMES`), flushed
+    /// at EOF. Comparing device-captured output against this isolates
+    /// the worker/ring/callback path from decoding and conversion.
+    fn reference_pipeline(path: &std::path::Path, out: OutputConfig) -> Vec<f32> {
+        let mut decoder = open_decoder(path).expect("decoder opens");
+        let info = *decoder.info();
+        let mut converter = FormatConverter::new(&info, out);
+        let mut samples = Vec::new();
+        loop {
+            let chunk = decoder
+                .next_chunk(super::DECODE_CHUNK_FRAMES)
+                .expect("chunk decodes");
+            if chunk.is_empty() {
+                samples.extend(converter.finish());
+                break;
+            }
+            samples.extend(converter.process(&chunk));
+        }
+        samples
+    }
+
+    fn first_diff(a: &[f32], b: &[f32]) -> Option<usize> {
+        a.iter()
+            .zip(b.iter())
+            .position(|(x, y)| x != y)
+            .or_else(|| (a.len() != b.len()).then_some(a.len().min(b.len())))
+    }
+
+    /// The converter must be chunking-invariant: feeding the same
+    /// signal in any piece sizes (the worker feeds 4096-frame decode
+    /// chunks; frame-quantised decoders make chunk lengths vary in
+    /// practice) must yield the same number of output samples with
+    /// the same values (up to f64 phase-rebasing rounding) at the
+    /// ratios real setups use, above all 44.1 kHz files on 48 kHz
+    /// devices.
+    #[test]
+    fn converter_chunked_input_matches_one_shot_at_real_ratios() {
+        for (in_rate, out_rate) in [(44_100u32, 48_000u32), (48_000, 44_100), (44_100, 44_100)] {
+            let frames = in_rate as usize * 2;
+            let mut signal = Vec::with_capacity(frames * 2);
+            for n in 0..frames {
+                let t = n as f64 / f64::from(in_rate);
+                signal.push((0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).cos()) as f32);
+                signal.push((0.4 * (2.0 * std::f64::consts::PI * 330.0 * t).sin()) as f32);
+            }
+            let info = StreamInfo {
+                sample_rate: in_rate,
+                channels: 2,
+                duration: None,
+            };
+            let out_cfg = OutputConfig {
+                sample_rate: out_rate,
+                channels: 2,
+            };
+            let one_shot = {
+                let mut conv = FormatConverter::new(&info, out_cfg);
+                let mut v = conv.process(&signal);
+                v.extend(conv.finish());
+                v
+            };
+            for chunk_frames in [1usize, 7, 1000, 4096] {
+                let mut conv = FormatConverter::new(&info, out_cfg);
+                let mut v = Vec::new();
+                for chunk in signal.chunks(chunk_frames * 2) {
+                    v.extend(conv.process(chunk));
+                }
+                v.extend(conv.finish());
+                // Values are compared with a tight tolerance, not
+                // bitwise: each `emit` rebases the f64 phase to the
+                // drained buffer, so chunk boundaries legitimately
+                // change rounding at the ~1e-8 level (measured max
+                // 3e-8 for this signal across ratios/chunkings). A
+                // dropped, duplicated, or mis-interpolated sample
+                // would err by ~1e-2 — six orders of magnitude above
+                // the bound. Total length may differ by at most one
+                // output frame: whether the residual fractional
+                // phase at EOF earns one final "held" frame is an
+                // end-of-stream rounding coin-flip (measured ±1
+                // frame, common prefix always in tolerance).
+                assert!(
+                    v.len().abs_diff(one_shot.len()) <= 2,
+                    "{in_rate}->{out_rate} Hz: {chunk_frames}-frame chunks change the output \
+                     length by more than one frame ({} vs {})",
+                    v.len(),
+                    one_shot.len()
+                );
+                let beyond = v
+                    .iter()
+                    .zip(one_shot.iter())
+                    .position(|(x, y)| (x - y).abs() > 1e-6);
+                assert_eq!(
+                    beyond, None,
+                    "{in_rate}->{out_rate} Hz: {chunk_frames}-frame chunks diverge from one-shot \
+                     beyond phase-rounding tolerance"
+                );
+            }
+            // Duration is preserved to within one output frame.
+            let expected_frames = frames as f64 * f64::from(out_rate) / f64::from(in_rate);
+            let got_frames = one_shot.len() / 2;
+            assert!(
+                (got_frames as f64 - expected_frames).abs() <= 1.5,
+                "{in_rate}->{out_rate} Hz: {got_frames} frames out, expected ≈{expected_frames:.1}"
+            );
+        }
+    }
+
+    /// End-to-end content integrity through worker → ring → callback
+    /// with resampling (44.1 kHz file, 48 kHz device — the most
+    /// common real-world shape): every converted sample must arrive
+    /// exactly once, in order, with no starved callback fills once
+    /// audio is flowing. DC fixtures cannot see reordering or
+    /// duplication; this can.
+    #[test]
+    fn end_to_end_tone_delivery_is_sample_exact_and_never_starves() {
+        let dir = TempDir::new("tone-e2e");
+        let path = write_tone_wav(&dir, "tone.wav", 44_100, 44_100 * 3);
+        let (engine, control) = EngineHandle::spawn_null(48_000, 2);
+        let id = TrackId::new(1);
+        engine.load(id, path.clone());
+        drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::Loaded { .. })
+        });
+        engine.play();
+        // Wait until real audio has been captured, then snapshot the
+        // diagnostic counter: startup shortfalls (gate open before
+        // the first push) are benign; after this point the callback
+        // must never starve again.
+        for _ in 0..4_000 {
+            control.drain_frames(512);
+            let _ = engine.events().recv_timeout(Duration::from_millis(5));
+            if control.captured().iter().any(|s| *s != 0.0) {
+                break;
+            }
+        }
+        assert!(
+            control.captured().iter().any(|s| *s != 0.0),
+            "audio never started flowing"
+        );
+        let underruns_at_flow = engine.underrun_count();
+        let events = drive_until(&engine, &control, |e| {
+            matches!(e, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::TrackEnded { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            engine.underrun_count(),
+            underruns_at_flow,
+            "callback starved mid-track (would be an audible cut)"
+        );
+        // 3.0 s of device frames were delivered (position is derived
+        // from delivered frames).
+        let millis = engine.position().as_millis();
+        assert!((2_990..=3_010).contains(&millis), "position {millis} ms");
+
+        let captured = control.captured();
+        let reference = reference_pipeline(
+            &path,
+            OutputConfig {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        );
+        assert!(reference.len() >= 128);
+        let start = captured
+            .windows(128)
+            .position(|w| w == &reference[..128])
+            .expect("reference sequence appears in the capture");
+        assert!(
+            captured[..start].iter().all(|s| *s == 0.0),
+            "only silence may precede the track"
+        );
+        assert!(
+            captured.len() >= start + reference.len(),
+            "capture holds fewer samples than the decoded track"
+        );
+        assert_eq!(
+            first_diff(&captured[start..start + reference.len()], &reference),
+            None,
+            "delivered samples diverge from direct decode+convert"
+        );
+        assert!(
+            captured[start + reference.len()..]
+                .iter()
+                .all(|s| *s == 0.0),
+            "only silence may follow the track"
+        );
+        engine.shutdown();
+    }
+
+    /// The callback-side source in isolation: irregular producer
+    /// pushes and consumer fills must deliver the input sequence in
+    /// exact order (silence appears only where the ring was short),
+    /// and the underrun diagnostic counts mid-stream starvation but
+    /// not the post-EOF drain.
+    #[test]
+    fn sample_source_preserves_order_and_counts_only_midstream_starvation() {
+        use ringbuf::traits::{Producer, Split};
+        use std::sync::Arc;
+
+        let (mut producer, consumer) = ringbuf::HeapRb::<f32>::new(4096).split();
+        let shared = Arc::new(Shared::new());
+        shared.gate_open.store(true, Ordering::Release);
+        let mut source = SampleSource {
+            consumer,
+            shared: Arc::clone(&shared),
+            channels: 2,
+            seen_generation: 0,
+        };
+        // Strictly positive input: any 0.0 in the output is inserted
+        // silence, never data.
+        let input: Vec<f32> = (0..3000).map(|i| (i + 1) as f32 * 0.0001).collect();
+        let mut output: Vec<f32> = Vec::new();
+        let mut pushed = 0usize;
+        let steps = [
+            (6usize, 14usize),
+            (200, 512),
+            (2, 2),
+            (1000, 300),
+            (34, 900),
+            (700, 62),
+            (4, 512),
+            (1054, 512),
+        ];
+        for (push_len, fill_len) in steps {
+            let n = producer.push_slice(&input[pushed..pushed + push_len]);
+            assert_eq!(n, push_len, "test keeps the ring far from full");
+            pushed += n;
+            let mut out = vec![0.0f32; fill_len];
+            source.fill(&mut out);
+            output.extend(out);
+        }
+        // Drain the remainder.
+        for _ in 0..100 {
+            if output.iter().filter(|s| **s != 0.0).count() == input.len() {
+                break;
+            }
+            let mut out = vec![0.0f32; 512];
+            source.fill(&mut out);
+            output.extend(out);
+        }
+        let delivered: Vec<f32> = output.into_iter().filter(|s| *s != 0.0).collect();
+        assert_eq!(
+            first_diff(&delivered, &input),
+            None,
+            "samples dropped, duplicated, or reordered through the ring"
+        );
+        assert_eq!(
+            shared.played_frames.load(Ordering::Relaxed),
+            1500,
+            "played-frame accounting tracks delivered frames"
+        );
+
+        // Counter semantics: a shortfall before EOF counts; the same
+        // shortfall after EOF is signalled does not.
+        let before = shared.underruns.load(Ordering::Relaxed);
+        let mut out = vec![0.0f32; 512];
+        source.fill(&mut out); // ring empty, live stream: starved
+        assert_eq!(shared.underruns.load(Ordering::Relaxed), before + 1);
+        shared.decoder_eof.store(true, Ordering::Release);
+        source.fill(&mut out); // ring empty, post-EOF: expected drain
+        assert_eq!(shared.underruns.load(Ordering::Relaxed), before + 1);
     }
 
     #[test]
