@@ -207,9 +207,15 @@ impl Flux {
                     Some(artist) => format!("{} — {artist}", track.title()),
                     None => track.title().to_owned(),
                 };
+                // The trailing counters are temporary playback-glitch
+                // diagnostics (engine generation / callback
+                // underruns): during uninterrupted playback neither
+                // may move. Remove once that investigation closes.
                 format!(
-                    "{title}    {} / {total}",
-                    format_duration(controller.position())
+                    "{title}    {} / {total}    [diag: gen {}, underruns {}]",
+                    format_duration(controller.position()),
+                    controller.engine_generation(),
+                    controller.underrun_count()
                 )
             }
             None => "Nothing selected".to_owned(),
