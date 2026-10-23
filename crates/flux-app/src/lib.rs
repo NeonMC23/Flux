@@ -340,6 +340,25 @@ impl Controller {
         self.engine.position()
     }
 
+    /// Diagnostic: audio-callback underruns so far (fills that ran
+    /// dry mid-track and emitted silence; see
+    /// `EngineHandle::underrun_count`). For playback-glitch
+    /// diagnosis in front-ends; never influences playback.
+    #[must_use]
+    pub fn underrun_count(&self) -> u64 {
+        self.engine.underrun_count()
+    }
+
+    /// Diagnostic: the engine's generation counter (see
+    /// `EngineHandle::generation`). Rises once per load/stop/restart
+    /// the engine processes; during uninterrupted playback of one
+    /// track it must stay put. For playback-glitch diagnosis in
+    /// front-ends; never influences playback.
+    #[must_use]
+    pub fn engine_generation(&self) -> u64 {
+        self.engine.generation()
+    }
+
     /// The current volume, `0.0..=1.0`.
     #[must_use]
     pub fn volume(&self) -> f32 {
@@ -971,6 +990,136 @@ mod tests {
             .find(|(_, t)| t.source().path() == path)
             .map(|(id, _)| *id)
             .unwrap_or_else(|| panic!("track for {} indexed", path.display()))
+    }
+
+    /// A mono 16-bit tone WAV (440 Hz cosine): unlike the DC
+    /// fixtures, any lost, duplicated, or reordered sample changes
+    /// the content, so exact-sequence comparison can see it.
+    fn write_tone_wav(dir: &Path, name: &str, frames: usize) -> PathBuf {
+        let path = dir.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        for n in 0..frames {
+            let t = n as f64 / 44_100.0;
+            let v = 0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).cos();
+            writer
+                .write_sample((v * 32_767.0) as i32)
+                .expect("write sample");
+        }
+        writer.finalize().expect("finalize");
+        path
+    }
+
+    /// The GUI's exact runtime shape — `play_track`, then a loop of
+    /// "device drains, `controller.poll()`" (its 150 ms Tick), with
+    /// a library scan completing mid-playback — must deliver the
+    /// track sample-for-sample, with no mid-track starvation and no
+    /// reload churn. The engine-generation assertion is the direct
+    /// pin: any load/stop reaching the engine mid-track flushes up
+    /// to seconds of buffered audio (heard as a cut + jump forward),
+    /// and must never happen during uninterrupted playback.
+    #[test]
+    fn gui_style_drive_loop_is_sample_exact_and_never_reloads() {
+        let dir = TempDir::new("gui-loop");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let tone_path = write_tone_wav(&root, "tone.wav", 44_100 * 2);
+        // A second folder whose scan will complete during playback.
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).expect("other dir");
+        write_dc_wav(&other, "extra.wav", 4_410, 0.2);
+
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let id = id_of(&controller, &tone_path);
+
+        // Reference: direct decode of the same file. The null device
+        // matches the file format (44.1 kHz mono), so engine
+        // conversion is the identity and delivered samples must
+        // equal decoded samples exactly.
+        let reference = {
+            let mut decoder = flux_audio::decode::open_decoder(&tone_path).expect("opens");
+            let mut all = Vec::new();
+            loop {
+                let chunk = decoder.next_chunk(4096).expect("decodes");
+                if chunk.is_empty() {
+                    break;
+                }
+                all.extend(chunk);
+            }
+            all
+        };
+        assert_eq!(reference.len(), 44_100 * 2);
+
+        control.clear_captured();
+        let generation_before = controller.engine_generation();
+        controller.play_track(id);
+        // Wait until audio is flowing (startup shortfalls before the
+        // worker's first push are benign) and snapshot diagnostics.
+        drive(&mut controller, &control, |_, _| {
+            control.captured().iter().any(|s| *s != 0.0)
+        });
+        let underruns_at_flow = controller.underrun_count();
+        let generation_at_flow = controller.engine_generation();
+        // A scan completing mid-playback must not disturb it.
+        controller.begin_scan(other);
+        // Position is derived from delivered frames; the identity
+        // conversion emits exactly the input count, so the 2 s track
+        // ends with position exactly 2 s and everything captured.
+        drive(&mut controller, &control, |c, _| {
+            !c.is_scanning() && c.position() >= Duration::from_secs(2)
+        });
+        // Collect a little post-track device time (must be silence).
+        for _ in 0..4 {
+            control.drain_frames(512);
+            controller.poll();
+        }
+
+        assert_eq!(
+            generation_at_flow,
+            generation_before + 1,
+            "play_track loads exactly once"
+        );
+        assert_eq!(
+            controller.engine_generation(),
+            generation_at_flow,
+            "no load/stop may reach the engine during uninterrupted playback"
+        );
+        assert_eq!(
+            controller.underrun_count(),
+            underruns_at_flow,
+            "callback starved mid-track"
+        );
+        let captured = control.captured();
+        let start = captured
+            .windows(64)
+            .position(|w| w == &reference[..64])
+            .expect("track head appears in the capture");
+        assert!(
+            captured[..start].iter().all(|s| *s == 0.0),
+            "only silence may precede the track"
+        );
+        assert!(
+            captured.len() >= start + reference.len(),
+            "capture holds fewer samples than the decoded track"
+        );
+        assert_eq!(
+            &captured[start..start + reference.len()],
+            reference.as_slice(),
+            "delivered samples diverge from direct decode"
+        );
+        assert!(
+            captured[start + reference.len()..]
+                .iter()
+                .all(|s| *s == 0.0),
+            "only silence may follow the track"
+        );
+        controller.shutdown();
     }
 
     #[test]
