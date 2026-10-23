@@ -428,6 +428,18 @@ impl EngineHandle {
         self.shared.underruns.load(Ordering::Relaxed)
     }
 
+    /// Diagnostic: the current generation counter (see
+    /// `Shared::generation`). It increases exactly when the worker
+    /// processes a load, a stop, or a restart-from-ended play — each
+    /// of which flushes all buffered samples. During uninterrupted
+    /// playback of one track it must not move; a value that climbs
+    /// mid-track is direct evidence of reload/stop churn upstream.
+    /// Read-only; never influences playback.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Relaxed)
+    }
+
     /// Stops the backend and joins the worker thread.
     pub fn shutdown(mut self) {
         self.shutdown_inner();
