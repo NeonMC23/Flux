@@ -466,9 +466,11 @@ impl Controller {
     /// Begins a background scan of `root` (recursive). Completion (and
     /// the refreshed track list) arrives via [`poll`](Self::poll);
     /// playback in progress is unaffected. A second scan while one is
-    /// running is reported as an error and ignored. When the scan
-    /// finishes, the updated library is saved to the index path (if
-    /// any) on the scan thread.
+    /// running is reported as an error and ignored. A `root` that does
+    /// not exist or is not a folder is likewise reported as an error
+    /// and ignored — no scan starts and no library or index state
+    /// changes. When the scan finishes, the updated library is saved
+    /// to the index path (if any) on the scan thread.
     pub fn begin_scan(&mut self, root: PathBuf) {
         self.begin_scan_roots(vec![root]);
     }
@@ -700,6 +702,19 @@ impl Controller {
             self.report_error("A library scan is already in progress.".to_owned());
             return;
         }
+        // Validate before touching any state: a rejected scan must
+        // leave the library, the session roots, and the saved index
+        // exactly as they were. (The library layer would merely
+        // itemize a bad root in its report; at this layer a mistyped
+        // folder deserves a clear, immediate error. A root that
+        // disappears *after* this check is still handled cleanly by
+        // the scan itself, which itemizes it and continues.)
+        for root in &roots {
+            if let Err(message) = validate_scan_root(root) {
+                self.report_error(message);
+                return;
+            }
+        }
         let Some(library) = self.library.take() else {
             self.report_error("A library scan is already in progress.".to_owned());
             return;
@@ -795,6 +810,27 @@ fn repeat_label(mode: RepeatMode) -> &'static str {
         RepeatMode::Off => "off",
         RepeatMode::All => "all",
         RepeatMode::One => "one",
+    }
+}
+
+/// Checks that `root` can be scanned as a *folder*: it must exist and
+/// be a directory. Checked with `symlink_metadata`, so a symbolic link
+/// is reported as a link rather than silently followed — consistent
+/// with the scanner's never-follow-links policy, which would skip a
+/// link root anyway. The error is a complete user-facing message.
+fn validate_scan_root(root: &Path) -> Result<(), String> {
+    let shown = root.display();
+    match std::fs::symlink_metadata(root) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "Cannot scan \"{shown}\": it is a symbolic link. Links are never \
+             followed — scan the real folder instead."
+        )),
+        Ok(_) => Err(format!("Cannot scan \"{shown}\": it is not a folder.")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "Cannot scan \"{shown}\": the folder does not exist."
+        )),
+        Err(err) => Err(format!("Cannot scan \"{shown}\": {err}")),
     }
 }
 
@@ -978,6 +1014,103 @@ mod tests {
         assert_eq!(ids_after, ids_before, "persisted IDs must be stable");
         assert_eq!(id_of(&controller2, &fx.a).get(), ids_before[0].get());
         controller2.shutdown();
+    }
+
+    #[test]
+    fn nonexistent_scan_folder_is_rejected_and_preserves_state() {
+        let dir = TempDir::new("scan-missing-root");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        assert_eq!(controller.tracks().len(), 4);
+        let index_path = dir.path().join("state").join("library-index.json");
+        let index_before = fs::read(&index_path).expect("scan saved the index");
+        let current = controller.current_id();
+        assert!(current.is_some());
+
+        let missing = dir.path().join("no-such-folder");
+        controller.begin_scan(missing.clone());
+
+        // Rejected synchronously: clear error, no scan started.
+        assert!(!controller.is_scanning());
+        let error = controller.last_error().expect("error reported").to_owned();
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        let events = controller.poll();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ControllerEvent::Error(_))),
+            "{events:?}"
+        );
+        assert!(
+            !events.contains(&ControllerEvent::LibraryChanged),
+            "a rejected scan must not signal a library change: {events:?}"
+        );
+
+        // Nothing else moved: tracks, selection, playback state, index.
+        assert_eq!(controller.tracks().len(), 4);
+        assert_eq!(controller.current_id(), current);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(
+            fs::read(&index_path).expect("index still readable"),
+            index_before,
+            "a rejected scan must not rewrite the index"
+        );
+
+        // The bad root was not remembered: refresh re-scans only the
+        // good root and completes normally.
+        controller.refresh();
+        assert!(controller.is_scanning());
+        drive(&mut controller, &control, |c, _| !c.is_scanning());
+        assert_eq!(controller.tracks().len(), 4);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn regular_file_as_scan_folder_is_rejected() {
+        let dir = TempDir::new("scan-file-root");
+        let fx = fixtures(&dir);
+        let (mut controller, _control) = boot(&dir);
+
+        controller.begin_scan(fx.a.clone());
+        assert!(!controller.is_scanning());
+        let error = controller.last_error().expect("error reported").to_owned();
+        assert!(error.contains("is not a folder"), "{error}");
+        assert!(controller.tracks().is_empty());
+        // No scan ran, so no index was written...
+        let index_path = dir.path().join("state").join("library-index.json");
+        assert!(
+            !index_path.exists(),
+            "a rejected scan must not create an index"
+        );
+        // ...and the path was not remembered as a session root.
+        controller.refresh();
+        assert!(
+            controller
+                .last_status()
+                .is_some_and(|s| s.contains("Nothing to refresh yet")),
+            "{:?}",
+            controller.last_status()
+        );
+        controller.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_scan_folder_is_rejected_without_following_it() {
+        let dir = TempDir::new("scan-symlink-root");
+        let fx = fixtures(&dir);
+        let link = dir.path().join("music-link");
+        std::os::unix::fs::symlink(&fx.root, &link).expect("create symlink");
+        let (mut controller, _control) = boot(&dir);
+
+        controller.begin_scan(link);
+        assert!(!controller.is_scanning());
+        let error = controller.last_error().expect("error reported").to_owned();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(controller.tracks().is_empty());
+        controller.shutdown();
     }
 
     #[test]
