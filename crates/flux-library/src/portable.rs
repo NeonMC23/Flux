@@ -483,6 +483,21 @@ pub enum Availability {
 
 /// Inexpensive change-detection hint for a track's file: size plus
 /// modification time. Never an identity by itself.
+///
+/// What it can establish: if either value differs from a fresh
+/// `stat`, the file was almost certainly rewritten, replaced, or
+/// touched since the fingerprint was recorded. What it cannot
+/// establish: that equal values mean equal *contents* — a same-size
+/// rewrite inside the same timestamp tick, a copied file with a
+/// preserved mtime, or two genuinely different files with equal
+/// size and mtime all compare equal. Reconciliation therefore uses
+/// it only as evidence of change (and, combined with an exact
+/// match requirement, as a relocation lead), never as proof of
+/// content identity.
+///
+/// A `modified_unix_ms` of 0 is the historical "unknown" sentinel
+/// (written when a platform could not report an mtime); consumers
+/// must not treat it as a real measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileFingerprint {
     /// File length in bytes.
@@ -2741,8 +2756,9 @@ fn availability_of(path: &Path) -> (Availability, Option<FileFingerprint>) {
 ///   scan re-read). The stored `album_artist` is carried over (the
 ///   runtime [`Track`] has no such field), and overrides,
 ///   availability, fingerprint, and timestamps are otherwise
-///   untouched — availability reconciliation is a later milestone's
-///   job, not a side effect of saving.
+///   untouched — availability/fingerprint maintenance is
+///   [`reconcile_portable_store`]'s job, not a side effect of
+///   saving.
 /// - **Nothing is ever deleted or moved**: records in the store but
 ///   not in the library (including ones this platform cannot
 ///   represent) are preserved as they are, and a library track whose
@@ -2866,6 +2882,677 @@ pub fn sync_library_to_portable_store(
         report.added = added;
     }
     Ok(report)
+}
+
+// ------------------------------------------------------ reconciliation ---
+
+/// What one [`reconcile_portable_store`] pass concluded about a
+/// single record. Only conclusions backed by an actual filesystem
+/// observation change the store; everything inconclusive leaves the
+/// record exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// Present, and the observed fingerprint matches the stored one
+    /// (or only an uninformative stored mtime of 0 had to be filled
+    /// in — see [`FingerprintEstablished`](Self::FingerprintEstablished)).
+    /// No store change.
+    Unchanged,
+    /// Present; a fingerprint is now recorded where none (or only a
+    /// size with an unknown, 0 mtime) existed before. This is not
+    /// evidence the file changed — it is the first usable
+    /// observation.
+    FingerprintEstablished,
+    /// Present, but the observed fingerprint differs from the stored
+    /// one. Size and mtime changes are reported independently. The
+    /// stored fingerprint was refreshed to the observed values when
+    /// a full observation was possible.
+    Changed {
+        /// The file length differs.
+        size_changed: bool,
+        /// The modification time differs (only claimed when both the
+        /// stored and observed values are known).
+        modified_changed: bool,
+        /// Whether the stored fingerprint was updated to the
+        /// observed values.
+        fingerprint_refreshed: bool,
+    },
+    /// Was marked missing; a regular file is present at the recorded
+    /// path again. Availability is restored to present.
+    Reappeared {
+        /// Whether the stored fingerprint was updated to the
+        /// observed values.
+        fingerprint_refreshed: bool,
+    },
+    /// Was marked present; no file exists at the recorded path
+    /// (confirmed by a not-found observation). Now marked missing —
+    /// the record itself, its ID, metadata, overrides, and path are
+    /// all retained.
+    NewlyMissing,
+    /// Still no file at the recorded path. No store change.
+    StillMissing,
+    /// Present, but the modification time could not be observed, so
+    /// no fingerprint conclusion (and no fingerprint update) was
+    /// possible. Recorded values are never fabricated.
+    FingerprintUnavailable,
+    /// The filesystem could not give a reliable answer (I/O error,
+    /// a symlink or non-regular file at the path, …). The record is
+    /// untouched; in particular this is **not** treated as missing.
+    InspectionError {
+        /// What prevented a conclusion.
+        reason: String,
+    },
+    /// The recorded path cannot be represented as an OS path on this
+    /// platform, so it was not inspected at all. Untouched.
+    UnrepresentablePath,
+}
+
+/// Possible new locations for one missing record, found by
+/// [`reconcile_portable_store`]'s candidate scan. Candidates are
+/// *reported only* — reconciliation never moves a record on its own
+/// (see [`relink_portable_track`] for the explicit, validated
+/// application step). `candidates.len() > 1` is ambiguous by
+/// definition and must never be auto-resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelinkCandidates {
+    /// The missing record these locations might belong to.
+    pub id: TrackId,
+    /// Unowned files under the root whose fingerprint and extension
+    /// match the record's stored fingerprint and path.
+    pub candidates: Vec<RelPath>,
+}
+
+impl RelinkCandidates {
+    /// Whether exactly one candidate exists (still requires the
+    /// explicit validation in [`relink_portable_track`]).
+    #[must_use]
+    pub fn is_unique(&self) -> bool {
+        self.candidates.len() == 1
+    }
+}
+
+/// The structured outcome of one [`reconcile_portable_store`] pass:
+/// a per-record outcome for every record in the persistent
+/// catalogue plus any relink candidates discovered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// One entry per catalogue record, in catalogue order.
+    pub outcomes: Vec<(TrackId, ReconcileOutcome)>,
+    /// Missing records that have at least one candidate location.
+    pub relink_candidates: Vec<RelinkCandidates>,
+    /// Filesystem entries that errored during the candidate walk
+    /// (the walk continues past them).
+    pub candidate_walk_errors: usize,
+}
+
+impl ReconcileReport {
+    fn count(&self, pick: impl Fn(&ReconcileOutcome) -> bool) -> usize {
+        self.outcomes.iter().filter(|(_, o)| pick(o)).count()
+    }
+
+    /// The outcome recorded for one track, if it was inspected.
+    #[must_use]
+    pub fn outcome_for(&self, id: TrackId) -> Option<&ReconcileOutcome> {
+        self.outcomes
+            .iter()
+            .find(|(track, _)| *track == id)
+            .map(|(_, outcome)| outcome)
+    }
+
+    /// Records inspected (the whole persistent catalogue).
+    #[must_use]
+    pub fn inspected_count(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Present and matching their stored fingerprint.
+    #[must_use]
+    pub fn unchanged_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::Unchanged))
+    }
+
+    /// Present with a first fingerprint now recorded.
+    #[must_use]
+    pub fn established_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::FingerprintEstablished))
+    }
+
+    /// Present but with a different fingerprint than stored.
+    #[must_use]
+    pub fn changed_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::Changed { .. }))
+    }
+
+    /// Missing before, present again now.
+    #[must_use]
+    pub fn reappeared_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::Reappeared { .. }))
+    }
+
+    /// Present before, confirmed gone now.
+    #[must_use]
+    pub fn newly_missing_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::NewlyMissing))
+    }
+
+    /// All records confirmed missing (newly + previously).
+    #[must_use]
+    pub fn missing_count(&self) -> usize {
+        self.count(|o| {
+            matches!(
+                o,
+                ReconcileOutcome::NewlyMissing | ReconcileOutcome::StillMissing
+            )
+        })
+    }
+
+    /// Present but without an observable modification time.
+    #[must_use]
+    pub fn fingerprint_unavailable_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::FingerprintUnavailable))
+    }
+
+    /// Records the filesystem gave no reliable answer for.
+    #[must_use]
+    pub fn inspection_error_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::InspectionError { .. }))
+    }
+
+    /// Records skipped because their path is unrepresentable here.
+    #[must_use]
+    pub fn unrepresentable_count(&self) -> usize {
+        self.count(|o| matches!(o, ReconcileOutcome::UnrepresentablePath))
+    }
+
+    /// Missing records with exactly one candidate location.
+    #[must_use]
+    pub fn unique_candidate_count(&self) -> usize {
+        self.relink_candidates
+            .iter()
+            .filter(|c| c.is_unique())
+            .count()
+    }
+
+    /// Missing records with several candidate locations.
+    #[must_use]
+    pub fn ambiguous_candidate_count(&self) -> usize {
+        self.relink_candidates
+            .iter()
+            .filter(|c| !c.is_unique())
+            .count()
+    }
+}
+
+/// Why an explicit relink (see [`relink_portable_track`]) was refused.
+#[derive(Debug)]
+pub enum RelinkError {
+    /// The storage layer rejected the operation (unknown ID,
+    /// read-only recovery, duplicate path, …).
+    Store(PortableStoreError),
+    /// The record itself may not be relinked (not missing, no stored
+    /// fingerprint, or an unrepresentable recorded path).
+    NotEligible {
+        /// The track that was asked about.
+        id: TrackId,
+        /// Why it may not be relinked.
+        reason: String,
+    },
+    /// The proposed candidate failed validation (gone, owned by
+    /// another record, wrong type, fingerprint or extension
+    /// mismatch, unobservable mtime).
+    CandidateInvalid {
+        /// Why the candidate was rejected.
+        reason: String,
+    },
+}
+
+impl fmt::Display for RelinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(err) => write!(f, "could not relink the track: {err}"),
+            Self::NotEligible { id, reason } => {
+                write!(f, "track {id} cannot be relinked: {reason}")
+            }
+            Self::CandidateInvalid { reason } => {
+                write!(f, "relink candidate rejected: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RelinkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<PortableStoreError> for RelinkError {
+    fn from(err: PortableStoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+/// One filesystem observation of a recorded file's path.
+enum Observation {
+    /// A regular file is there. `modified_unix_ms` is `None` when
+    /// the platform cannot report a (post-epoch) modification time.
+    File {
+        size_bytes: u64,
+        modified_unix_ms: Option<u64>,
+    },
+    /// Definitively nothing at the path (not-found, or a path
+    /// component is no longer a directory).
+    Missing,
+    /// No reliable conclusion; the string says why.
+    Error(String),
+}
+
+/// Stats `path` without following symlinks and without fabricating
+/// values. Unlike the sync path's `availability_of` (used only for
+/// files a scan just found), this distinguishes "gone" from "cannot
+/// tell" — reconciliation must never do the former's guesswork.
+fn inspect_recorded_file(path: &Path) -> Observation {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                Observation::Error(
+                    "the path is now a symbolic link; links are never followed".to_owned(),
+                )
+            } else if !file_type.is_file() {
+                Observation::Error("the path exists but is not a regular file".to_owned())
+            } else {
+                Observation::File {
+                    size_bytes: metadata.len(),
+                    modified_unix_ms: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                        // An mtime of exactly the epoch is the "unknown"
+                        // sentinel older observations wrote; never treat
+                        // it as a real measurement.
+                        .filter(|ms| *ms != 0),
+                }
+            }
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Observation::Missing
+        }
+        Err(err) => Observation::Error(format!("the file could not be inspected: {err}")),
+    }
+}
+
+/// The path's extension as a lowercase comparison key (extensions are
+/// matched ASCII-case-insensitively elsewhere in Flux too).
+fn extension_key(path: &RelPath) -> Option<String> {
+    path.to_os_path()?
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+}
+
+/// Reconciles the **complete persistent catalogue** in `store` with
+/// the filesystem under its root: refreshes availability and file
+/// fingerprints from actual observations, and reports possible new
+/// locations for missing records. In-memory only — call
+/// [`PortableStore::commit`] to publish; a failed commit leaves the
+/// previously committed catalogue intact and the updated state
+/// pending in the store, exactly like a failed sync.
+///
+/// Semantics, per record:
+///
+/// - Only a *not-found* observation marks a record
+///   [`Availability::Missing`]; I/O errors, symlinks, and
+///   non-regular files are reported as
+///   [`ReconcileOutcome::InspectionError`] and change nothing.
+///   Records whose path this platform cannot represent are skipped
+///   untouched ([`ReconcileOutcome::UnrepresentablePath`]).
+/// - Fingerprint comparison treats size and mtime independently.
+///   A stored mtime of 0 means "unknown" (older sentinel) and never
+///   by itself counts as a change; an unobservable mtime never
+///   overwrites a stored fingerprint with a fabricated value.
+///   Fingerprints are refreshed only from complete observations.
+/// - Nothing is ever deleted, moved, or retagged: IDs, tag
+///   snapshots, and user overrides are untouched (tag refresh is
+///   the scan/sync path's job), audio files are only ever `stat`ed,
+///   and setters are called only when a value actually changes, so
+///   unchanged segments are not rewritten on commit.
+/// - A record absent from any in-memory [`Library`] is reconciled
+///   exactly like any other: this pass reads the store, not a
+///   library. Absence from memory is never treated as deletable.
+///
+/// **Relink candidates** (reported, never applied here): for each
+/// record confirmed missing that has a stored fingerprint, the root
+/// is walked once (`.flux` excluded, symlinks never followed) for
+/// files owned by no record. A file is a candidate only if its
+/// observed fingerprint equals the stored one exactly *and* its
+/// extension matches the recorded path's. Filename similarity alone
+/// never produces a candidate. Size+mtime cannot prove content
+/// identity — candidates are leads for the explicit, revalidating
+/// [`relink_portable_track`] step, and several candidates for one
+/// record are reported as ambiguous, never auto-resolved.
+///
+/// # Errors
+///
+/// [`PortableStoreError::ReadOnlyRecovered`] before changing
+/// anything when the store is in the recovered read-only state;
+/// other storage errors abort the pass with whatever updates were
+/// already applied left pending (unpublished).
+pub fn reconcile_portable_store(
+    store: &mut PortableStore,
+) -> Result<ReconcileReport, PortableStoreError> {
+    store.ensure_writable()?;
+    let root = store.root().to_path_buf();
+    let policy = store.case_policy();
+
+    // Collect only what classification needs (not full record
+    // clones), so the store can be mutated while working.
+    let records: Vec<(TrackId, RelPath, Availability, Option<FileFingerprint>)> = store
+        .iter()
+        .map(|record| {
+            (
+                record.id(),
+                record.path().clone(),
+                record.availability(),
+                record.file(),
+            )
+        })
+        .collect();
+
+    let mut report = ReconcileReport::default();
+    let mut missing_with_fingerprint: Vec<(TrackId, RelPath, FileFingerprint)> = Vec::new();
+
+    for (id, path, availability, stored_fingerprint) in &records {
+        let id = *id;
+        let Some(relative_os) = path.to_os_path() else {
+            report
+                .outcomes
+                .push((id, ReconcileOutcome::UnrepresentablePath));
+            continue;
+        };
+        let outcome = match inspect_recorded_file(&root.join(&relative_os)) {
+            Observation::Missing => {
+                if let Some(fingerprint) = stored_fingerprint {
+                    missing_with_fingerprint.push((id, path.clone(), *fingerprint));
+                }
+                if *availability == Availability::Present {
+                    store.set_availability(id, Availability::Missing)?;
+                    ReconcileOutcome::NewlyMissing
+                } else {
+                    ReconcileOutcome::StillMissing
+                }
+            }
+            Observation::Error(reason) => ReconcileOutcome::InspectionError { reason },
+            Observation::File {
+                size_bytes,
+                modified_unix_ms,
+            } => {
+                let observed = modified_unix_ms.map(|ms| FileFingerprint {
+                    size_bytes,
+                    modified_unix_ms: ms,
+                });
+                if *availability == Availability::Missing {
+                    store.set_availability(id, Availability::Present)?;
+                    let refreshed = match observed {
+                        Some(fingerprint) if Some(fingerprint) != *stored_fingerprint => {
+                            store.set_file_fingerprint(id, Some(fingerprint))?;
+                            true
+                        }
+                        _ => false,
+                    };
+                    ReconcileOutcome::Reappeared {
+                        fingerprint_refreshed: refreshed,
+                    }
+                } else {
+                    match (*stored_fingerprint, observed) {
+                        (Some(stored), Some(now)) if stored == now => ReconcileOutcome::Unchanged,
+                        (Some(stored), Some(now)) => {
+                            let size_changed = stored.size_bytes != now.size_bytes;
+                            let modified_changed = stored.modified_unix_ms != 0
+                                && stored.modified_unix_ms != now.modified_unix_ms;
+                            store.set_file_fingerprint(id, Some(now))?;
+                            if size_changed || modified_changed {
+                                ReconcileOutcome::Changed {
+                                    size_changed,
+                                    modified_changed,
+                                    fingerprint_refreshed: true,
+                                }
+                            } else {
+                                // Sizes agree and only an unknown stored
+                                // mtime was filled in: first usable
+                                // observation, not evidence of change.
+                                ReconcileOutcome::FingerprintEstablished
+                            }
+                        }
+                        (Some(stored), None) => {
+                            if stored.size_bytes != size_bytes {
+                                ReconcileOutcome::Changed {
+                                    size_changed: true,
+                                    modified_changed: false,
+                                    fingerprint_refreshed: false,
+                                }
+                            } else {
+                                ReconcileOutcome::FingerprintUnavailable
+                            }
+                        }
+                        (None, Some(now)) => {
+                            store.set_file_fingerprint(id, Some(now))?;
+                            ReconcileOutcome::FingerprintEstablished
+                        }
+                        (None, None) => ReconcileOutcome::FingerprintUnavailable,
+                    }
+                }
+            }
+        };
+        report.outcomes.push((id, outcome));
+    }
+
+    // Candidate discovery: one walk, only when something missing has
+    // a fingerprint worth matching.
+    if !missing_with_fingerprint.is_empty() {
+        let owned: HashSet<PathKey> = records
+            .iter()
+            .map(|(_, path, _, _)| path_key(path, policy))
+            .collect();
+        let mut unowned: Vec<(RelPath, FileFingerprint)> = Vec::new();
+        let walker = walkdir::WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !(entry.depth() == 1 && entry.file_name() == FLUX_DIR_NAME));
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    report.candidate_walk_errors += 1;
+                    continue;
+                }
+            };
+            let file_type = entry.file_type();
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
+            let Ok(relative_os) = entry.path().strip_prefix(&root) else {
+                continue;
+            };
+            let Ok(relative) = RelPath::from_os_path(relative_os) else {
+                continue;
+            };
+            if owned.contains(&path_key(&relative, policy)) {
+                continue;
+            }
+            if let Observation::File {
+                size_bytes,
+                modified_unix_ms: Some(modified_unix_ms),
+            } = inspect_recorded_file(entry.path())
+            {
+                unowned.push((
+                    relative,
+                    FileFingerprint {
+                        size_bytes,
+                        modified_unix_ms,
+                    },
+                ));
+            }
+        }
+
+        for (id, recorded_path, fingerprint) in &missing_with_fingerprint {
+            let wanted_extension = extension_key(recorded_path);
+            let candidates: Vec<RelPath> = unowned
+                .iter()
+                .filter(|(candidate, candidate_fingerprint)| {
+                    candidate_fingerprint == fingerprint
+                        && extension_key(candidate) == wanted_extension
+                })
+                .map(|(candidate, _)| candidate.clone())
+                .collect();
+            if !candidates.is_empty() {
+                report.relink_candidates.push(RelinkCandidates {
+                    id: *id,
+                    candidates,
+                });
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Explicitly relinks one missing record to a chosen candidate file
+/// (typically from [`ReconcileReport::relink_candidates`]), after
+/// revalidating everything at apply time. On success the record
+/// keeps its [`TrackId`], tag snapshot, overrides, and timestamps
+/// (except `updated_unix_ms`); only its path and availability
+/// change, in memory — the caller commits to publish.
+///
+/// The matching policy, all of which must hold:
+///
+/// - the record is currently [`Availability::Missing`] and has a
+///   stored fingerprint;
+/// - the candidate path is owned by no record and is representable
+///   on this platform;
+/// - the candidate is a present regular file (not a symlink) whose
+///   observed fingerprint equals the stored one **exactly** and
+///   whose extension matches the recorded path's.
+///
+/// Filename similarity plays no part. Size+mtime equality is a
+/// strong relocation signal (a rename preserves both) but cannot
+/// *prove* content identity; that residual uncertainty is why this
+/// step is explicit and why reconciliation never calls it.
+///
+/// Returns the candidate's observed fingerprint (equal to the
+/// stored one, which therefore needs no update).
+///
+/// # Errors
+///
+/// [`RelinkError::NotEligible`] for the record-side conditions,
+/// [`RelinkError::CandidateInvalid`] for the candidate-side ones,
+/// [`RelinkError::Store`] for storage failures (including the
+/// recovered read-only state).
+pub fn relink_portable_track(
+    store: &mut PortableStore,
+    id: TrackId,
+    candidate: &RelPath,
+) -> Result<FileFingerprint, RelinkError> {
+    store.ensure_writable()?;
+    let record = store
+        .get(id)
+        .ok_or(PortableStoreError::TrackNotFound { id })?;
+    let not_eligible = |reason: String| RelinkError::NotEligible { id, reason };
+    if record.availability() != Availability::Missing {
+        return Err(not_eligible("the track is not marked missing".to_owned()));
+    }
+    let Some(stored_fingerprint) = record.file() else {
+        return Err(not_eligible(
+            "the track has no recorded file fingerprint to match against".to_owned(),
+        ));
+    };
+    if record.path().to_os_path().is_none() {
+        return Err(not_eligible(
+            "the recorded path cannot be represented on this platform".to_owned(),
+        ));
+    }
+    let recorded_extension = extension_key(record.path());
+
+    let invalid = |reason: String| RelinkError::CandidateInvalid { reason };
+    if let Some(existing) = store.id_for_path(candidate) {
+        return Err(invalid(format!(
+            "the candidate path already belongs to track {existing}"
+        )));
+    }
+    let Some(candidate_os) = candidate.to_os_path() else {
+        return Err(invalid(
+            "the candidate path cannot be represented on this platform".to_owned(),
+        ));
+    };
+    if extension_key(candidate) != recorded_extension {
+        return Err(invalid(
+            "the candidate has a different file extension than the recorded path".to_owned(),
+        ));
+    }
+    let observed = match inspect_recorded_file(&store.root().join(&candidate_os)) {
+        Observation::File {
+            size_bytes,
+            modified_unix_ms: Some(modified_unix_ms),
+        } => FileFingerprint {
+            size_bytes,
+            modified_unix_ms,
+        },
+        Observation::File { .. } => {
+            return Err(invalid(
+                "the candidate's modification time is unavailable, so its fingerprint cannot be verified"
+                    .to_owned(),
+            ));
+        }
+        Observation::Missing => {
+            return Err(invalid("the candidate file is not present".to_owned()));
+        }
+        Observation::Error(reason) => return Err(invalid(reason)),
+    };
+    if observed != stored_fingerprint {
+        return Err(invalid(
+            "the candidate's fingerprint does not match the recorded fingerprint".to_owned(),
+        ));
+    }
+
+    store.set_path(id, candidate.clone())?;
+    store.set_availability(id, Availability::Present)?;
+    Ok(observed)
+}
+
+/// Rebuilds the in-memory [`Library`] from the store (e.g. after
+/// reconciliation changed paths), while carrying over tracks that
+/// exist only in memory — ones a sync intentionally skipped
+/// (outside the root, unrepresentable, …) — so a refresh can never
+/// silently drop them. Store records win for shared IDs; the ID
+/// counter is the maximum of both. Returns the rebuilt library and
+/// how many store records this platform could not represent (as in
+/// [`Library::from_portable_store`]).
+#[must_use]
+pub fn refresh_library_from_portable_store(
+    current: &Library,
+    store: &PortableStore,
+) -> (Library, usize) {
+    let (rebuilt, skipped) = Library::from_portable_store(store);
+    let (rebuilt_tracks, rebuilt_next) = rebuilt.parts();
+    let mut tracks: Vec<(TrackId, Track)> = rebuilt_tracks.to_vec();
+    let mut present: HashSet<TrackId> = tracks.iter().map(|(id, _)| *id).collect();
+    let (current_tracks, current_next) = current.parts();
+    for (id, track) in current_tracks {
+        if store.get(*id).is_none() && present.insert(*id) {
+            tracks.push((*id, track.clone()));
+        }
+    }
+    (
+        Library::from_parts(tracks, rebuilt_next.max(current_next)),
+        skipped,
+    )
 }
 
 #[cfg(test)]
@@ -4569,5 +5256,682 @@ mod tests {
             "{err:?}"
         );
         assert!(!store.has_uncommitted_changes(), "nothing was applied");
+    }
+
+    // ---- S6: catalogue reconciliation --------------------------------
+
+    /// A deterministic whole-second timestamp well after the epoch.
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// Writes `bytes` under `root/name` (creating parents) and pins
+    /// the file's mtime, so fingerprint fixtures never depend on
+    /// wall-clock timing or timestamp granularity.
+    fn write_file_at(root: &Path, name: &str, bytes: &[u8], modified: SystemTime) -> PathBuf {
+        let path = root.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent dir");
+        }
+        fs::write(&path, bytes).expect("write fixture");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open fixture");
+        file.set_modified(modified).expect("pin mtime");
+        path
+    }
+
+    fn fingerprint_of(path: &Path) -> FileFingerprint {
+        let metadata = fs::symlink_metadata(path).expect("stat fixture");
+        FileFingerprint {
+            size_bytes: metadata.len(),
+            modified_unix_ms: u64::try_from(
+                metadata
+                    .modified()
+                    .expect("mtime")
+                    .duration_since(UNIX_EPOCH)
+                    .expect("post-epoch")
+                    .as_millis(),
+            )
+            .expect("mtime fits u64"),
+        }
+    }
+
+    const T0: u64 = 1_700_000_000;
+
+    #[test]
+    fn reconcile_unchanged_file_is_a_no_op() {
+        let dir = TempDir::new("s6-unchanged");
+        let path = write_file_at(dir.path(), "a.flac", b"12345", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                Some(fingerprint_of(&path)),
+                title_tags("Aye"),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(report.outcome_for(id), Some(&ReconcileOutcome::Unchanged));
+        assert_eq!(report.unchanged_count(), 1);
+        assert!(
+            !store.has_uncommitted_changes(),
+            "an unchanged catalogue must not dirty any segment"
+        );
+        assert_eq!(
+            fs::read(&path).expect("fixture"),
+            b"12345",
+            "audio untouched"
+        );
+    }
+
+    #[test]
+    fn reconcile_deleted_file_marks_missing_and_preserves_record() {
+        let dir = TempDir::new("s6-deleted");
+        let path = write_file_at(dir.path(), "a.flac", b"data", at(T0));
+        let fingerprint = fingerprint_of(&path);
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                Some(fingerprint),
+                title_tags("Aye"),
+            )
+            .expect("add");
+        let mut overrides = MetadataOverrides::new();
+        overrides.set_title("User Title".to_owned());
+        store
+            .set_overrides(id, overrides.clone())
+            .expect("overrides");
+        store.commit().expect("commit");
+
+        fs::remove_file(&path).expect("delete fixture");
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.outcome_for(id),
+            Some(&ReconcileOutcome::NewlyMissing)
+        );
+        assert_eq!(report.missing_count(), 1);
+
+        let record = store.get(id).expect("record retained");
+        assert_eq!(record.availability(), Availability::Missing);
+        assert_eq!(record.path(), &rel("a.flac"), "recorded path retained");
+        assert_eq!(
+            record.file(),
+            Some(fingerprint),
+            "fingerprint retained for matching"
+        );
+        assert_eq!(record.tags(), &title_tags("Aye"));
+        assert_eq!(record.overrides(), &overrides);
+
+        store.commit().expect("publish");
+        let mut reopened = PortableStore::open(dir.path()).expect("reopen").store;
+        assert_eq!(
+            reopened.get(id).expect("still there").availability(),
+            Availability::Missing
+        );
+        let again = reconcile_portable_store(&mut reopened).expect("reconcile again");
+        assert_eq!(again.outcome_for(id), Some(&ReconcileOutcome::StillMissing));
+        assert!(
+            !reopened.has_uncommitted_changes(),
+            "still-missing is a no-op, not a rewrite"
+        );
+    }
+
+    #[test]
+    fn reconcile_detects_size_and_mtime_changes_independently() {
+        let dir = TempDir::new("s6-changed");
+        let a = write_file_at(dir.path(), "a.flac", b"1234", at(T0));
+        let b = write_file_at(dir.path(), "b.flac", b"1234", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id_a = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                Some(fingerprint_of(&a)),
+                TagSet::default(),
+            )
+            .expect("add a");
+        let id_b = store
+            .add_track(
+                rel("b.flac"),
+                Availability::Present,
+                Some(fingerprint_of(&b)),
+                TagSet::default(),
+            )
+            .expect("add b");
+        store.commit().expect("commit");
+
+        // a: different size, same mtime. b: same size, later mtime.
+        write_file_at(dir.path(), "a.flac", b"123456789", at(T0));
+        write_file_at(dir.path(), "b.flac", b"wxyz", at(T0 + 3600));
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.outcome_for(id_a),
+            Some(&ReconcileOutcome::Changed {
+                size_changed: true,
+                modified_changed: false,
+                fingerprint_refreshed: true,
+            })
+        );
+        assert_eq!(
+            report.outcome_for(id_b),
+            Some(&ReconcileOutcome::Changed {
+                size_changed: false,
+                modified_changed: true,
+                fingerprint_refreshed: true,
+            })
+        );
+        assert_eq!(report.changed_count(), 2);
+        assert_eq!(store.get(id_a).expect("a").file(), Some(fingerprint_of(&a)));
+        assert_eq!(store.get(id_b).expect("b").file(), Some(fingerprint_of(&b)));
+        // IDs and availability are not casualties of a changed file.
+        assert_eq!(
+            store.get(id_a).expect("a").availability(),
+            Availability::Present
+        );
+    }
+
+    #[test]
+    fn reconcile_inspection_error_is_not_missing() {
+        let dir = TempDir::new("s6-inspection-error");
+        let path = write_file_at(dir.path(), "a.flac", b"data", at(T0));
+        let fingerprint = fingerprint_of(&path);
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                Some(fingerprint),
+                TagSet::default(),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        // Replace the file with a directory of the same name: the
+        // filesystem cannot give a file answer, which must not be
+        // misread as "confirmed missing".
+        fs::remove_file(&path).expect("remove file");
+        fs::create_dir(&path).expect("directory in its place");
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert!(
+            matches!(
+                report.outcome_for(id),
+                Some(ReconcileOutcome::InspectionError { .. })
+            ),
+            "{:?}",
+            report.outcome_for(id)
+        );
+        assert_eq!(report.missing_count(), 0);
+        let record = store.get(id).expect("record");
+        assert_eq!(
+            record.availability(),
+            Availability::Present,
+            "availability untouched"
+        );
+        assert_eq!(record.file(), Some(fingerprint), "fingerprint untouched");
+        assert!(
+            !store.has_uncommitted_changes(),
+            "no conclusion, no mutation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_symlink_at_recorded_path_is_an_inspection_error() {
+        let dir = TempDir::new("s6-symlink");
+        let real = write_file_at(dir.path(), "real.flac", b"data", at(T0));
+        let path = dir.path().join("a.flac");
+        std::os::unix::fs::symlink(&real, &path).expect("symlink");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Missing,
+                Some(fingerprint_of(&real)),
+                TagSet::default(),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert!(
+            matches!(
+                report.outcome_for(id),
+                Some(ReconcileOutcome::InspectionError { .. })
+            ),
+            "a symlink is never followed or claimed: {:?}",
+            report.outcome_for(id)
+        );
+        assert_eq!(
+            store.get(id).expect("record").availability(),
+            Availability::Missing,
+            "not upgraded to present through a link"
+        );
+    }
+
+    #[test]
+    fn reconcile_establishes_missing_or_unknown_fingerprints() {
+        let dir = TempDir::new("s6-establish");
+        let a = write_file_at(dir.path(), "a.flac", b"1234", at(T0));
+        let b = write_file_at(dir.path(), "b.flac", b"123456", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        // Migration-style record: no fingerprint at all.
+        let id_a = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                None,
+                TagSet::default(),
+            )
+            .expect("add a");
+        // Legacy record: size known, mtime the 0 "unknown" sentinel.
+        let id_b = store
+            .add_track(
+                rel("b.flac"),
+                Availability::Present,
+                Some(FileFingerprint {
+                    size_bytes: 6,
+                    modified_unix_ms: 0,
+                }),
+                TagSet::default(),
+            )
+            .expect("add b");
+        store.commit().expect("commit");
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.outcome_for(id_a),
+            Some(&ReconcileOutcome::FingerprintEstablished)
+        );
+        assert_eq!(
+            report.outcome_for(id_b),
+            Some(&ReconcileOutcome::FingerprintEstablished),
+            "filling in an unknown mtime is not evidence of change"
+        );
+        assert_eq!(store.get(id_a).expect("a").file(), Some(fingerprint_of(&a)));
+        assert_eq!(store.get(id_b).expect("b").file(), Some(fingerprint_of(&b)));
+    }
+
+    #[test]
+    fn reconcile_epoch_mtime_is_unavailable_not_fabricated() {
+        let dir = TempDir::new("s6-epoch-mtime");
+        write_file_at(dir.path(), "a.flac", b"1234", UNIX_EPOCH);
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                None,
+                TagSet::default(),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.outcome_for(id),
+            Some(&ReconcileOutcome::FingerprintUnavailable)
+        );
+        assert_eq!(
+            store.get(id).expect("record").file(),
+            None,
+            "never fabricate a fingerprint"
+        );
+        assert_eq!(
+            store.get(id).expect("record").availability(),
+            Availability::Present
+        );
+    }
+
+    #[test]
+    fn reconcile_reappeared_file_restores_availability() {
+        let dir = TempDir::new("s6-reappeared");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Missing,
+                Some(FileFingerprint {
+                    size_bytes: 4,
+                    modified_unix_ms: T0 * 1000,
+                }),
+                title_tags("Aye"),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        // The file comes back, rewritten (different size and mtime).
+        let path = write_file_at(dir.path(), "a.flac", b"1234567", at(T0 + 60));
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.outcome_for(id),
+            Some(&ReconcileOutcome::Reappeared {
+                fingerprint_refreshed: true
+            })
+        );
+        let record = store.get(id).expect("record");
+        assert_eq!(record.availability(), Availability::Present);
+        assert_eq!(record.file(), Some(fingerprint_of(&path)));
+        assert_eq!(
+            record.tags(),
+            &title_tags("Aye"),
+            "metadata survives the round trip"
+        );
+    }
+
+    #[test]
+    fn relink_unique_candidate_end_to_end() {
+        let dir = TempDir::new("s6-relink");
+        let original = write_file_at(dir.path(), "sub/a.flac", b"payload", at(T0));
+        let bytes_before = fs::read(&original).expect("fixture bytes");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("sub/a.flac"),
+                Availability::Present,
+                Some(fingerprint_of(&original)),
+                title_tags("Aye"),
+            )
+            .expect("add");
+        let mut overrides = MetadataOverrides::new();
+        overrides.set_title("User Title".to_owned());
+        store
+            .set_overrides(id, overrides.clone())
+            .expect("overrides");
+        store.commit().expect("commit");
+
+        // The user moves the file (rename preserves size + mtime).
+        fs::create_dir_all(dir.path().join("other")).expect("new folder");
+        let moved = dir.path().join("other").join("b.flac");
+        fs::rename(&original, &moved).expect("move fixture");
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.outcome_for(id),
+            Some(&ReconcileOutcome::NewlyMissing)
+        );
+        assert_eq!(report.relink_candidates.len(), 1);
+        let found = &report.relink_candidates[0];
+        assert_eq!(found.id, id);
+        assert!(found.is_unique());
+        assert_eq!(found.candidates, vec![rel("other/b.flac")]);
+        // Reconciliation itself moved nothing.
+        assert_eq!(store.get(id).expect("record").path(), &rel("sub/a.flac"));
+
+        // A wrong candidate is refused without side effects.
+        let err = relink_portable_track(&mut store, id, &rel("other/nope.flac"))
+            .expect_err("nonexistent candidate must refuse");
+        assert!(
+            matches!(err, RelinkError::CandidateInvalid { .. }),
+            "{err:?}"
+        );
+        assert_eq!(store.get(id).expect("record").path(), &rel("sub/a.flac"));
+
+        // The explicit, validated application.
+        relink_portable_track(&mut store, id, &rel("other/b.flac")).expect("relink");
+        let record = store.get(id).expect("record");
+        assert_eq!(record.path(), &rel("other/b.flac"));
+        assert_eq!(record.availability(), Availability::Present);
+        assert_eq!(record.tags(), &title_tags("Aye"));
+        assert_eq!(record.overrides(), &overrides);
+        store.commit().expect("publish");
+
+        let reopened = PortableStore::open(dir.path()).expect("reopen").store;
+        assert_eq!(
+            reopened.get(id).expect("record").path(),
+            &rel("other/b.flac")
+        );
+        assert_eq!(
+            fs::read(&moved).expect("moved fixture"),
+            bytes_before,
+            "audio untouched"
+        );
+    }
+
+    #[test]
+    fn relink_ambiguous_candidates_are_never_auto_selected() {
+        let dir = TempDir::new("s6-ambiguous");
+        let original = write_file_at(dir.path(), "a.flac", b"payload", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                Some(fingerprint_of(&original)),
+                TagSet::default(),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        fs::remove_file(&original).expect("remove original");
+        // Two unowned files fingerprint-identical to the original.
+        write_file_at(dir.path(), "x/dup.flac", b"payload", at(T0));
+        write_file_at(dir.path(), "y/dup.flac", b"payload", at(T0));
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(report.ambiguous_candidate_count(), 1);
+        assert_eq!(report.unique_candidate_count(), 0);
+        let found = &report.relink_candidates[0];
+        assert_eq!(found.candidates.len(), 2);
+        let record = store.get(id).expect("record");
+        assert_eq!(record.path(), &rel("a.flac"), "ambiguity moves nothing");
+        assert_eq!(record.availability(), Availability::Missing);
+    }
+
+    #[test]
+    fn relink_filename_alone_never_matches() {
+        let dir = TempDir::new("s6-filename-only");
+        let original = write_file_at(dir.path(), "gone/a.flac", b"1234", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("gone/a.flac"),
+                Availability::Present,
+                Some(fingerprint_of(&original)),
+                TagSet::default(),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+        fs::remove_file(&original).expect("remove original");
+
+        // Same filename elsewhere, different size; same size
+        // elsewhere, different mtime. Neither may be a candidate.
+        write_file_at(dir.path(), "elsewhere/a.flac", b"12345678", at(T0));
+        write_file_at(dir.path(), "other/b.flac", b"1234", at(T0 + 99));
+
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.outcome_for(id),
+            Some(&ReconcileOutcome::NewlyMissing)
+        );
+        assert!(
+            report.relink_candidates.is_empty(),
+            "no fingerprint match, no candidates: {:?}",
+            report.relink_candidates
+        );
+        let err = relink_portable_track(&mut store, id, &rel("elsewhere/a.flac"))
+            .expect_err("same-name different file must refuse");
+        assert!(
+            matches!(err, RelinkError::CandidateInvalid { .. }),
+            "{err:?}"
+        );
+        assert_eq!(store.get(id).expect("record").path(), &rel("gone/a.flac"));
+    }
+
+    #[test]
+    fn reconcile_covers_records_in_later_segments() {
+        let dir = TempDir::new("s6-segments");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let mut last_id = None;
+        for i in 0..1001 {
+            last_id = Some(
+                store
+                    .add_track(
+                        rel(&format!("f{i:04}.flac")),
+                        Availability::Missing,
+                        None,
+                        TagSet::default(),
+                    )
+                    .expect("add"),
+            );
+        }
+        store.commit().expect("commit");
+        assert!(store.segment_count() >= 2, "fixture must span segments");
+        let last_id = last_id.expect("last id");
+
+        // Only the very last record's file exists.
+        write_file_at(dir.path(), "f1000.flac", b"x", at(T0));
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(
+            report.inspected_count(),
+            1001,
+            "the whole catalogue, every segment"
+        );
+        assert_eq!(
+            report.outcome_for(last_id),
+            Some(&ReconcileOutcome::Reappeared {
+                fingerprint_refreshed: true
+            })
+        );
+        assert_eq!(report.missing_count(), 1000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_failed_commit_keeps_previous_catalogue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("s6-failed-commit");
+        let path = write_file_at(dir.path(), "a.flac", b"data", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                Some(fingerprint_of(&path)),
+                TagSet::default(),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        fs::remove_file(&path).expect("delete fixture");
+        let report = reconcile_portable_store(&mut store).expect("reconcile");
+        assert_eq!(report.newly_missing_count(), 1);
+
+        // Publication fails: the .flux directory is read-only.
+        let flux = flux_dir(&dir);
+        fs::set_permissions(&flux, fs::Permissions::from_mode(0o500)).expect("chmod ro");
+        let result = store.commit();
+        fs::set_permissions(&flux, fs::Permissions::from_mode(0o700)).expect("chmod back");
+        assert!(result.is_err(), "commit must fail while read-only");
+
+        // The previously committed catalogue is what a reopen sees.
+        let reopened = PortableStore::open(dir.path()).expect("reopen").store;
+        assert_eq!(
+            reopened.get(id).expect("record").availability(),
+            Availability::Present,
+            "failed publication preserves the prior committed catalogue"
+        );
+        // And the pending reconciled state is retryable, not lost.
+        assert!(store.has_uncommitted_changes());
+        store.commit().expect("retry publishes");
+        let reopened = PortableStore::open(dir.path()).expect("reopen").store;
+        assert_eq!(
+            reopened.get(id).expect("record").availability(),
+            Availability::Missing
+        );
+    }
+
+    #[test]
+    fn reconcile_refuses_read_only_recovered_store() {
+        let dir = TempDir::new("s6-recovered");
+        write_file_at(dir.path(), "a.flac", b"1", at(T0));
+        write_file_at(dir.path(), "b.flac", b"2", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        store
+            .add_track(rel("a.flac"), Availability::Present, None, title_tags("A"))
+            .expect("add a");
+        store.commit().expect("commit a (becomes backup)");
+        store
+            .add_track(rel("b.flac"), Availability::Present, None, title_tags("B"))
+            .expect("add b");
+        store.commit().expect("commit b");
+        drop(store);
+        fs::write(flux_dir(&dir).join(CATALOG_FILE_NAME), b"junk").expect("damage primary");
+
+        let mut recovered = PortableStore::open(dir.path()).expect("recover").store;
+        assert!(recovered.is_recovered_read_only());
+        let err = reconcile_portable_store(&mut recovered).expect_err("must refuse");
+        assert!(
+            matches!(err, PortableStoreError::ReadOnlyRecovered),
+            "{err:?}"
+        );
+        assert!(!recovered.has_uncommitted_changes(), "nothing was applied");
+    }
+
+    #[test]
+    fn refresh_library_from_store_carries_over_memory_only_tracks() {
+        let dir = TempDir::new("s6-refresh");
+        let outside = TempDir::new("s6-refresh-outside");
+        write_file_at(dir.path(), "a.flac", b"junk-audio", at(T0));
+        write_file_at(outside.path(), "outside.flac", b"junk-audio", at(T0));
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let stored_id = store
+            .add_track(
+                rel("a.flac"),
+                Availability::Present,
+                None,
+                title_tags("Aye"),
+            )
+            .expect("add");
+        store.commit().expect("commit");
+
+        // In-memory library: the store's track plus one the store
+        // cannot hold (scanned from outside the root).
+        let (mut library, _) = Library::from_portable_store(&store);
+        library.scan(&[outside.path()]);
+        let (tracks_before, _) = library.parts();
+        assert_eq!(tracks_before.len(), 2);
+        let memory_only_id = tracks_before
+            .iter()
+            .map(|(id, _)| *id)
+            .find(|id| *id != stored_id)
+            .expect("memory-only track");
+
+        // The store record moves (as a relink would do).
+        store
+            .set_path(stored_id, rel("moved.flac"))
+            .expect("move in store");
+        store.commit().expect("publish");
+
+        let (refreshed, skipped) = refresh_library_from_portable_store(&library, &store);
+        assert_eq!(skipped, 0);
+        let (tracks_after, _) = refreshed.parts();
+        assert_eq!(
+            tracks_after.len(),
+            2,
+            "memory-only track carried over, not dropped"
+        );
+        let stored = tracks_after
+            .iter()
+            .find(|(id, _)| *id == stored_id)
+            .expect("stored track");
+        assert_eq!(
+            stored.1.source().path(),
+            dir.path().join("moved.flac"),
+            "runtime picks up the store's new path"
+        );
+        assert!(
+            tracks_after.iter().any(|(id, _)| *id == memory_only_id),
+            "in-memory-only track preserved"
+        );
     }
 }

@@ -24,7 +24,10 @@
 //!   `M` migrate a legacy index (type index file, then destination
 //!   folder; review the plan, `y` executes, `Esc` cancels; afterwards
 //!   `a` opens the migrated library), `B` switch back to the app
-//!   library index, `A` acknowledge a recovered library
+//!   library index, `A` acknowledge a recovered library, `X`
+//!   reconcile the portable catalogue with the filesystem (refresh
+//!   availability/fingerprints; missing records are kept and
+//!   possible new locations are only reported, never auto-applied)
 //!
 //! Startup always uses the legacy app index: opening, creating,
 //! migrating, or switching libraries only ever happens through the
@@ -232,6 +235,13 @@ impl Tui {
                     && let Err(err) = self.controller.acknowledge_portable_recovery()
                 {
                     self.lifecycle_msg = Some(err);
+                }
+            }
+            KeyCode::Char('X') => {
+                // Failures land in the controller's error line; the
+                // detailed summary replaces the lifecycle message.
+                if let Ok(report) = self.controller.reconcile_portable_library() {
+                    self.lifecycle_msg = Some(reconcile_summary(&report));
                 }
             }
             KeyCode::Char('/') => {
@@ -498,7 +508,7 @@ impl Tui {
         let help = match self.mode {
             Mode::Normal => "Enter play · Space pause · s stop · n/p next/prev · +/- volume \
                              · o scan · r refresh · / search · R repeat · O open library \
-                             · C create · M migrate · B app index · q quit"
+                             · C create · M migrate · B app index · X reconcile · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
@@ -585,6 +595,29 @@ impl Tui {
 /// what is excluded and why. (IDs/counter preservation and the
 /// untouched legacy index/audio are guarantees of the shared
 /// migration API.)
+/// The reconciliation result in one line, including whether
+/// possible new locations were found for missing tracks (never
+/// applied automatically).
+fn reconcile_summary(report: &flux_app::ReconcileReport) -> String {
+    let mut summary = format!(
+        "Reconciled {}: {} unchanged, {} changed, {} back, {} missing (kept), {} uninspectable.",
+        report.inspected_count(),
+        report.unchanged_count() + report.established_count(),
+        report.changed_count(),
+        report.reappeared_count(),
+        report.missing_count(),
+        report.inspection_error_count() + report.fingerprint_unavailable_count(),
+    );
+    let with_candidates = report.unique_candidate_count() + report.ambiguous_candidate_count();
+    if with_candidates > 0 {
+        summary.push_str(&format!(
+            " {with_candidates} missing track(s) have possible new locations ({} ambiguous); nothing moved.",
+            report.ambiguous_candidate_count()
+        ));
+    }
+    summary
+}
+
 fn migration_plan_summary(plan: &MigrationPlan) -> String {
     format!(
         "Migrate {} track(s) ({} present, {} missing→unavailable); excluded: \
@@ -809,6 +842,33 @@ mod tests {
             .map(|(id, _)| id.get())
             .collect();
         assert_eq!(ids, vec![1], "migrated ID preserved through activation");
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn reconcile_key_reports_summary_and_never_switches() {
+        use flux_app::StorageMode;
+
+        let dir = TempDir::new("reconcile-key");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut tui = tui(&dir);
+
+        // Legacy mode: X is refused visibly and changes nothing.
+        key(&mut tui, KeyCode::Char('X'));
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
+        assert!(tui.controller.last_error().is_some());
+        assert!(tui.lifecycle_msg.is_none(), "no false success summary");
+
+        // Create + switch, then X reconciles and reports.
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+        key(&mut tui, KeyCode::Char('X'));
+        assert_eq!(tui.mode, Mode::Normal);
+        let message = tui.lifecycle_msg.clone().expect("summary shown");
+        assert!(message.starts_with("Reconciled 0:"), "{message}");
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
         tui.controller.shutdown();
     }
 

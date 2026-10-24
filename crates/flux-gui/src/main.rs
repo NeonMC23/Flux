@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use flux_app::{
-    Controller, MigrationPlan, StorageMode, default_index_path, format_duration, is_track_playable,
+    Controller, MigrationPlan, ReconcileReport, StorageMode, default_index_path, format_duration,
+    is_track_playable,
 };
 use flux_core::{APP_NAME, MILESTONE, PlaybackState, TrackId};
 use iced::widget::{button, column, container, row, scrollable, slider, text, text_input};
@@ -55,6 +56,31 @@ fn migration_plan_summary(plan: &MigrationPlan) -> String {
         plan.unrepresentable_count(),
         plan.ambiguous_count(),
     )
+}
+
+/// The reconciliation result in words: what was refreshed, what is
+/// missing, and whether possible new locations were found (applying
+/// one is a separate validated step the GUI does not automate).
+fn reconcile_summary(report: &ReconcileReport) -> String {
+    let mut summary = format!(
+        "Reconciliation: {} track(s) checked — {} unchanged, {} changed, \
+         {} present again, {} missing (records kept), {} could not be inspected.",
+        report.inspected_count(),
+        report.unchanged_count() + report.established_count(),
+        report.changed_count(),
+        report.reappeared_count(),
+        report.missing_count(),
+        report.inspection_error_count() + report.fingerprint_unavailable_count(),
+    );
+    if report.unique_candidate_count() > 0 || report.ambiguous_candidate_count() > 0 {
+        summary.push_str(&format!(
+            " Possible new locations found for {} missing track(s) ({} ambiguous); \
+             nothing was moved automatically.",
+            report.unique_candidate_count() + report.ambiguous_candidate_count(),
+            report.ambiguous_candidate_count(),
+        ));
+    }
+    summary
 }
 
 pub fn main() -> iced::Result {
@@ -100,6 +126,7 @@ enum Message {
     ExecuteMigrationPressed,
     CancelMigrationPressed,
     OpenMigratedPressed,
+    ReconcilePressed,
     ScanPressed,
     RefreshPressed,
     SearchChanged(String),
@@ -232,6 +259,14 @@ impl Flux {
                     self.after_switch();
                 }
             }
+            Message::ReconcilePressed => {
+                // Failures are mirrored into the controller's error
+                // line; the detailed summary goes to the lifecycle
+                // message area.
+                if let Ok(report) = self.controller.reconcile_portable_library() {
+                    self.lifecycle_msg = Some(reconcile_summary(&report));
+                }
+            }
             Message::ScanPressed => {
                 let path = self.dir_input.trim();
                 if !path.is_empty() {
@@ -328,10 +363,15 @@ impl Flux {
         content = content.push(lib_row);
 
         if controller.storage_mode() == StorageMode::Portable {
-            content = content.push(
+            let portable_actions = row![
                 button(text("Use app library index"))
                     .on_press_maybe((!scanning).then_some(Message::UseLegacyIndexPressed)),
-            );
+                button(text("Reconcile library"))
+                    .on_press_maybe((!scanning).then_some(Message::ReconcilePressed)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+            content = content.push(portable_actions);
         }
         if controller.portable_recovery().is_some() {
             content = content.push(
@@ -633,6 +673,40 @@ mod tests {
             .map(|(id, _)| id.get())
             .collect();
         assert_eq!(ids, vec![1], "migrated ID preserved through activation");
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn reconcile_message_reports_summary_and_never_switches() {
+        let dir = TempDir::new("reconcile");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut gui = gui(&dir);
+
+        // Legacy mode: refused and visible, active library untouched.
+        send(&mut gui, Message::ReconcilePressed);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Legacy);
+        assert!(gui.controller.last_error().is_some());
+        assert!(gui.lifecycle_msg.is_none(), "no false success summary");
+
+        // Portable mode: the summary reaches the lifecycle area.
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::CreateLibraryPressed);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+        send(&mut gui, Message::ReconcilePressed);
+        let message = gui.lifecycle_msg.clone().expect("summary shown");
+        assert!(
+            message.starts_with("Reconciliation: 0 track(s) checked"),
+            "{message}"
+        );
+        assert_eq!(
+            gui.controller.storage_mode(),
+            StorageMode::Portable,
+            "reconciling never switches libraries"
+        );
         gui.controller.shutdown();
     }
 

@@ -64,6 +64,17 @@
 //! and neither switches a running controller by itself — activating
 //! the result is the separate switch step above.
 //!
+//! Reconciliation ([`Controller::reconcile_portable_library`]) is the
+//! portable catalogue's explicit maintenance pass: it compares every
+//! persistent record (not just the ones loaded in memory) with the
+//! filesystem, refreshes availability and size/mtime fingerprints,
+//! retains missing records with their IDs and metadata, and reports
+//! possible new locations for moved files as candidates. Applying a
+//! candidate is the separate, revalidated
+//! [`Controller::relink_portable_track`] step — reconciliation never
+//! moves, deletes, or retags anything by itself, and never runs
+//! implicitly at startup or after a scan.
+//!
 //! # Threading
 //!
 //! All `Controller` methods are synchronous and, except where noted,
@@ -101,12 +112,15 @@ use flux_audio::engine::{EngineEvent, EngineHandle};
 use flux_core::{PlaybackState, RepeatMode, Track, TrackId};
 use flux_library::portable::{
     CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, OpenedStore, PortableStore,
-    sync_library_to_portable_store,
+    reconcile_portable_store, refresh_library_from_portable_store, sync_library_to_portable_store,
 };
 use flux_library::{Library, PortableSyncReport, ScanReport};
 
 pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
-pub use flux_library::{PortableStoreError, RecoveryInfo, StoreError};
+pub use flux_library::{
+    PortableStoreError, ReconcileOutcome, ReconcileReport, RecoveryInfo, RelPath, RelinkCandidates,
+    RelinkError, StoreError,
+};
 
 /// Whether real device audio is available to this controller's engine.
 ///
@@ -1205,6 +1219,165 @@ impl Controller {
         }
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.outbox.push(ControllerEvent::PlaybackChanged);
+    }
+
+    // ---------------------------------------------- reconciliation ---
+
+    /// Reconciles the active portable library's persistent catalogue
+    /// with the filesystem (see
+    /// [`flux_library::reconcile_portable_store`] for the exact
+    /// semantics): availability and file fingerprints are refreshed
+    /// for **every** catalogue record — including ones not currently
+    /// loaded in memory — missing records are retained, inspection
+    /// failures change nothing, and possible new locations for
+    /// missing files are reported as candidates, never applied
+    /// automatically (see
+    /// [`relink_portable_track`](Self::relink_portable_track)).
+    ///
+    /// The result is published through the normal portable save path
+    /// (sync + commit); if publication fails, the error is returned
+    /// (and mirrored into [`last_error`](Self::last_error)), the
+    /// previously committed catalogue stays intact on disk, and the
+    /// reconciled state remains pending in memory so a later
+    /// [`save_index`](Self::save_index) retries it. On success the
+    /// runtime view is refreshed from the store — in-memory-only
+    /// tracks are carried over, the queue selection is preserved
+    /// (IDs never change), and playback is not interrupted (a
+    /// relinked currently-playing track keeps playing its already
+    /// loaded audio; the new path applies from the next load).
+    ///
+    /// Refused (with no change) while a scan is running, in legacy
+    /// mode, and while a recovered store awaits acknowledgement.
+    /// Never runs implicitly: not at startup, not after scans.
+    pub fn reconcile_portable_library(&mut self) -> Result<ReconcileReport, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.portable_store.as_mut() else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let report = match reconcile_portable_store(store) {
+            Ok(report) => report,
+            Err(err) => {
+                let message = format!("Could not reconcile the portable library: {err}");
+                self.report_error(message.clone());
+                return Err(message);
+            }
+        };
+        self.publish_portable()?;
+        self.refresh_from_store();
+        self.report_status(format!(
+            "Reconciled {} track(s): {} unchanged, {} changed, {} now present again, \
+             {} missing, {} could not be inspected.",
+            report.inspected_count(),
+            report.unchanged_count() + report.established_count(),
+            report.changed_count(),
+            report.reappeared_count(),
+            report.missing_count(),
+            report.inspection_error_count() + report.fingerprint_unavailable_count(),
+        ));
+        Ok(report)
+    }
+
+    /// Relinks one missing portable track to a chosen candidate
+    /// path (typically from a [`ReconcileReport`]), after the
+    /// storage layer revalidates it: the candidate must be an
+    /// unowned, present regular file whose size+mtime fingerprint
+    /// exactly equals the stored one and whose extension matches
+    /// the recorded path (see
+    /// [`flux_library::relink_portable_track`]). Filename similarity
+    /// never suffices. On success the track keeps its ID and
+    /// metadata, the change is published through the normal save
+    /// path, and the runtime view is refreshed; on any refusal
+    /// nothing changes.
+    pub fn relink_portable_track(
+        &mut self,
+        id: TrackId,
+        candidate: &RelPath,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.portable_store.as_mut() else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if let Err(err) = flux_library::relink_portable_track(store, id, candidate) {
+            let message = err.to_string();
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.publish_portable()?;
+        self.refresh_from_store();
+        self.report_status(format!(
+            "Relinked track {id} to {}.",
+            candidate.display_lossy()
+        ));
+        Ok(())
+    }
+
+    /// Shared preconditions for portable catalogue maintenance
+    /// (reconcile/relink): no scan in flight (the store is owned by
+    /// the scan worker then), portable backend active, no
+    /// unacknowledged recovery.
+    fn portable_maintenance_guard(&self) -> Result<(), String> {
+        if self.is_scanning() {
+            return Err("A library scan is in progress; try again when it finishes.".to_owned());
+        }
+        if matches!(self.storage, StorageBackend::Legacy { .. }) {
+            return Err(
+                "This applies to portable libraries; the active library uses the legacy index."
+                    .to_owned(),
+            );
+        }
+        if self.portable_recovery.is_some() {
+            return Err(PORTABLE_RECOVERY_READ_ONLY.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Publishes pending portable state through the one save path
+    /// (sync + commit), reporting any failure. Reconciliation's
+    /// availability/fingerprint updates survive the sync untouched
+    /// by design.
+    fn publish_portable(&mut self) -> Result<(), String> {
+        let (Some(library), Some(store)) = (self.library.as_ref(), self.portable_store.as_mut())
+        else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        match persist_portable(library, store) {
+            Ok(_) => Ok(()),
+            Err(message) => {
+                self.report_error(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    /// Refreshes the runtime library/snapshot from the portable
+    /// store after catalogue maintenance, carrying over
+    /// in-memory-only tracks and preserving the queue selection
+    /// (same library, same IDs — unlike a library switch).
+    fn refresh_from_store(&mut self) {
+        let (Some(current), Some(store)) = (self.library.as_ref(), self.portable_store.as_ref())
+        else {
+            return;
+        };
+        let (library, skipped) = refresh_library_from_portable_store(current, store);
+        self.tracks = snapshot(&library);
+        self.library = Some(library);
+        self.rebuild_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        if skipped > 0 {
+            self.report_status(skipped_unrepresentable_message(skipped));
+        }
     }
 
     /// Decoded-stream facts for the loaded track, once known.
@@ -3778,5 +3951,240 @@ mod tests {
         assert!(controller.tracks().is_empty());
         assert_eq!(controller.current_id(), None);
         controller.shutdown();
+    }
+
+    // ---- S6: catalogue reconciliation -------------------------------
+
+    #[test]
+    fn controller_reconcile_marks_missing_and_publishes() {
+        use flux_library::{Availability, PortableStore};
+
+        let dir = TempDir::new("s6-reconcile");
+        let root = seeded_root(&dir, "portable");
+        let (mut controller, _c) = boot_portable_at(&root).expect("portable boot");
+        assert_eq!(track_ids(&controller), vec![2, 5]);
+
+        // ID 2's file disappears; ID 5 was already missing.
+        fs::remove_file(root.join("a.wav")).expect("delete audio");
+        let report = controller
+            .reconcile_portable_library()
+            .expect("reconcile succeeds");
+        assert_eq!(
+            report.outcome_for(TrackId::new(2)),
+            Some(&flux_library::ReconcileOutcome::NewlyMissing)
+        );
+        assert_eq!(
+            report.outcome_for(TrackId::new(5)),
+            Some(&flux_library::ReconcileOutcome::StillMissing)
+        );
+        assert_eq!(report.missing_count(), 2);
+        // Both records remain visible (missing is retained, never deleted).
+        assert_eq!(track_ids(&controller), vec![2, 5]);
+        assert!(controller.last_error().is_none());
+        assert!(
+            controller
+                .last_status()
+                .is_some_and(|status| status.starts_with("Reconciled 2 track(s)")),
+            "{:?}",
+            controller.last_status()
+        );
+        controller.shutdown();
+
+        // Published: a fresh open sees the refreshed availability.
+        let reopened = PortableStore::open(&root).expect("reopen").store;
+        assert_eq!(
+            reopened
+                .get(TrackId::new(2))
+                .expect("record 2")
+                .availability(),
+            Availability::Missing
+        );
+        assert_eq!(
+            reopened
+                .get(TrackId::new(2))
+                .expect("record 2")
+                .tags()
+                .title
+                .as_deref(),
+            Some("Aye"),
+            "metadata preserved"
+        );
+    }
+
+    #[test]
+    fn controller_reconcile_guards_legacy_recovery_and_scanning() {
+        let dir = TempDir::new("s6-reconcile-guards");
+
+        // Legacy mode: refused, visible, nothing changes.
+        let (mut legacy, _l) = boot_legacy_at(None);
+        assert!(legacy.reconcile_portable_library().is_err());
+        assert!(legacy.last_error().is_some());
+        assert_eq!(legacy.storage_mode(), StorageMode::Legacy);
+        legacy.shutdown();
+
+        // Recovered (read-only) portable store: refused until the
+        // user acknowledges recovery — reconcile cannot bypass it.
+        let root = seeded_root(&dir, "portable");
+        let (mut warm, _w) = boot_portable_at(&root).expect("seeded store opens");
+        warm.save_index().expect("advance generation");
+        warm.shutdown();
+        fs::write(catalog_path(&root), b"garbage").expect("damage primary");
+        let (mut controller, _c) = boot_portable_at(&root).expect("recovered boot");
+        assert!(controller.portable_recovery().is_some());
+        assert!(controller.reconcile_portable_library().is_err());
+        controller
+            .acknowledge_portable_recovery()
+            .expect("acknowledge");
+        controller
+            .reconcile_portable_library()
+            .expect("reconcile after acknowledgement");
+
+        // While a scan owns the store: refused.
+        let saved_library = controller.library.take();
+        let (_tx, rx) = std::sync::mpsc::channel::<ScanOutcome>();
+        controller.scan_rx = Some(rx);
+        assert!(controller.is_scanning());
+        assert!(controller.reconcile_portable_library().is_err());
+        controller.scan_rx = None;
+        controller.library = saved_library;
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_relink_flow_moves_runtime_path_and_preserves_selection() {
+        use flux_library::PortableStore;
+
+        let dir = TempDir::new("s6-relink-flow");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("root");
+        write_dc_wav(&root, "a.wav", 11_025, 0.4);
+        // An unrelated legacy index that must never be touched.
+        let bystander = dir.path().join("legacy.json");
+        fs::write(&bystander, b"bystander").expect("bystander");
+
+        create_portable_library(&root).expect("create library");
+        let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
+        scanned(&mut controller, &control, root.clone());
+        assert_eq!(track_ids(&controller), vec![1]);
+        let id = TrackId::new(1);
+        assert_eq!(controller.current_id(), Some(id));
+
+        // The user renames the file; reconciliation reports the lead.
+        fs::rename(root.join("a.wav"), root.join("moved.wav")).expect("rename");
+        let report = controller
+            .reconcile_portable_library()
+            .expect("reconcile succeeds");
+        assert_eq!(report.unique_candidate_count(), 1);
+        let candidate = report.relink_candidates[0].candidates[0].clone();
+        // Nothing applied yet: the runtime still shows the old path.
+        assert!(
+            controller
+                .track(id)
+                .expect("track")
+                .source()
+                .path()
+                .ends_with("a.wav")
+        );
+
+        controller
+            .relink_portable_track(id, &candidate)
+            .expect("validated relink applies");
+        let canonical_root = controller.portable_root().expect("root").to_path_buf();
+        assert_eq!(
+            controller.track(id).expect("track").source().path(),
+            canonical_root.join("moved.wav"),
+            "runtime picks up the new path"
+        );
+        assert_eq!(
+            controller.current_id(),
+            Some(id),
+            "selection preserved (same library)"
+        );
+        assert_eq!(fs::read(&bystander).expect("bystander"), b"bystander");
+        controller.shutdown();
+
+        let reopened = PortableStore::open(&root).expect("reopen").store;
+        assert_eq!(
+            reopened.get(id).expect("record").path(),
+            &flux_library::RelPath::from_utf8("moved.wav").expect("rel")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_reconcile_failed_commit_is_visible_and_retryable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use flux_library::{Availability, PortableStore};
+
+        let dir = TempDir::new("s6-reconcile-failed-commit");
+        let root = seeded_root(&dir, "portable");
+        let (mut controller, _c) = boot_portable_at(&root).expect("portable boot");
+        fs::remove_file(root.join("a.wav")).expect("delete audio");
+
+        let flux_dir = root.join(".flux");
+        fs::set_permissions(&flux_dir, fs::Permissions::from_mode(0o500)).expect("chmod ro");
+        let result = controller.reconcile_portable_library();
+        fs::set_permissions(&flux_dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+        assert!(
+            result.is_err(),
+            "publication failure is returned, not hidden"
+        );
+        assert!(controller.last_error().is_some(), "and visible");
+        // The controller stays on the same library throughout.
+        assert_eq!(controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(track_ids(&controller), vec![2, 5]);
+
+        // The pending reconciled state publishes on the next save.
+        controller.save_index().expect("retry publishes");
+        controller.shutdown();
+        let reopened = PortableStore::open(&root).expect("reopen").store;
+        assert_eq!(
+            reopened
+                .get(TrackId::new(2))
+                .expect("record 2")
+                .availability(),
+            Availability::Missing
+        );
+    }
+
+    #[test]
+    fn controller_reconcile_preserves_memory_only_tracks() {
+        use flux_library::PortableStore;
+
+        let dir = TempDir::new("s6-reconcile-memory-only");
+        let root = seeded_root(&dir, "portable");
+        let outside = two_track_dir(&dir, "outside");
+        let (mut controller, _c) = boot_portable_at(&root).expect("portable boot");
+        assert_eq!(track_ids(&controller), vec![2, 5]);
+
+        // White-box (like the scan-handoff tests): put a track into
+        // the in-memory library that the store does not hold, as a
+        // sync-skipped outside-root scan result would.
+        let mut library = controller.library.take().expect("library present");
+        library.scan(&[outside.as_path()]);
+        controller.tracks = super::snapshot(&library);
+        controller.library = Some(library);
+        controller.rebuild_queue();
+        let with_memory_only = track_ids(&controller);
+        assert_eq!(
+            with_memory_only.len(),
+            4,
+            "two outside tracks joined in memory"
+        );
+
+        controller
+            .reconcile_portable_library()
+            .expect("reconcile succeeds");
+        assert_eq!(
+            track_ids(&controller),
+            with_memory_only,
+            "the refresh after reconcile must not drop in-memory-only tracks"
+        );
+        controller.shutdown();
+
+        // The store still holds only its own two records.
+        let reopened = PortableStore::open(&root).expect("reopen").store;
+        assert_eq!(reopened.len(), 2);
     }
 }

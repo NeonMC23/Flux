@@ -65,8 +65,9 @@ pub use migrate::{
 pub use portable::{
     Availability, EffectiveMetadata, FileFingerprint, ImportedTrack, MetadataOverrides,
     OpenedStore, PORTABLE_SCHEMA_VERSION, PathCasePolicy, PathValidationError, PortableStore,
-    PortableStoreError, PortableSyncReport, PortableSyncSkipped, RecoveryInfo, RelPath, SegmentId,
-    StoredTrack, TagSet,
+    PortableStoreError, PortableSyncReport, PortableSyncSkipped, ReconcileOutcome, ReconcileReport,
+    RecoveryInfo, RelPath, RelinkCandidates, RelinkError, SegmentId, StoredTrack, TagSet,
+    reconcile_portable_store, refresh_library_from_portable_store, relink_portable_track,
 };
 pub use scan::{SUPPORTED_EXTENSIONS, ScanIssue, ScanReport};
 pub use store::{INDEX_VERSION, StoreError};
