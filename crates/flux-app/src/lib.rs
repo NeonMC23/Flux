@@ -25,34 +25,44 @@
 //! - The track snapshot (`tracks()`) is a display cache refreshed
 //!   whenever the library changes; it decides nothing.
 //!
-//! # Storage backends
+//! # Storage backends and library lifecycle
 //!
-//! Persistence goes through one explicit backend, chosen at
-//! construction and fixed for the controller's lifetime
-//! ([`StorageMode`]):
+//! Persistence goes through one explicit backend at a time
+//! ([`StorageMode`]). The backend is chosen at construction and can
+//! afterwards be replaced only through the explicit switch methods,
+//! which build and validate the candidate library first and swap
+//! atomically — a failed switch changes nothing, and queue/selection
+//! state never carries track IDs across libraries (playback stops
+//! and the queue is rebuilt from the new library):
 //!
-//! - **Legacy** ([`Controller::new`] / [`Controller::open_default`]):
-//!   the version-1 JSON index at the given path (today's default; its
-//!   startup behavior is unchanged — a missing index starts empty, an
+//! - **Legacy** ([`Controller::new`] / [`Controller::open_default`],
+//!   later [`Controller::switch_to_legacy_index`]): the version-1
+//!   JSON index at the given path (today's default; its startup
+//!   behavior is unchanged — a missing index starts empty, an
 //!   unreadable one starts empty with a reported error).
-//! - **Portable** ([`Controller::new_portable`]): the `.flux` store at
-//!   a caller-supplied library root. Opening is fallible and strict:
-//!   a missing or invalid store is a [`PortableOpenError`], never a
-//!   silent fallback to an empty library or the legacy index, and
-//!   nothing is created. The in-memory [`Library`] is reconstructed
-//!   from the store (IDs, counter, and missing records included);
-//!   saves sync it back and commit through the store's own protocol.
-//!   A store recovered from its backup catalogue stays read-only —
-//!   scans and saves refuse — until
+//! - **Portable** ([`Controller::new_portable`], later
+//!   [`Controller::switch_to_portable`] /
+//!   [`Controller::switch_to_new_portable_library`]): the `.flux`
+//!   store at a caller-supplied library root. Opening is fallible and
+//!   strict: a missing or invalid store is a [`PortableOpenError`],
+//!   never a silent fallback to an empty library or the legacy index,
+//!   and nothing is created. The in-memory [`Library`] is
+//!   reconstructed from the store (IDs, counter, and missing records
+//!   included); saves sync it back and commit through the store's own
+//!   protocol. A store recovered from its backup catalogue stays
+//!   read-only — scans and saves refuse — until
 //!   [`acknowledge_portable_recovery`](Controller::acknowledge_portable_recovery)
 //!   is called explicitly. Because a portable library can only store
 //!   paths inside its own root, portable-mode scans accept only
 //!   folders within that root.
 //!
-//! Migration from the legacy index is a separate, explicit operation
-//! ([`plan_legacy_migration`] / [`migrate_legacy_library`]): never a
-//! side effect of startup, scanning, or saving, and it never
-//! switches a running controller's backend.
+//! Creating a brand-new portable library ([`create_portable_library`])
+//! and migrating a legacy index ([`plan_legacy_migration`] →
+//! [`execute_legacy_migration`], or the one-call
+//! [`migrate_legacy_library`]) are likewise explicit, caller-requested
+//! operations: never side effects of startup, scanning, or saving,
+//! and neither switches a running controller by itself — activating
+//! the result is the separate switch step above.
 //!
 //! # Threading
 //!
@@ -89,11 +99,14 @@ use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
 use flux_audio::engine::{EngineEvent, EngineHandle};
 use flux_core::{PlaybackState, RepeatMode, Track, TrackId};
-use flux_library::portable::{PortableStore, sync_library_to_portable_store};
+use flux_library::portable::{
+    CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, OpenedStore, PortableStore,
+    sync_library_to_portable_store,
+};
 use flux_library::{Library, PortableSyncReport, ScanReport};
 
 pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
-pub use flux_library::{PortableStoreError, RecoveryInfo};
+pub use flux_library::{PortableStoreError, RecoveryInfo, StoreError};
 
 /// Whether real device audio is available to this controller's engine.
 ///
@@ -129,9 +142,10 @@ impl AudioStatus {
 }
 
 /// Which persistence backend a [`Controller`] uses. Chosen by which
-/// constructor built the controller and fixed for its lifetime —
-/// there is no implicit switching, and a failure in one backend can
-/// never make the controller write to the other.
+/// constructor built the controller; afterwards it changes only via
+/// the explicit, validated `switch_to_*` methods — there is no
+/// implicit switching, and a failure in one backend can never make
+/// the controller write to the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageMode {
     /// The legacy version-1 JSON index (the long-standing default).
@@ -184,6 +198,175 @@ impl std::error::Error for PortableOpenError {
 impl From<PortableStoreError> for PortableOpenError {
     fn from(err: PortableStoreError) -> Self {
         Self::Store(err)
+    }
+}
+
+/// The result of [`create_portable_library`]: a brand-new, verified
+/// empty portable library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedLibrary {
+    root: PathBuf,
+    library_id: String,
+}
+
+impl CreatedLibrary {
+    /// The library root (canonical) the store was created under.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The new library's stable identity.
+    #[must_use]
+    pub fn library_id(&self) -> &str {
+        &self.library_id
+    }
+}
+
+/// Why creating a portable library (or switching to a newly created
+/// one) failed. Destination contents are never modified on any of
+/// these paths: refusal is total, exactly as in migration.
+#[derive(Debug)]
+pub enum CreateLibraryError {
+    /// The supplied root does not exist, is not a directory, or
+    /// cannot be canonicalized. (Creation never invents directories
+    /// from a typed path.)
+    RootInvalid {
+        /// The root the caller supplied.
+        root: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// The root already contains a valid portable library.
+    AlreadyInitialized {
+        /// The root the caller supplied.
+        root: PathBuf,
+    },
+    /// The root contains a partial or invalid portable store (`.flux`
+    /// leftovers without a valid catalogue). Every file is preserved;
+    /// creation refuses automatic replacement or repair.
+    PartialOrInvalid {
+        /// The root the caller supplied.
+        root: PathBuf,
+        /// What was found (and why it does not validate).
+        detail: String,
+    },
+    /// The storage layer failed while creating or reopening.
+    Store(PortableStoreError),
+    /// The created store did not verify as a fresh empty library
+    /// when reopened. Whatever was created is preserved on disk.
+    Verification {
+        /// The root the caller supplied.
+        root: PathBuf,
+        /// What did not match a fresh empty library.
+        detail: String,
+    },
+    /// A scan is in progress on the controller that was asked to
+    /// create-and-switch; nothing was created. (Only returned by
+    /// [`Controller::switch_to_new_portable_library`].)
+    ScanInProgress,
+}
+
+impl fmt::Display for CreateLibraryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootInvalid { root, reason } => {
+                write!(f, "library root {} is not usable: {reason}", root.display())
+            }
+            Self::AlreadyInitialized { root } => write!(
+                f,
+                "{} already contains a Flux portable library; refusing to overwrite it",
+                root.display()
+            ),
+            Self::PartialOrInvalid { root, detail } => write!(
+                f,
+                "{} contains a partial or invalid portable store ({}); \
+                 refusing automatic replacement — its files were left untouched",
+                root.display(),
+                detail
+            ),
+            Self::Store(err) => write!(f, "could not create the portable library: {err}"),
+            Self::Verification { root, detail } => write!(
+                f,
+                "the library created at {} did not verify as a fresh empty library: {detail}",
+                root.display()
+            ),
+            Self::ScanInProgress => {
+                write!(
+                    f,
+                    "a library scan is in progress; try again when it finishes"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CreateLibraryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<PortableStoreError> for CreateLibraryError {
+    fn from(err: PortableStoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+impl From<PortableOpenError> for CreateLibraryError {
+    fn from(err: PortableOpenError) -> Self {
+        match err {
+            PortableOpenError::RootInvalid { root, reason } => Self::RootInvalid { root, reason },
+            PortableOpenError::Store(err) => Self::Store(err),
+        }
+    }
+}
+
+/// Why switching the active library failed. On every variant the
+/// previously active library, backend, queue, and playback state are
+/// completely unchanged — the candidate was never installed.
+#[derive(Debug)]
+pub enum SwitchError {
+    /// A scan is in progress (the library is owned by the scan
+    /// thread); retry when it finishes.
+    ScanInProgress,
+    /// The portable candidate could not be opened or validated.
+    Portable(PortableOpenError),
+    /// The legacy candidate index could not be loaded or validated.
+    Legacy(StoreError),
+}
+
+impl fmt::Display for SwitchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ScanInProgress => {
+                write!(
+                    f,
+                    "a library scan is in progress; try again when it finishes"
+                )
+            }
+            Self::Portable(err) => write!(f, "could not switch libraries: {err}"),
+            Self::Legacy(err) => write!(f, "could not switch libraries: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SwitchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ScanInProgress => None,
+            Self::Portable(err) => Some(err),
+            Self::Legacy(err) => Some(err),
+        }
+    }
+}
+
+impl From<PortableOpenError> for SwitchError {
+    fn from(err: PortableOpenError) -> Self {
+        Self::Portable(err)
     }
 }
 
@@ -353,6 +536,146 @@ pub fn migrate_legacy_library(
     flux_library::migrate::migrate_legacy_index(legacy_index, destination_root)
 }
 
+/// Executes a previously built [`MigrationPlan`] (see
+/// [`plan_legacy_migration`]) — the step a UI runs only after the
+/// user has reviewed the plan and explicitly confirmed. Dropping a
+/// plan instead is a complete cancellation: planning wrote nothing.
+/// Executing never switches any controller's active library;
+/// activating the result is a separate
+/// [`Controller::switch_to_portable`] call.
+pub fn execute_legacy_migration(plan: &MigrationPlan) -> Result<MigrationReport, MigrationError> {
+    flux_library::migrate::execute_migration(plan)
+}
+
+/// Creates a new, empty portable library at the explicitly supplied
+/// `root` (which must already exist as a directory), publishes its
+/// initial catalogue through the portable store's own creation API,
+/// and verifies the result by reopening it.
+///
+/// Refusals mirror migration's destination policy and never modify
+/// anything: a valid existing library is
+/// [`CreateLibraryError::AlreadyInitialized`]; `.flux` leftovers that
+/// do not validate (partial or damaged store) are
+/// [`CreateLibraryError::PartialOrInvalid`] with every file
+/// preserved. No controller is involved and nothing is switched —
+/// pair with [`Controller::switch_to_portable`] (or the one-call
+/// [`Controller::switch_to_new_portable_library`]) to start using it.
+pub fn create_portable_library(root: &Path) -> Result<CreatedLibrary, CreateLibraryError> {
+    let root_invalid = |reason: String| CreateLibraryError::RootInvalid {
+        root: root.to_owned(),
+        reason,
+    };
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(root_invalid("it exists but is not a directory".to_owned())),
+        Err(err) => {
+            return Err(root_invalid(format!(
+                "it does not exist or cannot be inspected: {err}"
+            )));
+        }
+    }
+    let canonical = std::fs::canonicalize(root)
+        .map_err(|err| root_invalid(format!("it cannot be canonicalized: {err}")))?;
+
+    check_creatable_destination(root, &canonical)?;
+
+    let created = PortableStore::create(&canonical)?;
+    let library_id = created.library_id().to_owned();
+    drop(created);
+
+    // Success means a *verified* fresh library: reopen it exactly as
+    // a future open would see it.
+    let opened = PortableStore::open(&canonical)?;
+    let verification = |detail: String| CreateLibraryError::Verification {
+        root: root.to_owned(),
+        detail,
+    };
+    if opened.recovery.is_some() {
+        return Err(verification(
+            "the new store opens only through backup recovery".to_owned(),
+        ));
+    }
+    if !opened.store.is_empty()
+        || opened.store.generation() != 1
+        || opened.store.next_track_id() != 1
+    {
+        return Err(verification(format!(
+            "reopened store has {} track(s), generation {}, next ID {} (expected 0 / 1 / 1)",
+            opened.store.len(),
+            opened.store.generation(),
+            opened.store.next_track_id()
+        )));
+    }
+    if opened.store.library_id() != library_id {
+        return Err(verification(
+            "the reopened store has a different library identity".to_owned(),
+        ));
+    }
+
+    Ok(CreatedLibrary {
+        root: canonical,
+        library_id,
+    })
+}
+
+/// The destination gate for creation — the same policy S3 migration
+/// applies to its destination, expressed through the public store
+/// API plus one directory listing: an existing valid library is
+/// "already initialized"; any other pre-existing `.flux` content is
+/// partial/invalid and must be preserved, never repaired over. A
+/// completely empty `.flux/` directory holds no data and does not
+/// block creation.
+fn check_creatable_destination(
+    root: &Path,
+    canonical_root: &Path,
+) -> Result<(), CreateLibraryError> {
+    let partial = |detail: String| CreateLibraryError::PartialOrInvalid {
+        root: root.to_owned(),
+        detail,
+    };
+    let flux_dir = canonical_root.join(FLUX_DIR_NAME);
+    match std::fs::symlink_metadata(&flux_dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(partial(format!(
+            "the .flux storage directory cannot be inspected: {err}"
+        ))),
+        Ok(metadata) if !metadata.is_dir() => Err(partial(
+            ".flux exists but is not a directory (or is a symlink); \
+             refusing to treat it as storage"
+                .to_owned(),
+        )),
+        Ok(_) => {
+            if flux_dir.join(CATALOG_FILE_NAME).exists()
+                || flux_dir.join(CATALOG_BACKUP_FILE_NAME).exists()
+            {
+                match PortableStore::open(canonical_root) {
+                    Ok(_) => Err(CreateLibraryError::AlreadyInitialized {
+                        root: root.to_owned(),
+                    }),
+                    Err(err) => Err(partial(format!("the existing store does not open: {err}"))),
+                }
+            } else {
+                match std::fs::read_dir(&flux_dir) {
+                    Ok(mut entries) => {
+                        if entries.next().is_some() {
+                            Err(partial(
+                                ".flux contains files but no catalogue — the remains of \
+                                 an interrupted store creation or a damaged store"
+                                    .to_owned(),
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Err(err) => Err(partial(format!(
+                        "the .flux storage directory cannot be listed: {err}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
 /// Whether the engine can actually decode this track's file, by
 /// extension (the contents are validated when the track is opened).
 /// Front-ends use this to mark indexed-but-unplayable tracks instead
@@ -475,28 +798,8 @@ impl Controller {
         audio: AudioStatus,
         library_root: &Path,
     ) -> Result<Self, PortableOpenError> {
-        let root_invalid = |reason: String| PortableOpenError::RootInvalid {
-            root: library_root.to_owned(),
-            reason,
-        };
-        match std::fs::metadata(library_root) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err(root_invalid("it exists but is not a directory".to_owned())),
-            Err(err) => {
-                return Err(root_invalid(format!(
-                    "it does not exist or cannot be inspected: {err}"
-                )));
-            }
-        }
-        // Open under the canonical root so library track paths and
-        // scan paths share one spelling (path identity here is
-        // spelling-based by design).
-        let root = std::fs::canonicalize(library_root)
-            .map_err(|err| root_invalid(format!("it cannot be canonicalized: {err}")))?;
-
-        let opened = PortableStore::open(&root)?;
+        let (root, opened, library, skipped) = open_portable_candidate(library_root)?;
         let recovery = opened.recovery;
-        let (library, skipped) = Library::from_portable_store(&opened.store);
 
         let mut controller = Self::assemble(
             engine,
@@ -508,11 +811,7 @@ impl Controller {
             vec![root],
         );
         if skipped > 0 {
-            controller.report_status(format!(
-                "{skipped} track(s) in this library cannot be shown on this platform \
-                 because their file paths are not representable here. They are \
-                 preserved unchanged in the library files."
-            ));
+            controller.report_status(skipped_unrepresentable_message(skipped));
         }
         if controller.portable_recovery.is_some() {
             controller.report_error(PORTABLE_RECOVERY_READ_ONLY.to_owned());
@@ -731,6 +1030,181 @@ impl Controller {
             "Portable library recovery acknowledged; scanning and saving are enabled.".to_owned(),
         );
         Ok(())
+    }
+
+    // --------------------------------------------------- switching ---
+
+    /// Switches the active library to the existing portable library
+    /// at `library_root`. The candidate is fully opened and
+    /// validated first; only then is it installed — so on any
+    /// [`SwitchError`] the current library, backend, queue, and
+    /// playback state are completely unchanged, and the audio engine
+    /// is never restarted (the same engine serves both libraries).
+    ///
+    /// On success playback stops and the queue is rebuilt from the
+    /// new library: track IDs are unique only within one library, so
+    /// the old selection is discarded rather than ever being
+    /// reinterpreted. Unsaved changes of the outgoing library (for
+    /// example a portable sync whose commit previously failed) are
+    /// discarded — switching never writes to the old backend as a
+    /// side effect. A backup-recovered candidate installs in the
+    /// usual read-only state (see
+    /// [`portable_recovery`](Self::portable_recovery)). The outcome
+    /// is also mirrored into [`last_error`](Self::last_error) /
+    /// [`last_status`](Self::last_status) for front-ends.
+    pub fn switch_to_portable(&mut self, library_root: &Path) -> Result<(), SwitchError> {
+        if self.is_scanning() {
+            self.report_error(SwitchError::ScanInProgress.to_string());
+            return Err(SwitchError::ScanInProgress);
+        }
+        let (root, opened, library, skipped) = match open_portable_candidate(library_root) {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                let err = SwitchError::from(err);
+                self.report_error(err.to_string());
+                return Err(err);
+            }
+        };
+        let recovery = opened.recovery;
+        self.install_library(
+            library,
+            StorageBackend::Portable { root: root.clone() },
+            Some(opened.store),
+            recovery,
+        );
+        self.roots = vec![root.clone()];
+        if skipped > 0 {
+            self.report_status(skipped_unrepresentable_message(skipped));
+        }
+        if self.portable_recovery.is_some() {
+            self.report_error(PORTABLE_RECOVERY_READ_ONLY.to_owned());
+        } else {
+            self.report_status(format!(
+                "Switched to the portable library at {}.",
+                root.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Creates a new portable library at `library_root` (see
+    /// [`create_portable_library`]) and, only after it verifies,
+    /// switches the active library to it (see
+    /// [`switch_to_portable`](Self::switch_to_portable) for the
+    /// switch semantics). If creation refuses or fails, the active
+    /// library is unchanged and nothing was created over existing
+    /// data.
+    pub fn switch_to_new_portable_library(
+        &mut self,
+        library_root: &Path,
+    ) -> Result<CreatedLibrary, CreateLibraryError> {
+        if self.is_scanning() {
+            self.report_error(CreateLibraryError::ScanInProgress.to_string());
+            return Err(CreateLibraryError::ScanInProgress);
+        }
+        let created = match create_portable_library(library_root) {
+            Ok(created) => created,
+            Err(err) => {
+                self.report_error(err.to_string());
+                return Err(err);
+            }
+        };
+        // The just-verified store is opened again through the normal
+        // validated switch path — deliberately not a shortcut.
+        match self.switch_to_portable(created.root()) {
+            Ok(()) => {
+                self.report_status(format!(
+                    "Created and switched to the new portable library at {}.",
+                    created.root().display()
+                ));
+                Ok(created)
+            }
+            Err(SwitchError::Portable(err)) => Err(CreateLibraryError::from(err)),
+            Err(other) => {
+                // ScanInProgress was pre-checked above and Legacy
+                // cannot arise from a portable switch; keep the
+                // error honest rather than unreachable!()-ing.
+                Err(CreateLibraryError::Verification {
+                    root: library_root.to_owned(),
+                    detail: format!("the created library could not be activated: {other}"),
+                })
+            }
+        }
+    }
+
+    /// Switches the active library to the legacy version-1 index at
+    /// `index_path` (or to no persistence when `None`). An existing
+    /// index is fully loaded and validated before anything changes;
+    /// a corrupt one fails with [`SwitchError::Legacy`] and the
+    /// current library stays active (no empty-library substitution —
+    /// that leniency is a *startup* behavior of
+    /// [`Controller::new`], not of switching). A missing index file
+    /// means an empty legacy library, matching legacy startup.
+    /// Playback stops and the queue is rebuilt from the new library,
+    /// as with every switch.
+    pub fn switch_to_legacy_index(
+        &mut self,
+        index_path: Option<PathBuf>,
+    ) -> Result<(), SwitchError> {
+        if self.is_scanning() {
+            self.report_error(SwitchError::ScanInProgress.to_string());
+            return Err(SwitchError::ScanInProgress);
+        }
+        let library = match &index_path {
+            Some(path) if path.exists() => match Library::load_from_path(path) {
+                Ok(library) => library,
+                Err(err) => {
+                    let err = SwitchError::Legacy(err);
+                    self.report_error(err.to_string());
+                    return Err(err);
+                }
+            },
+            _ => Library::new(),
+        };
+        let shown = index_path
+            .as_ref()
+            .map(|path| format!(" at {}", path.display()))
+            .unwrap_or_default();
+        self.install_library(library, StorageBackend::Legacy { index_path }, None, None);
+        self.roots = Vec::new();
+        self.report_status(format!("Switched to the legacy library index{shown}."));
+        Ok(())
+    }
+
+    /// The single commit point of a library switch: stops playback,
+    /// forgets the engine's loaded track, discards the outgoing
+    /// library/store, and installs the already-validated candidate.
+    /// The queue is rebuilt from the new library with the *new*
+    /// library's first track selected (or none) — the outgoing
+    /// selection is never carried over, because an ID from one
+    /// library must never be read as an ID from another. Volume and
+    /// repeat mode are user preferences, not library state, and are
+    /// kept.
+    fn install_library(
+        &mut self,
+        library: Library,
+        storage: StorageBackend,
+        portable_store: Option<PortableStore>,
+        portable_recovery: Option<RecoveryInfo>,
+    ) {
+        self.player.stop();
+        self.engine.stop();
+        self.engine_loaded = None;
+        self.stream_info = None;
+
+        self.tracks = snapshot(&library);
+        self.library = Some(library);
+        self.storage = storage;
+        self.portable_store = portable_store;
+        self.portable_recovery = portable_recovery;
+
+        let queue = self.player.queue_mut();
+        queue.clear();
+        for (id, _) in &self.tracks {
+            queue.push(*id);
+        }
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.outbox.push(ControllerEvent::PlaybackChanged);
     }
 
     /// Decoded-stream facts for the loaded track, once known.
@@ -1437,6 +1911,49 @@ fn validate_scan_root(root: &Path) -> Result<(), String> {
     }
 }
 
+/// Opens and validates a portable library candidate without
+/// touching any controller: canonicalizes the root (so library
+/// track paths and scan paths share one spelling — path identity
+/// here is spelling-based by design), opens the store, and rebuilds
+/// the in-memory library. Returns the canonical root, the opened
+/// store, the library, and how many records this platform cannot
+/// represent. Used identically by construction ([`Controller::new_portable`])
+/// and by switching ([`Controller::switch_to_portable`]), so a
+/// candidate is judged by exactly the same rules in both.
+fn open_portable_candidate(
+    library_root: &Path,
+) -> Result<(PathBuf, OpenedStore, Library, usize), PortableOpenError> {
+    let root_invalid = |reason: String| PortableOpenError::RootInvalid {
+        root: library_root.to_owned(),
+        reason,
+    };
+    match std::fs::metadata(library_root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(root_invalid("it exists but is not a directory".to_owned())),
+        Err(err) => {
+            return Err(root_invalid(format!(
+                "it does not exist or cannot be inspected: {err}"
+            )));
+        }
+    }
+    let root = std::fs::canonicalize(library_root)
+        .map_err(|err| root_invalid(format!("it cannot be canonicalized: {err}")))?;
+
+    let opened = PortableStore::open(&root)?;
+    let (library, skipped) = Library::from_portable_store(&opened.store);
+    Ok((root, opened, library, skipped))
+}
+
+/// The status text shown when some records of an opened portable
+/// library cannot be represented on this platform.
+fn skipped_unrepresentable_message(skipped: usize) -> String {
+    format!(
+        "{skipped} track(s) in this library cannot be shown on this platform \
+         because their file paths are not representable here. They are \
+         preserved unchanged in the library files."
+    )
+}
+
 /// The portable save: sync the in-memory library into the store,
 /// then commit through the store's own publication protocol. The
 /// two failure stages get distinct messages; either way the synced
@@ -1482,7 +1999,8 @@ mod tests {
     use flux_core::{PlaybackState, RepeatMode, TrackId};
 
     use super::{
-        AudioStatus, Controller, ControllerEvent, PortableOpenError, ScanOutcome, StorageMode,
+        AudioStatus, Controller, ControllerEvent, CreateLibraryError, PortableOpenError,
+        ScanOutcome, StorageMode, SwitchError, create_portable_library, execute_legacy_migration,
         is_track_playable, migrate_legacy_library, plan_legacy_migration,
     };
 
@@ -2860,5 +3378,405 @@ mod tests {
         assert_eq!(portable_controller.storage_mode(), StorageMode::Portable);
         assert_eq!(track_ids(&portable_controller), legacy_ids);
         portable_controller.shutdown();
+    }
+
+    // ---- S5: explicit library lifecycle (create / switch) -----------
+
+    /// A legacy controller with a caller-chosen index path (or none).
+    fn boot_legacy_at(index: Option<PathBuf>) -> (Controller, NullControl) {
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        (Controller::new(engine, AudioStatus::Ready, index), control)
+    }
+
+    /// A folder with exactly two scannable tracks (IDs 1 and 2 after
+    /// a scan), unlike `fixtures` (four indexed files).
+    fn two_track_dir(dir: &TempDir, name: &str) -> PathBuf {
+        let root = dir.path().join(name);
+        fs::create_dir_all(&root).expect("music dir");
+        write_dc_wav(&root, "a.wav", 11_025, 0.4);
+        write_dc_wav(&root, "b.wav", 11_025, 0.3);
+        root
+    }
+
+    /// A portable root seeded by `seed_portable_store` (ID 2 “Aye”,
+    /// present as `a.wav`; ID 5 “Gone”, missing; counter 9).
+    fn seeded_root(dir: &TempDir, name: &str) -> PathBuf {
+        let root = dir.path().join(name);
+        fs::create_dir_all(&root).expect("portable root");
+        write_dc_wav(&root, "a.wav", 11_025, 0.4);
+        seed_portable_store(&root);
+        root
+    }
+
+    fn catalog_path(root: &Path) -> PathBuf {
+        root.join(".flux")
+            .join(flux_library::portable::CATALOG_FILE_NAME)
+    }
+
+    #[test]
+    fn create_portable_library_publishes_empty_library_and_reopens() {
+        let dir = TempDir::new("s5-create");
+        let root = dir.path().join("new-library");
+        fs::create_dir_all(&root).expect("root");
+
+        let created = create_portable_library(&root).expect("creation");
+        assert_eq!(created.root(), fs::canonicalize(&root).expect("canonical"));
+        assert!(!created.library_id().is_empty());
+        let catalog = catalog_path(&root);
+        let catalog_before = fs::read(&catalog).expect("initial catalogue published");
+
+        let (controller, _c) = boot_portable_at(&root).expect("created library opens");
+        assert_eq!(controller.storage_mode(), StorageMode::Portable);
+        assert!(controller.tracks().is_empty(), "a new library is empty");
+        controller.shutdown();
+
+        // Creating again refuses and changes nothing on disk.
+        let err = create_portable_library(&root).expect_err("second creation must refuse");
+        assert!(
+            matches!(err, CreateLibraryError::AlreadyInitialized { .. }),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&catalog).expect("catalog"), catalog_before);
+    }
+
+    #[test]
+    fn create_refuses_partial_destination_and_preserves_bytes() {
+        let dir = TempDir::new("s5-create-refusals");
+
+        // Leftover segment, no catalogue.
+        let partial = dir.path().join("partial");
+        fs::create_dir_all(partial.join(".flux")).expect("flux dir");
+        let orphan = partial.join(".flux").join("segment-leftover.json");
+        fs::write(&orphan, b"leftover-bytes").expect("orphan");
+        let err = create_portable_library(&partial).expect_err("partial store must refuse");
+        assert!(
+            matches!(err, CreateLibraryError::PartialOrInvalid { .. }),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&orphan).expect("orphan"), b"leftover-bytes");
+        assert!(!catalog_path(&partial).exists());
+
+        // Corrupt catalogue: preserved, not repaired over.
+        let corrupt = dir.path().join("corrupt");
+        fs::create_dir_all(corrupt.join(".flux")).expect("flux dir");
+        let catalog = catalog_path(&corrupt);
+        fs::write(&catalog, b"{ not a catalogue").expect("catalog");
+        let err = create_portable_library(&corrupt).expect_err("invalid store must refuse");
+        assert!(
+            matches!(err, CreateLibraryError::PartialOrInvalid { .. }),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&catalog).expect("catalog"), b"{ not a catalogue");
+
+        // A missing root is refused and never invented.
+        let missing = dir.path().join("missing");
+        let err = create_portable_library(&missing).expect_err("missing root must refuse");
+        assert!(
+            matches!(err, CreateLibraryError::RootInvalid { .. }),
+            "{err:?}"
+        );
+        assert!(!missing.exists(), "creation must not invent directories");
+
+        // An empty .flux directory holds no data and does not block.
+        let empty_flux = dir.path().join("empty-flux");
+        fs::create_dir_all(empty_flux.join(".flux")).expect("flux dir");
+        create_portable_library(&empty_flux).expect("empty .flux is creatable");
+    }
+
+    #[test]
+    fn switch_to_new_portable_library_creates_and_activates() {
+        let dir = TempDir::new("s5-create-switch");
+        let music = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, music);
+        assert_eq!(track_ids(&controller), vec![1, 2]);
+        let index_path = dir.path().join("state").join("library-index.json");
+        let index_before = fs::read(&index_path).expect("index written");
+        let _ = controller.poll(); // drain scan events
+
+        let new_root = dir.path().join("portable");
+        fs::create_dir_all(&new_root).expect("new root");
+        let created = controller
+            .switch_to_new_portable_library(&new_root)
+            .expect("create + switch");
+        assert_eq!(controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(controller.portable_root(), Some(created.root()));
+        assert!(
+            controller.tracks().is_empty(),
+            "the new library starts empty"
+        );
+        assert_eq!(controller.current_id(), None);
+        assert!(
+            controller.poll().contains(&ControllerEvent::LibraryChanged),
+            "front-ends must learn the library changed"
+        );
+        // The outgoing legacy index was not written as a side effect.
+        assert_eq!(fs::read(&index_path).expect("index"), index_before);
+        // And the new library is a real, reopenable store.
+        let (again, _c2) = boot_portable_at(&new_root).expect("created library reopens");
+        again.shutdown();
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switch_replaces_library_and_never_carries_ids_across() {
+        let dir = TempDir::new("s5-switch-ids");
+        // Portable candidate with IDs 2 (“Aye”) and 5 (“Gone”).
+        let portable_root = seeded_root(&dir, "portable");
+
+        // Legacy controller with different tracks; ID 1 selected and
+        // playing — an ID the candidate does not even have.
+        let music = two_track_dir(&dir, "legacy-music");
+        let (mut controller, control) = boot_legacy_at(None);
+        scanned(&mut controller, &control, music);
+        assert_eq!(track_ids(&controller), vec![1, 2]);
+        controller.play_track(TrackId::new(1));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_id(), Some(TrackId::new(1)));
+
+        controller
+            .switch_to_portable(&portable_root)
+            .expect("switch to existing library");
+        assert_eq!(controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(track_ids(&controller), vec![2, 5]);
+        assert_eq!(
+            controller.player_state(),
+            PlaybackState::Stopped,
+            "playback must not continue into another library"
+        );
+        // The selection is the NEW library's first track, not the old
+        // library's ID 1 reinterpreted (ID 1 does not exist here, and
+        // ID 2 is a different track than the legacy ID 2 was).
+        assert_eq!(controller.current_id(), Some(TrackId::new(2)));
+        assert_eq!(
+            controller.track(TrackId::new(2)).expect("track 2").title(),
+            "Aye"
+        );
+        assert!(controller.track(TrackId::new(1)).is_none());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn failed_switch_leaves_active_library_completely_unchanged() {
+        let dir = TempDir::new("s5-failed-switch");
+        let music = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, music);
+        let index_path = dir.path().join("state").join("library-index.json");
+        controller.play_track(TrackId::new(2));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+
+        let assert_unchanged = |c: &Controller| {
+            assert_eq!(c.storage_mode(), StorageMode::Legacy);
+            assert_eq!(c.legacy_index_path(), Some(index_path.as_path()));
+            assert_eq!(track_ids(c), vec![1, 2]);
+            assert_eq!(c.current_id(), Some(TrackId::new(2)));
+            assert_eq!(c.player_state(), PlaybackState::Playing);
+        };
+
+        // Nonexistent candidate: refused, nothing created.
+        let missing = dir.path().join("nowhere");
+        let err = controller
+            .switch_to_portable(&missing)
+            .expect_err("missing candidate must fail");
+        assert!(matches!(
+            err,
+            SwitchError::Portable(PortableOpenError::RootInvalid { .. })
+        ));
+        assert_unchanged(&controller);
+        assert!(!missing.exists());
+
+        // Empty folder: no store, and opening must not create one.
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).expect("empty dir");
+        assert!(controller.switch_to_portable(&empty).is_err());
+        assert_unchanged(&controller);
+        assert!(!empty.join(".flux").exists(), "opening never creates");
+
+        // Corrupt store: refused, bytes preserved.
+        let corrupt = dir.path().join("corrupt");
+        fs::create_dir_all(corrupt.join(".flux")).expect("flux dir");
+        let catalog = catalog_path(&corrupt);
+        fs::write(&catalog, b"garbage").expect("catalog");
+        assert!(controller.switch_to_portable(&corrupt).is_err());
+        assert_unchanged(&controller);
+        assert_eq!(fs::read(&catalog).expect("catalog"), b"garbage");
+
+        // Create over an initialized library: refused.
+        let initialized = seeded_root(&dir, "initialized");
+        let err = controller
+            .switch_to_new_portable_library(&initialized)
+            .expect_err("initialized destination must refuse");
+        assert!(matches!(err, CreateLibraryError::AlreadyInitialized { .. }));
+        assert_unchanged(&controller);
+
+        // Corrupt legacy index candidate: refused (no empty-library
+        // substitution on switch, unlike legacy startup).
+        let bad_index = dir.path().join("bad-index.json");
+        fs::write(&bad_index, b"{ nope").expect("bad index");
+        let err = controller
+            .switch_to_legacy_index(Some(bad_index))
+            .expect_err("corrupt legacy candidate must fail");
+        assert!(matches!(err, SwitchError::Legacy(_)), "{err:?}");
+        assert_unchanged(&controller);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switch_during_scan_is_refused() {
+        let dir = TempDir::new("s5-switch-scanning");
+        let portable_root = seeded_root(&dir, "portable");
+        let (mut controller, _ctl) = boot_legacy_at(None);
+
+        // Simulate the in-flight-scan state (library owned by the
+        // worker) deterministically, as the S1 handoff tests do.
+        let saved_library = controller.library.take();
+        let (_tx, rx) = std::sync::mpsc::channel::<ScanOutcome>();
+        controller.scan_rx = Some(rx);
+        assert!(controller.is_scanning());
+
+        let err = controller
+            .switch_to_portable(&portable_root)
+            .expect_err("switch during scan must refuse");
+        assert!(matches!(err, SwitchError::ScanInProgress), "{err:?}");
+
+        let new_root = dir.path().join("created-during-scan");
+        fs::create_dir_all(&new_root).expect("root");
+        let err = controller
+            .switch_to_new_portable_library(&new_root)
+            .expect_err("create+switch during scan must refuse");
+        assert!(matches!(err, CreateLibraryError::ScanInProgress), "{err:?}");
+        assert!(
+            !new_root.join(".flux").exists(),
+            "a refused create+switch must not create anything"
+        );
+
+        // Hand the library back for a clean shutdown.
+        controller.scan_rx = None;
+        controller.library = saved_library;
+        controller.shutdown();
+    }
+
+    #[test]
+    fn migration_cancel_writes_nothing_and_execute_never_switches() {
+        let dir = TempDir::new("s5-migration-flow");
+        let music = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, music.clone());
+        let index_path = dir.path().join("state").join("library-index.json");
+        let index_before = fs::read(&index_path).expect("index");
+
+        // Plan, then drop it (the UI cancel path): nothing written.
+        let plan = plan_legacy_migration(&index_path, &music).expect("plan");
+        assert_eq!(plan.migrated_count(), 2);
+        drop(plan);
+        assert!(!music.join(".flux").exists(), "cancel must write nothing");
+        assert_eq!(controller.storage_mode(), StorageMode::Legacy);
+
+        // Plan + execute: store exists, controller untouched.
+        let plan = plan_legacy_migration(&index_path, &music).expect("plan again");
+        execute_legacy_migration(&plan).expect("execute");
+        assert!(catalog_path(&music).exists());
+        assert_eq!(controller.storage_mode(), StorageMode::Legacy);
+        assert_eq!(track_ids(&controller), vec![1, 2]);
+        assert_eq!(fs::read(&index_path).expect("index"), index_before);
+
+        // Only the explicit switch activates the migrated library.
+        controller.switch_to_portable(&music).expect("activate");
+        assert_eq!(controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(track_ids(&controller), vec![1, 2]);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switch_to_recovered_store_keeps_read_only_gate() {
+        use flux_library::{Availability, PortableStore, RelPath, TagSet};
+
+        let dir = TempDir::new("s5-switch-recovery");
+        let portable_root = dir.path().join("portable");
+        fs::create_dir_all(&portable_root).expect("portable root");
+        write_dc_wav(&portable_root, "a.wav", 4_410, 0.4);
+        write_dc_wav(&portable_root, "b.wav", 4_410, 0.3);
+        let tags = |title: &str| TagSet {
+            title: Some(title.to_owned()),
+            ..TagSet::default()
+        };
+        let mut store = PortableStore::create(&portable_root).expect("create");
+        store
+            .add_track(
+                RelPath::from_utf8("a.wav").expect("rel"),
+                Availability::Present,
+                None,
+                tags("Aye"),
+            )
+            .expect("add a");
+        store.commit().expect("commit with a (becomes backup)");
+        store
+            .add_track(
+                RelPath::from_utf8("b.wav").expect("rel"),
+                Availability::Present,
+                None,
+                tags("Bee"),
+            )
+            .expect("add b");
+        store.commit().expect("commit with b");
+        drop(store);
+        // Damage the primary; the backup (with only “Aye”, ID 1)
+        // must be what the switch sees.
+        fs::write(catalog_path(&portable_root), b"garbage").expect("damage");
+
+        let (mut controller, _ctl) = boot_legacy_at(None);
+        controller
+            .switch_to_portable(&portable_root)
+            .expect("recovered store still switches in");
+        assert_eq!(track_ids(&controller), vec![1]);
+        assert!(controller.portable_recovery().is_some());
+        assert!(
+            controller.save_index().is_err(),
+            "recovery gate must survive the switch"
+        );
+        controller
+            .acknowledge_portable_recovery()
+            .expect("acknowledge");
+        controller.save_index().expect("save after acknowledge");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switch_back_to_legacy_loads_index_and_rebuilds_state() {
+        let dir = TempDir::new("s5-switch-back");
+        // A legacy index with two tracks (built by a real scan).
+        let music = two_track_dir(&dir, "legacy-music");
+        let (mut legacy, legacy_control) = boot(&dir);
+        scanned(&mut legacy, &legacy_control, music);
+        legacy.shutdown();
+        let index_path = dir.path().join("state").join("library-index.json");
+
+        // Start portable, then switch to that legacy index.
+        let portable_root = seeded_root(&dir, "portable");
+        let catalog_before = fs::read(catalog_path(&portable_root)).expect("catalog");
+        let (mut controller, _c) = boot_portable_at(&portable_root).expect("portable boot");
+        assert_eq!(track_ids(&controller), vec![2, 5]);
+        controller
+            .switch_to_legacy_index(Some(index_path.clone()))
+            .expect("switch to legacy");
+        assert_eq!(controller.storage_mode(), StorageMode::Legacy);
+        assert_eq!(controller.portable_root(), None);
+        assert_eq!(track_ids(&controller), vec![1, 2]);
+        assert_eq!(controller.current_id(), Some(TrackId::new(1)));
+        // The portable store was not written by the switch.
+        assert_eq!(
+            fs::read(catalog_path(&portable_root)).expect("catalog"),
+            catalog_before
+        );
+
+        // A missing index file means an empty legacy library
+        // (legacy startup semantics), still an explicit switch.
+        controller
+            .switch_to_legacy_index(Some(dir.path().join("absent.json")))
+            .expect("missing index switches to empty legacy");
+        assert!(controller.tracks().is_empty());
+        assert_eq!(controller.current_id(), None);
+        controller.shutdown();
     }
 }
