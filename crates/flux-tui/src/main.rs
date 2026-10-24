@@ -20,6 +20,16 @@
 //! - `o` scan a folder (type a path), `r` refresh scanned folders
 //! - `/` search/filter, `Esc` clear search or cancel input
 //! - `q` or `Ctrl-C` quit (terminal state is always restored)
+//! - `O` open a portable library (type its folder), `C` create one,
+//!   `M` migrate a legacy index (type index file, then destination
+//!   folder; review the plan, `y` executes, `Esc` cancels; afterwards
+//!   `a` opens the migrated library), `B` switch back to the app
+//!   library index, `A` acknowledge a recovered library
+//!
+//! Startup always uses the legacy app index: opening, creating,
+//! migrating, or switching libraries only ever happens through the
+//! explicit keys above, and a failed/cancelled switch leaves the
+//! active library untouched.
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -31,7 +41,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use flux_app::{Controller, format_duration, is_track_playable};
+use flux_app::{
+    Controller, MigrationPlan, StorageMode, default_index_path, format_duration, is_track_playable,
+};
 use flux_core::{MILESTONE, PlaybackState, Track, TrackId};
 
 fn main() -> ExitCode {
@@ -78,11 +90,25 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Mode {
     Normal,
     ScanInput,
     SearchInput,
+    /// Typing a folder whose portable library to open (`O`).
+    OpenInput,
+    /// Typing a folder for a new portable library (`C`).
+    CreateInput,
+    /// Typing the legacy index file to migrate (`M`, step 1).
+    MigrateSourceInput,
+    /// Typing the migration destination folder (`M`, step 2).
+    MigrateDestInput,
+    /// A migration plan awaits confirmation: `y` executes, anything
+    /// else cancels (planning wrote nothing).
+    MigrateConfirm,
+    /// A migration finished: `a` opens the result, anything else
+    /// keeps the current library.
+    MigratedDone,
 }
 
 struct Tui {
@@ -96,6 +122,14 @@ struct Tui {
     input: String,
     /// The active library filter (empty = everything).
     search: String,
+    /// Legacy index file chosen at migration step 1.
+    migrate_source: PathBuf,
+    /// Planned-but-unconfirmed migration (nothing written yet).
+    pending_plan: Option<MigrationPlan>,
+    /// Destination of a completed migration, offered for activation.
+    migrated_dest: Option<PathBuf>,
+    /// Latest library-lifecycle outcome (plan summary, errors, …).
+    lifecycle_msg: Option<String>,
 }
 
 impl Tui {
@@ -172,6 +206,34 @@ impl Tui {
                 self.input.clear();
             }
             KeyCode::Char('r') => self.controller.refresh(),
+            KeyCode::Char('O') => {
+                self.mode = Mode::OpenInput;
+                self.input.clear();
+            }
+            KeyCode::Char('C') => {
+                self.mode = Mode::CreateInput;
+                self.input.clear();
+            }
+            KeyCode::Char('M') => {
+                self.mode = Mode::MigrateSourceInput;
+                self.input.clear();
+            }
+            KeyCode::Char('B') => {
+                if self
+                    .controller
+                    .switch_to_legacy_index(default_index_path())
+                    .is_ok()
+                {
+                    self.after_switch();
+                }
+            }
+            KeyCode::Char('A') => {
+                if self.controller.portable_recovery().is_some()
+                    && let Err(err) = self.controller.acknowledge_portable_recovery()
+                {
+                    self.lifecycle_msg = Some(err);
+                }
+            }
             KeyCode::Char('/') => {
                 self.mode = Mode::SearchInput;
                 self.input.clone_from(&self.search);
@@ -186,10 +248,43 @@ impl Tui {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        // The two migration decision modes are single-key, not text.
+        match self.mode {
+            Mode::MigrateConfirm => {
+                if key.code == KeyCode::Char('y') {
+                    self.execute_pending_migration();
+                } else {
+                    self.pending_plan = None;
+                    self.lifecycle_msg =
+                        Some("Migration cancelled — nothing was written.".to_owned());
+                    self.mode = Mode::Normal;
+                }
+                return false;
+            }
+            Mode::MigratedDone => {
+                if key.code == KeyCode::Char('a')
+                    && let Some(destination) = self.migrated_dest.clone()
+                    && self.controller.switch_to_portable(&destination).is_ok()
+                {
+                    self.after_switch();
+                }
+                self.migrated_dest = None;
+                self.mode = Mode::Normal;
+                return false;
+            }
+            _ => {}
+        }
+
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Esc => {
+                // Cancelling an input never changes the active
+                // library and abandons any in-flight plan.
+                self.pending_plan = None;
+                self.mode = Mode::Normal;
+            }
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.input);
+                let mut next = Mode::Normal;
                 match self.mode {
                     Mode::ScanInput => {
                         let path = text.trim();
@@ -201,9 +296,47 @@ impl Tui {
                         self.search = text;
                         self.cursor = 0;
                     }
-                    Mode::Normal => {}
+                    Mode::OpenInput => {
+                        let path = PathBuf::from(text.trim());
+                        if self.controller.switch_to_portable(&path).is_ok() {
+                            self.after_switch();
+                        }
+                    }
+                    Mode::CreateInput => {
+                        let path = PathBuf::from(text.trim());
+                        if self
+                            .controller
+                            .switch_to_new_portable_library(&path)
+                            .is_ok()
+                        {
+                            self.after_switch();
+                        }
+                    }
+                    Mode::MigrateSourceInput => {
+                        let source = text.trim();
+                        if !source.is_empty() {
+                            self.migrate_source = PathBuf::from(source);
+                            next = Mode::MigrateDestInput;
+                        }
+                    }
+                    Mode::MigrateDestInput => {
+                        let destination = PathBuf::from(text.trim());
+                        match flux_app::plan_legacy_migration(&self.migrate_source, &destination) {
+                            Ok(plan) => {
+                                self.lifecycle_msg = Some(migration_plan_summary(&plan));
+                                self.pending_plan = Some(plan);
+                                self.migrated_dest = None;
+                                next = Mode::MigrateConfirm;
+                            }
+                            Err(err) => {
+                                self.lifecycle_msg =
+                                    Some(format!("Migration planning failed: {err}"));
+                            }
+                        }
+                    }
+                    Mode::Normal | Mode::MigrateConfirm | Mode::MigratedDone => {}
                 }
-                self.mode = Mode::Normal;
+                self.mode = next;
             }
             KeyCode::Backspace => {
                 self.input.pop();
@@ -215,6 +348,50 @@ impl Tui {
             _ => {}
         }
         false
+    }
+
+    /// Runs the migration the user confirmed with `y`. Execution
+    /// never switches the active library by itself; success moves to
+    /// [`Mode::MigratedDone`], where `a` activates the result.
+    fn execute_pending_migration(&mut self) {
+        let Some(plan) = self.pending_plan.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let destination = plan.destination_root().to_path_buf();
+        match flux_app::execute_legacy_migration(&plan) {
+            Ok(report) => {
+                let done = report.plan();
+                self.lifecycle_msg = Some(format!(
+                    "Migration complete: {} track(s) migrated ({} present, {} missing), \
+                     {} excluded. Active library unchanged — press a to open the \
+                     migrated library, Esc to keep the current one.",
+                    done.migrated_count(),
+                    done.present_count(),
+                    done.missing_count(),
+                    done.records().len() - done.migrated_count(),
+                ));
+                self.migrated_dest = Some(destination);
+                self.mode = Mode::MigratedDone;
+            }
+            Err(err) => {
+                self.lifecycle_msg = Some(format!("Migration failed: {err}"));
+                self.mode = Mode::Normal;
+            }
+        }
+    }
+
+    /// Housekeeping after a successful library switch: cursor,
+    /// search, and pending migration state referred to the old
+    /// library. (The controller already stopped playback and rebuilt
+    /// its queue from the new library.)
+    fn after_switch(&mut self) {
+        self.cursor = 0;
+        self.offset = 0;
+        self.search.clear();
+        self.pending_plan = None;
+        self.migrated_dest = None;
+        self.lifecycle_msg = None;
     }
 
     /// After next/previous, put the cursor on the player's selection.
@@ -250,7 +427,17 @@ impl Tui {
         queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
 
         // Header.
-        let mut header = format!("Flux {MILESTONE} — terminal player");
+        let library_label = match self.controller.storage_mode() {
+            StorageMode::Legacy => "library: legacy index".to_owned(),
+            StorageMode::Portable => match self.controller.portable_root() {
+                Some(root) => format!("library: portable {}", root.display()),
+                None => "library: portable".to_owned(),
+            },
+        };
+        let mut header = format!("Flux {MILESTONE} — terminal player   [{library_label}]");
+        if self.controller.portable_recovery().is_some() {
+            header.push_str("   [recovered — read-only, A acknowledges]");
+        }
         if self.controller.is_scanning() {
             header.push_str("   [scanning…]");
         }
@@ -301,6 +488,8 @@ impl Tui {
             queue!(out, SetForegroundColor(Color::Red))?;
             self.line(out, status_y, error, width, false)?;
             queue!(out, SetForegroundColor(Color::Reset))?;
+        } else if let Some(message) = &self.lifecycle_msg {
+            self.line(out, status_y, message, width, false)?;
         } else if let Some(status) = self.controller.last_status() {
             self.line(out, status_y, status, width, false)?;
         }
@@ -308,13 +497,37 @@ impl Tui {
         // Help / input line.
         let help = match self.mode {
             Mode::Normal => "Enter play · Space pause · s stop · n/p next/prev · +/- volume \
-                             · o scan · r refresh · / search · R repeat · q quit"
+                             · o scan · r refresh · / search · R repeat · O open library \
+                             · C create · M migrate · B app index · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
                 self.input
             ),
             Mode::SearchInput => format!("Search (Enter to apply, Esc to cancel): {}_", self.input),
+            Mode::OpenInput => format!(
+                "Open portable library folder (Enter to switch, Esc to cancel): {}_",
+                self.input
+            ),
+            Mode::CreateInput => format!(
+                "Create portable library in folder (Enter to create + switch, Esc to cancel): {}_",
+                self.input
+            ),
+            Mode::MigrateSourceInput => format!(
+                "Legacy index file to migrate (Enter for destination, Esc to cancel): {}_",
+                self.input
+            ),
+            Mode::MigrateDestInput => format!(
+                "Migration destination folder (Enter to plan, Esc to cancel): {}_",
+                self.input
+            ),
+            Mode::MigrateConfirm => {
+                "Migration planned — review the status line: y executes, Esc cancels.".to_owned()
+            }
+            Mode::MigratedDone => {
+                "Migration done — a opens the migrated library, Esc keeps the current one."
+                    .to_owned()
+            }
         };
         self.line(out, (height - 1) as u16, &help, width, false)?;
 
@@ -368,6 +581,25 @@ impl Tui {
     }
 }
 
+/// What the user reviews before pressing `y`: what will migrate,
+/// what is excluded and why. (IDs/counter preservation and the
+/// untouched legacy index/audio are guarantees of the shared
+/// migration API.)
+fn migration_plan_summary(plan: &MigrationPlan) -> String {
+    format!(
+        "Migrate {} track(s) ({} present, {} missing→unavailable); excluded: \
+         {} external, {} symlinked, {} unrepresentable, {} ambiguous. \
+         y = execute, Esc = cancel (writes nothing).",
+        plan.migrated_count(),
+        plan.present_count(),
+        plan.missing_count(),
+        plan.external_count(),
+        plan.symlinked_count(),
+        plan.unrepresentable_count(),
+        plan.ambiguous_count(),
+    )
+}
+
 fn display_title(track: &Track) -> String {
     match track.artist() {
         Some(artist) => format!("{} — {artist}", track.title()),
@@ -409,6 +641,10 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         mode: Mode::Normal,
         input: String::new(),
         search: String::new(),
+        migrate_source: PathBuf::new(),
+        pending_plan: None,
+        migrated_dest: None,
+        lifecycle_msg: None,
     };
     let mut stdout = std::io::stdout();
     let result = tui.event_loop(&mut stdout);
@@ -420,7 +656,181 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::pad_with_right;
+    use super::{Mode, Tui, pad_with_right};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(test: &str) -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "flux-tui-test-{}-{test}-{unique}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A Tui over a hermetic legacy controller — the key-handling
+    /// wiring is what is under test; lifecycle semantics themselves
+    /// live in `flux-app`.
+    fn tui(dir: &TempDir) -> Tui {
+        let (engine, audio) = flux_app::default_engine();
+        Tui {
+            controller: flux_app::Controller::new(
+                engine,
+                audio,
+                Some(dir.path().join("library-index.json")),
+            ),
+            cursor: 0,
+            offset: 0,
+            mode: Mode::Normal,
+            input: String::new(),
+            search: String::new(),
+            migrate_source: std::path::PathBuf::new(),
+            pending_plan: None,
+            migrated_dest: None,
+            lifecycle_msg: None,
+        }
+    }
+
+    fn key(tui: &mut Tui, code: KeyCode) {
+        assert!(
+            !tui.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+            "test keys must not quit"
+        );
+    }
+
+    fn type_path(tui: &mut Tui, path: &std::path::Path) {
+        for c in path.display().to_string().chars() {
+            key(tui, KeyCode::Char(c));
+        }
+        key(tui, KeyCode::Enter);
+    }
+
+    #[test]
+    fn create_key_flow_creates_and_switches_and_esc_cancels() {
+        use flux_app::StorageMode;
+
+        let dir = TempDir::new("create-flow");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut tui = tui(&dir);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
+
+        // Esc during path entry cancels: nothing happens.
+        key(&mut tui, KeyCode::Char('C'));
+        assert_eq!(tui.mode, Mode::CreateInput);
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
+        assert!(!root.join(".flux").exists());
+
+        // Full flow: C, type folder, Enter → created + switched.
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+        assert!(root.join(".flux").exists(), "store created via flux-app");
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn migration_key_flow_plans_executes_and_activates() {
+        use flux_app::StorageMode;
+
+        let dir = TempDir::new("migrate-flow");
+        let root = dir.path().join("music");
+        std::fs::create_dir_all(&root).expect("root");
+        let song = root.join("song.wav");
+        std::fs::write(&song, minimal_wav()).expect("song");
+        let index = dir.path().join("legacy.json");
+        std::fs::write(
+            &index,
+            format!(
+                r#"{{"version":1,"next_id":2,"tracks":[{{"id":1,"title":"Song","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
+                song.display()
+            ),
+        )
+        .expect("index");
+
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('M'));
+        assert_eq!(tui.mode, Mode::MigrateSourceInput);
+        type_path(&mut tui, &index);
+        assert_eq!(tui.mode, Mode::MigrateDestInput);
+        type_path(&mut tui, &root);
+        assert_eq!(tui.mode, Mode::MigrateConfirm);
+        assert!(tui.pending_plan.is_some());
+        assert!(!root.join(".flux").exists(), "planning wrote nothing");
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
+
+        // Cancel at the confirmation step.
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert!(tui.pending_plan.is_none());
+        assert!(!root.join(".flux").exists(), "cancel wrote nothing");
+
+        // Again, this time confirm and activate.
+        key(&mut tui, KeyCode::Char('M'));
+        type_path(&mut tui, &index);
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.mode, Mode::MigratedDone);
+        assert!(root.join(".flux").exists());
+        assert_eq!(
+            tui.controller.storage_mode(),
+            StorageMode::Legacy,
+            "execution alone never switches"
+        );
+
+        key(&mut tui, KeyCode::Char('a'));
+        assert_eq!(tui.mode, Mode::Normal);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+        let ids: Vec<u64> = tui
+            .controller
+            .tracks()
+            .iter()
+            .map(|(id, _)| id.get())
+            .collect();
+        assert_eq!(ids, vec![1], "migrated ID preserved through activation");
+        tui.controller.shutdown();
+    }
+
+    /// The smallest valid PCM WAV header (no samples); nothing here
+    /// plays it.
+    fn minimal_wav() -> Vec<u8> {
+        let mut wav = Vec::with_capacity(44);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        wav.extend_from_slice(&88_200u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav
+    }
 
     #[test]
     fn pad_with_right_handles_degenerate_widths() {
