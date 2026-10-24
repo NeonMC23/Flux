@@ -173,14 +173,6 @@ struct Shared {
     drained: AtomicBool,
     /// Device frames actually delivered for the current generation.
     played_frames: AtomicU64,
-    /// Diagnostic: callback fills that found fewer samples in the
-    /// ring than requested while the stream was live (gate open,
-    /// decoder not yet at EOF). This is the only place a starved
-    /// callback is observable at all — the fill itself must degrade
-    /// to silence, which is otherwise indistinguishable from valid
-    /// silent samples. Incremented with one relaxed atomic add on
-    /// the shortfall branch only; the sample path is unaffected.
-    underruns: AtomicU64,
 }
 
 impl Shared {
@@ -193,7 +185,6 @@ impl Shared {
             decoder_eof: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             played_frames: AtomicU64::new(0),
-            underruns: AtomicU64::new(0),
         }
     }
 
@@ -244,16 +235,6 @@ impl FillCallback for SampleSource {
             return;
         }
         let popped = self.consumer.pop_slice(out);
-        if popped < out.len() && !self.shared.decoder_eof.load(Ordering::Relaxed) {
-            // Mid-stream starvation: the device asked for more than
-            // the ring held and the remainder becomes silence. (The
-            // final drain after decoder EOF is exempt — shortfalls
-            // there are the stream ending, not the supply failing.
-            // A count of one or two right after pressing play is
-            // likewise benign: the gate opens before the worker's
-            // first push lands.)
-            self.shared.underruns.fetch_add(1, Ordering::Relaxed);
-        }
         out[popped..].fill(0.0);
         let gain = f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed));
         if gain != 1.0 {
@@ -415,29 +396,6 @@ impl EngineHandle {
         }
         let frames = self.shared.played_frames.load(Ordering::Relaxed);
         Duration::from_secs_f64(frames as f64 / f64::from(self.config.sample_rate))
-    }
-
-    /// Diagnostic: how many times the audio callback asked for more
-    /// samples than the ring buffer held while a track was live
-    /// (see `Shared::underruns`). Each counted fill emitted silence
-    /// for the missing remainder — an audible cut if it happens
-    /// mid-track. Intended for playback-glitch diagnosis (the
-    /// `play_file` example prints it); it never influences playback.
-    #[must_use]
-    pub fn underrun_count(&self) -> u64 {
-        self.shared.underruns.load(Ordering::Relaxed)
-    }
-
-    /// Diagnostic: the current generation counter (see
-    /// `Shared::generation`). It increases exactly when the worker
-    /// processes a load, a stop, or a restart-from-ended play — each
-    /// of which flushes all buffered samples. During uninterrupted
-    /// playback of one track it must not move; a value that climbs
-    /// mid-track is direct evidence of reload/stop churn upstream.
-    /// Read-only; never influences playback.
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.shared.generation.load(Ordering::Relaxed)
     }
 
     /// Stops the backend and joins the worker thread.
@@ -1555,11 +1513,12 @@ mod tests {
     /// End-to-end content integrity through worker → ring → callback
     /// with resampling (44.1 kHz file, 48 kHz device — the most
     /// common real-world shape): every converted sample must arrive
-    /// exactly once, in order, with no starved callback fills once
-    /// audio is flowing. DC fixtures cannot see reordering or
-    /// duplication; this can.
+    /// exactly once, in order, bracketed only by silence — so a
+    /// starved fill, which would insert zeros mid-sequence, fails
+    /// here too. DC fixtures cannot see reordering or duplication;
+    /// this can.
     #[test]
-    fn end_to_end_tone_delivery_is_sample_exact_and_never_starves() {
+    fn end_to_end_tone_delivery_is_sample_exact() {
         let dir = TempDir::new("tone-e2e");
         let path = write_tone_wav(&dir, "tone.wav", 44_100, 44_100 * 3);
         let (engine, control) = EngineHandle::spawn_null(48_000, 2);
@@ -1569,10 +1528,8 @@ mod tests {
             matches!(e, EngineEvent::Loaded { .. })
         });
         engine.play();
-        // Wait until real audio has been captured, then snapshot the
-        // diagnostic counter: startup shortfalls (gate open before
-        // the first push) are benign; after this point the callback
-        // must never starve again.
+        // Wait until real audio has been captured (proves the
+        // pipeline actually started), then run to track end.
         for _ in 0..4_000 {
             control.drain_frames(512);
             let _ = engine.events().recv_timeout(Duration::from_millis(5));
@@ -1584,18 +1541,12 @@ mod tests {
             control.captured().iter().any(|s| *s != 0.0),
             "audio never started flowing"
         );
-        let underruns_at_flow = engine.underrun_count();
         let events = drive_until(&engine, &control, |e| {
             matches!(e, EngineEvent::TrackEnded { .. })
         });
         assert!(
             matches!(events.last(), Some(EngineEvent::TrackEnded { .. })),
             "{events:?}"
-        );
-        assert_eq!(
-            engine.underrun_count(),
-            underruns_at_flow,
-            "callback starved mid-track (would be an audible cut)"
         );
         // 3.0 s of device frames were delivered (position is derived
         // from delivered frames).
@@ -1640,10 +1591,11 @@ mod tests {
     /// The callback-side source in isolation: irregular producer
     /// pushes and consumer fills must deliver the input sequence in
     /// exact order (silence appears only where the ring was short),
-    /// and the underrun diagnostic counts mid-stream starvation but
-    /// not the post-EOF drain.
+    /// played-frame accounting must track delivered frames, and the
+    /// drained flag must rise only once the stream is at EOF *and*
+    /// the ring is empty.
     #[test]
-    fn sample_source_preserves_order_and_counts_only_midstream_starvation() {
+    fn sample_source_preserves_order_and_signals_drain_at_eof() {
         use ringbuf::traits::{Producer, Split};
         use std::sync::Arc;
 
@@ -1700,15 +1652,23 @@ mod tests {
             "played-frame accounting tracks delivered frames"
         );
 
-        // Counter semantics: a shortfall before EOF counts; the same
-        // shortfall after EOF is signalled does not.
-        let before = shared.underruns.load(Ordering::Relaxed);
+        // Drain signalling: an empty ring alone does not end the
+        // stream; EOF while samples remain does not either. Both
+        // together do. (The input above is fully delivered here, so
+        // the ring is empty.)
         let mut out = vec![0.0f32; 512];
-        source.fill(&mut out); // ring empty, live stream: starved
-        assert_eq!(shared.underruns.load(Ordering::Relaxed), before + 1);
+        source.fill(&mut out);
+        assert!(
+            !shared.drained.load(Ordering::Relaxed),
+            "empty ring before EOF must not signal end-of-track"
+        );
+        assert!(out.iter().all(|s| *s == 0.0), "starved fill is silence");
         shared.decoder_eof.store(true, Ordering::Release);
-        source.fill(&mut out); // ring empty, post-EOF: expected drain
-        assert_eq!(shared.underruns.load(Ordering::Relaxed), before + 1);
+        source.fill(&mut out);
+        assert!(
+            shared.drained.load(Ordering::Relaxed),
+            "EOF with an empty ring signals end-of-track"
+        );
     }
 
     #[test]

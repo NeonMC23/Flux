@@ -8,13 +8,24 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Opaque in-memory identifier for a track.
+/// Opaque identifier for a track within one library.
 ///
-/// IDs are assigned by collections (such as the in-memory library) when a
-/// track is added. They are **not** persistent, are **not** globally unique
-/// across runs or collections, and carry no meaning outside the collection
-/// that issued them. They exist so queues and other models can refer to
-/// tracks without copying metadata around.
+/// IDs are assigned by the library collection (`flux-library`'s `Library`)
+/// when a track is added, sequentially from a monotonically increasing
+/// counter. The library store persists both the issued IDs and that
+/// counter, so an ID is stable across save/load cycles (and across any
+/// migration that maps the record unambiguously) for every record that
+/// was successfully persisted, and a removed track's ID is never reused
+/// within that library's history — a stale ID simply stops resolving
+/// instead of silently naming a different track. An ID issued in memory
+/// but never persisted carries no such guarantee: if the process ends
+/// before the library is saved, a later run may issue the same number
+/// again.
+///
+/// Uniqueness is scoped to the issuing library: independent libraries
+/// mint overlapping IDs, so IDs from different libraries must never be
+/// mixed. Within its library, an ID exists so queues and other models
+/// can refer to tracks without copying metadata around.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TrackId(u64);
 
