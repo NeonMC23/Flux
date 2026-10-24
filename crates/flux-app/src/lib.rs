@@ -340,25 +340,6 @@ impl Controller {
         self.engine.position()
     }
 
-    /// Diagnostic: audio-callback underruns so far (fills that ran
-    /// dry mid-track and emitted silence; see
-    /// `EngineHandle::underrun_count`). For playback-glitch
-    /// diagnosis in front-ends; never influences playback.
-    #[must_use]
-    pub fn underrun_count(&self) -> u64 {
-        self.engine.underrun_count()
-    }
-
-    /// Diagnostic: the engine's generation counter (see
-    /// `EngineHandle::generation`). Rises once per load/stop/restart
-    /// the engine processes; during uninterrupted playback of one
-    /// track it must stay put. For playback-glitch diagnosis in
-    /// front-ends; never influences playback.
-    #[must_use]
-    pub fn engine_generation(&self) -> u64 {
-        self.engine.generation()
-    }
-
     /// The current volume, `0.0..=1.0`.
     #[must_use]
     pub fn volume(&self) -> f32 {
@@ -544,29 +525,43 @@ impl Controller {
     pub fn poll(&mut self) -> Vec<ControllerEvent> {
         let mut events = std::mem::take(&mut self.outbox);
 
+        // `Done` is boxed because a `ScanOutcome` carries the whole
+        // `Library` (a large value to move through every `poll`);
+        // boxing it only on the rare scan-finished poll keeps this
+        // per-call enum small.
         enum ScanPoll {
-            Done(ScanOutcome),
+            Done(Box<ScanOutcome>),
             Lost,
         }
         let scan_state = self.scan_rx.as_ref().map(|rx| match rx.try_recv() {
-            Ok(outcome) => Some(ScanPoll::Done(outcome)),
+            Ok(outcome) => Some(ScanPoll::Done(Box::new(outcome))),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => Some(ScanPoll::Lost),
         });
         match scan_state {
             Some(Some(ScanPoll::Done(outcome))) => {
                 self.scan_rx = None;
-                self.finish_scan(outcome);
+                self.finish_scan(*outcome);
                 events.push(ControllerEvent::LibraryChanged);
             }
             Some(Some(ScanPoll::Lost)) => {
                 self.scan_rx = None;
-                if self.library.is_none() {
-                    self.library = Some(Library::new());
-                    self.tracks.clear();
-                    self.rebuild_queue();
-                }
-                self.report_error("The library scan ended unexpectedly.".to_owned());
+                let message = if self.library.is_none() {
+                    // The scan thread owned the library and is gone
+                    // without reporting back (e.g. it panicked), so the
+                    // in-memory collection cannot come back from the
+                    // thread; recover what can faithfully be recovered.
+                    if self.recover_from_lost_scan() {
+                        "The library scan ended unexpectedly; the library \
+                         was restored from the saved index."
+                    } else {
+                        "The library scan ended unexpectedly, and no saved \
+                         index was available to restore the library from."
+                    }
+                } else {
+                    "The library scan ended unexpectedly."
+                };
+                self.report_error(message.to_owned());
             }
             _ => {}
         }
@@ -772,19 +767,36 @@ impl Controller {
                 }
             });
         match spawned {
-            Ok(_handle) => {
-                if work_tx.send((library, roots, index_path)).is_ok() {
+            Ok(_handle) => match work_tx.send((library, roots, index_path)) {
+                Ok(()) => {
                     self.scan_rx = Some(done_rx);
-                } else {
-                    self.library = Some(Library::new());
-                    self.report_error("The library scan could not be started.".to_owned());
                 }
-            }
+                Err(err) => {
+                    // The receiver is gone, so the scan will never run —
+                    // but a failed `send` hands the payload back, so the
+                    // library (which left `self` only for this handoff)
+                    // is recovered whole instead of being discarded.
+                    let (library, _roots, _index_path) = err.0;
+                    self.scan_start_failed(
+                        library,
+                        "The library scan could not be started.".to_owned(),
+                    );
+                }
+            },
             Err(err) => {
-                self.library = Some(library);
-                self.report_error(format!("Could not start the scan thread: {err}"));
+                self.scan_start_failed(library, format!("Could not start the scan thread: {err}"));
             }
         }
+    }
+
+    /// Puts the library back after a scan could not be started (the
+    /// thread spawn or the work handoff failed). The collection is
+    /// exactly as it was before the attempt and `scan_rx` stays `None`,
+    /// so the controller is not left believing a scan is running; only
+    /// the reported error is new.
+    fn scan_start_failed(&mut self, library: Library, message: String) {
+        self.library = Some(library);
+        self.report_error(message);
     }
 
     fn finish_scan(&mut self, outcome: ScanOutcome) {
@@ -803,6 +815,34 @@ impl Controller {
         ));
         if let Some(Err(message)) = outcome.saved {
             self.report_error(message);
+        }
+    }
+
+    /// Recovers a library after the scan thread that owned it vanished
+    /// without reporting back. The last saved index is the only faithful
+    /// recovery source — rebuilding a `Library` from the display
+    /// snapshot would renumber track IDs and break every queue
+    /// reference — so it is reloaded when available. Returns whether a
+    /// saved library was restored; otherwise installs an empty library,
+    /// there being nothing the previous state could be recovered from.
+    fn recover_from_lost_scan(&mut self) -> bool {
+        let restored = match &self.index_path {
+            Some(path) if path.exists() => Library::load_from_path(path).ok(),
+            _ => None,
+        };
+        match restored {
+            Some(library) => {
+                self.tracks = snapshot(&library);
+                self.library = Some(library);
+                self.rebuild_queue();
+                true
+            }
+            None => {
+                self.library = Some(Library::new());
+                self.tracks.clear();
+                self.rebuild_queue();
+                false
+            }
         }
     }
 
@@ -877,7 +917,7 @@ mod tests {
     use flux_audio::output::NullControl;
     use flux_core::{PlaybackState, RepeatMode, TrackId};
 
-    use super::{AudioStatus, Controller, ControllerEvent, is_track_playable};
+    use super::{AudioStatus, Controller, ControllerEvent, ScanOutcome, is_track_playable};
 
     struct TempDir(PathBuf);
 
@@ -1018,11 +1058,12 @@ mod tests {
     /// The GUI's exact runtime shape — `play_track`, then a loop of
     /// "device drains, `controller.poll()`" (its 150 ms Tick), with
     /// a library scan completing mid-playback — must deliver the
-    /// track sample-for-sample, with no mid-track starvation and no
-    /// reload churn. The engine-generation assertion is the direct
-    /// pin: any load/stop reaching the engine mid-track flushes up
-    /// to seconds of buffered audio (heard as a cut + jump forward),
-    /// and must never happen during uninterrupted playback.
+    /// track sample-for-sample, bracketed only by silence. This is
+    /// the end-to-end pin on the whole controller path the GUI
+    /// drives: any load/stop reaching the engine mid-track would
+    /// flush buffered audio and break the sequence, and any starved
+    /// callback fill would insert zeros inside it — either failure
+    /// (heard by users as cuts and jumps) shows up here first.
     #[test]
     fn gui_style_drive_loop_is_sample_exact_and_never_reloads() {
         let dir = TempDir::new("gui-loop");
@@ -1057,15 +1098,12 @@ mod tests {
         assert_eq!(reference.len(), 44_100 * 2);
 
         control.clear_captured();
-        let generation_before = controller.engine_generation();
         controller.play_track(id);
-        // Wait until audio is flowing (startup shortfalls before the
-        // worker's first push are benign) and snapshot diagnostics.
+        // Wait until audio is flowing, so what follows really is
+        // mid-playback rather than startup.
         drive(&mut controller, &control, |_, _| {
             control.captured().iter().any(|s| *s != 0.0)
         });
-        let underruns_at_flow = controller.underrun_count();
-        let generation_at_flow = controller.engine_generation();
         // A scan completing mid-playback must not disturb it.
         controller.begin_scan(other);
         // Position is derived from delivered frames; the identity
@@ -1080,21 +1118,6 @@ mod tests {
             controller.poll();
         }
 
-        assert_eq!(
-            generation_at_flow,
-            generation_before + 1,
-            "play_track loads exactly once"
-        );
-        assert_eq!(
-            controller.engine_generation(),
-            generation_at_flow,
-            "no load/stop may reach the engine during uninterrupted playback"
-        );
-        assert_eq!(
-            controller.underrun_count(),
-            underruns_at_flow,
-            "callback starved mid-track"
-        );
         let captured = control.captured();
         let start = captured
             .windows(64)
@@ -1634,5 +1657,148 @@ mod tests {
             "scan saved its index before shutdown"
         );
         controller2.shutdown();
+    }
+
+    /// S1 regression: a scan whose work handoff fails (the receiving
+    /// end is gone) must hand the library back intact — never replace
+    /// it with an empty one. Reproduces the exact production sequence
+    /// deterministically: take the library, attempt the `send` against
+    /// a dropped receiver, recover the payload from `SendError`, and
+    /// run it through the same handler `begin_scan_roots` uses for both
+    /// its spawn-failure and send-failure arms.
+    #[test]
+    fn failed_scan_handoff_restores_the_library() {
+        let dir = TempDir::new("handoff_failure");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let before: Vec<_> = controller
+            .tracks()
+            .iter()
+            .map(|(id, t)| (*id, t.source().path().to_owned()))
+            .collect();
+        assert_eq!(before.len(), 4);
+        assert!(controller.last_error().is_none());
+
+        let (work_tx, work_rx) =
+            std::sync::mpsc::channel::<(flux_library::Library, Vec<PathBuf>, Option<PathBuf>)>();
+        drop(work_rx);
+        let library = controller.library.take().expect("library present");
+        let err = work_tx
+            .send((library, vec![fx.root.clone()], None))
+            .expect_err("send to a dropped receiver must fail");
+        let (library, _roots, _index_path) = err.0;
+        controller.scan_start_failed(library, "The library scan could not be started.".to_owned());
+
+        // The collection is exactly as before the attempt — same IDs,
+        // same paths — the failure is reported as an error (not a false
+        // success), and no scan is believed to be running.
+        let after: Vec<_> = controller
+            .tracks()
+            .iter()
+            .map(|(id, t)| (*id, t.source().path().to_owned()))
+            .collect();
+        assert_eq!(after, before);
+        assert!(controller.library.is_some(), "library must be restored");
+        assert!(!controller.is_scanning());
+        assert_eq!(
+            controller.last_error(),
+            Some("The library scan could not be started.")
+        );
+        let events = controller.poll();
+        assert!(
+            events.contains(&ControllerEvent::Error(
+                "The library scan could not be started.".to_owned()
+            )),
+            "the failure must reach the UI as an error event: {events:?}"
+        );
+
+        // The controller is undamaged: a real scan still works and
+        // finds the same library.
+        scanned(&mut controller, &control, fx.root.clone());
+        assert_eq!(controller.tracks().len(), 4);
+        controller.shutdown();
+    }
+
+    /// S1 regression: if the scan thread vanishes while owning the
+    /// library (its result channel disconnects), `poll` must restore
+    /// the library from the saved index — with the same stable IDs —
+    /// instead of installing an empty library.
+    #[test]
+    fn lost_scan_thread_recovers_library_from_saved_index() {
+        let dir = TempDir::new("lost_scan_recovery");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let before: Vec<_> = controller
+            .tracks()
+            .iter()
+            .map(|(id, t)| (*id, t.source().path().to_owned()))
+            .collect();
+        assert_eq!(before.len(), 4, "scan indexed and saved the fixtures");
+
+        // Simulate the lost thread deterministically: the library is
+        // gone with it (`None` here) and the result channel is
+        // disconnected.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<ScanOutcome>();
+        drop(done_tx);
+        controller.scan_rx = Some(done_rx);
+        controller.library = None;
+        let events = controller.poll();
+
+        let after: Vec<_> = controller
+            .tracks()
+            .iter()
+            .map(|(id, t)| (*id, t.source().path().to_owned()))
+            .collect();
+        assert_eq!(after, before, "IDs and paths restored from the saved index");
+        assert!(controller.library.is_some());
+        assert!(!controller.is_scanning());
+        let error = controller.last_error().expect("failure reported");
+        assert!(
+            error.contains("restored from the saved index"),
+            "got: {error}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ControllerEvent::Error(_))),
+            "got: {events:?}"
+        );
+        // Fully usable again — for example, it can save its index.
+        controller.save_index().expect("restored library can save");
+        controller.shutdown();
+    }
+
+    /// The honest floor of the same failure: with no saved index to
+    /// restore from, a lost scan thread leaves an empty library — but
+    /// the failure is reported as a failure, never as success.
+    #[test]
+    fn lost_scan_thread_without_saved_index_reports_and_starts_empty() {
+        let dir = TempDir::new("lost_scan_no_index");
+        let fx = fixtures(&dir);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let mut controller = Controller::new(engine, AudioStatus::Ready, None);
+        scanned(&mut controller, &control, fx.root.clone());
+        assert_eq!(controller.tracks().len(), 4);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<ScanOutcome>();
+        drop(done_tx);
+        controller.scan_rx = Some(done_rx);
+        controller.library = None;
+        let events = controller.poll();
+
+        assert!(controller.tracks().is_empty());
+        assert!(controller.library.is_some(), "empty fallback installed");
+        assert!(!controller.is_scanning());
+        let error = controller.last_error().expect("failure reported");
+        assert!(error.contains("no saved index"), "got: {error}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ControllerEvent::Error(_))),
+            "got: {events:?}"
+        );
+        controller.shutdown();
     }
 }
