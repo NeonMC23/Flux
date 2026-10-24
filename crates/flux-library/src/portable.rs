@@ -92,9 +92,12 @@
 //!   audio-file integrity (size/mtime fingerprints detect change, not
 //!   correctness).
 //! - This module is the storage layer only: one writer is assumed (no
-//!   inter-process locking yet), no filesystem monitoring, import, or
-//!   migration logic lives here, and the application's current startup
-//!   path continues to use the legacy index in [`crate::store`].
+//!   inter-process locking yet) and no filesystem monitoring lives
+//!   here. It exposes a bulk-import primitive
+//!   ([`PortableStore::import_tracks`]) for migration/restore code in
+//!   [`crate::migrate`]; the migration policy itself lives there, and
+//!   the application's current startup path continues to use the
+//!   legacy index in [`crate::store`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -102,10 +105,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flux_core::TrackId;
+use flux_core::{Track, TrackId, TrackSource};
 use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::Library;
 
 /// The `.flux` schema version this build reads and writes. (The legacy
 /// single-file index in [`crate::store`] is an independent format with
@@ -780,6 +785,33 @@ impl StoredTrack {
     }
 }
 
+/// A complete track record supplied to
+/// [`PortableStore::import_tracks`]: every field of a [`StoredTrack`],
+/// including a predetermined identity. This exists for migration and
+/// restore flows that must reproduce an existing library's IDs
+/// exactly; ordinary additions go through
+/// [`PortableStore::add_track`], which allocates a fresh ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedTrack {
+    /// The predetermined stable identity (never 0; see
+    /// [`PortableStore::import_tracks`] for the ordering rules).
+    pub id: TrackId,
+    /// The library-relative locator.
+    pub path: RelPath,
+    /// Last-known availability.
+    pub availability: Availability,
+    /// Size/mtime change-detection hint, when known.
+    pub file: Option<FileFingerprint>,
+    /// The embedded-tag snapshot.
+    pub tags: TagSet,
+    /// The sparse user overrides.
+    pub overrides: MetadataOverrides,
+    /// When the record was added (ms since the Unix epoch).
+    pub added_unix_ms: u64,
+    /// When the record last changed (ms since the Unix epoch).
+    pub updated_unix_ms: u64,
+}
+
 /// File-stem fallback title: strips the final `.ext`, never empty.
 fn filename_stem(file_name: &str) -> String {
     match file_name.rfind('.') {
@@ -1327,7 +1359,7 @@ fn parse_segment_file_name(name: &str) -> Option<(u64, u64)> {
     Some((id.parse().ok()?, generation.parse().ok()?))
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -1709,6 +1741,14 @@ impl PortableStore {
         self.generation
     }
 
+    /// The raw value the next allocated [`TrackId`] will have (IDs
+    /// start at 1). Every already-issued ID — live or retired — is
+    /// strictly smaller than this counter.
+    #[must_use]
+    pub fn next_track_id(&self) -> u64 {
+        self.next_track_id
+    }
+
     /// The active path case policy.
     #[must_use]
     pub fn case_policy(&self) -> PathCasePolicy {
@@ -1837,6 +1877,144 @@ impl PortableStore {
         self.track_segment.insert(id, segment_id);
         self.path_index.insert(key, id);
         Ok(id)
+    }
+
+    /// Bulk-inserts complete records with predetermined IDs and sets
+    /// the ID counter — the migration/restore counterpart of
+    /// [`add_track`](Self::add_track).
+    ///
+    /// This exists because migration must reproduce a source
+    /// library's identities exactly: the same `TrackId` for every
+    /// migrated record, the same retired-ID gaps, and the same
+    /// next-ID counter so no ID from the source library's history is
+    /// ever reused in the new one. `add_track` deliberately cannot do
+    /// any of that (it allocates sequentially), and synthesizing gaps
+    /// by adding and removing throwaway records would be both
+    /// fragile and unbounded work for large counters.
+    ///
+    /// Rules — the whole batch is validated before anything is
+    /// mutated, so a rejected batch leaves the store exactly as it
+    /// was:
+    ///
+    /// - record IDs are never 0, are strictly ascending within the
+    ///   batch, and every one exceeds the greatest ID already in the
+    ///   store (segments hold records in ascending order; imports
+    ///   append new history, they never rewrite it);
+    /// - no imported path collides with a path already in the store
+    ///   or with another record in the batch, under the active
+    ///   [`PathCasePolicy`];
+    /// - `next_track_id` (the counter after the import) is at least
+    ///   the current counter — counters never move backwards — and
+    ///   strictly exceeds the greatest imported ID.
+    ///
+    /// Like every mutation, the import becomes durable on the next
+    /// [`commit`](Self::commit); importing an empty batch merely to
+    /// advance the counter is still committed as a catalogue change.
+    ///
+    /// # Errors
+    ///
+    /// [`PortableStoreError::ReadOnlyRecovered`] in the recovered
+    /// state; [`PortableStoreError::InvalidStore`] for ID-rule
+    /// violations; [`PortableStoreError::DuplicatePath`] for path
+    /// collisions; [`PortableStoreError::InvalidCounter`] for an
+    /// impossible `next_track_id`.
+    pub fn import_tracks(
+        &mut self,
+        records: Vec<ImportedTrack>,
+        next_track_id: u64,
+    ) -> Result<(), PortableStoreError> {
+        self.ensure_writable()?;
+
+        // Validate the entire batch up front (all-or-nothing in
+        // memory, matching the failed-commit atomicity on disk).
+        let existing_max_id = self
+            .segments
+            .iter()
+            .filter_map(|segment| segment.records.last())
+            .map(|record| record.id.get())
+            .max()
+            .unwrap_or(0);
+        let mut greatest_id = existing_max_id;
+        let mut batch_keys: HashMap<PathKey, TrackId> = HashMap::with_capacity(records.len());
+        let mut keys: Vec<PathKey> = Vec::with_capacity(records.len());
+        for record in &records {
+            let raw_id = record.id.get();
+            if raw_id == 0 {
+                return Err(PortableStoreError::InvalidStore(
+                    "an imported track has ID 0 (IDs start at 1)".to_owned(),
+                ));
+            }
+            if raw_id <= greatest_id {
+                return Err(PortableStoreError::InvalidStore(format!(
+                    "imported track ID {raw_id} is not greater than {greatest_id}: \
+                     imported IDs must be strictly ascending and exceed every ID \
+                     already in the store"
+                )));
+            }
+            greatest_id = raw_id;
+            let key = path_key(&record.path, self.policy);
+            if let Some(existing) = self.path_index.get(&key) {
+                return Err(PortableStoreError::DuplicatePath {
+                    path: record.path.display_lossy(),
+                    existing: *existing,
+                });
+            }
+            if let Some(existing) = batch_keys.get(&key) {
+                return Err(PortableStoreError::DuplicatePath {
+                    path: record.path.display_lossy(),
+                    existing: *existing,
+                });
+            }
+            batch_keys.insert(key.clone(), record.id);
+            keys.push(key);
+        }
+        if next_track_id < self.next_track_id {
+            return Err(PortableStoreError::InvalidCounter {
+                reason: format!(
+                    "import would move the next_track_id counter backwards \
+                     ({} < {})",
+                    next_track_id, self.next_track_id
+                ),
+            });
+        }
+        if next_track_id <= greatest_id {
+            return Err(PortableStoreError::InvalidCounter {
+                reason: format!(
+                    "next_track_id {next_track_id} would reuse imported track ID \
+                     {greatest_id}"
+                ),
+            });
+        }
+
+        // Apply: placement and indexes exactly as `add_track` does.
+        for (record, key) in records.into_iter().zip(keys) {
+            let id = record.id;
+            let stored = StoredTrack {
+                id,
+                path: record.path,
+                availability: record.availability,
+                file: record.file,
+                tags: record.tags,
+                overrides: record.overrides,
+                added_unix_ms: record.added_unix_ms,
+                updated_unix_ms: record.updated_unix_ms,
+            };
+            let estimate = record_estimate(&stored);
+            let seg_index = self.placement_segment(estimate);
+            let segment = &mut self.segments[seg_index];
+            segment.records.push(stored);
+            segment.estimated_bytes = segment.estimated_bytes.saturating_add(estimate);
+            segment.dirty = true;
+            let segment_id = segment.id;
+            self.track_segment.insert(id, segment_id);
+            self.path_index.insert(key, id);
+        }
+        self.next_track_id = next_track_id;
+        // A counter-only import (empty batch) dirties no segment, but
+        // the catalogue still has to be republished for the new
+        // counter to persist — the same reason repacks set this flag.
+        self.pending_structure_change = true;
+        Ok(())
     }
 
     /// Chooses (creating if needed) the segment a new record of
@@ -2408,6 +2586,286 @@ fn load_generation(
     }
 
     Ok(LoadedGeneration { catalog, segments })
+}
+
+// ---------------------------------------------------- Library bridge ---
+//
+// The application works with the in-memory [`Library`] (absolute
+// [`PathBuf`] tracks); the portable store is its persistence backend
+// in portable mode. These two conversions are the whole bridge, and
+// they live here — next to both data models — so the storage format
+// knowledge stays in this crate.
+
+/// Builds the runtime [`Track`] for one stored record: effective
+/// metadata (overrides → tags → fallbacks) and the absolute path
+/// under `root`. `None` when the record's relative path cannot be
+/// represented on this platform (opaque Unix bytes off Unix).
+fn track_from_stored(root: &Path, stored: &StoredTrack) -> Option<Track> {
+    let rel_os = stored.path().to_os_path()?;
+    let meta = stored.effective_metadata();
+    let mut track = Track::new(meta.title, TrackSource::local(root.join(rel_os)));
+    if let Some(artist) = meta.artist {
+        track = track.with_artist(artist);
+    }
+    if let Some(album) = meta.album {
+        track = track.with_album(album);
+    }
+    if let Some(number) = meta.track_number {
+        track = track.with_track_number(number);
+    }
+    if let Some(disc) = meta.disc_number {
+        track = track.with_disc_number(disc);
+    }
+    if let Some(ms) = meta.duration_ms {
+        track = track.with_duration(Duration::from_millis(ms));
+    }
+    Some(track)
+}
+
+impl Library {
+    /// Reconstructs the in-memory library — records, derived indexes,
+    /// and the next-ID counter with its retired-ID gaps — from an
+    /// opened portable store. Stable IDs and effective metadata are
+    /// preserved exactly; track paths become `store.root()` joined
+    /// with each record's relative path.
+    ///
+    /// Records whose relative path cannot be represented on this
+    /// platform are skipped (they have no usable absolute path here);
+    /// the returned count says how many. Skipped records are *not*
+    /// deleted from the store — [`sync_library_to_portable_store`]
+    /// never removes records — they simply do not appear in this
+    /// platform's runtime view.
+    #[must_use]
+    pub fn from_portable_store(store: &PortableStore) -> (Library, usize) {
+        let root = store.root();
+        let mut tracks = Vec::with_capacity(store.len());
+        let mut skipped = 0;
+        for stored in store.iter() {
+            match track_from_stored(root, stored) {
+                Some(track) => tracks.push((stored.id(), track)),
+                None => skipped += 1,
+            }
+        }
+        (Library::from_parts(tracks, store.next_track_id()), skipped)
+    }
+}
+
+/// One library record that [`sync_library_to_portable_store`] did not
+/// write to the portable store, with the reason. The record remains
+/// in the in-memory library — skipped is reported, never silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableSyncSkipped {
+    /// The library track that was not synced.
+    pub id: TrackId,
+    /// Why it cannot be stored in the portable library.
+    pub reason: String,
+}
+
+/// The outcome of one [`sync_library_to_portable_store`] call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortableSyncReport {
+    /// Records newly imported into the store (with their library IDs).
+    pub added: usize,
+    /// Existing records whose tag snapshot was refreshed.
+    pub updated: usize,
+    /// Records that could not be stored portably (see
+    /// [`PortableSyncSkipped`]).
+    pub skipped: Vec<PortableSyncSkipped>,
+}
+
+fn tags_from_track(track: &Track, album_artist: Option<String>) -> TagSet {
+    TagSet {
+        title: Some(track.title().to_owned()),
+        artist: track.artist().map(ToOwned::to_owned),
+        album: track.album().map(ToOwned::to_owned),
+        album_artist,
+        track_number: track.track_number(),
+        disc_number: track.disc_number(),
+        duration_ms: track
+            .duration()
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+    }
+}
+
+/// Whether the runtime track's metadata differs from what the stored
+/// record's effective view produces (i.e. a scan refreshed it).
+fn track_differs_from_stored(track: &Track, stored: &StoredTrack) -> bool {
+    let meta = stored.effective_metadata();
+    track.title() != meta.title
+        || track.artist() != meta.artist.as_deref()
+        || track.album() != meta.album.as_deref()
+        || track.track_number() != meta.track_number
+        || track.disc_number() != meta.disc_number
+        || track
+            .duration()
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            != meta.duration_ms
+}
+
+fn availability_of(path: &Path) -> (Availability, Option<FileFingerprint>) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => (
+            Availability::Present,
+            Some(FileFingerprint {
+                size_bytes: metadata.len(),
+                modified_unix_ms: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+            }),
+        ),
+        Ok(_) => (Availability::Present, None),
+        Err(_) => (Availability::Missing, None),
+    }
+}
+
+/// Writes the in-memory library's current contents into the portable
+/// store (in memory; call [`PortableStore::commit`] to publish). This
+/// is the portable backend's save path: scan results arrive as a
+/// mutated [`Library`], and this function reconciles that into
+/// portable records.
+///
+/// Exact behavior:
+///
+/// - **New IDs** (in the library, unknown to the store) are imported
+///   with their library-issued IDs via [`PortableStore::import_tracks`],
+///   and the store counter is aligned to the library's — so IDs the
+///   library issued to tracks that cannot be stored (outside the
+///   root, unrepresentable) stay retired in the store's history too.
+///   A new record's availability/fingerprint come from a `stat` of
+///   its file (inside the root by construction).
+/// - **Existing IDs** get their tag snapshot refreshed when the
+///   library's metadata differs from the stored effective view (a
+///   scan re-read). The stored `album_artist` is carried over (the
+///   runtime [`Track`] has no such field), and overrides,
+///   availability, fingerprint, and timestamps are otherwise
+///   untouched — availability reconciliation is a later milestone's
+///   job, not a side effect of saving.
+/// - **Nothing is ever deleted or moved**: records in the store but
+///   not in the library (including ones this platform cannot
+///   represent) are preserved as they are, and a library track whose
+///   path no longer matches its stored relative path keeps the
+///   stored path. Library tracks outside the root, with
+///   non-portable names, with an ID the store already retired, or
+///   whose library path another record holds are reported in
+///   [`PortableSyncReport::skipped`] instead of failing the sync.
+///
+/// # Errors
+///
+/// [`PortableStoreError::ReadOnlyRecovered`] before changing anything
+/// when the store is in the recovered read-only state. Other storage
+/// errors abort the sync; in-memory updates already applied stay
+/// pending in the store (nothing is published until commit), so a
+/// later sync + commit retries cleanly.
+pub fn sync_library_to_portable_store(
+    library: &Library,
+    store: &mut PortableStore,
+) -> Result<PortableSyncReport, PortableStoreError> {
+    store.ensure_writable()?;
+    let root = store.root().to_path_buf();
+    let policy = store.case_policy();
+    let store_max_id = store
+        .iter()
+        .map(|record| record.id().get())
+        .max()
+        .unwrap_or(0);
+    let (tracks, library_next_id) = library.parts();
+    let now = now_unix_ms();
+
+    let mut report = PortableSyncReport::default();
+    let mut updates: Vec<(TrackId, TagSet)> = Vec::new();
+    let mut imports: Vec<ImportedTrack> = Vec::new();
+    let mut import_keys: HashMap<PathKey, TrackId> = HashMap::new();
+
+    for (id, track) in tracks {
+        let id = *id;
+        let absolute = track.source().path();
+        let relative_os = match absolute.strip_prefix(&root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel,
+            _ => {
+                report.skipped.push(PortableSyncSkipped {
+                    id,
+                    reason: "track file is outside the portable library folder".to_owned(),
+                });
+                continue;
+            }
+        };
+        let relative_path = match RelPath::from_os_path(relative_os) {
+            Ok(path) => path,
+            Err(err) => {
+                report.skipped.push(PortableSyncSkipped {
+                    id,
+                    reason: format!("track path cannot be stored portably: {err}"),
+                });
+                continue;
+            }
+        };
+
+        match store.get(id) {
+            Some(stored) => {
+                if track_differs_from_stored(track, stored) {
+                    let candidate = tags_from_track(track, stored.tags().album_artist.clone());
+                    if candidate != *stored.tags() {
+                        updates.push((id, candidate));
+                    }
+                }
+            }
+            None => {
+                if id.get() <= store_max_id {
+                    report.skipped.push(PortableSyncSkipped {
+                        id,
+                        reason: "track ID was already retired in the portable library's history"
+                            .to_owned(),
+                    });
+                    continue;
+                }
+                if let Some(existing) = store.id_for_path(&relative_path) {
+                    report.skipped.push(PortableSyncSkipped {
+                        id,
+                        reason: format!("library path is already held by track {existing}"),
+                    });
+                    continue;
+                }
+                let key = path_key(&relative_path, policy);
+                if let Some(existing) = import_keys.get(&key) {
+                    report.skipped.push(PortableSyncSkipped {
+                        id,
+                        reason: format!(
+                            "library path is already claimed in this sync by track {existing}"
+                        ),
+                    });
+                    continue;
+                }
+                import_keys.insert(key, id);
+                let (availability, fingerprint) = availability_of(absolute);
+                imports.push(ImportedTrack {
+                    id,
+                    path: relative_path,
+                    availability,
+                    file: fingerprint,
+                    tags: tags_from_track(track, None),
+                    overrides: MetadataOverrides::new(),
+                    added_unix_ms: now,
+                    updated_unix_ms: now,
+                });
+            }
+        }
+    }
+
+    for (id, tags) in updates {
+        store.set_tags(id, tags)?;
+        report.updated += 1;
+    }
+    let added = imports.len();
+    let effective_next = library_next_id.max(store.next_track_id());
+    if !imports.is_empty() || effective_next > store.next_track_id() {
+        imports.sort_by_key(|record| record.id.get());
+        store.import_tracks(imports, effective_next)?;
+        report.added = added;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -3727,5 +4185,389 @@ mod tests {
                 .expect("add after emptying");
             assert_eq!(fresh, TrackId::new(6));
         }
+    }
+
+    // -------------------------------------------- bulk import (S3) ---
+
+    fn imported(id: u64, path: &str) -> ImportedTrack {
+        ImportedTrack {
+            id: TrackId::new(id),
+            path: rel(path),
+            availability: Availability::Missing,
+            file: None,
+            tags: TagSet::default(),
+            overrides: MetadataOverrides::new(),
+            added_unix_ms: 111,
+            updated_unix_ms: 222,
+        }
+    }
+
+    #[test]
+    fn import_tracks_preserves_ids_gaps_counter_and_every_field() {
+        let dir = TempDir::new("import-preserve");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+
+        let mut first = imported(2, "two.flac");
+        first.tags = title_tags("Two");
+        first.availability = Availability::Present;
+        first.file = Some(FileFingerprint {
+            size_bytes: 42,
+            modified_unix_ms: 4242,
+        });
+        let mut second = imported(5, "sub/five.flac");
+        second.overrides.set_artist("The Fives".to_owned());
+        second.overrides.clear_album();
+
+        store
+            .import_tracks(vec![first, second], 9)
+            .expect("import accepted");
+        assert_eq!(store.next_track_id(), 9);
+        store.commit().expect("commit");
+        drop(store);
+
+        let mut store = PortableStore::open(dir.path()).expect("reopen").store;
+        let ids: Vec<u64> = store.iter().map(|record| record.id().get()).collect();
+        assert_eq!(ids, vec![2, 5], "IDs and their gaps preserved in order");
+        assert_eq!(store.next_track_id(), 9, "counter preserved across reopen");
+
+        let two = store.get(TrackId::new(2)).expect("track 2");
+        assert_eq!(two.tags().title.as_deref(), Some("Two"));
+        assert_eq!(two.availability(), Availability::Present);
+        assert_eq!(
+            two.file(),
+            Some(FileFingerprint {
+                size_bytes: 42,
+                modified_unix_ms: 4242
+            })
+        );
+        assert_eq!(two.added_unix_ms(), 111);
+        assert_eq!(two.updated_unix_ms(), 222);
+
+        let five = store.get(TrackId::new(5)).expect("track 5");
+        assert_eq!(five.overrides().artist(), Some(Some("The Fives")));
+        assert_eq!(
+            five.overrides().album(),
+            Some(None),
+            "cleared override kept"
+        );
+
+        // Allocation continues at the imported counter, never into a gap.
+        let fresh = store
+            .add_track(
+                rel("nine.flac"),
+                Availability::Present,
+                None,
+                TagSet::default(),
+            )
+            .expect("add after import");
+        assert_eq!(fresh, TrackId::new(9));
+    }
+
+    #[test]
+    fn import_tracks_empty_batch_still_publishes_the_counter() {
+        let dir = TempDir::new("import-empty");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        store
+            .import_tracks(Vec::new(), 7)
+            .expect("counter-only import");
+        assert!(
+            store.has_uncommitted_changes(),
+            "a counter-only import must remain publishable"
+        );
+        store.commit().expect("commit");
+        drop(store);
+
+        let mut store = PortableStore::open(dir.path()).expect("reopen").store;
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.next_track_id(), 7);
+        let fresh = store
+            .add_track(
+                rel("seven.flac"),
+                Availability::Present,
+                None,
+                TagSet::default(),
+            )
+            .expect("add");
+        assert_eq!(fresh, TrackId::new(7));
+    }
+
+    #[test]
+    fn import_tracks_rejects_invalid_batches_without_mutating() {
+        let dir = TempDir::new("import-reject");
+        let mut store = seeded(&dir, 2); // IDs 1, 2; counter 3.
+        let assert_unchanged = |store: &PortableStore| {
+            assert_eq!(store.len(), 2);
+            assert_eq!(store.next_track_id(), 3);
+            assert!(
+                !store.has_uncommitted_changes(),
+                "a rejected batch must leave no pending state"
+            );
+        };
+
+        // ID 0.
+        let err = store
+            .import_tracks(vec![imported(0, "zero.flac")], 4)
+            .unwrap_err();
+        assert!(
+            matches!(err, PortableStoreError::InvalidStore(_)),
+            "{err:?}"
+        );
+        assert_unchanged(&store);
+
+        // ID not exceeding the existing maximum.
+        let err = store
+            .import_tracks(vec![imported(2, "again.flac")], 4)
+            .unwrap_err();
+        assert!(
+            matches!(err, PortableStoreError::InvalidStore(_)),
+            "{err:?}"
+        );
+        assert_unchanged(&store);
+
+        // Batch not strictly ascending.
+        let err = store
+            .import_tracks(vec![imported(5, "five.flac"), imported(4, "four.flac")], 6)
+            .unwrap_err();
+        assert!(
+            matches!(err, PortableStoreError::InvalidStore(_)),
+            "{err:?}"
+        );
+        assert_unchanged(&store);
+
+        // Path collision with an existing record (seeded paths are
+        // "0000.flac", "0001.flac").
+        let err = store
+            .import_tracks(vec![imported(3, "0000.flac")], 4)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PortableStoreError::DuplicatePath { existing, .. } if existing == TrackId::new(1)
+            ),
+            "{err:?}"
+        );
+        assert_unchanged(&store);
+
+        // Path collision within the batch itself.
+        let err = store
+            .import_tracks(vec![imported(3, "same.flac"), imported(4, "same.flac")], 5)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PortableStoreError::DuplicatePath { existing, .. } if existing == TrackId::new(3)
+            ),
+            "{err:?}"
+        );
+        assert_unchanged(&store);
+
+        // Counter moving backwards, and counter that would reuse an
+        // imported ID.
+        let err = store
+            .import_tracks(vec![imported(3, "three.flac")], 2)
+            .unwrap_err();
+        assert!(
+            matches!(err, PortableStoreError::InvalidCounter { .. }),
+            "{err:?}"
+        );
+        let err = store
+            .import_tracks(vec![imported(5, "five.flac")], 5)
+            .unwrap_err();
+        assert!(
+            matches!(err, PortableStoreError::InvalidCounter { .. }),
+            "{err:?}"
+        );
+        assert_unchanged(&store);
+    }
+
+    // ------------------------------------------ Library bridge (S4) ---
+
+    #[test]
+    fn library_from_portable_store_preserves_ids_counter_and_metadata() {
+        use flux_core::TrackSource;
+
+        let dir = TempDir::new("bridge-load");
+        dir.write("Artist/song.flac", b"song");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let mut two = imported(2, "Artist/song.flac");
+        two.tags = TagSet {
+            title: Some("Song".to_owned()),
+            artist: Some("Singer".to_owned()),
+            album: None,
+            album_artist: Some("Band".to_owned()),
+            track_number: Some(4),
+            disc_number: None,
+            duration_ms: Some(90_000),
+        };
+        two.availability = Availability::Present;
+        let mut five = imported(5, "gone.flac");
+        five.overrides.set_title("User Title".to_owned());
+        five.availability = Availability::Missing;
+        store.import_tracks(vec![two, five], 9).expect("import");
+        store.commit().expect("commit");
+        drop(store);
+        let store = PortableStore::open(dir.path()).expect("open").store;
+
+        let (mut library, skipped) = Library::from_portable_store(&store);
+        assert_eq!(skipped, 0);
+        let ids: Vec<u64> = library.iter().map(|(id, _)| id.get()).collect();
+        assert_eq!(ids, vec![2, 5], " IDs and gaps preserved");
+        let song = library.get(TrackId::new(2)).expect("track 2");
+        assert_eq!(song.title(), "Song");
+        assert_eq!(song.artist(), Some("Singer"));
+        assert_eq!(song.track_number(), Some(4));
+        assert_eq!(
+            song.duration(),
+            Some(std::time::Duration::from_millis(90_000))
+        );
+        assert_eq!(
+            song.source(),
+            &TrackSource::local(dir.path().join("Artist").join("song.flac"))
+        );
+        // Missing records are represented, with effective metadata.
+        let gone = library.get(TrackId::new(5)).expect("track 5");
+        assert_eq!(
+            gone.title(),
+            "User Title",
+            "override is the effective title"
+        );
+        // The counter survives: allocation continues at 9.
+        let fresh = library.insert(flux_core::Track::new(
+            "New",
+            TrackSource::local(dir.path().join("new.flac")),
+        ));
+        assert_eq!(fresh, TrackId::new(9));
+        // Path index rebuilt: lookup by absolute path works.
+        assert_eq!(
+            library.id_for_path(&dir.path().join("gone.flac")),
+            Some(TrackId::new(5))
+        );
+    }
+
+    #[test]
+    fn sync_library_adds_updates_preserves_and_skips_honestly() {
+        use flux_core::{Track, TrackSource};
+
+        let dir = TempDir::new("bridge-sync");
+        dir.write("keep.flac", b"keep");
+        let new_file = dir.write("new.flac", b"new-bytes");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let mut two = imported(2, "keep.flac");
+        two.tags = title_tags("Before");
+        two.tags.album_artist = Some("Band".to_owned());
+        two.availability = Availability::Missing; // must survive sync untouched
+        two.overrides.set_album("User Album".to_owned());
+        store.import_tracks(vec![two], 4).expect("import");
+        store.commit().expect("commit");
+
+        let (mut library, skipped) = Library::from_portable_store(&store);
+        assert_eq!(skipped, 0);
+        // A scan-style metadata refresh for track 2 and a new inside
+        // track (ID 4) plus one outside the root (ID 5, unpersistable).
+        assert!(
+            library.update_metadata(
+                TrackId::new(2),
+                Track::new("After", TrackSource::local(dir.path().join("keep.flac")))
+                    .with_artist("Singer"),
+            )
+        );
+        let new_id = library.insert(Track::new("New", TrackSource::local(&new_file)));
+        assert_eq!(new_id, TrackId::new(4));
+        let outside_id = library.insert(Track::new(
+            "Outside",
+            TrackSource::local("/somewhere-else/out.flac"),
+        ));
+        assert_eq!(outside_id, TrackId::new(5));
+
+        let report = sync_library_to_portable_store(&library, &mut store).expect("sync");
+        assert_eq!(report.added, 1);
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].id, outside_id);
+        assert!(
+            report.skipped[0].reason.contains("outside"),
+            "{}",
+            report.skipped[0].reason
+        );
+        store.commit().expect("commit");
+
+        let kept = store.get(TrackId::new(2)).expect("track 2");
+        assert_eq!(kept.tags().title.as_deref(), Some("After"));
+        assert_eq!(kept.tags().artist.as_deref(), Some("Singer"));
+        assert_eq!(
+            kept.tags().album_artist.as_deref(),
+            Some("Band"),
+            "album artist (invisible to Track) survives the round trip"
+        );
+        assert_eq!(
+            kept.overrides().album(),
+            Some(Some("User Album")),
+            "overrides are not baked into tags"
+        );
+        assert_eq!(
+            kept.availability(),
+            Availability::Missing,
+            "sync never refreshes availability as a side effect"
+        );
+        let added = store.get(TrackId::new(4)).expect("track 4");
+        assert_eq!(added.availability(), Availability::Present);
+        assert_eq!(added.file().map(|f| f.size_bytes), Some(9));
+        assert!(
+            store.get(outside_id).is_none(),
+            "external track stays memory-only"
+        );
+        assert_eq!(
+            store.next_track_id(),
+            6,
+            "counter aligned past the skipped external ID so it stays retired"
+        );
+
+        // A second sync with no library changes is a clean no-op.
+        let report = sync_library_to_portable_store(&library, &mut store).expect("resync");
+        assert_eq!(report.added, 0);
+        assert_eq!(report.updated, 0);
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "the external track is still reported"
+        );
+        assert!(!store.has_uncommitted_changes());
+    }
+
+    #[test]
+    fn sync_refuses_a_recovered_read_only_store_before_changing_anything() {
+        let dir = TempDir::new("bridge-sync-readonly");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        store
+            .add_track(rel("a.flac"), Availability::Present, None, title_tags("A"))
+            .expect("add");
+        store.commit().expect("commit gen2");
+        store
+            .add_track(rel("b.flac"), Availability::Present, None, title_tags("B"))
+            .expect("add");
+        store.commit().expect("commit gen3 (backup = gen2)");
+        let library_id = store.library_id().to_owned();
+        drop(store);
+
+        // Damage the primary: open recovers the backup, read-only.
+        fs::write(
+            dir.path().join(FLUX_DIR_NAME).join(CATALOG_FILE_NAME),
+            b"junk",
+        )
+        .expect("damage primary");
+        let opened = PortableStore::open(dir.path()).expect("recovered open");
+        assert!(opened.recovery.is_some());
+        let mut store = opened.store;
+        assert_eq!(store.library_id(), library_id);
+        assert_eq!(store.len(), 1, "backup generation only");
+
+        let (library, _) = Library::from_portable_store(&store);
+        let err = sync_library_to_portable_store(&library, &mut store)
+            .expect_err("read-only store must refuse sync");
+        assert!(
+            matches!(err, PortableStoreError::ReadOnlyRecovered),
+            "{err:?}"
+        );
+        assert!(!store.has_uncommitted_changes(), "nothing was applied");
     }
 }

@@ -316,6 +316,122 @@ fn validate_and_build(index: IndexFile) -> Result<Library, StoreError> {
     Ok(Library::from_parts(tracks, index.next_id))
 }
 
+// ------------------------------------------------ migration decoding ---
+//
+// S3 migration ([`crate::migrate`]) must see legacy paths in their
+// original stored representation. It therefore cannot use
+// [`Library::load_from_path`]: that loader converts every
+// [`StoredPath::UnixBytes`] through `StoredPath::into_path`, which on
+// non-Unix platforms decodes with `String::from_utf8_lossy` and would
+// silently rewrite non-UTF-8 names into different (replacement-
+// character) paths. The decoder below is migration-only: it applies
+// the same schema, version, ID, and counter validation as the public
+// loader, but returns paths unconverted so the migration layer can
+// classify and report them byte-exactly. Duplicate-path detection is
+// deliberately *not* repeated here — the public loader detects it via
+// converted `PathBuf` equality (the lossy conversion migration must
+// avoid), so migration performs its own lossless, component-based
+// duplicate check on the values returned here. The legacy schema and
+// the public loader's behavior are unchanged.
+
+/// A legacy track path in its original stored representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LegacyPathData {
+    /// UTF-8 path text, exactly as stored (native spelling of the
+    /// platform that wrote the index).
+    Utf8(String),
+    /// Raw Unix path bytes, exactly as stored.
+    UnixBytes(Vec<u8>),
+}
+
+/// One legacy track record, decoded losslessly for migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyTrackData {
+    pub(crate) id: u64,
+    pub(crate) title: String,
+    pub(crate) artist: Option<String>,
+    pub(crate) album: Option<String>,
+    pub(crate) track_number: Option<u32>,
+    pub(crate) disc_number: Option<u32>,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) path: LegacyPathData,
+}
+
+/// A whole legacy index, decoded losslessly for migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyIndexData {
+    pub(crate) next_id: u64,
+    pub(crate) tracks: Vec<LegacyTrackData>,
+}
+
+/// Reads and validates a legacy index for migration, preserving the
+/// original path representation of every record. Read-only: the index
+/// file is never modified.
+///
+/// Validation mirrors the public loader (supported version, non-zero
+/// IDs, no duplicate IDs, a counter that reuses nothing); see the
+/// section comment above for why duplicate *paths* are checked by the
+/// caller instead.
+pub(crate) fn load_legacy_index_data(path: &Path) -> Result<LegacyIndexData, StoreError> {
+    let bytes = fs::read(path)?;
+    let index: IndexFile = serde_json::from_slice(&bytes)?;
+
+    if index.version != INDEX_VERSION {
+        return Err(StoreError::UnsupportedVersion {
+            found: index.version,
+            supported: INDEX_VERSION,
+        });
+    }
+    if index.next_id == 0 {
+        return Err(StoreError::InvalidIndex(
+            "next_id counter is 0 (IDs start at 1)".to_owned(),
+        ));
+    }
+
+    let mut seen_ids: HashSet<u64> = HashSet::new();
+    let mut max_id = 0u64;
+    let mut tracks: Vec<LegacyTrackData> = Vec::with_capacity(index.tracks.len());
+    for record in index.tracks {
+        if record.id == 0 {
+            return Err(StoreError::InvalidIndex(
+                "a track has ID 0 (IDs start at 1)".to_owned(),
+            ));
+        }
+        if !seen_ids.insert(record.id) {
+            return Err(StoreError::InvalidIndex(format!(
+                "duplicate track ID {}",
+                record.id
+            )));
+        }
+        max_id = max_id.max(record.id);
+        tracks.push(LegacyTrackData {
+            id: record.id,
+            title: record.title,
+            artist: record.artist,
+            album: record.album,
+            track_number: record.track_number,
+            disc_number: record.disc_number,
+            duration_ms: record.duration_ms,
+            path: match record.path {
+                StoredPath::Utf8(text) => LegacyPathData::Utf8(text),
+                StoredPath::UnixBytes(bytes) => LegacyPathData::UnixBytes(bytes),
+            },
+        });
+    }
+
+    if index.next_id <= max_id {
+        return Err(StoreError::InvalidIndex(format!(
+            "next_id counter {} would reuse an existing ID (max in use: {max_id})",
+            index.next_id
+        )));
+    }
+
+    Ok(LegacyIndexData {
+        next_id: index.next_id,
+        tracks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -524,6 +640,58 @@ mod tests {
         );
         // A valid empty index loads fine.
         assert!(load_raw(&dir, &index_json(1, vec![])).is_ok());
+    }
+
+    #[test]
+    fn migration_decoder_preserves_raw_path_representations() {
+        use super::{LegacyPathData, load_legacy_index_data};
+
+        // Raw bytes that are not valid UTF-8: on non-Unix the public
+        // loader would decode this with replacement characters, which
+        // is exactly what migration must never do.
+        let raw_bytes: Vec<u8> = b"/music/bad-\xff-name.flac".to_vec();
+        let json = serde_json::json!({
+            "version": INDEX_VERSION,
+            "next_id": 3,
+            "tracks": [
+                {
+                    "id": 1, "title": "Text", "artist": null, "album": null,
+                    "track_number": null, "disc_number": null,
+                    "duration_ms": null, "path": {"utf8": "/music/ok.flac"}
+                },
+                {
+                    "id": 2, "title": "Bytes", "artist": "A", "album": null,
+                    "track_number": 7, "disc_number": null,
+                    "duration_ms": 1234, "path": {"unix_bytes": raw_bytes}
+                },
+            ]
+        })
+        .to_string();
+
+        let dir = TempDir::new("raw-decode");
+        let path = dir.write("index.json", json.as_bytes());
+        let data = load_legacy_index_data(&path).expect("raw decode");
+        assert_eq!(data.next_id, 3);
+        assert_eq!(
+            data.tracks[0].path,
+            LegacyPathData::Utf8("/music/ok.flac".to_owned())
+        );
+        assert_eq!(
+            data.tracks[1].path,
+            LegacyPathData::UnixBytes(raw_bytes),
+            "non-UTF-8 bytes preserved exactly, no lossy decode"
+        );
+        assert_eq!(data.tracks[1].artist.as_deref(), Some("A"));
+        assert_eq!(data.tracks[1].track_number, Some(7));
+        assert_eq!(data.tracks[1].duration_ms, Some(1234));
+
+        // The same scalar validation as the public loader applies.
+        let dup = index_json(3, vec![record(1, "/a.flac"), record(1, "/b.flac")]);
+        let dup_path = dir.write("dup.json", dup.as_bytes());
+        assert!(matches!(
+            load_legacy_index_data(&dup_path),
+            Err(StoreError::InvalidIndex(_))
+        ));
     }
 
     #[cfg(unix)]
