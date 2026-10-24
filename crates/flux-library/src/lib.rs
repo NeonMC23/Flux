@@ -14,6 +14,12 @@
 //!   JSON index at a caller-injected path. This crate never chooses
 //!   OS-specific application directories (that is `flux-platform`'s job,
 //!   and the two crates are deliberately independent).
+//! - [`portable`]: the segmented `.flux` storage engine for a portable
+//!   library root — catalog + generation-qualified track segments,
+//!   crash-safe publication, backup recovery, byte-exact relative
+//!   paths, and sparse metadata overrides. The legacy index above
+//!   remains the application's startup path until the migration
+//!   milestone; the portable store is exposed and tested independently.
 //!
 //! # Stale-ID boundary
 //!
@@ -38,13 +44,20 @@
 //! a track whose file has disappeared stays in the library until it is
 //! explicitly removed — scanning only ever adds or updates, never prunes.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use flux_core::{Track, TrackId};
 
+pub mod portable;
 pub mod scan;
 pub mod store;
 
+pub use portable::{
+    Availability, EffectiveMetadata, FileFingerprint, MetadataOverrides, OpenedStore,
+    PORTABLE_SCHEMA_VERSION, PathCasePolicy, PathValidationError, PortableStore,
+    PortableStoreError, RecoveryInfo, RelPath, SegmentId, StoredTrack, TagSet,
+};
 pub use scan::{SUPPORTED_EXTENSIONS, ScanIssue, ScanReport};
 pub use store::{INDEX_VERSION, StoreError};
 
@@ -78,11 +91,21 @@ pub use store::{INDEX_VERSION, StoreError};
 /// aliases down to one real file is a future scanner concern, not the
 /// collection's.
 ///
-/// Lookups are linear scans. That is a deliberate simplicity trade-off at
-/// this scale and can be revisited if library sizes ever make it matter.
+/// ID and path lookups go through derived in-memory indexes that mirror
+/// `tracks` exactly: the `Vec` remains the authoritative,
+/// insertion-ordered record set, and every successful mutation updates
+/// the indexes as part of the same operation (failed mutations change
+/// neither the records nor the indexes). The indexes are never
+/// persisted; they are rebuilt from the validated records whenever a
+/// `Library` is constructed.
 pub struct Library {
     tracks: Vec<(TrackId, Track)>,
     next_id: u64,
+    /// Derived index: track ID → position in `tracks`.
+    by_id: HashMap<TrackId, usize>,
+    /// Derived index: local path → track ID, keyed by the same plain
+    /// [`Path`] value equality (and matching `Hash`) as deduplication.
+    by_path: HashMap<PathBuf, TrackId>,
 }
 
 impl Library {
@@ -92,6 +115,8 @@ impl Library {
         Self {
             tracks: Vec::new(),
             next_id: 1,
+            by_id: HashMap::new(),
+            by_path: HashMap::new(),
         }
     }
 
@@ -102,16 +127,13 @@ impl Library {
     /// as it is — the incoming track, including any different metadata,
     /// is dropped — and the **existing** track's ID is returned.
     pub fn insert(&mut self, track: Track) -> TrackId {
-        let path = track.source().path();
-        if let Some((existing_id, _)) = self
-            .tracks
-            .iter()
-            .find(|(_, stored)| stored.source().path() == path)
-        {
+        if let Some(existing_id) = self.by_path.get(track.source().path()) {
             return *existing_id;
         }
         let id = TrackId::new(self.next_id);
         self.next_id += 1;
+        self.by_path.insert(track.source().path().to_owned(), id);
+        self.by_id.insert(id, self.tracks.len());
         self.tracks.push((id, track));
         id
     }
@@ -120,20 +142,15 @@ impl Library {
     /// longer) in the library.
     #[must_use]
     pub fn get(&self, id: TrackId) -> Option<&Track> {
-        self.tracks
-            .iter()
-            .find(|(stored_id, _)| *stored_id == id)
-            .map(|(_, track)| track)
+        let index = *self.by_id.get(&id)?;
+        self.tracks.get(index).map(|(_, track)| track)
     }
 
     /// Returns the ID of the track stored for `path`, using the same path
     /// equality as deduplication, or `None` if no track has that path.
     #[must_use]
     pub fn id_for_path(&self, path: &Path) -> Option<TrackId> {
-        self.tracks
-            .iter()
-            .find(|(_, stored)| stored.source().path() == path)
-            .map(|(id, _)| *id)
+        self.by_path.get(path).copied()
     }
 
     /// Replaces the metadata of the track with the given ID, keeping the
@@ -147,17 +164,24 @@ impl Library {
     /// tags changed keeps its identity, so queues referencing the ID stay
     /// valid.
     pub fn update_metadata(&mut self, id: TrackId, track: Track) -> bool {
-        let Some((_, stored)) = self
-            .tracks
-            .iter_mut()
-            .find(|(stored_id, _)| *stored_id == id)
-        else {
+        let Some(&index) = self.by_id.get(&id) else {
+            return false;
+        };
+        let Some((_, stored)) = self.tracks.get_mut(index) else {
             return false;
         };
         if stored.source().path() != track.source().path() {
             return false;
         }
+        // The paths are equal but may be spelled differently (e.g. a
+        // redundant `.` segment), and the stored track adopts the
+        // replacement's spelling — refresh the path-index key so the
+        // index stays an exact mirror of the records.
+        let old_path = stored.source().path().to_owned();
+        let new_path = track.source().path().to_owned();
         *stored = track;
+        self.by_path.remove(&old_path);
+        self.by_path.insert(new_path, id);
         true
     }
 
@@ -170,11 +194,16 @@ impl Library {
     /// else (queues, players) is notified — see the stale-ID boundary
     /// documented at the crate level.
     pub fn remove(&mut self, id: TrackId) -> Option<Track> {
-        let position = self
-            .tracks
-            .iter()
-            .position(|(stored_id, _)| *stored_id == id)?;
-        Some(self.tracks.remove(position).1)
+        let position = *self.by_id.get(&id)?;
+        let (_, removed) = self.tracks.remove(position);
+        self.by_id.remove(&id);
+        self.by_path.remove(removed.source().path());
+        // `Vec::remove` shifts every later entry one position earlier;
+        // rewrite their ID-index entries to match.
+        for (offset, (track_id, _)) in self.tracks[position..].iter().enumerate() {
+            self.by_id.insert(*track_id, position + offset);
+        }
+        Some(removed)
     }
 
     /// Whether a track with the given ID is currently in the library.
@@ -229,9 +258,30 @@ impl Library {
     }
 
     /// Persistence seam: rebuilds a library from already-validated parts
-    /// (see [`store`]'s load validation). Not part of the public API.
+    /// (see [`store`]'s load validation, which guarantees unique IDs and
+    /// paths). The derived indexes are built here, before the library is
+    /// exposed. Not part of the public API.
     pub(crate) fn from_parts(tracks: Vec<(TrackId, Track)>, next_id: u64) -> Self {
-        Self { tracks, next_id }
+        let mut by_id = HashMap::with_capacity(tracks.len());
+        let mut by_path = HashMap::with_capacity(tracks.len());
+        for (index, (id, track)) in tracks.iter().enumerate() {
+            debug_assert!(
+                by_id.insert(*id, index).is_none(),
+                "from_parts received a duplicate track ID"
+            );
+            debug_assert!(
+                by_path
+                    .insert(track.source().path().to_owned(), *id)
+                    .is_none(),
+                "from_parts received a duplicate track path"
+            );
+        }
+        Self {
+            tracks,
+            next_id,
+            by_id,
+            by_path,
+        }
     }
 }
 
@@ -332,7 +382,7 @@ pub(crate) mod test_support {
 mod tests {
     use std::path::Path;
 
-    use flux_core::{Track, TrackSource};
+    use flux_core::{Track, TrackId, TrackSource};
 
     use super::Library;
 
@@ -500,5 +550,266 @@ mod tests {
         assert_eq!(library.search("").count(), 2);
         assert_eq!(library.search("   ").count(), 2);
         assert_eq!(library.search("  a  ").count(), 1);
+    }
+
+    /// The derived indexes must mirror the authoritative `tracks` Vec
+    /// exactly: same cardinality, and every entry reachable by ID and by
+    /// path at its Vec position (through both the raw indexes and the
+    /// public lookups built on them).
+    fn assert_indexes_consistent(library: &Library) {
+        assert_eq!(library.by_id.len(), library.tracks.len(), "by_id size");
+        assert_eq!(library.by_path.len(), library.tracks.len(), "by_path size");
+        for (index, (id, track)) in library.tracks.iter().enumerate() {
+            assert_eq!(library.by_id.get(id), Some(&index), "by_id[{id}]");
+            assert_eq!(
+                library.by_path.get(track.source().path()),
+                Some(id),
+                "by_path[{id}]"
+            );
+            assert_eq!(library.get(*id), Some(track), "get({id})");
+            assert_eq!(
+                library.id_for_path(track.source().path()),
+                Some(*id),
+                "id_for_path for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_metadata_with_respelled_equal_path_keeps_path_index_exact() {
+        let mut library = Library::new();
+        let id = library.insert(track("Old", "/music/a.flac"));
+        // Equal under Path equality (`.` normalized away), differently
+        // spelled: the update is accepted and the stored path adopts
+        // the replacement's spelling.
+        assert!(library.update_metadata(id, track("New", "/music/./a.flac")));
+        assert_eq!(
+            library.get(id).expect("stored").source().path(),
+            Path::new("/music/./a.flac")
+        );
+        // Both spellings resolve through the path index.
+        assert_eq!(library.id_for_path(Path::new("/music/a.flac")), Some(id));
+        assert_eq!(library.id_for_path(Path::new("/music/./a.flac")), Some(id));
+        assert_indexes_consistent(&library);
+
+        // Removing afterwards frees the path for a fresh identity.
+        assert!(library.remove(id).is_some());
+        assert_eq!(library.id_for_path(Path::new("/music/a.flac")), None);
+        assert_indexes_consistent(&library);
+    }
+
+    #[test]
+    fn failed_mutations_leave_indexes_unchanged() {
+        let mut library = Library::new();
+        let a = library.insert(track("A", "/a.flac").with_artist("Artist"));
+        let b = library.insert(track("B", "/b.flac"));
+        let before: Vec<_> = library
+            .iter()
+            .map(|(id, t)| (id, t.title().to_owned()))
+            .collect();
+
+        // Every failing/no-op mutation shape the API has.
+        assert_eq!(
+            library.insert(track("A2", "/a.flac")),
+            a,
+            "duplicate insert"
+        );
+        assert!(!library.update_metadata(a, track("Hijack", "/b.flac")));
+        assert!(!library.update_metadata(TrackId::new(999), track("X", "/a.flac")));
+        assert_eq!(library.remove(TrackId::new(999)), None);
+
+        let after: Vec<_> = library
+            .iter()
+            .map(|(id, t)| (id, t.title().to_owned()))
+            .collect();
+        assert_eq!(before, after, "records untouched by failed mutations");
+        assert_eq!(library.get(a).map(Track::title), Some("A"));
+        assert_eq!(library.id_for_path(Path::new("/b.flac")), Some(b));
+        assert_indexes_consistent(&library);
+    }
+
+    #[test]
+    fn from_parts_builds_indexes_including_retired_id_gaps() {
+        // The store hands `from_parts` validated records whose IDs may
+        // have gaps (retired IDs of long-removed tracks).
+        let mut library = Library::from_parts(
+            vec![
+                (TrackId::new(2), track("Two", "/two.flac")),
+                (TrackId::new(5), track("Five", "/five.flac")),
+            ],
+            6,
+        );
+        assert_eq!(library.get(TrackId::new(2)).map(Track::title), Some("Two"));
+        assert_eq!(library.get(TrackId::new(5)).map(Track::title), Some("Five"));
+        assert_eq!(library.get(TrackId::new(1)), None);
+        assert_eq!(library.get(TrackId::new(3)), None);
+        assert_eq!(
+            library.id_for_path(Path::new("/five.flac")),
+            Some(TrackId::new(5))
+        );
+        assert_indexes_consistent(&library);
+
+        // Allocation continues from the restored counter, never into a gap.
+        assert_eq!(library.insert(track("Six", "/six.flac")), TrackId::new(6));
+        assert_indexes_consistent(&library);
+    }
+
+    /// Naive linear-scan oracle implementing the documented `Library`
+    /// semantics the way the pre-index implementation did. The indexed
+    /// implementation must be indistinguishable from it through the
+    /// public API.
+    struct ReferenceLibrary {
+        tracks: Vec<(TrackId, Track)>,
+        next_id: u64,
+    }
+
+    impl ReferenceLibrary {
+        fn new() -> Self {
+            Self {
+                tracks: Vec::new(),
+                next_id: 1,
+            }
+        }
+
+        fn insert(&mut self, track: Track) -> TrackId {
+            if let Some((id, _)) = self
+                .tracks
+                .iter()
+                .find(|(_, t)| t.source().path() == track.source().path())
+            {
+                return *id;
+            }
+            let id = TrackId::new(self.next_id);
+            self.next_id += 1;
+            self.tracks.push((id, track));
+            id
+        }
+
+        fn update_metadata(&mut self, id: TrackId, track: Track) -> bool {
+            let Some((_, stored)) = self.tracks.iter_mut().find(|(tid, _)| *tid == id) else {
+                return false;
+            };
+            if stored.source().path() != track.source().path() {
+                return false;
+            }
+            *stored = track;
+            true
+        }
+
+        fn remove(&mut self, id: TrackId) -> Option<String> {
+            let position = self.tracks.iter().position(|(tid, _)| *tid == id)?;
+            Some(self.tracks.remove(position).1.title().to_owned())
+        }
+    }
+
+    fn pick_id(issued: &[TrackId], rand: &mut impl FnMut() -> usize) -> TrackId {
+        if issued.is_empty() || rand().is_multiple_of(8) {
+            TrackId::new(10_000 + (rand() % 100) as u64)
+        } else {
+            issued[rand() % issued.len()]
+        }
+    }
+
+    #[test]
+    fn indexed_library_matches_linear_reference_model() {
+        // Path spellings chosen to stress the equality rule: `.` is
+        // normalized away, `..` is not resolved, case is never folded.
+        const PATHS: &[&str] = &[
+            "/m/a.flac",
+            "/m/./a.flac",
+            "/m/sub/../a.flac",
+            "/m/A.flac",
+            "/m/b.flac",
+            "/m/sub/c.flac",
+            "/m/sub/./c.flac",
+            "/x.flac",
+        ];
+        let mut library = Library::new();
+        let mut model = ReferenceLibrary::new();
+        let mut issued: Vec<TrackId> = Vec::new();
+        // Fixed-seed LCG: the operation sequence is fully deterministic,
+        // so any failure reproduces exactly.
+        let mut rng_state = 0x243F_6A88_85A3_08D3u64;
+        let mut rand = move || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng_state >> 33) as usize
+        };
+
+        for step in 0..600 {
+            let title = format!("T{step}");
+            match rand() % 100 {
+                0..=39 => {
+                    let path = PATHS[rand() % PATHS.len()];
+                    let got = library.insert(track(&title, path));
+                    let want = model.insert(track(&title, path));
+                    assert_eq!(got, want, "insert id at step {step}");
+                    issued.push(got);
+                }
+                40..=64 => {
+                    let id = pick_id(&issued, &mut rand);
+                    let path = PATHS[rand() % PATHS.len()];
+                    let got = library.update_metadata(id, track(&title, path));
+                    let want = model.update_metadata(id, track(&title, path));
+                    assert_eq!(got, want, "update_metadata at step {step}");
+                }
+                65..=84 => {
+                    let id = pick_id(&issued, &mut rand);
+                    let got = library.remove(id).map(|t| t.title().to_owned());
+                    let want = model.remove(id);
+                    assert_eq!(got, want, "remove at step {step}");
+                }
+                _ => {}
+            }
+
+            // Full observable-state equivalence after every step.
+            assert_eq!(library.len(), model.tracks.len(), "len at step {step}");
+            let got: Vec<_> = library
+                .iter()
+                .map(|(id, t)| (id, t.title().to_owned(), t.source().path().to_owned()))
+                .collect();
+            let want: Vec<_> = model
+                .tracks
+                .iter()
+                .map(|(id, t)| (*id, t.title().to_owned(), t.source().path().to_owned()))
+                .collect();
+            assert_eq!(got, want, "insertion-ordered contents at step {step}");
+            for path in PATHS {
+                let path = Path::new(path);
+                let want = model
+                    .tracks
+                    .iter()
+                    .find(|(_, t)| t.source().path() == path)
+                    .map(|(id, _)| *id);
+                assert_eq!(
+                    library.id_for_path(path),
+                    want,
+                    "id_for_path at step {step}"
+                );
+            }
+            assert_indexes_consistent(&library);
+
+            if step % 100 == 99 {
+                for query in ["", "t1", "T42", "zzz"] {
+                    let got: Vec<_> = library.search(query).map(|(id, _)| id).collect();
+                    let needle = query.trim().to_lowercase();
+                    let want: Vec<_> = model
+                        .tracks
+                        .iter()
+                        .filter(|(_, t)| {
+                            needle.is_empty()
+                                || t.title().to_lowercase().contains(&needle)
+                                || t.artist()
+                                    .is_some_and(|a| a.to_lowercase().contains(&needle))
+                                || t.album()
+                                    .is_some_and(|a| a.to_lowercase().contains(&needle))
+                        })
+                        .map(|(id, _)| *id)
+                        .collect();
+                    assert_eq!(got, want, "search {query:?} at step {step}");
+                }
+            }
+        }
     }
 }
