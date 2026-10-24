@@ -19,10 +19,40 @@
 //!   tells it what to load/play and consumes its events.
 //! - The controller itself owns only coordination state: the volume
 //!   (`Player` has none), which track it last asked the engine to load
-//!   (a sync ledger, not a second selection), the index path, scan
-//!   bookkeeping, and the last status/error strings for display.
+//!   (a sync ledger, not a second selection), the storage backend
+//!   (below), scan bookkeeping, and the last status/error strings for
+//!   display.
 //! - The track snapshot (`tracks()`) is a display cache refreshed
 //!   whenever the library changes; it decides nothing.
+//!
+//! # Storage backends
+//!
+//! Persistence goes through one explicit backend, chosen at
+//! construction and fixed for the controller's lifetime
+//! ([`StorageMode`]):
+//!
+//! - **Legacy** ([`Controller::new`] / [`Controller::open_default`]):
+//!   the version-1 JSON index at the given path (today's default; its
+//!   startup behavior is unchanged — a missing index starts empty, an
+//!   unreadable one starts empty with a reported error).
+//! - **Portable** ([`Controller::new_portable`]): the `.flux` store at
+//!   a caller-supplied library root. Opening is fallible and strict:
+//!   a missing or invalid store is a [`PortableOpenError`], never a
+//!   silent fallback to an empty library or the legacy index, and
+//!   nothing is created. The in-memory [`Library`] is reconstructed
+//!   from the store (IDs, counter, and missing records included);
+//!   saves sync it back and commit through the store's own protocol.
+//!   A store recovered from its backup catalogue stays read-only —
+//!   scans and saves refuse — until
+//!   [`acknowledge_portable_recovery`](Controller::acknowledge_portable_recovery)
+//!   is called explicitly. Because a portable library can only store
+//!   paths inside its own root, portable-mode scans accept only
+//!   folders within that root.
+//!
+//! Migration from the legacy index is a separate, explicit operation
+//! ([`plan_legacy_migration`] / [`migrate_legacy_library`]): never a
+//! side effect of startup, scanning, or saving, and it never
+//! switches a running controller's backend.
 //!
 //! # Threading
 //!
@@ -53,11 +83,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
+use std::fmt;
+
 use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
 use flux_audio::engine::{EngineEvent, EngineHandle};
 use flux_core::{PlaybackState, RepeatMode, Track, TrackId};
-use flux_library::{Library, ScanReport};
+use flux_library::portable::{PortableStore, sync_library_to_portable_store};
+use flux_library::{Library, PortableSyncReport, ScanReport};
+
+pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
+pub use flux_library::{PortableStoreError, RecoveryInfo};
 
 /// Whether real device audio is available to this controller's engine.
 ///
@@ -92,6 +128,89 @@ impl AudioStatus {
     }
 }
 
+/// Which persistence backend a [`Controller`] uses. Chosen by which
+/// constructor built the controller and fixed for its lifetime —
+/// there is no implicit switching, and a failure in one backend can
+/// never make the controller write to the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageMode {
+    /// The legacy version-1 JSON index (the long-standing default).
+    Legacy,
+    /// The portable `.flux` store at an explicit library root.
+    Portable,
+}
+
+/// Why [`Controller::new_portable`] could not open its library.
+/// Construction fails as a whole: there is no controller, no empty-
+/// library fallback, and no legacy fallback in these cases.
+#[derive(Debug)]
+pub enum PortableOpenError {
+    /// The supplied library root does not exist, is not a directory,
+    /// or cannot be canonicalized.
+    RootInvalid {
+        /// The library root the caller supplied.
+        root: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// The portable store failed to open or validate (including: no
+    /// store exists at the root — opening never creates one — or
+    /// neither catalogue validates).
+    Store(PortableStoreError),
+}
+
+impl fmt::Display for PortableOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootInvalid { root, reason } => write!(
+                f,
+                "portable library root {} is not usable: {reason}",
+                root.display()
+            ),
+            Self::Store(err) => write!(f, "could not open the portable library: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for PortableOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(err) => Some(err),
+            Self::RootInvalid { .. } => None,
+        }
+    }
+}
+
+impl From<PortableStoreError> for PortableOpenError {
+    fn from(err: PortableStoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+/// The active persistence backend (the storage counterpart of
+/// [`StorageMode`], with the location it persists to).
+enum StorageBackend {
+    Legacy {
+        index_path: Option<PathBuf>,
+    },
+    /// `root` is canonical: library paths and scan paths are built
+    /// from it so path identity is spelling-consistent.
+    Portable {
+        root: PathBuf,
+    },
+}
+
+/// Message used wherever a write is refused because the portable
+/// store is in the recovered read-only state.
+const PORTABLE_RECOVERY_READ_ONLY: &str = "The portable library was recovered from its backup \
+     catalogue and is read-only. Acknowledge the recovery to enable saving and scanning.";
+
+/// Message used when the portable store object itself is gone (its
+/// scan thread vanished and reopening failed): saves cannot pretend
+/// to succeed.
+const PORTABLE_STORE_UNAVAILABLE: &str = "The portable library store is unavailable because it \
+     could not be reopened after the failed scan; changes cannot be saved.";
+
 /// Notifications produced by [`Controller::poll`]. Front-ends treat
 /// these as "re-read controller state now" signals; `Error`/`Status`
 /// also carry the message (mirrored in
@@ -110,12 +229,46 @@ pub enum ControllerEvent {
     Error(String),
 }
 
+/// How the scan worker persists the scanned library — the active
+/// backend travels with the work so a scan can only ever write to
+/// the backend the controller was constructed with.
+enum ScanPersistence {
+    /// No persistence (legacy mode without an index path).
+    None,
+    /// Save the version-1 index at this path.
+    Legacy(PathBuf),
+    /// Sync into and commit this portable store. The store is
+    /// `Send` and single-writer: the worker owns it for the scan's
+    /// duration exactly as it owns the `Library`. (Boxed: the store
+    /// is a large value to move through the channel types, and it
+    /// only changes hands at scan start/finish.)
+    Portable(Box<PortableStore>),
+    /// Portable mode, but the store object was lost with a previous
+    /// scan thread and could not be reopened; saving must fail
+    /// visibly instead of pretending to persist.
+    PortableUnavailable,
+}
+
+/// The payload handed to the scan worker thread: everything it owns
+/// while scanning, recoverable whole from a failed handoff.
+struct ScanWork {
+    library: Library,
+    roots: Vec<PathBuf>,
+    persistence: ScanPersistence,
+}
+
 /// The result of one background scan, delivered to the controller.
 struct ScanOutcome {
     library: Library,
     report: ScanReport,
-    /// `Some` when the scan thread also tried to save the index.
+    /// The persistence backend, handed back (the portable store
+    /// returns to controller ownership here, including any pending
+    /// uncommitted changes after a failed commit).
+    persistence: ScanPersistence,
+    /// `Some` when the scan thread also tried to save.
     saved: Option<Result<(), String>>,
+    /// The portable sync outcome, when the portable save ran.
+    sync_report: Option<PortableSyncReport>,
 }
 
 /// Creates the engine a Flux application should use, together with its
@@ -165,6 +318,41 @@ pub fn default_index_path() -> Option<PathBuf> {
     flux_platform::app_dirs("flux").map(|dirs| dirs.data_dir().join("library-index.json"))
 }
 
+/// Builds a migration plan from the legacy index at `legacy_index`
+/// to a new portable library at `destination_root`, without writing
+/// anything. This is an explicit, caller-requested operation: no
+/// constructor, scan, or save in this crate ever invokes migration
+/// on its own, and executing a plan never changes any running
+/// controller's backend (constructing a portable controller for the
+/// result is a separate, explicit step —
+/// [`Controller::new_portable`]).
+///
+/// # Errors
+///
+/// Every S3 refusal is preserved verbatim as a [`MigrationError`]:
+/// unreadable/invalid legacy index, unusable destination root, or a
+/// destination that already contains an initialized or partial
+/// portable store.
+pub fn plan_legacy_migration(
+    legacy_index: &Path,
+    destination_root: &Path,
+) -> Result<MigrationPlan, MigrationError> {
+    flux_library::migrate::plan_migration(legacy_index, destination_root)
+}
+
+/// Plans and executes a legacy-index migration in one explicit call
+/// (see [`plan_legacy_migration`]). Returns the verified
+/// [`MigrationReport`]; on failure the legacy index is untouched and
+/// any partial destination artifacts are preserved, with the
+/// [`MigrationError`] naming the stage and whether a destination
+/// store was created.
+pub fn migrate_legacy_library(
+    legacy_index: &Path,
+    destination_root: &Path,
+) -> Result<MigrationReport, MigrationError> {
+    flux_library::migrate::migrate_legacy_index(legacy_index, destination_root)
+}
+
 /// Whether the engine can actually decode this track's file, by
 /// extension (the contents are validated when the track is opened).
 /// Front-ends use this to mark indexed-but-unplayable tracks instead
@@ -203,7 +391,15 @@ pub struct Controller {
     /// Stream facts for `engine_loaded`, once the engine confirms it.
     stream_info: Option<StreamInfo>,
     volume: f32,
-    index_path: Option<PathBuf>,
+    /// The persistence backend, fixed at construction.
+    storage: StorageBackend,
+    /// The portable store in portable mode — `None` in legacy mode,
+    /// while a scan thread owns it, or if it was lost with a scan
+    /// thread and could not be reopened (saves then fail visibly).
+    portable_store: Option<PortableStore>,
+    /// Pending backup-recovery details in portable mode, until
+    /// explicitly acknowledged.
+    portable_recovery: Option<RecoveryInfo>,
     /// Directories scanned this session, for `refresh`.
     roots: Vec<PathBuf>,
     scan_rx: Option<Receiver<ScanOutcome>>,
@@ -238,6 +434,104 @@ impl Controller {
             },
             _ => (Library::new(), None),
         };
+        let mut controller = Self::assemble(
+            engine,
+            audio,
+            library,
+            StorageBackend::Legacy { index_path },
+            None,
+            None,
+            Vec::new(),
+        );
+        if let Some(error) = last_error {
+            controller.report_error(error);
+        }
+        controller
+    }
+
+    /// Creates a controller whose persistence backend is the portable
+    /// `.flux` store at `library_root` (supplied explicitly by the
+    /// caller — never guessed). The in-memory library is
+    /// reconstructed from the store: stable IDs, the next-ID counter
+    /// with its retired gaps, effective metadata, and missing
+    /// (unavailable) records are all preserved.
+    ///
+    /// Unlike the legacy constructor this is strict and fallible: a
+    /// nonexistent or non-directory root, a root with no portable
+    /// store, or a store whose catalogues do not validate all fail
+    /// with [`PortableOpenError`] — no controller is produced, no
+    /// empty library is substituted, no legacy index is consulted,
+    /// and no store is created. (The engine is dropped on the error
+    /// path, which shuts it down cleanly.)
+    ///
+    /// If the store opens from its backup catalogue, the controller
+    /// is usable for browsing/playback but read-only for persistence
+    /// (see [`portable_recovery`](Self::portable_recovery)) until
+    /// [`acknowledge_portable_recovery`](Self::acknowledge_portable_recovery)
+    /// is called explicitly; that state is also reported in
+    /// [`last_error`](Self::last_error) at construction.
+    pub fn new_portable(
+        engine: EngineHandle,
+        audio: AudioStatus,
+        library_root: &Path,
+    ) -> Result<Self, PortableOpenError> {
+        let root_invalid = |reason: String| PortableOpenError::RootInvalid {
+            root: library_root.to_owned(),
+            reason,
+        };
+        match std::fs::metadata(library_root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(root_invalid("it exists but is not a directory".to_owned())),
+            Err(err) => {
+                return Err(root_invalid(format!(
+                    "it does not exist or cannot be inspected: {err}"
+                )));
+            }
+        }
+        // Open under the canonical root so library track paths and
+        // scan paths share one spelling (path identity here is
+        // spelling-based by design).
+        let root = std::fs::canonicalize(library_root)
+            .map_err(|err| root_invalid(format!("it cannot be canonicalized: {err}")))?;
+
+        let opened = PortableStore::open(&root)?;
+        let recovery = opened.recovery;
+        let (library, skipped) = Library::from_portable_store(&opened.store);
+
+        let mut controller = Self::assemble(
+            engine,
+            audio,
+            library,
+            StorageBackend::Portable { root: root.clone() },
+            Some(opened.store),
+            recovery,
+            vec![root],
+        );
+        if skipped > 0 {
+            controller.report_status(format!(
+                "{skipped} track(s) in this library cannot be shown on this platform \
+                 because their file paths are not representable here. They are \
+                 preserved unchanged in the library files."
+            ));
+        }
+        if controller.portable_recovery.is_some() {
+            controller.report_error(PORTABLE_RECOVERY_READ_ONLY.to_owned());
+        }
+        Ok(controller)
+    }
+
+    /// Shared construction once the initial library and backend are
+    /// known: snapshot, playback model, queue, and engine volume are
+    /// set up identically for both backends.
+    fn assemble(
+        engine: EngineHandle,
+        audio: AudioStatus,
+        library: Library,
+        storage: StorageBackend,
+        portable_store: Option<PortableStore>,
+        portable_recovery: Option<RecoveryInfo>,
+        roots: Vec<PathBuf>,
+    ) -> Self {
         let mut controller = Self {
             tracks: snapshot(&library),
             library: Some(library),
@@ -247,23 +541,24 @@ impl Controller {
             engine_loaded: None,
             stream_info: None,
             volume: 1.0,
-            index_path,
-            roots: Vec::new(),
+            storage,
+            portable_store,
+            portable_recovery,
+            roots,
             scan_rx: None,
             outbox: Vec::new(),
             last_error: None,
             last_status: None,
         };
-        if let Some(error) = last_error {
-            controller.report_error(error);
-        }
         controller.rebuild_queue();
         controller.engine.set_volume(controller.volume);
         controller
     }
 
     /// The standard application setup: [`default_engine`] +
-    /// [`default_index_path`].
+    /// [`default_index_path`] (legacy backend, as before — portable
+    /// mode is always an explicit choice via
+    /// [`new_portable`](Self::new_portable)).
     #[must_use]
     pub fn open_default() -> Self {
         let (engine, audio) = default_engine();
@@ -356,6 +651,86 @@ impl Controller {
     #[must_use]
     pub fn audio_status(&self) -> &AudioStatus {
         &self.audio
+    }
+
+    /// The persistence backend this controller uses (fixed at
+    /// construction).
+    #[must_use]
+    pub fn storage_mode(&self) -> StorageMode {
+        match &self.storage {
+            StorageBackend::Legacy { .. } => StorageMode::Legacy,
+            StorageBackend::Portable { .. } => StorageMode::Portable,
+        }
+    }
+
+    /// The legacy index path in legacy mode (`None` in portable mode,
+    /// or when running without persistence).
+    #[must_use]
+    pub fn legacy_index_path(&self) -> Option<&Path> {
+        match &self.storage {
+            StorageBackend::Legacy { index_path } => index_path.as_deref(),
+            StorageBackend::Portable { .. } => None,
+        }
+    }
+
+    /// The library root in portable mode (canonical), `None` in
+    /// legacy mode.
+    #[must_use]
+    pub fn portable_root(&self) -> Option<&Path> {
+        match &self.storage {
+            StorageBackend::Portable { root } => Some(root),
+            StorageBackend::Legacy { .. } => None,
+        }
+    }
+
+    /// Pending backup-recovery details in portable mode: while this
+    /// is `Some`, the store is read-only and scans/saves refuse until
+    /// [`acknowledge_portable_recovery`](Self::acknowledge_portable_recovery)
+    /// is called.
+    #[must_use]
+    pub fn portable_recovery(&self) -> Option<&RecoveryInfo> {
+        self.portable_recovery.as_ref()
+    }
+
+    /// Explicitly acknowledges a portable backup recovery: the
+    /// validated backup catalogue is restored as the primary and the
+    /// store becomes writable again (see
+    /// `flux_library::PortableStore::acknowledge_recovery`). This is
+    /// the only way out of the recovered read-only state — it never
+    /// happens as a side effect of scanning or saving.
+    ///
+    /// # Errors
+    ///
+    /// A user-facing message in legacy mode, while a scan is in
+    /// progress, when no recovery is pending, or when the store
+    /// operation itself fails.
+    pub fn acknowledge_portable_recovery(&mut self) -> Result<(), String> {
+        if matches!(self.storage, StorageBackend::Legacy { .. }) {
+            return Err(
+                "This controller uses the legacy library index; there is no portable \
+                 recovery to acknowledge."
+                    .to_owned(),
+            );
+        }
+        if self.is_scanning() {
+            return Err(
+                "A scan is in progress; acknowledge the recovery when it finishes.".to_owned(),
+            );
+        }
+        let Some(store) = self.portable_store.as_mut() else {
+            return Err(PORTABLE_STORE_UNAVAILABLE.to_owned());
+        };
+        if !store.is_recovered_read_only() {
+            return Err("The portable library is not in a recovered read-only state.".to_owned());
+        }
+        store
+            .acknowledge_recovery()
+            .map_err(|err| format!("Could not acknowledge the portable library recovery: {err}"))?;
+        self.portable_recovery = None;
+        self.report_status(
+            "Portable library recovery acknowledged; scanning and saving are enabled.".to_owned(),
+        );
+        Ok(())
     }
 
     /// Decoded-stream facts for the loaded track, once known.
@@ -470,7 +845,15 @@ impl Controller {
     /// not exist or is not a folder is likewise reported as an error
     /// and ignored — no scan starts and no library or index state
     /// changes. When the scan finishes, the updated library is saved
-    /// to the index path (if any) on the scan thread.
+    /// to the active backend (legacy index path, if any, or the
+    /// portable store) on the scan thread.
+    ///
+    /// In portable mode a scan is also refused — same "reported and
+    /// ignored" contract — while the store is in the recovered
+    /// read-only state (a scan's completion would have to write), and
+    /// for folders outside the library root: a portable library can
+    /// only store files inside its own root, so scanning its root (or
+    /// a subfolder) is the whole model.
     pub fn begin_scan(&mut self, root: PathBuf) {
         self.begin_scan_roots(vec![root]);
     }
@@ -478,7 +861,9 @@ impl Controller {
     /// Re-scans every directory scanned this session (picking up files
     /// added since). With no prior scan this session, reports a status
     /// message instead. Roots are not persisted in the version-1
-    /// index, so refresh is session-scoped by design.
+    /// index, so refresh is session-scoped by design. (In portable
+    /// mode the library root itself is the session's initial scan
+    /// root, so refresh always has somewhere to look.)
     pub fn refresh(&mut self) {
         if self.roots.is_empty() {
             self.report_status("Nothing to refresh yet — scan a folder first.".to_owned());
@@ -488,21 +873,51 @@ impl Controller {
         self.begin_scan_roots(roots);
     }
 
-    /// Saves the library index now (blocking; intended for shutdown —
-    /// scans already save automatically on completion).
+    /// Saves the library to the active backend now (blocking;
+    /// intended for shutdown — scans already save automatically on
+    /// completion). Named for its legacy-index origin; in portable
+    /// mode it syncs and commits the portable store. A failed save
+    /// loses nothing: the in-memory library (and, portably, the
+    /// synced-but-uncommitted store state) is retained, so a later
+    /// save retries the same changes.
     ///
     /// # Errors
     ///
-    /// A user-facing message if a scan is in progress or the write
-    /// fails. Without an index path this is a no-op success.
+    /// A user-facing message if a scan is in progress, the write
+    /// fails, or (portable) the store is read-only pending recovery
+    /// acknowledgement or unavailable. In legacy mode without an
+    /// index path this is a no-op success.
     pub fn save_index(&mut self) -> Result<(), String> {
-        let Some(path) = self.index_path.clone() else {
-            return Ok(());
-        };
         let Some(library) = self.library.as_ref() else {
-            return Err("A scan is in progress; the index will be saved when it finishes.".into());
+            return Err(match self.storage {
+                StorageBackend::Legacy { .. } => {
+                    "A scan is in progress; the index will be saved when it finishes."
+                }
+                StorageBackend::Portable { .. } => {
+                    "A scan is in progress; the portable library will be saved when it finishes."
+                }
+            }
+            .into());
         };
-        save_library(library, &path)
+        match &self.storage {
+            StorageBackend::Legacy { index_path } => match index_path {
+                Some(path) => save_library(library, path),
+                None => Ok(()),
+            },
+            StorageBackend::Portable { .. } => {
+                if self
+                    .portable_store
+                    .as_ref()
+                    .is_some_and(|store| store.is_recovered_read_only())
+                {
+                    return Err(PORTABLE_RECOVERY_READ_ONLY.to_owned());
+                }
+                match self.portable_store.as_mut() {
+                    Some(store) => persist_portable(library, store).map(|_| ()),
+                    None => Err(PORTABLE_STORE_UNAVAILABLE.to_owned()),
+                }
+            }
+        }
     }
 
     /// Clean shutdown: waits for any running scan to finish (its save
@@ -512,6 +927,9 @@ impl Controller {
             && let Ok(outcome) = rx.recv()
         {
             self.library = Some(outcome.library);
+            if let ScanPersistence::Portable(store) = outcome.persistence {
+                self.portable_store = Some(*store);
+            }
         }
         self.engine.shutdown();
     }
@@ -552,11 +970,28 @@ impl Controller {
                     // in-memory collection cannot come back from the
                     // thread; recover what can faithfully be recovered.
                     if self.recover_from_lost_scan() {
-                        "The library scan ended unexpectedly; the library \
-                         was restored from the saved index."
+                        match self.storage {
+                            StorageBackend::Legacy { .. } => {
+                                "The library scan ended unexpectedly; the library \
+                                 was restored from the saved index."
+                            }
+                            StorageBackend::Portable { .. } => {
+                                "The library scan ended unexpectedly; the library \
+                                 was restored from the portable library files."
+                            }
+                        }
                     } else {
-                        "The library scan ended unexpectedly, and no saved \
-                         index was available to restore the library from."
+                        match self.storage {
+                            StorageBackend::Legacy { .. } => {
+                                "The library scan ended unexpectedly, and no saved \
+                                 index was available to restore the library from."
+                            }
+                            StorageBackend::Portable { .. } => {
+                                "The library scan ended unexpectedly, and the \
+                                 portable library could not be reopened to \
+                                 restore the library from."
+                            }
+                        }
                     }
                 } else {
                     "The library scan ended unexpectedly."
@@ -716,6 +1151,13 @@ impl Controller {
             self.report_error("A library scan is already in progress.".to_owned());
             return;
         }
+        // A recovered portable store is read-only, and a scan's
+        // completion always saves — refuse up front rather than
+        // scan successfully and then fail to persist.
+        if self.portable_recovery.is_some() {
+            self.report_error(PORTABLE_RECOVERY_READ_ONLY.to_owned());
+            return;
+        }
         // Validate before touching any state: a rejected scan must
         // leave the library, the session roots, and the saved index
         // exactly as they were. (The library layer would merely
@@ -723,12 +1165,21 @@ impl Controller {
         // folder deserves a clear, immediate error. A root that
         // disappears *after* this check is still handled cleanly by
         // the scan itself, which itemizes it and continues.)
+        let mut effective_roots = Vec::with_capacity(roots.len());
         for root in &roots {
             if let Err(message) = validate_scan_root(root) {
                 self.report_error(message);
                 return;
             }
+            match self.portable_scan_root(root) {
+                Ok(effective) => effective_roots.push(effective),
+                Err(message) => {
+                    self.report_error(message);
+                    return;
+                }
+            }
         }
+        let roots = effective_roots;
         let Some(library) = self.library.take() else {
             self.report_error("A library scan is already in progress.".to_owned());
             return;
@@ -746,28 +1197,63 @@ impl Controller {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        let index_path = self.index_path.clone();
-        let (work_tx, work_rx) =
-            std::sync::mpsc::channel::<(Library, Vec<PathBuf>, Option<PathBuf>)>();
+        // The backend — and, portably, the store itself — travels
+        // with the work, so the worker can only save where this
+        // controller was constructed to save.
+        let persistence = match &self.storage {
+            StorageBackend::Legacy { index_path } => match index_path {
+                Some(path) => ScanPersistence::Legacy(path.clone()),
+                None => ScanPersistence::None,
+            },
+            StorageBackend::Portable { .. } => match self.portable_store.take() {
+                Some(store) => ScanPersistence::Portable(Box::new(store)),
+                None => ScanPersistence::PortableUnavailable,
+            },
+        };
+        let work = ScanWork {
+            library,
+            roots,
+            persistence,
+        };
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<ScanWork>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<ScanOutcome>();
         // Spawn first and hand the library over only once the thread
         // exists, so a spawn failure cannot lose the collection.
         let spawned = std::thread::Builder::new()
             .name("flux-library-scan".to_owned())
             .spawn(move || {
-                if let Ok((mut library, roots, index_path)) = work_rx.recv() {
+                if let Ok(ScanWork {
+                    mut library,
+                    roots,
+                    mut persistence,
+                }) = work_rx.recv()
+                {
                     let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
                     let report = library.scan(&root_refs);
-                    let saved = index_path.as_ref().map(|path| save_library(&library, path));
+                    let (saved, sync_report) = match &mut persistence {
+                        ScanPersistence::None => (None, None),
+                        ScanPersistence::Legacy(path) => (Some(save_library(&library, path)), None),
+                        ScanPersistence::Portable(store) => {
+                            match persist_portable(&library, store) {
+                                Ok(sync_report) => (Some(Ok(())), Some(sync_report)),
+                                Err(message) => (Some(Err(message)), None),
+                            }
+                        }
+                        ScanPersistence::PortableUnavailable => {
+                            (Some(Err(PORTABLE_STORE_UNAVAILABLE.to_owned())), None)
+                        }
+                    };
                     let _ = done_tx.send(ScanOutcome {
                         library,
                         report,
+                        persistence,
                         saved,
+                        sync_report,
                     });
                 }
             });
         match spawned {
-            Ok(_handle) => match work_tx.send((library, roots, index_path)) {
+            Ok(_handle) => match work_tx.send(work) {
                 Ok(()) => {
                     self.scan_rx = Some(done_rx);
                 }
@@ -776,35 +1262,66 @@ impl Controller {
                     // but a failed `send` hands the payload back, so the
                     // library (which left `self` only for this handoff)
                     // is recovered whole instead of being discarded.
-                    let (library, _roots, _index_path) = err.0;
                     self.scan_start_failed(
-                        library,
+                        err.0,
                         "The library scan could not be started.".to_owned(),
                     );
                 }
             },
             Err(err) => {
-                self.scan_start_failed(library, format!("Could not start the scan thread: {err}"));
+                self.scan_start_failed(work, format!("Could not start the scan thread: {err}"));
             }
         }
     }
 
-    /// Puts the library back after a scan could not be started (the
-    /// thread spawn or the work handoff failed). The collection is
-    /// exactly as it was before the attempt and `scan_rx` stays `None`,
-    /// so the controller is not left believing a scan is running; only
-    /// the reported error is new.
-    fn scan_start_failed(&mut self, library: Library, message: String) {
-        self.library = Some(library);
+    /// Portable-mode scan-root gate: the folder must be the library
+    /// root or inside it (canonically — a symlinked parent cannot
+    /// smuggle an outside folder in, matching the scanner's
+    /// never-follow-links stance), and the scan then runs under the
+    /// canonical spelling so discovered paths share the loaded
+    /// tracks' path identity. Legacy mode applies no extra rule.
+    fn portable_scan_root(&self, root: &Path) -> Result<PathBuf, String> {
+        let StorageBackend::Portable { root: library_root } = &self.storage else {
+            return Ok(root.to_path_buf());
+        };
+        let canonical = std::fs::canonicalize(root)
+            .map_err(|err| format!("Cannot scan \"{}\": {err}", root.display()))?;
+        if canonical.starts_with(library_root) {
+            Ok(canonical)
+        } else {
+            Err(format!(
+                "Cannot scan \"{}\": it is outside this portable library's folder ({}). \
+                 A portable library can only store files inside its own folder — \
+                 scan that folder instead.",
+                root.display(),
+                library_root.display()
+            ))
+        }
+    }
+
+    /// Puts the library (and, portably, the store) back after a scan
+    /// could not be started (the thread spawn or the work handoff
+    /// failed). The collection is exactly as it was before the
+    /// attempt and `scan_rx` stays `None`, so the controller is not
+    /// left believing a scan is running; only the reported error is
+    /// new.
+    fn scan_start_failed(&mut self, work: ScanWork, message: String) {
+        self.library = Some(work.library);
+        if let ScanPersistence::Portable(store) = work.persistence {
+            self.portable_store = Some(*store);
+        }
         self.report_error(message);
     }
 
     fn finish_scan(&mut self, outcome: ScanOutcome) {
         self.tracks = snapshot(&outcome.library);
         self.library = Some(outcome.library);
+        if let ScanPersistence::Portable(store) = outcome.persistence {
+            self.portable_store = Some(*store);
+        }
         self.rebuild_queue();
         let report = &outcome.report;
-        self.report_status(format!(
+        let mut message = format!(
             "Scan complete: {} added, {} updated, {} already indexed, {} skipped, {} failed. {} track(s) in the library.",
             report.added(),
             report.updated(),
@@ -812,23 +1329,50 @@ impl Controller {
             report.skipped().len(),
             report.failed().len(),
             self.tracks.len(),
-        ));
+        );
+        if let Some(sync_report) = &outcome.sync_report
+            && !sync_report.skipped.is_empty()
+        {
+            message += &format!(
+                " {} track(s) could not be stored in the portable library and \
+                 are kept for this session only.",
+                sync_report.skipped.len()
+            );
+        }
+        self.report_status(message);
         if let Some(Err(message)) = outcome.saved {
             self.report_error(message);
         }
     }
 
     /// Recovers a library after the scan thread that owned it vanished
-    /// without reporting back. The last saved index is the only faithful
-    /// recovery source — rebuilding a `Library` from the display
-    /// snapshot would renumber track IDs and break every queue
-    /// reference — so it is reloaded when available. Returns whether a
-    /// saved library was restored; otherwise installs an empty library,
-    /// there being nothing the previous state could be recovered from.
+    /// without reporting back. The last saved state — legacy index or
+    /// committed portable store — is the only faithful recovery
+    /// source: rebuilding a `Library` from the display snapshot would
+    /// renumber track IDs and break every queue reference. Returns
+    /// whether a saved library was restored; otherwise installs an
+    /// empty library, there being nothing the previous state could be
+    /// recovered from. Uncommitted changes the lost thread had synced
+    /// into the portable store are gone with it (exactly like an
+    /// unsaved legacy scan); the committed generation is intact.
     fn recover_from_lost_scan(&mut self) -> bool {
-        let restored = match &self.index_path {
-            Some(path) if path.exists() => Library::load_from_path(path).ok(),
-            _ => None,
+        let restored = match &self.storage {
+            StorageBackend::Legacy { index_path } => match index_path {
+                Some(path) if path.exists() => Library::load_from_path(path).ok(),
+                _ => None,
+            },
+            StorageBackend::Portable { root } => match PortableStore::open(root) {
+                Ok(opened) => {
+                    let (library, _skipped) = Library::from_portable_store(&opened.store);
+                    self.portable_recovery = opened.recovery;
+                    self.portable_store = Some(opened.store);
+                    Some(library)
+                }
+                Err(_) => {
+                    self.portable_store = None;
+                    None
+                }
+            },
         };
         match restored {
             Some(library) => {
@@ -893,6 +1437,26 @@ fn validate_scan_root(root: &Path) -> Result<(), String> {
     }
 }
 
+/// The portable save: sync the in-memory library into the store,
+/// then commit through the store's own publication protocol. The
+/// two failure stages get distinct messages; either way the synced
+/// state stays pending inside the (controller-owned) store, so the
+/// next save retries the same changes instead of losing them.
+fn persist_portable(
+    library: &Library,
+    store: &mut PortableStore,
+) -> Result<PortableSyncReport, String> {
+    let report = sync_library_to_portable_store(library, store)
+        .map_err(|err| format!("Could not save the portable library: {err}"))?;
+    store.commit().map_err(|err| {
+        format!(
+            "Could not save the portable library while committing it: {err}. \
+             The changes are kept in memory; saving again will retry."
+        )
+    })?;
+    Ok(report)
+}
+
 /// Creates parent directories, then writes the versioned index
 /// (flushing the "parent must exist" precondition of
 /// `Library::save_to_path`).
@@ -917,7 +1481,10 @@ mod tests {
     use flux_audio::output::NullControl;
     use flux_core::{PlaybackState, RepeatMode, TrackId};
 
-    use super::{AudioStatus, Controller, ControllerEvent, ScanOutcome, is_track_playable};
+    use super::{
+        AudioStatus, Controller, ControllerEvent, PortableOpenError, ScanOutcome, StorageMode,
+        is_track_playable, migrate_legacy_library, plan_legacy_migration,
+    };
 
     struct TempDir(PathBuf);
 
@@ -1680,15 +2247,17 @@ mod tests {
         assert_eq!(before.len(), 4);
         assert!(controller.last_error().is_none());
 
-        let (work_tx, work_rx) =
-            std::sync::mpsc::channel::<(flux_library::Library, Vec<PathBuf>, Option<PathBuf>)>();
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<super::ScanWork>();
         drop(work_rx);
         let library = controller.library.take().expect("library present");
         let err = work_tx
-            .send((library, vec![fx.root.clone()], None))
+            .send(super::ScanWork {
+                library,
+                roots: vec![fx.root.clone()],
+                persistence: super::ScanPersistence::None,
+            })
             .expect_err("send to a dropped receiver must fail");
-        let (library, _roots, _index_path) = err.0;
-        controller.scan_start_failed(library, "The library scan could not be started.".to_owned());
+        controller.scan_start_failed(err.0, "The library scan could not be started.".to_owned());
 
         // The collection is exactly as before the attempt — same IDs,
         // same paths — the failure is reported as an error (not a false
@@ -1800,5 +2369,496 @@ mod tests {
             "got: {events:?}"
         );
         controller.shutdown();
+    }
+
+    // ------------------------------------------------- S4 storage ----
+
+    fn imported_record(
+        id: u64,
+        path: &str,
+        availability: flux_library::Availability,
+        title: &str,
+    ) -> flux_library::ImportedTrack {
+        use flux_library::{MetadataOverrides, RelPath, TagSet};
+        flux_library::ImportedTrack {
+            id: TrackId::new(id),
+            path: RelPath::from_utf8(path).expect("relative fixture path"),
+            availability,
+            file: None,
+            tags: TagSet {
+                title: Some(title.to_owned()),
+                ..TagSet::default()
+            },
+            overrides: MetadataOverrides::new(),
+            added_unix_ms: 1,
+            updated_unix_ms: 1,
+        }
+    }
+
+    /// A portable store holding ID 2 (`a.wav`, present) and ID 5
+    /// (`gone.wav`, missing), counter at 9.
+    fn seed_portable_store(root: &Path) {
+        use flux_library::{Availability, PortableStore};
+        let mut store = PortableStore::create(root).expect("create portable store");
+        store
+            .import_tracks(
+                vec![
+                    imported_record(2, "a.wav", Availability::Present, "Aye"),
+                    imported_record(5, "gone.wav", Availability::Missing, "Gone"),
+                ],
+                9,
+            )
+            .expect("seed import");
+        store.commit().expect("seed commit");
+    }
+
+    fn boot_portable_at(root: &Path) -> Result<(Controller, NullControl), PortableOpenError> {
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        Controller::new_portable(engine, AudioStatus::Ready, root).map(|c| (c, control))
+    }
+
+    fn track_ids(controller: &Controller) -> Vec<u64> {
+        controller.tracks().iter().map(|(id, _)| id.get()).collect()
+    }
+
+    #[test]
+    fn legacy_mode_is_the_default_and_still_loads_and_saves() {
+        let dir = TempDir::new("s4-legacy-mode");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        assert_eq!(controller.storage_mode(), StorageMode::Legacy);
+        assert_eq!(
+            controller.legacy_index_path(),
+            Some(
+                dir.path()
+                    .join("state")
+                    .join("library-index.json")
+                    .as_path()
+            )
+        );
+        assert_eq!(controller.portable_root(), None);
+        assert!(controller.portable_recovery().is_none());
+        let err = controller
+            .acknowledge_portable_recovery()
+            .expect_err("no portable recovery exists in legacy mode");
+        assert!(err.contains("legacy"), "{err}");
+
+        scanned(&mut controller, &control, fx.root.clone());
+        assert_eq!(controller.tracks().len(), 4);
+        assert!(
+            !fx.root.join(".flux").exists(),
+            "legacy mode never writes a portable store"
+        );
+        controller.save_index().expect("legacy save");
+        controller.shutdown();
+
+        let (controller2, _c2) = boot(&dir);
+        assert_eq!(controller2.storage_mode(), StorageMode::Legacy);
+        assert_eq!(controller2.tracks().len(), 4, "legacy index reloaded");
+        controller2.shutdown();
+    }
+
+    #[test]
+    fn portable_mode_opens_store_and_reconstructs_records() {
+        let dir = TempDir::new("s4-portable-open");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 4_410, 0.4);
+        seed_portable_store(&root);
+        // A bystander legacy-index-shaped file: portable mode must
+        // never read or write it.
+        let legacy_bystander = dir.path().join("state").join("library-index.json");
+        fs::create_dir_all(legacy_bystander.parent().expect("parent")).expect("state dir");
+        fs::write(&legacy_bystander, b"legacy bystander bytes").expect("bystander");
+
+        let (controller, _control) = boot_portable_at(&root).expect("portable open succeeds");
+        assert_eq!(controller.storage_mode(), StorageMode::Portable);
+        let canonical_root = fs::canonicalize(&root).expect("canonical root");
+        assert_eq!(controller.portable_root(), Some(canonical_root.as_path()));
+        assert_eq!(controller.legacy_index_path(), None);
+        assert!(controller.portable_recovery().is_none());
+        assert!(controller.last_error().is_none());
+
+        assert_eq!(track_ids(&controller), vec![2, 5]);
+        let aye = controller.track(TrackId::new(2)).expect("track 2");
+        assert_eq!(aye.title(), "Aye");
+        assert_eq!(aye.source().path(), canonical_root.join("a.wav").as_path());
+        let gone = controller.track(TrackId::new(5)).expect("track 5");
+        assert_eq!(gone.title(), "Gone", "missing records are represented");
+        assert_eq!(
+            fs::read(&legacy_bystander).expect("bystander"),
+            b"legacy bystander bytes",
+            "portable mode never writes the legacy index"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn portable_ids_gaps_and_counter_survive_scan_save_reopen() {
+        use flux_library::{Availability, PortableStore};
+
+        let dir = TempDir::new("s4-portable-ids");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 4_410, 0.4);
+        seed_portable_store(&root);
+
+        let (mut controller, control) = boot_portable_at(&root).expect("open");
+        let b_file = write_dc_wav(&root, "b.wav", 4_410, 0.3);
+        scanned(&mut controller, &control, root.clone());
+        assert_eq!(track_ids(&controller), vec![2, 5, 9]);
+        assert_eq!(
+            id_of(&controller, &fs::canonicalize(&b_file).expect("canonical")),
+            TrackId::new(9),
+            "the preserved counter (9) issues the next ID"
+        );
+
+        // On disk: the new record persisted to the portable store,
+        // the missing record is still Missing, the counter advanced.
+        let store = PortableStore::open(&root).expect("direct open").store;
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.next_track_id(), 10);
+        assert_eq!(
+            store
+                .get(TrackId::new(5))
+                .expect("missing kept")
+                .availability(),
+            Availability::Missing
+        );
+        assert_eq!(
+            store.get(TrackId::new(9)).expect("new kept").availability(),
+            Availability::Present
+        );
+        drop(store);
+        controller.shutdown();
+
+        // Reopen and scan a third file: allocation continues at 10.
+        let (mut controller, control) = boot_portable_at(&root).expect("reopen");
+        assert_eq!(track_ids(&controller), vec![2, 5, 9]);
+        let c_file = write_dc_wav(&root, "c.wav", 4_410, 0.2);
+        scanned(&mut controller, &control, root.clone());
+        assert_eq!(
+            id_of(&controller, &fs::canonicalize(&c_file).expect("canonical")),
+            TrackId::new(10)
+        );
+        controller.shutdown();
+        let store = PortableStore::open(&root).expect("direct open").store;
+        assert_eq!(store.next_track_id(), 11);
+        assert!(
+            !dir.path().join("state").join("library-index.json").exists(),
+            "no legacy index was ever written"
+        );
+    }
+
+    #[test]
+    fn portable_open_failures_never_fall_back_or_create_anything() {
+        let dir = TempDir::new("s4-portable-fail");
+        let try_open = |root: &Path| {
+            let (engine, _control) = EngineHandle::spawn_null(44_100, 1);
+            Controller::new_portable(engine, AudioStatus::Ready, root)
+                .map(|controller| controller.shutdown())
+        };
+
+        // Missing root.
+        let err = try_open(&dir.path().join("nope")).expect_err("missing root must fail");
+        assert!(
+            matches!(err, PortableOpenError::RootInvalid { .. }),
+            "{err:?}"
+        );
+
+        // Existing folder without a portable store: explicit failure,
+        // and opening created nothing (no silent initialization).
+        let empty_root = dir.path().join("empty-lib");
+        fs::create_dir_all(&empty_root).expect("empty root");
+        let err = try_open(&empty_root).expect_err("storeless root must fail");
+        assert!(
+            matches!(
+                err,
+                PortableOpenError::Store(flux_library::PortableStoreError::StoreNotFound { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(
+            !empty_root.join(".flux").exists(),
+            "a failed open must not initialize a store"
+        );
+
+        // Corrupt store: typed failure, files untouched, no fallback.
+        let bad_root = dir.path().join("bad-lib");
+        let flux_dir = bad_root.join(".flux");
+        fs::create_dir_all(&flux_dir).expect(".flux dir");
+        fs::write(flux_dir.join("catalog.flux"), b"garbage{").expect("garbage catalog");
+        let err = try_open(&bad_root).expect_err("corrupt store must fail");
+        assert!(
+            matches!(
+                err,
+                PortableOpenError::Store(
+                    flux_library::PortableStoreError::BothCataloguesInvalid { .. }
+                )
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            fs::read(flux_dir.join("catalog.flux")).expect("catalog"),
+            b"garbage{",
+            "corrupt storage is preserved, never repaired or replaced"
+        );
+    }
+
+    #[test]
+    fn portable_recovery_gates_writes_until_acknowledged() {
+        use flux_library::{Availability, PortableStore, RelPath, TagSet};
+
+        let dir = TempDir::new("s4-portable-recovery");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 4_410, 0.4);
+        write_dc_wav(&root, "b.wav", 4_410, 0.3);
+        let tags = |title: &str| TagSet {
+            title: Some(title.to_owned()),
+            ..TagSet::default()
+        };
+        let mut store = PortableStore::create(&root).expect("create");
+        store
+            .add_track(
+                RelPath::from_utf8("a.wav").expect("rel"),
+                Availability::Present,
+                None,
+                tags("Aye"),
+            )
+            .expect("add a");
+        store.commit().expect("commit with a (becomes backup)");
+        store
+            .add_track(
+                RelPath::from_utf8("b.wav").expect("rel"),
+                Availability::Present,
+                None,
+                tags("Bee"),
+            )
+            .expect("add b");
+        store.commit().expect("commit with b");
+        drop(store);
+        fs::write(root.join(".flux").join("catalog.flux"), b"junk").expect("damage primary");
+
+        let (mut controller, control) =
+            boot_portable_at(&root).expect("backup recovery still opens");
+        let recovery = controller.portable_recovery().expect("recovery pending");
+        assert_eq!(recovery.recovered_generation, 2);
+        assert_eq!(
+            controller.tracks().len(),
+            1,
+            "only the backup generation's track is visible"
+        );
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|e| e.contains("read-only")),
+            "recovery state is visible: {:?}",
+            controller.last_error()
+        );
+
+        // Writes are gated: save refuses, scan refuses.
+        let err = controller.save_index().expect_err("save must refuse");
+        assert!(err.contains("read-only"), "{err}");
+        controller.begin_scan(root.clone());
+        assert!(
+            !controller.is_scanning(),
+            "scan must refuse while read-only"
+        );
+
+        // Explicit acknowledgement restores writability.
+        controller
+            .acknowledge_portable_recovery()
+            .expect("acknowledge");
+        assert!(controller.portable_recovery().is_none());
+        controller
+            .save_index()
+            .expect("save works after acknowledgement");
+        scanned(&mut controller, &control, root.clone());
+        assert_eq!(controller.tracks().len(), 2, "b is scanned back in");
+        controller.shutdown();
+
+        let store = PortableStore::open(&root).expect("direct open").store;
+        assert_eq!(store.len(), 2);
+        assert!(!store.is_recovered_read_only());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_commit_failure_is_visible_and_the_retry_persists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use flux_library::PortableStore;
+
+        let dir = TempDir::new("s4-portable-commit-fail");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 4_410, 0.4);
+        PortableStore::create(&root).expect("create empty store");
+
+        let (mut controller, control) = boot_portable_at(&root).expect("open");
+        let flux_dir = root.join(".flux");
+        fs::set_permissions(&flux_dir, fs::Permissions::from_mode(0o555))
+            .expect("make .flux read-only");
+        scanned(&mut controller, &control, root.clone());
+        // Restore writability before any assertion can panic, so the
+        // temp-dir cleanup works either way.
+        fs::set_permissions(&flux_dir, fs::Permissions::from_mode(0o755))
+            .expect("restore .flux permissions");
+
+        assert_eq!(
+            controller.tracks().len(),
+            1,
+            "the scan result is kept in memory"
+        );
+        let error = controller.last_error().expect("commit failure reported");
+        assert!(
+            error.contains("Could not save the portable library"),
+            "{error}"
+        );
+        let store = PortableStore::open(&root).expect("direct open").store;
+        assert_eq!(store.len(), 0, "the failed commit published nothing");
+        drop(store);
+
+        // The pending changes were retained: an explicit save retries
+        // and now persists them without rescanning.
+        controller.save_index().expect("retry save succeeds");
+        let store = PortableStore::open(&root).expect("direct open").store;
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.next_track_id(), 2);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn portable_scan_outside_the_root_is_rejected_subfolders_allowed() {
+        use flux_library::PortableStore;
+
+        let dir = TempDir::new("s4-portable-scan-scope");
+        let root = dir.path().join("library");
+        fs::create_dir_all(root.join("sub")).expect("subfolder");
+        write_dc_wav(&root, "a.wav", 4_410, 0.4);
+        seed_portable_store(&root);
+        let (mut controller, control) = boot_portable_at(&root).expect("open");
+        let generation_before = PortableStore::open(&root)
+            .expect("direct open")
+            .store
+            .generation();
+
+        let outside = dir.path().join("elsewhere");
+        fs::create_dir_all(&outside).expect("outside dir");
+        write_dc_wav(&outside, "x.wav", 4_410, 0.5);
+        controller.begin_scan(outside);
+        assert!(!controller.is_scanning());
+        let error = controller.last_error().expect("rejection reported");
+        assert!(
+            error.contains("outside this portable library's folder"),
+            "{error}"
+        );
+        assert_eq!(controller.tracks().len(), 2, "library unchanged");
+        let store = PortableStore::open(&root).expect("direct open").store;
+        assert_eq!(store.generation(), generation_before, "store untouched");
+        drop(store);
+
+        // A subfolder of the root scans fine.
+        let sub_file = write_dc_wav(&root.join("sub"), "s.wav", 4_410, 0.3);
+        scanned(&mut controller, &control, root.join("sub"));
+        assert_eq!(
+            id_of(
+                &controller,
+                &fs::canonicalize(&sub_file).expect("canonical")
+            ),
+            TrackId::new(9)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn lost_scan_thread_recovers_the_portable_library() {
+        let dir = TempDir::new("s4-portable-lost-scan");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 4_410, 0.4);
+        seed_portable_store(&root);
+        let (mut controller, _control) = boot_portable_at(&root).expect("open");
+        let before: Vec<_> = controller
+            .tracks()
+            .iter()
+            .map(|(id, t)| (*id, t.source().path().to_owned()))
+            .collect();
+        assert_eq!(before.len(), 2);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<ScanOutcome>();
+        drop(done_tx);
+        controller.scan_rx = Some(done_rx);
+        controller.library = None;
+        controller.portable_store = None;
+        controller.poll();
+
+        let after: Vec<_> = controller
+            .tracks()
+            .iter()
+            .map(|(id, t)| (*id, t.source().path().to_owned()))
+            .collect();
+        assert_eq!(after, before, "IDs and paths restored from the store");
+        assert!(controller.portable_store.is_some(), "store reopened");
+        let error = controller.last_error().expect("failure reported");
+        assert!(
+            error.contains("restored from the portable library files"),
+            "{error}"
+        );
+        controller.save_index().expect("restored store can save");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn explicit_migration_never_switches_the_active_backend() {
+        let dir = TempDir::new("s4-migration");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let legacy_ids = track_ids(&controller);
+        assert_eq!(legacy_ids.len(), 4);
+        let index_path = dir.path().join("state").join("library-index.json");
+        let index_before = fs::read(&index_path).expect("scan saved the index");
+
+        // Plan is read-only; execution migrates into the music folder
+        // itself (every legacy path is inside it).
+        let plan = plan_legacy_migration(&index_path, &fx.root).expect("plan");
+        assert_eq!(plan.migrated_count(), 4);
+        assert!(!fx.root.join(".flux").exists(), "planning wrote nothing");
+        let report = migrate_legacy_library(&index_path, &fx.root).expect("migration succeeds");
+        assert_eq!(report.plan().present_count(), 4);
+        assert!(!report.library_id().is_empty());
+
+        // The running controller is untouched: same backend, same
+        // tracks, no new error, and it still saves to the legacy
+        // index — which is byte-for-byte what it was.
+        assert_eq!(controller.storage_mode(), StorageMode::Legacy);
+        assert_eq!(track_ids(&controller), legacy_ids);
+        assert!(controller.last_error().is_none());
+        assert_eq!(fs::read(&index_path).expect("index"), index_before);
+        controller.save_index().expect("legacy save still works");
+
+        // A second migration refuses (destination initialized) and
+        // still changes nothing about the controller.
+        let err =
+            migrate_legacy_library(&index_path, &fx.root).expect_err("re-migration must refuse");
+        assert!(
+            matches!(
+                err,
+                flux_library::MigrationError::DestinationAlreadyInitialized { .. }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(controller.storage_mode(), StorageMode::Legacy);
+        assert_eq!(track_ids(&controller), legacy_ids);
+        controller.shutdown();
+
+        // Only an explicit new construction uses the migrated store —
+        // and it sees the very same IDs.
+        let (portable_controller, _c2) = boot_portable_at(&fx.root).expect("migrated store opens");
+        assert_eq!(portable_controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(track_ids(&portable_controller), legacy_ids);
+        portable_controller.shutdown();
     }
 }
