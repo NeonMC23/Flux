@@ -17,9 +17,13 @@
 //! - [`portable`]: the segmented `.flux` storage engine for a portable
 //!   library root — catalog + generation-qualified track segments,
 //!   crash-safe publication, backup recovery, byte-exact relative
-//!   paths, and sparse metadata overrides. The legacy index above
-//!   remains the application's startup path until the migration
-//!   milestone; the portable store is exposed and tested independently.
+//!   paths, and sparse metadata overrides.
+//! - [`migrate`]: explicit, plan-first migration from the legacy index
+//!   to a portable store at a caller-supplied root, preserving track
+//!   IDs and the ID counter. Neither the portable store nor migration
+//!   is wired into application startup yet — the legacy index above
+//!   remains the startup path until the library lifecycle milestone;
+//!   both are exposed and tested independently.
 //!
 //! # Stale-ID boundary
 //!
@@ -49,14 +53,20 @@ use std::path::{Path, PathBuf};
 
 use flux_core::{Track, TrackId};
 
+pub mod migrate;
 pub mod portable;
 pub mod scan;
 pub mod store;
 
+pub use migrate::{
+    ExclusionReason, IdGap, LegacyPath, MigrationDecision, MigrationError, MigrationPlan,
+    MigrationReport, MigrationStage, PlannedRecord,
+};
 pub use portable::{
-    Availability, EffectiveMetadata, FileFingerprint, MetadataOverrides, OpenedStore,
-    PORTABLE_SCHEMA_VERSION, PathCasePolicy, PathValidationError, PortableStore,
-    PortableStoreError, RecoveryInfo, RelPath, SegmentId, StoredTrack, TagSet,
+    Availability, EffectiveMetadata, FileFingerprint, ImportedTrack, MetadataOverrides,
+    OpenedStore, PORTABLE_SCHEMA_VERSION, PathCasePolicy, PathValidationError, PortableStore,
+    PortableStoreError, PortableSyncReport, PortableSyncSkipped, RecoveryInfo, RelPath, SegmentId,
+    StoredTrack, TagSet,
 };
 pub use scan::{SUPPORTED_EXTENSIONS, ScanIssue, ScanReport};
 pub use store::{INDEX_VERSION, StoreError};
