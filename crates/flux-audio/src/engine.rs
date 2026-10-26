@@ -476,6 +476,8 @@ impl EngineHandle {
             session != 0,
             "playback load-session identifier exhausted after 2^64 loads"
         );
+        self.shared.base_frames.store(0, Ordering::Release);
+        self.shared.played_frames.store(0, Ordering::Release);
         let _ = self.commands.send(Command::Load { session, id, path });
         session
     }
@@ -500,6 +502,8 @@ impl EngineHandle {
 
     /// Stops playback and unloads the current track.
     pub fn stop(&self) {
+        self.shared.base_frames.store(0, Ordering::Release);
+        self.shared.played_frames.store(0, Ordering::Release);
         let _ = self.commands.send(Command::Stop);
     }
 
@@ -673,8 +677,6 @@ fn run_worker<F>(
             Ok(Command::Load { session, id, path }) => {
                 current_session = session;
                 current_generation = shared.bump_generation();
-                shared.base_frames.store(0, Ordering::Release);
-                shared.played_frames.store(0, Ordering::Release);
                 decoder = None;
                 current = None;
                 converter = None;
@@ -1269,6 +1271,41 @@ mod tests {
         assert!(
             engine.waveform().iter().all(|sample| *sample == 0.0),
             "stopped output must be silent"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn seek_while_stopped_then_play_starts_at_the_target() {
+        let dir = TempDir::new("seek-stopped");
+        let path = write_two_level_wav(&dir, "two-level.wav", 44_100, 44_100, 88_200, 0.2, -0.3);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let id = TrackId::new(8);
+        engine.load(id, path);
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Loaded { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Loaded { .. })));
+
+        let _ = engine.seek(Duration::from_millis(1_500));
+        engine.play();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Started { .. })));
+        control.clear_captured();
+        for _ in 0..20 {
+            control.drain_frames(512);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let captured = control.captured();
+        assert!(
+            captured
+                .iter()
+                .filter(|sample| (**sample + 0.3).abs() < 0.01)
+                .count()
+                > 1_000,
+            "playing after a stopped seek must use the later source region"
         );
         engine.shutdown();
     }

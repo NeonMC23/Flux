@@ -25,6 +25,7 @@ use iced::advanced::widget::Tree;
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
     button, column, container, mouse_area, progress_bar, row, scrollable, slider, text, text_input,
+    tooltip,
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Rectangle, Shadow, Subscription, Task, Theme, mouse,
@@ -223,6 +224,102 @@ fn accent_button_style(_: &Theme, status: button::Status) -> button::Style {
         },
         shadow: Shadow::default(),
         snap: true,
+    }
+}
+
+fn transport_button_style(
+    primary: bool,
+    enabled: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        if !enabled {
+            return button::Style {
+                background: Some(
+                    (if primary {
+                        SURFACE_HI
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .into(),
+                ),
+                text_color: Color::from_rgba8(0x99, 0x8f, 0xa6, 0.35),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 1.0,
+                    radius: 9.0.into(),
+                },
+                shadow: Shadow::default(),
+                snap: true,
+            };
+        }
+        if primary {
+            accent_button_style(theme, status)
+        } else {
+            ghost_style(theme, status)
+        }
+    }
+}
+
+fn tooltip_style(_: &Theme) -> container::Style {
+    container::Style::default()
+        .background(SURFACE_HI)
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 7.0.into(),
+        })
+        .shadow(Shadow::default())
+}
+
+fn seek_style(_: &Theme, status: slider::Status) -> slider::Style {
+    let active = matches!(status, slider::Status::Hovered | slider::Status::Dragged);
+    let played = if active {
+        Color::from_rgb8(0xff, 0x86, 0xd8)
+    } else {
+        ACCENT
+    };
+    let remaining = if active { BORDER } else { SURFACE_HI };
+    let radius = match status {
+        slider::Status::Dragged => 7.0,
+        slider::Status::Hovered => 6.5,
+        slider::Status::Active => 6.0,
+    };
+    slider::Style {
+        rail: slider::Rail {
+            backgrounds: (played.into(), remaining.into()),
+            width: 4.0,
+            border: iced::border::rounded(2.0),
+        },
+        handle: slider::Handle {
+            shape: slider::HandleShape::Circle { radius },
+            background: ACCENT.into(),
+            border_width: 2.0,
+            border_color: BG,
+        },
+    }
+}
+
+fn volume_style(_: &Theme, status: slider::Status) -> slider::Style {
+    let active = matches!(status, slider::Status::Hovered | slider::Status::Dragged);
+    let played = if active {
+        Color::from_rgb8(0xff, 0x86, 0xd8)
+    } else {
+        ACCENT
+    };
+    slider::Style {
+        rail: slider::Rail {
+            backgrounds: (played.into(), SURFACE_HI.into()),
+            width: 3.0,
+            border: iced::border::rounded(1.5),
+        },
+        handle: slider::Handle {
+            shape: slider::HandleShape::Circle {
+                radius: if active { 5.0 } else { 4.0 },
+            },
+            background: ACCENT.into(),
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        },
     }
 }
 
@@ -515,7 +612,7 @@ impl<'a, Message> From<FlowOscilloscope<'a>> for Element<'a, Message> {
     }
 }
 
-fn queue_drag_events(
+fn global_input_events(
     event: iced::Event,
     _status: iced::event::Status,
     _window: window::Id,
@@ -523,6 +620,9 @@ fn queue_drag_events(
     match event {
         iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
             Some(Message::QueueDragRelease)
+        }
+        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { .. }) => {
+            Some(Message::SeekCommit)
         }
         iced::Event::Mouse(mouse::Event::CursorLeft) => Some(Message::QueueDragCancel),
         _ => None,
@@ -733,6 +833,7 @@ struct FluxReady {
     queue_drag: Option<QueueDrag>,
     last_queue_current: Option<QueueEntryId>,
     scope: FlowScope,
+    seek_preview: Option<f32>,
     show_setup: bool,
     queue_visible: bool,
     window_width: f32,
@@ -779,6 +880,8 @@ enum Message {
     Previous,
     CycleRepeat,
     VolumeChanged(f32),
+    SeekPreview(f32),
+    SeekCommit,
     KeyPressed(Key, Modifiers),
     Tick,
     WaveTick,
@@ -809,6 +912,7 @@ impl FluxReady {
             queue_drag: None,
             last_queue_current: current,
             scope: FlowScope::default(),
+            seek_preview: None,
             show_setup,
             queue_visible: true,
             window_width: 1_180.0,
@@ -826,7 +930,7 @@ impl FluxReady {
                 }
                 _ => None,
             }),
-            iced::event::listen_with(queue_drag_events),
+            iced::event::listen_with(global_input_events),
         ];
         if self.controller.player_state() == PlaybackState::Playing
             && self.controller.audio_status().is_ready()
@@ -842,6 +946,7 @@ impl FluxReady {
         self.migrated_dest = None;
         self.lifecycle_msg = None;
         self.queue_drag = None;
+        self.seek_preview = None;
         let current = self.controller.current_queue_entry_id();
         self.queue_page = current
             .and_then(|entry| self.controller.queue_entry_index(entry))
@@ -855,6 +960,7 @@ impl FluxReady {
         let current = self.controller.current_queue_entry_id();
         if current != self.last_queue_current {
             self.last_queue_current = current;
+            self.seek_preview = None;
             self.focus_queue_current();
         }
     }
@@ -909,6 +1015,39 @@ impl FluxReady {
             .unwrap_or(false)
         {
             self.focus_queue_entry(entry);
+        }
+    }
+
+    fn commit_seek_preview(&mut self) {
+        let Some(preview) = self.seek_preview.take() else {
+            return;
+        };
+        let Some(total) = self.controller.current_duration() else {
+            return;
+        };
+        if total.is_zero() || !preview.is_finite() {
+            return;
+        }
+        let target = Duration::from_secs_f32(preview.max(0.0)).min(total);
+        if self.controller.seek(target).is_ok() {
+            self.scope.reset();
+        }
+    }
+
+    fn seek_relative(&mut self, seconds: f32) {
+        let Some(total) = self.controller.current_duration() else {
+            return;
+        };
+        if total.is_zero() {
+            return;
+        }
+        let base = self
+            .seek_preview
+            .unwrap_or_else(|| self.controller.position().as_secs_f32());
+        self.seek_preview = None;
+        let target = Duration::from_secs_f32((base + seconds).max(0.0)).min(total);
+        if self.controller.seek(target).is_ok() {
+            self.scope.reset();
         }
     }
 
@@ -1063,6 +1202,7 @@ impl FluxReady {
                 self.queue_page = self.queue_page.saturating_add(1);
             }
             Message::PlayTrack(id) => {
+                self.seek_preview = None;
                 self.controller.play_track(id);
                 self.follow_queue_current();
             }
@@ -1104,15 +1244,35 @@ impl FluxReady {
                     drag.moved = true;
                 }
             }
-            Message::QueueDragCancel => self.cancel_queue_drag(),
-            Message::QueueDragRelease => self.finish_queue_drag(),
+            Message::QueueDragCancel => {
+                self.cancel_queue_drag();
+                self.commit_seek_preview();
+            }
+            Message::SeekPreview(value) => {
+                if let Some(total) = self.controller.current_duration()
+                    && !total.is_zero()
+                    && value.is_finite()
+                {
+                    self.seek_preview = Some(value.clamp(0.0, total.as_secs_f32()));
+                }
+            }
+            Message::SeekCommit => self.commit_seek_preview(),
+            Message::QueueDragRelease => {
+                self.finish_queue_drag();
+                self.commit_seek_preview();
+            }
             Message::TogglePlayPause => self.controller.toggle_play_pause(),
-            Message::Stop => self.controller.stop(),
+            Message::Stop => {
+                self.seek_preview = None;
+                self.controller.stop();
+            }
             Message::Next => {
+                self.seek_preview = None;
                 self.controller.next();
                 self.follow_queue_current();
             }
             Message::Previous => {
+                self.seek_preview = None;
                 self.controller.previous();
                 self.follow_queue_current();
             }
@@ -1138,6 +1298,22 @@ impl FluxReady {
                     Key::Character("n") => self.controller.next(),
                     Key::Character("p") => self.controller.previous(),
                     Key::Character("s") => self.controller.stop(),
+                    Key::Named(Named::ArrowLeft) => {
+                        let step = if modifiers.contains(Modifiers::SHIFT) {
+                            -30.0
+                        } else {
+                            -5.0
+                        };
+                        self.seek_relative(step);
+                    }
+                    Key::Named(Named::ArrowRight) => {
+                        let step = if modifiers.contains(Modifiers::SHIFT) {
+                            30.0
+                        } else {
+                            5.0
+                        };
+                        self.seek_relative(step);
+                    }
                     Key::Character("/") => {
                         return iced::widget::operation::focus(iced::widget::Id::new(
                             "flux-search",
@@ -1182,6 +1358,7 @@ impl FluxReady {
             }
             Message::WindowResized(width) => {
                 self.cancel_queue_drag();
+                self.seek_preview = None;
                 self.window_width = width;
             }
             Message::WindowCloseRequested(id) => {
@@ -1948,6 +2125,8 @@ impl FluxReady {
         let current = self.controller.current_track();
         let current_entry = self.controller.current_queue_entry();
         let state = self.controller.player_state();
+        let audio_ready = self.controller.audio_status().is_ready();
+        let playable = current.is_some_and(is_track_playable);
         let (title, subtitle) = match (current_entry, current) {
             (_, Some(track)) => (
                 track.title().to_owned(),
@@ -1962,65 +2141,86 @@ impl FluxReady {
                 "Select a track to begin".to_owned(),
             ),
         };
-        let total = current
-            .and_then(|track| {
-                track
-                    .duration()
-                    .or_else(|| self.controller.stream_info().and_then(|info| info.duration))
-            })
-            .unwrap_or(Duration::ZERO);
-        let position = self.controller.position();
-        let progress = if total.is_zero() {
-            0.0
-        } else {
-            (position.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
-        };
+
+        let total = self.controller.current_duration();
+        let total_secs = total.map_or(0.0, |duration| duration.as_secs_f32());
+        let position = self
+            .seek_preview
+            .unwrap_or_else(|| self.controller.position().as_secs_f32())
+            .clamp(0.0, total_secs.max(0.0));
+        let can_seek = audio_ready && playable && total.is_some_and(|d| !d.is_zero());
+
+        let transport_enabled = audio_ready && current.is_some();
+        let play_enabled = audio_ready && playable;
+        let skip_enabled = transport_enabled && self.controller.queue_len() > 0;
+        let stop_enabled = transport_enabled && state != PlaybackState::Stopped;
 
         let transport = row![
-            button(text("Prev").size(10))
-                .style(ghost_style)
-                .padding([7, 8])
-                .on_press(Message::Previous),
-            button(
-                text(if state == PlaybackState::Playing {
+            transport_button("|<", "Previous", false, skip_enabled, Message::Previous),
+            transport_button(
+                if state == PlaybackState::Playing {
+                    "II"
+                } else {
+                    "▶"
+                },
+                if state == PlaybackState::Playing {
                     "Pause"
                 } else {
                     "Play"
-                })
-                .size(11)
-            )
-            .style(accent_button_style)
-            .padding([7, 13])
-            .on_press(Message::TogglePlayPause),
-            button(text("Stop").size(10))
-                .style(ghost_style)
-                .padding([7, 8])
-                .on_press(Message::Stop),
-            button(text("Next").size(10))
-                .style(ghost_style)
-                .padding([7, 8])
-                .on_press(Message::Next),
-            button(text(repeat_label(self.controller.repeat_mode())).size(10))
-                .style(nav_style(self.controller.repeat_mode() != RepeatMode::Off))
-                .padding([6, 8])
-                .on_press(Message::CycleRepeat),
+                },
+                true,
+                play_enabled,
+                Message::TogglePlayPause,
+            ),
+            transport_button(">|", "Next", false, skip_enabled, Message::Next),
+            transport_button("■", "Stop", false, stop_enabled, Message::Stop),
+            repeat_button(self.controller.repeat_mode()),
         ]
-        .spacing(4)
+        .spacing(6)
         .align_y(Alignment::Center);
+        let controls = container(transport)
+            .width(Length::Fill)
+            .center_x(Length::Fill);
 
-        let volume = row![
-            text("VOL").size(9).color(MUTED),
-            slider(0.0..=1.0, self.controller.volume(), Message::VolumeChanged)
-                .step(0.01_f32)
-                .width(105),
-            text(format!(
-                "{:>3}%",
-                (self.controller.volume() * 100.0).round() as u32
-            ))
+        let total_label = total
+            .filter(|duration| !duration.is_zero())
+            .map_or_else(|| "--:--".to_owned(), format_duration);
+        let elapsed = text(format_duration(Duration::from_secs_f32(position)))
             .size(9)
-            .color(MUTED),
+            .color(if self.seek_preview.is_some() {
+                ACCENT
+            } else {
+                MUTED
+            });
+
+        let progress_bar_element: Element<'_, Message> = if can_seek {
+            let slider = slider(0.0..=total_secs, position, Message::SeekPreview)
+                .step(0.1_f32)
+                .shift_step(5.0_f32)
+                .height(18.0)
+                .width(Length::Fill)
+                .style(seek_style)
+                .on_release(Message::SeekCommit);
+            slider.into()
+        } else {
+            let progress = if total_secs > 0.0 {
+                (position / total_secs).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            progress_bar(0.0..=1.0, progress)
+                .girth(4)
+                .style(progress_style)
+                .length(Length::Fill)
+                .into()
+        };
+
+        let progress_row = row![
+            elapsed,
+            progress_bar_element,
+            text(total_label).size(9).color(MUTED),
         ]
-        .spacing(7)
+        .spacing(8)
         .align_y(Alignment::Center);
 
         let mut info = column![
@@ -2031,7 +2231,7 @@ impl FluxReady {
         ]
         .spacing(2)
         .width(Length::Fill);
-        if !self.controller.audio_status().is_ready() {
+        if !audio_ready {
             let (_, _, color) = audio_summary(self.controller.audio_status());
             info = info.push(
                 text("Audio unavailable · see Library setup")
@@ -2039,37 +2239,46 @@ impl FluxReady {
                     .color(color),
             );
         }
+        let compact = self.window_width < 1_080.0;
+        let left = container(
+            row![artwork(current, 54.0), info,]
+                .spacing(12)
+                .align_y(Alignment::Center),
+        )
+        .width(Length::Fixed(if compact { 220.0 } else { 260.0 }));
 
-        let now = row![
-            artwork(current, 54.0),
-            info,
-            transport,
-            iced::widget::Space::new().width(16),
-            volume,
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        let center = column![controls, progress_row]
+            .spacing(4)
+            .width(Length::Fill);
 
-        let progress_row = row![
-            text(format_duration(position)).size(9).color(MUTED),
-            progress_bar(0.0..=1.0, progress)
-                .girth(4)
-                .style(progress_style)
-                .length(Length::Fill),
-            text(if total.is_zero() {
-                "--:--".to_owned()
-            } else {
-                format_duration(total)
-            })
-            .size(9)
-            .color(MUTED),
-        ]
-        .spacing(9)
-        .align_y(Alignment::Center);
+        let volume_width = if compact { 78.0 } else { 105.0 };
+        let right = container(
+            row![
+                text("VOL").size(9).color(MUTED),
+                slider(0.0..=1.0, self.controller.volume(), Message::VolumeChanged)
+                    .step(0.01_f32)
+                    .style(volume_style)
+                    .width(volume_width),
+                text(format!(
+                    "{:>3}%",
+                    (self.controller.volume() * 100.0).round() as u32
+                ))
+                .size(9)
+                .color(MUTED),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fixed(if compact { 170.0 } else { 190.0 }))
+        .align_x(Alignment::End);
+
+        let top = row![left, center, right]
+            .spacing(18)
+            .align_y(Alignment::Center);
 
         container(
-            column![now, progress_row, self.oscilloscope()]
-                .spacing(6)
+            column![top, self.oscilloscope()]
+                .spacing(8)
                 .padding([8, 16]),
         )
         .width(Length::Fill)
@@ -2340,6 +2549,65 @@ fn queue_row<'a>(
     .into()
 }
 
+fn transport_button<'a>(
+    icon: &'static str,
+    label: &'static str,
+    primary: bool,
+    enabled: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    let content = container(text(icon).size(if primary { 16 } else { 12 }))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+    let button = button(content)
+        .width(Length::Fixed(if primary { 40.0 } else { 32.0 }))
+        .height(Length::Fixed(32.0))
+        .padding(0)
+        .style(transport_button_style(primary, enabled))
+        .on_press_maybe(enabled.then_some(message));
+    tooltip(
+        button,
+        container(text(label).size(10).color(TEXT))
+            .padding([4, 7])
+            .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(6)
+    .delay(Duration::from_millis(350))
+    .into()
+}
+
+fn repeat_button<'a>(mode: RepeatMode) -> Element<'a, Message> {
+    let icon = if mode == RepeatMode::One {
+        "↻1"
+    } else {
+        "↻"
+    };
+    let content = container(text(icon).size(12))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+    let button = button(content)
+        .width(Length::Fixed(32.0))
+        .height(Length::Fixed(32.0))
+        .padding(0)
+        .style(nav_style(mode != RepeatMode::Off))
+        .on_press(Message::CycleRepeat);
+    tooltip(
+        button,
+        container(text(repeat_label(mode)).size(10).color(TEXT))
+            .padding([4, 7])
+            .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(6)
+    .delay(Duration::from_millis(350))
+    .into()
+}
+
 fn repeat_label(mode: RepeatMode) -> &'static str {
     match mode {
         RepeatMode::Off => "Repeat: off",
@@ -2455,6 +2723,7 @@ mod tests {
             queue_drag: None,
             last_queue_current,
             scope: FlowScope::default(),
+            seek_preview: None,
             show_setup: false,
             queue_visible: true,
             window_width: 1_180.0,
@@ -2704,6 +2973,49 @@ mod tests {
         send(&mut gui, Message::QueueDragHover(0));
         send(&mut gui, Message::QueueDragRelease);
         assert_eq!(gui.controller.queue_len(), 0);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn seek_preview_clamps_and_clears_on_commit_or_track_change() {
+        let dir = TempDir::new("seek-preview");
+        let root = dir.path().join("music");
+        std::fs::create_dir_all(&root).expect("music dir");
+        let one = root.join("one.wav");
+        let two = root.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        std::fs::write(&two, minimal_wav()).expect("two");
+        std::fs::write(
+            dir.path().join("library-index.json"),
+            format!(
+                r#"{{"version":1,"next_id":3,"tracks":[{{"id":1,"title":"One","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":1000,"path":{{"utf8":"{}"}}}},{{"id":2,"title":"Two","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":1000,"path":{{"utf8":"{}"}}}}]}}"#,
+                one.display(),
+                two.display()
+            ),
+        )
+        .expect("index");
+        let mut gui = gui(&dir);
+        assert_eq!(
+            gui.controller.current_duration(),
+            Some(Duration::from_secs(1))
+        );
+
+        send(&mut gui, Message::SeekPreview(0.5));
+        assert_eq!(gui.seek_preview, Some(0.5));
+        send(&mut gui, Message::SeekPreview(5.0));
+        assert_eq!(gui.seek_preview, Some(1.0));
+        send(&mut gui, Message::Tick);
+        assert_eq!(
+            gui.seek_preview,
+            Some(1.0),
+            "a repaint must not commit an in-progress slider drag"
+        );
+        send(&mut gui, Message::SeekCommit);
+        assert!(gui.seek_preview.is_none());
+
+        send(&mut gui, Message::SeekPreview(250.0));
+        send(&mut gui, Message::Next);
+        assert!(gui.seek_preview.is_none(), "track changes cancel a preview");
         gui.controller.shutdown();
     }
 
