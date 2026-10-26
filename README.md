@@ -62,10 +62,11 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   (*Refresh* re-scans this session's folders). Click a track to play
   it; use the transport row for pause/stop/skip/repeat/volume; the
   search box filters by title, artist, or album. The queue panel shows
-  the whole queue with the current entry highlighted; use the row
-  arrows to reorder, `×` to remove, or click an entry to play it.
-  `+` on a library row appends it to the queue; `→` inserts it after
-  the current entry.
+  the whole queue with the current entry highlighted. Drag a row by its
+  grip to reorder it; the pink insertion line shows the drop position.
+  `Ctrl+↑`/`Ctrl+↓` moves the current entry from the keyboard, `×`
+  removes an entry, and clicking a row plays it. `+` on a library row
+  appends it to the queue; `→` inserts it after the current entry.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, `o` scan a folder
   (type the path), `r` refresh, `/` search, `q` quit. For the queue,

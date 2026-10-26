@@ -1883,6 +1883,28 @@ impl Controller {
         Ok(moved)
     }
 
+    /// Moves one queue entry to insertion gap `gap` (`0..=len`, where
+    /// `0` is before the first entry and `len` is after the last).
+    ///
+    /// Playback, the current entry identity, repeat mode, and the queue
+    /// persistence guarantees are unchanged except for the new order.
+    /// Invalid gaps or absent entries are no-ops.
+    pub fn move_queue_entry_to_gap(
+        &mut self,
+        entry: QueueEntryId,
+        gap: usize,
+    ) -> Result<bool, String> {
+        if gap > self.queue_len() || self.player.queue().entry(entry).is_none() {
+            return Ok(false);
+        }
+        let moved = self.player.queue_mut().move_entry_to_gap(entry, gap);
+        if moved {
+            self.queue_auto_library = false;
+            self.after_queue_change();
+        }
+        Ok(moved)
+    }
+
     /// Starts or resumes playback of the current selection.
     pub fn play(&mut self) {
         match self.player.play() {
@@ -5884,6 +5906,101 @@ mod tests {
             controller.player_state(),
             PlaybackState::Playing,
             "play-now adds an absent track and starts it"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn queue_gap_moves_handle_beginning_middle_and_end_without_touching_playback() {
+        let dir = TempDir::new("queue-gap-moves");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        controller.play_track(a);
+        controller.enqueue_track(a).expect("duplicate");
+        controller.set_repeat_mode(RepeatMode::All);
+        let current = controller.current_queue_entry_id().expect("current");
+        let current_track = controller
+            .current_track()
+            .map(|track| track.title().to_owned());
+        let len = controller.queue_len();
+        let b_entry = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b entry");
+
+        assert!(
+            controller
+                .move_queue_entry_to_gap(b_entry, 0)
+                .expect("beginning move")
+        );
+        assert_eq!(controller.queue_entries()[0].id(), b_entry);
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.repeat_mode(), RepeatMode::All);
+
+        assert!(
+            controller
+                .move_queue_entry_to_gap(b_entry, 2)
+                .expect("middle move")
+        );
+        assert_eq!(controller.queue_entry_index(b_entry), Some(1));
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+
+        assert!(
+            controller
+                .move_queue_entry_to_gap(current, len)
+                .expect("end move")
+        );
+        assert_eq!(
+            controller.queue_entry_index(current),
+            Some(controller.queue_len() - 1)
+        );
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_eq!(
+            controller
+                .current_track()
+                .map(|track| track.title().to_owned()),
+            current_track
+        );
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.repeat_mode(), RepeatMode::All);
+
+        let before_invalid = queue_snapshot(&controller);
+        assert!(
+            !controller
+                .move_queue_entry_to_gap(current, len + 1)
+                .expect("invalid gap is a no-op")
+        );
+        assert!(
+            !controller
+                .move_queue_entry_to_gap(QueueEntryId::new(999), 0)
+                .expect("absent entry is a no-op")
+        );
+        assert_eq!(queue_snapshot(&controller), before_invalid);
+
+        let loaded = QueueStore::new(legacy_queue_file(&dir))
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert!(!loaded.auto_library);
+        assert_eq!(loaded.queue.current_entry_id(), Some(current));
+        assert_eq!(
+            loaded
+                .queue
+                .entries()
+                .iter()
+                .map(|entry| entry.id())
+                .collect::<Vec<_>>(),
+            queue_snapshot(&controller)
+                .0
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
         );
         controller.shutdown();
     }

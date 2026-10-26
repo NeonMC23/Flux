@@ -20,9 +20,11 @@ use flux_app::{
 use flux_core::{APP_NAME, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId};
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
-    button, column, container, progress_bar, row, scrollable, slider, text, text_input,
+    button, column, container, mouse_area, progress_bar, row, scrollable, slider, text, text_input,
 };
-use iced::{Alignment, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, window};
+use iced::{
+    Alignment, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, mouse, window,
+};
 
 // ------------------------------------------------------------------ look ---
 
@@ -43,6 +45,7 @@ const SUCCESS: Color = Color::from_rgb8(0x7d, 0xe2, 0xb4);
 const TRACK_PAGE_SIZE: usize = 150;
 const GROUP_PAGE_SIZE: usize = 100;
 const QUEUE_PAGE_SIZE: usize = 8;
+const QUEUE_ROW_HEIGHT: f32 = 38.0;
 const WAVE_BARS: usize = 96;
 const WAVE_TICK: Duration = Duration::from_millis(70);
 
@@ -264,6 +267,53 @@ fn track_row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button:
     }
 }
 
+fn queue_row_style(selected: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| {
+        let background = if dragging {
+            SURFACE_HI
+        } else if selected {
+            ACCENT_SOFT
+        } else {
+            Color::TRANSPARENT
+        };
+        let border = if dragging {
+            ACCENT
+        } else if selected {
+            ACCENT_BORDER
+        } else {
+            Color::TRANSPARENT
+        };
+        container::Style::default()
+            .background(background)
+            .border(Border {
+                color: border,
+                width: if dragging || selected { 1.0 } else { 0.0 },
+                radius: 8.0.into(),
+            })
+    }
+}
+
+fn queue_gap_style(active: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| {
+        let color = if active { ACCENT } else { Color::TRANSPARENT };
+        container::Style::default()
+            .background(color)
+            .border(Border {
+                color,
+                width: 0.0,
+                radius: 1.0.into(),
+            })
+    }
+}
+
+fn queue_gap_line<'a>(active: bool) -> Element<'a, Message> {
+    container(iced::widget::Space::new().width(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fixed(2.0))
+        .style(queue_gap_style(active))
+        .into()
+}
+
 fn group_style(_: &Theme, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
@@ -312,6 +362,20 @@ fn oscilloscope_samples(
         *sample = (signal * envelope * amplitude).clamp(-1.0, 1.0);
     }
     samples
+}
+
+fn queue_drag_events(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+            Some(Message::QueueDragRelease)
+        }
+        iced::Event::Mouse(mouse::Event::CursorLeft) => Some(Message::QueueDragCancel),
+        _ => None,
+    }
 }
 
 fn audio_summary(status: &AudioStatus) -> (&'static str, String, Color) {
@@ -495,6 +559,13 @@ impl LibraryView {
     }
 }
 
+#[derive(Debug, Clone)]
+struct QueueDrag {
+    entry: QueueEntryId,
+    target_gap: Option<usize>,
+    moved: bool,
+}
+
 struct FluxReady {
     controller: Controller,
     dir_input: String,
@@ -508,6 +579,7 @@ struct FluxReady {
     selected_group: Option<String>,
     page: usize,
     queue_page: usize,
+    queue_drag: Option<QueueDrag>,
     last_queue_current: Option<QueueEntryId>,
     show_setup: bool,
     queue_visible: bool,
@@ -544,9 +616,12 @@ enum Message {
     PlayTrack(TrackId),
     EnqueueTrack(TrackId),
     PlayNextTrack(TrackId),
-    PlayQueueEntry(QueueEntryId),
     RemoveQueueEntry(QueueEntryId),
-    MoveQueueEntry(QueueEntryId, isize),
+    QueueDragStart(QueueEntryId),
+    QueueDragHover(usize),
+    QueueDragLeave,
+    QueueDragCancel,
+    QueueDragRelease,
     TogglePlayPause,
     Stop,
     Next,
@@ -580,6 +655,7 @@ impl FluxReady {
             selected_group: None,
             page: 0,
             queue_page,
+            queue_drag: None,
             last_queue_current: current,
             show_setup,
             queue_visible: true,
@@ -599,6 +675,7 @@ impl FluxReady {
                 }
                 _ => None,
             }),
+            iced::event::listen_with(queue_drag_events),
         ];
         if self.controller.player_state() == PlaybackState::Playing
             && self.controller.audio_status().is_ready()
@@ -613,6 +690,7 @@ impl FluxReady {
         self.pending_plan = None;
         self.migrated_dest = None;
         self.lifecycle_msg = None;
+        self.queue_drag = None;
         let current = self.controller.current_queue_entry_id();
         self.queue_page = current
             .and_then(|entry| self.controller.queue_entry_index(entry))
@@ -631,10 +709,55 @@ impl FluxReady {
     }
 
     fn focus_queue_current(&mut self) {
-        if let Some(entry) = self.controller.current_queue_entry_id()
-            && let Some(index) = self.controller.queue_entry_index(entry)
-        {
+        if let Some(entry) = self.controller.current_queue_entry_id() {
+            self.focus_queue_entry(entry);
+        }
+    }
+
+    fn focus_queue_entry(&mut self, entry: QueueEntryId) {
+        if let Some(index) = self.controller.queue_entry_index(entry) {
             self.queue_page = index / QUEUE_PAGE_SIZE;
+        }
+    }
+
+    fn cancel_queue_drag(&mut self) {
+        self.queue_drag = None;
+    }
+
+    fn finish_queue_drag(&mut self) {
+        let Some(drag) = self.queue_drag.take() else {
+            return;
+        };
+        if self.controller.queue_entry_index(drag.entry).is_none() {
+            return;
+        }
+        if !drag.moved {
+            let _ = self.controller.play_queue_entry(drag.entry);
+            self.follow_queue_current();
+            return;
+        }
+        let Some(gap) = drag.target_gap else {
+            return;
+        };
+        if self
+            .controller
+            .move_queue_entry_to_gap(drag.entry, gap)
+            .unwrap_or(false)
+        {
+            self.focus_queue_entry(drag.entry);
+        }
+    }
+
+    fn move_current_queue_entry(&mut self, delta: isize) {
+        let Some(entry) = self.controller.current_queue_entry_id() else {
+            return;
+        };
+        if self
+            .controller
+            .move_queue_entry_by(entry, delta)
+            .unwrap_or(false)
+        {
+            self.focus_queue_entry(entry);
         }
     }
 
@@ -774,11 +897,20 @@ impl FluxReady {
                 self.show_setup = false;
             }
             Message::ToggleSetup => self.toggle_setup(),
-            Message::ToggleQueue => self.queue_visible = !self.queue_visible,
+            Message::ToggleQueue => {
+                self.cancel_queue_drag();
+                self.queue_visible = !self.queue_visible;
+            }
             Message::PagePrev => self.page = self.page.saturating_sub(1),
             Message::PageNext => self.page = self.page.saturating_add(1),
-            Message::QueuePagePrev => self.queue_page = self.queue_page.saturating_sub(1),
-            Message::QueuePageNext => self.queue_page = self.queue_page.saturating_add(1),
+            Message::QueuePagePrev => {
+                self.cancel_queue_drag();
+                self.queue_page = self.queue_page.saturating_sub(1);
+            }
+            Message::QueuePageNext => {
+                self.cancel_queue_drag();
+                self.queue_page = self.queue_page.saturating_add(1);
+            }
             Message::PlayTrack(id) => {
                 self.controller.play_track(id);
                 self.follow_queue_current();
@@ -791,21 +923,38 @@ impl FluxReady {
                 let _ = self.controller.play_next_track(id);
                 self.follow_queue_current();
             }
-            Message::PlayQueueEntry(entry) => {
-                let _ = self.controller.play_queue_entry(entry);
-                self.follow_queue_current();
-            }
             Message::RemoveQueueEntry(entry) => {
-                let _ = self.controller.remove_queue_entry(entry);
-                self.follow_queue_current();
-                self.focus_queue_current();
-            }
-            Message::MoveQueueEntry(entry, delta) => {
-                let _ = self.controller.move_queue_entry_by(entry, delta);
-                if let Some(index) = self.controller.queue_entry_index(entry) {
-                    self.queue_page = index / QUEUE_PAGE_SIZE;
+                if self.queue_drag.is_some() {
+                    self.cancel_queue_drag();
+                } else {
+                    let _ = self.controller.remove_queue_entry(entry);
+                    self.follow_queue_current();
+                    self.focus_queue_current();
                 }
             }
+            Message::QueueDragStart(entry) => {
+                if self.controller.queue_entry_index(entry).is_some() {
+                    self.queue_drag = Some(QueueDrag {
+                        entry,
+                        target_gap: None,
+                        moved: false,
+                    });
+                }
+            }
+            Message::QueueDragHover(gap) => {
+                if let Some(drag) = &mut self.queue_drag {
+                    drag.target_gap = (gap <= self.controller.queue_len()).then_some(gap);
+                    drag.moved = true;
+                }
+            }
+            Message::QueueDragLeave => {
+                if let Some(drag) = &mut self.queue_drag {
+                    drag.target_gap = None;
+                    drag.moved = true;
+                }
+            }
+            Message::QueueDragCancel => self.cancel_queue_drag(),
+            Message::QueueDragRelease => self.finish_queue_drag(),
             Message::TogglePlayPause => self.controller.toggle_play_pause(),
             Message::Stop => self.controller.stop(),
             Message::Next => {
@@ -818,30 +967,54 @@ impl FluxReady {
             }
             Message::CycleRepeat => self.controller.cycle_repeat_mode(),
             Message::VolumeChanged(volume) => self.controller.set_volume(volume),
-            Message::KeyPressed(key, _modifiers) => match key.as_ref() {
-                Key::Named(Named::Space) => self.controller.toggle_play_pause(),
-                Key::Character("n") => self.controller.next(),
-                Key::Character("p") => self.controller.previous(),
-                Key::Character("s") => self.controller.stop(),
-                Key::Character("/") => {
-                    return iced::widget::operation::focus(iced::widget::Id::new("flux-search"));
+            Message::KeyPressed(key, modifiers) => {
+                if modifiers.contains(Modifiers::CTRL) {
+                    match key.as_ref() {
+                        Key::Named(Named::ArrowUp) => {
+                            self.cancel_queue_drag();
+                            self.move_current_queue_entry(-1);
+                        }
+                        Key::Named(Named::ArrowDown) => {
+                            self.cancel_queue_drag();
+                            self.move_current_queue_entry(1);
+                        }
+                        _ => {}
+                    }
+                    return Task::none();
                 }
-                Key::Character("1") => self.select_view(LibraryView::Tracks),
-                Key::Character("2") => self.select_view(LibraryView::Artists),
-                Key::Character("3") => self.select_view(LibraryView::Albums),
-                Key::Character("4") => self.select_view(LibraryView::Folders),
-                Key::Character("l") => self.toggle_setup(),
-                Key::Named(Named::Escape) => {
-                    self.search.clear();
-                    self.selected_group = None;
-                    self.show_setup = false;
-                    self.page = 0;
+                match key.as_ref() {
+                    Key::Named(Named::Space) => self.controller.toggle_play_pause(),
+                    Key::Character("n") => self.controller.next(),
+                    Key::Character("p") => self.controller.previous(),
+                    Key::Character("s") => self.controller.stop(),
+                    Key::Character("/") => {
+                        return iced::widget::operation::focus(iced::widget::Id::new(
+                            "flux-search",
+                        ));
+                    }
+                    Key::Character("1") => self.select_view(LibraryView::Tracks),
+                    Key::Character("2") => self.select_view(LibraryView::Artists),
+                    Key::Character("3") => self.select_view(LibraryView::Albums),
+                    Key::Character("4") => self.select_view(LibraryView::Folders),
+                    Key::Character("l") => self.toggle_setup(),
+                    Key::Named(Named::Escape) => {
+                        self.cancel_queue_drag();
+                        self.search.clear();
+                        self.selected_group = None;
+                        self.show_setup = false;
+                        self.page = 0;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Message::Tick => {
                 self.controller.poll();
                 self.follow_queue_current();
+                if let Some(entry) = self.queue_drag.as_ref().map(|drag| drag.entry)
+                    && self.controller.queue_entry_index(entry).is_none()
+                {
+                    self.cancel_queue_drag();
+                }
             }
             Message::AnimationTick => {
                 if self.controller.player_state() == PlaybackState::Playing
@@ -850,7 +1023,10 @@ impl FluxReady {
                     self.wave_phase = (self.wave_phase + 0.09) % 1_000.0;
                 }
             }
-            Message::WindowResized(width) => self.window_width = width,
+            Message::WindowResized(width) => {
+                self.cancel_queue_drag();
+                self.window_width = width;
+            }
             Message::WindowCloseRequested(id) => {
                 let _ = self.controller.save_index();
                 return window::close(id);
@@ -1536,6 +1712,8 @@ impl FluxReady {
         let start = page * QUEUE_PAGE_SIZE;
         let end = (start + QUEUE_PAGE_SIZE).min(total);
         let current_entry_id = self.controller.current_queue_entry_id();
+        let dragged = self.queue_drag.as_ref().map(|drag| drag.entry);
+        let target_gap = self.queue_drag.as_ref().and_then(|drag| drag.target_gap);
 
         panel = panel.push(
             row![
@@ -1544,6 +1722,11 @@ impl FluxReady {
                 text(format!("{total}")).size(9).color(MUTED),
             ]
             .align_y(Alignment::Center),
+        );
+        panel = panel.push(
+            text("DRAG TO REORDER · CTRL+↑/↓ CURRENT")
+                .size(8)
+                .color(MUTED),
         );
 
         if total == 0 {
@@ -1557,18 +1740,22 @@ impl FluxReady {
                 .spacing(3),
             );
         } else {
-            let mut rows = column![].spacing(3);
+            let mut rows = column![].spacing(0);
             for (offset, entry) in entries[start..end].iter().enumerate() {
                 let index = start + offset;
+                rows = rows.push(queue_gap_line(target_gap == Some(index)));
                 rows = rows.push(queue_row(
                     *entry,
                     index,
-                    total,
                     current_entry_id,
+                    dragged == Some(entry.id()),
                     self.controller.track(entry.track()),
                 ));
             }
-            panel = panel.push(scrollable(rows).height(Length::Fill));
+            rows = rows.push(queue_gap_line(target_gap == Some(end)));
+            panel = panel.push(
+                mouse_area(scrollable(rows).height(Length::Fill)).on_exit(Message::QueueDragLeave),
+            );
             panel = panel.push(
                 row![
                     text(format!("{}-{} of {total}", start + 1, end))
@@ -1951,8 +2138,8 @@ fn track_row<'a>(
 fn queue_row<'a>(
     entry: QueueEntry,
     index: usize,
-    total: usize,
     current: Option<QueueEntryId>,
+    dragging: bool,
     track: Option<&'a Track>,
 ) -> Element<'a, Message> {
     let is_current = current == Some(entry.id());
@@ -1987,39 +2174,51 @@ fn queue_row<'a>(
         column![
             text(title)
                 .size(11)
-                .color(if is_current { ACCENT } else { TEXT }),
+                .color(if is_current || dragging { ACCENT } else { TEXT }),
             text(subtitle).size(9).color(MUTED),
         ]
         .spacing(1)
         .width(Length::Fill),
         text(duration).size(9).color(MUTED),
+        text("⠿")
+            .size(12)
+            .color(if dragging { ACCENT } else { MUTED }),
     ]
     .spacing(5)
     .align_y(Alignment::Center);
 
-    let main = button(content)
+    let main = container(content)
         .width(Length::Fill)
-        .padding([4, 5])
-        .style(track_row_style(is_current))
-        .on_press_maybe(playable.then_some(Message::PlayQueueEntry(entry.id())));
-
-    let up = button(text("↑").size(10))
-        .style(ghost_style)
-        .padding([3, 4])
-        .on_press_maybe((index > 0).then_some(Message::MoveQueueEntry(entry.id(), -1)));
-    let down = button(text("↓").size(10))
-        .style(ghost_style)
-        .padding([3, 4])
-        .on_press_maybe((index + 1 < total).then_some(Message::MoveQueueEntry(entry.id(), 1)));
+        .height(Length::Fixed(QUEUE_ROW_HEIGHT))
+        .padding([3, 5])
+        .style(queue_row_style(is_current, dragging));
     let remove = button(text("×").size(11))
         .style(ghost_style)
         .padding([3, 4])
         .on_press(Message::RemoveQueueEntry(entry.id()));
 
-    row![main, up, down, remove]
-        .spacing(1)
-        .align_y(Alignment::Center)
-        .into()
+    let on_move = move |point: iced::Point| {
+        Message::QueueDragHover(if point.y < QUEUE_ROW_HEIGHT / 2.0 {
+            index
+        } else {
+            index + 1
+        })
+    };
+
+    mouse_area(
+        row![main, remove]
+            .spacing(1)
+            .height(Length::Fixed(QUEUE_ROW_HEIGHT))
+            .align_y(Alignment::Center),
+    )
+    .on_press(Message::QueueDragStart(entry.id()))
+    .on_move(on_move)
+    .interaction(if dragging {
+        mouse::Interaction::Grabbing
+    } else {
+        mouse::Interaction::Grab
+    })
+    .into()
 }
 
 fn repeat_label(mode: RepeatMode) -> &'static str {
@@ -2134,6 +2333,7 @@ mod tests {
             selected_group: None,
             page: 0,
             queue_page: 0,
+            queue_drag: None,
             last_queue_current,
             show_setup: false,
             queue_visible: true,
@@ -2293,8 +2493,8 @@ mod tests {
     }
 
     #[test]
-    fn queue_panel_messages_mutate_the_real_controller_queue() {
-        let dir = TempDir::new("queue-messages");
+    fn queue_drag_messages_reorder_without_changing_the_current_entry() {
+        let dir = TempDir::new("queue-drag");
         let root = dir.path().join("music");
         std::fs::create_dir_all(&root).expect("music dir");
         let one = root.join("one.wav");
@@ -2313,51 +2513,78 @@ mod tests {
         let mut gui = gui(&dir);
         assert_eq!(gui.controller.queue_len(), 2);
         let current = gui.controller.current_queue_entry_id().expect("current");
-
-        send(&mut gui, Message::EnqueueTrack(TrackId::new(1)));
-        assert_eq!(gui.controller.queue_len(), 3);
-        assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
-
-        send(&mut gui, Message::PlayNextTrack(TrackId::new(2)));
-        assert_eq!(gui.controller.queue_len(), 4);
-        let next_entry = gui.controller.queue_entries()[gui
-            .controller
-            .queue_entry_index(current)
-            .expect("current index")
-            + 1]
-        .id();
-        assert_eq!(
-            gui.controller
-                .queue_entries()
-                .iter()
-                .find(|entry| entry.id() == next_entry)
-                .map(|entry| entry.track()),
-            Some(TrackId::new(2))
-        );
-
-        send(&mut gui, Message::MoveQueueEntry(current, 1));
-        assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
-        assert_eq!(
-            gui.controller.queue_entry_index(current),
-            Some(1),
-            "the message reorders through Controller::move_queue_entry_by"
-        );
-
-        let duplicate = gui
+        let other = gui
             .controller
             .queue_entries()
             .iter()
-            .find(|entry| entry.track() == TrackId::new(1) && entry.id() != current)
+            .find(|entry| entry.id() != current)
             .map(|entry| entry.id())
-            .expect("duplicate entry");
-        send(&mut gui, Message::PlayQueueEntry(duplicate));
-        assert_eq!(gui.controller.current_queue_entry_id(), Some(duplicate));
+            .expect("second entry");
+        let state = gui.controller.player_state();
+        let order = |gui: &FluxReady| {
+            gui.controller
+                .queue_entries()
+                .iter()
+                .map(|entry| entry.id())
+                .collect::<Vec<_>>()
+        };
 
-        let len = gui.controller.queue_len();
-        send(&mut gui, Message::RemoveQueueEntry(duplicate));
-        assert_eq!(gui.controller.queue_len(), len - 1);
-        assert_eq!(gui.controller.player_state(), PlaybackState::Stopped);
-        assert_ne!(gui.controller.current_queue_entry_id(), Some(duplicate));
+        send(&mut gui, Message::QueueDragStart(current));
+        assert!(gui.queue_drag.is_some());
+        send(&mut gui, Message::QueueDragHover(2));
+        send(&mut gui, Message::QueueDragRelease);
+        assert_eq!(order(&gui), vec![other, current]);
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
+        assert_eq!(gui.controller.player_state(), state);
+        assert!(gui.queue_drag.is_none());
+        assert_eq!(
+            gui.controller.queue_entry_index(current),
+            Some(1),
+            "dropping at the end moved the entry, not the playback selection"
+        );
+
+        send(&mut gui, Message::EnqueueTrack(TrackId::new(1)));
+        let duplicate = *order(&gui).last().expect("duplicate at end");
+        send(&mut gui, Message::QueueDragStart(duplicate));
+        send(&mut gui, Message::QueueDragHover(0));
+        send(&mut gui, Message::QueueDragRelease);
+        assert_eq!(order(&gui), vec![duplicate, other, current]);
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
+        assert_eq!(gui.controller.player_state(), state);
+
+        let before_outside_drop = order(&gui);
+        send(&mut gui, Message::QueueDragStart(duplicate));
+        send(&mut gui, Message::QueueDragHover(2));
+        send(&mut gui, Message::QueueDragLeave);
+        send(&mut gui, Message::QueueDragRelease);
+        assert_eq!(order(&gui), before_outside_drop);
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
+        assert!(gui.queue_drag.is_none());
+
+        let before_invalid_drop = order(&gui);
+        send(&mut gui, Message::QueueDragStart(duplicate));
+        send(&mut gui, Message::QueueDragHover(99));
+        send(&mut gui, Message::QueueDragRelease);
+        assert_eq!(order(&gui), before_invalid_drop);
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
+        assert!(gui.queue_drag.is_none());
+
+        send(&mut gui, Message::QueueDragStart(current));
+        send(&mut gui, Message::QueuePageNext);
+        assert!(gui.queue_drag.is_none());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn queue_drag_on_empty_queue_is_a_safe_noop() {
+        let dir = TempDir::new("queue-drag-empty");
+        let mut gui = gui(&dir);
+        assert_eq!(gui.controller.queue_len(), 0);
+        send(&mut gui, Message::QueueDragStart(QueueEntryId::new(1)));
+        assert!(gui.queue_drag.is_none());
+        send(&mut gui, Message::QueueDragHover(0));
+        send(&mut gui, Message::QueueDragRelease);
+        assert_eq!(gui.controller.queue_len(), 0);
         gui.controller.shutdown();
     }
 

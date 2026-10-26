@@ -421,6 +421,24 @@ impl Queue {
         self.move_entry(id, target)
     }
 
+    /// Moves one entry to insertion gap `gap`.
+    ///
+    /// Gaps are the spaces between entries: `0` is before the first entry,
+    /// `len()` is after the last, and `i` is between entries `i - 1` and
+    /// `i`. Returns `false` for an absent entry, an out-of-range gap, or a
+    /// drop that would not change the order.
+    pub fn move_entry_to_gap(&mut self, id: QueueEntryId, gap: usize) -> bool {
+        if gap > self.entries.len() {
+            return false;
+        }
+        let Some(source) = self.entry_index(id) else {
+            return false;
+        };
+        // Removing the source first shifts every later gap left by one.
+        let target = if source < gap { gap - 1 } else { gap };
+        self.move_entry(id, target)
+    }
+
     /// Advances the selection as if the current track just ended on its
     /// own, and returns the track that should play next.
     ///
@@ -734,6 +752,40 @@ mod tests {
 
         assert!(!queue.move_entry_by(ids[1], -5), "clamped at start");
         assert!(!queue.move_entry(QueueEntryId::new(999), 1));
+    }
+
+    #[test]
+    fn moving_to_insertion_gaps_handles_beginning_middle_and_end() {
+        let (mut queue, ids) = queue_of(&[1, 2, 3, 4]);
+        queue.set_current_entry(ids[1]).expect("current 2");
+
+        assert!(queue.move_entry_to_gap(ids[0], 4));
+        assert_eq!(tracks(&queue), vec![2, 3, 4, 1]);
+        assert_eq!(queue.current_entry_id(), Some(ids[1]));
+
+        assert!(queue.move_entry_to_gap(ids[3], 0));
+        assert_eq!(tracks(&queue), vec![4, 2, 3, 1]);
+        assert_eq!(queue.current_entry_id(), Some(ids[1]));
+
+        assert!(queue.move_entry_to_gap(ids[0], 2));
+        assert_eq!(tracks(&queue), vec![4, 2, 1, 3]);
+        assert_eq!(queue.current_entry_id(), Some(ids[1]));
+        assert!(!queue.move_entry_to_gap(ids[0], 2), "same final position");
+        assert!(!queue.move_entry_to_gap(ids[0], 5), "gap past the end");
+        assert!(!queue.move_entry_to_gap(QueueEntryId::new(999), 1));
+    }
+
+    #[test]
+    fn moving_a_duplicate_to_a_gap_keeps_occurrences_distinct() {
+        let (mut queue, ids) = queue_of(&[7, 7, 8]);
+        queue
+            .set_current_entry(ids[1])
+            .expect("current second duplicate");
+        assert!(queue.move_entry_to_gap(ids[2], 0));
+        assert_eq!(tracks(&queue), vec![8, 7, 7]);
+        assert_eq!(queue.entries()[1].id(), ids[0]);
+        assert_eq!(queue.entries()[2].id(), ids[1]);
+        assert_eq!(queue.current_entry_id(), Some(ids[1]));
     }
 
     #[test]
