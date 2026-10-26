@@ -110,6 +110,7 @@ use std::fmt;
 
 use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
+pub use flux_audio::engine::WAVEFORM_WINDOW;
 use flux_audio::engine::{EngineEvent, EngineHandle};
 use flux_core::{PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId};
 use flux_library::portable::{
@@ -1161,6 +1162,16 @@ impl Controller {
     #[must_use]
     pub fn position(&self) -> Duration {
         self.engine.position()
+    }
+
+    /// The latest real output samples for the oscilloscope.
+    ///
+    /// These are post-gain, mono device-rate samples captured in the
+    /// audio callback through a non-blocking tap. The UI should call this
+    /// from its paint timer, never from the audio thread.
+    #[must_use]
+    pub fn waveform(&self) -> [f32; WAVEFORM_WINDOW] {
+        self.engine.waveform()
     }
 
     /// The current volume, `0.0..=1.0`.

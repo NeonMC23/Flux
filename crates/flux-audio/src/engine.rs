@@ -23,8 +23,10 @@
 //!   on decoding or the device. (The one exception is
 //!   [`EngineHandle::spawn`], which waits for the backend to open.)
 //! - The audio callback ([`FillCallback`]) only pops from a lock-free
-//!   SPSC ring buffer and fills silence on underrun — no allocation,
-//!   locking, or I/O on the real-time thread.
+//!   SPSC ring buffer, fills silence on underrun, and publishes the
+//!   final mono output into a second bounded lock-free tap for the
+//!   oscilloscope — no allocation, locking, or I/O on the real-time
+//!   thread. The GUI drains that tap on its own thread.
 //! - Every load/stop bumps a **generation counter**. The callback
 //!   discards buffered samples when the generation changes and then
 //!   *acknowledges* the new generation; the worker pushes no samples
@@ -45,14 +47,14 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flux_core::TrackId;
-use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use crate::decode::{DecodeError, Decoder, StreamInfo, open_decoder};
 use crate::output::{FillCallback, NullControl, NullOutput, OutputBackend, OutputConfig};
@@ -62,6 +64,17 @@ const DECODE_CHUNK_FRAMES: usize = 4096;
 /// Worker loop tick: how long to wait for a command before pumping
 /// more samples / checking end-of-track.
 const WORKER_TICK: Duration = Duration::from_millis(5);
+
+/// Number of post-mix samples exposed to the GUI oscilloscope.
+///
+/// This matches Flow's default Web Audio `AnalyserNode.fftSize` of 4096
+/// time-domain samples.
+pub const WAVEFORM_WINDOW: usize = 4096;
+
+/// Mono samples buffered between the audio callback and the next GUI
+/// waveform read. The callback never blocks when this is full; it drops
+/// the excess sample instead. At 48 kHz this is roughly 340 ms.
+const WAVEFORM_RING_CAPACITY: usize = 16_384;
 
 /// Errors surfaced by the engine, via [`EngineEvent::Error`] or from
 /// [`EngineHandle::spawn`].
@@ -213,11 +226,48 @@ impl Shared {
     }
 }
 
+/// GUI-side tail of the lock-free waveform tap.
+///
+/// The audio callback owns the producer side; this reader is touched
+/// only by the UI thread. It keeps the most recent [`WAVEFORM_WINDOW`]
+/// mono samples and is allowed to drop older samples when the UI is
+/// slower than the device.
+struct WaveformReader {
+    consumer: HeapCons<f32>,
+    window: VecDeque<f32>,
+}
+
+impl WaveformReader {
+    fn new(consumer: HeapCons<f32>) -> Self {
+        Self {
+            consumer,
+            window: VecDeque::with_capacity(WAVEFORM_WINDOW),
+        }
+    }
+
+    fn snapshot(&mut self) -> [f32; WAVEFORM_WINDOW] {
+        while let Some(sample) = self.consumer.try_pop() {
+            if self.window.len() == WAVEFORM_WINDOW {
+                self.window.pop_front();
+            }
+            self.window.push_back(sample);
+        }
+
+        let mut snapshot = [0.0; WAVEFORM_WINDOW];
+        let start = WAVEFORM_WINDOW.saturating_sub(self.window.len());
+        for (target, sample) in snapshot[start..].iter_mut().zip(&self.window) {
+            *target = *sample;
+        }
+        snapshot
+    }
+}
+
 /// The callback-side sample source living inside the backend.
 /// Real-time safe: pops from the lock-free ring, applies gain, counts
 /// delivered frames, and outputs silence whenever gated or starved.
 struct SampleSource {
     consumer: ringbuf::HeapCons<f32>,
+    waveform: HeapProd<f32>,
     shared: Arc<Shared>,
     channels: usize,
     seen_generation: u64,
@@ -243,10 +293,12 @@ impl FillCallback for SampleSource {
                 .acked_generation
                 .store(generation, Ordering::Release);
             out.fill(0.0);
+            self.tap(out);
             return;
         }
         if !self.shared.gate_open.load(Ordering::Acquire) {
             out.fill(0.0);
+            self.tap(out);
             return;
         }
         let popped = self.consumer.pop_slice(out);
@@ -266,6 +318,24 @@ impl FillCallback for SampleSource {
         if self.shared.decoder_eof.load(Ordering::Acquire) && self.consumer.is_empty() {
             self.shared.drained.store(true, Ordering::Release);
         }
+        self.tap(out);
+    }
+}
+
+impl SampleSource {
+    /// Publishes the final post-gain, post-remix output as a mono
+    /// stream. Real-time safe: no allocation and no blocking; excess
+    /// samples are simply dropped when the GUI has not read recently.
+    fn tap(&mut self, out: &[f32]) {
+        let channels = self.channels.max(1);
+        for frame in out.chunks_exact(channels) {
+            let mono = if channels == 1 {
+                frame[0]
+            } else {
+                frame.iter().sum::<f32>() / channels as f32
+            };
+            let _ = self.waveform.try_push(mono);
+        }
     }
 }
 
@@ -275,6 +345,7 @@ pub struct EngineHandle {
     commands: Sender<Command>,
     events: Receiver<EngineEvent>,
     shared: Arc<Shared>,
+    waveform: Arc<Mutex<WaveformReader>>,
     config: OutputConfig,
     worker: Option<std::thread::JoinHandle<()>>,
     /// Monotonic load-session allocator. A new value is minted for every
@@ -306,15 +377,27 @@ impl EngineHandle {
             std::sync::mpsc::sync_channel::<Result<OutputConfig, EngineError>>(1);
         let shared = Arc::new(Shared::new());
         let worker_shared = Arc::clone(&shared);
+        let (waveform_tx, waveform_rx) = HeapRb::<f32>::new(WAVEFORM_RING_CAPACITY).split();
+        let waveform = Arc::new(Mutex::new(WaveformReader::new(waveform_rx)));
         let worker = std::thread::Builder::new()
             .name("flux-audio-engine".to_owned())
-            .spawn(move || run_worker(make_backend, command_rx, event_tx, init_tx, worker_shared))
+            .spawn(move || {
+                run_worker(
+                    make_backend,
+                    command_rx,
+                    event_tx,
+                    init_tx,
+                    worker_shared,
+                    waveform_tx,
+                )
+            })
             .map_err(|err| EngineError::Output(format!("could not spawn engine thread: {err}")))?;
         match init_rx.recv() {
             Ok(Ok(config)) => Ok(Self {
                 commands: command_tx,
                 events: event_rx,
                 shared,
+                waveform,
                 config,
                 worker: Some(worker),
                 // 0 is reserved for "no session"; real sessions start at 1.
@@ -435,6 +518,21 @@ impl EngineHandle {
         Duration::from_secs_f64(frames as f64 / f64::from(self.config.sample_rate))
     }
 
+    /// The latest post-gain, mono output samples for visualization.
+    ///
+    /// This is the same signal that reaches the output device, captured
+    /// in the real-time callback through a lock-free producer. The
+    /// returned window is always [`WAVEFORM_WINDOW`] samples long,
+    /// zero-padded while playback has not produced a full window yet.
+    #[must_use]
+    pub fn waveform(&self) -> [f32; WAVEFORM_WINDOW] {
+        let mut reader = match self.waveform.lock() {
+            Ok(reader) => reader,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reader.snapshot()
+    }
+
     /// Stops the backend and joins the worker thread.
     pub fn shutdown(mut self) {
         self.shutdown_inner();
@@ -469,6 +567,7 @@ fn run_worker<F>(
     events: Sender<EngineEvent>,
     init: std::sync::mpsc::SyncSender<Result<OutputConfig, EngineError>>,
     shared: Arc<Shared>,
+    waveform: HeapProd<f32>,
 ) where
     F: FnOnce() -> Result<Box<dyn OutputBackend>, EngineError>,
 {
@@ -487,6 +586,7 @@ fn run_worker<F>(
     let (mut producer, consumer) = HeapRb::<f32>::new(capacity).split();
     let source = SampleSource {
         consumer,
+        waveform,
         channels: usize::from(config.channels),
         seen_generation: shared.generation.load(Ordering::Acquire),
         shared: Arc::clone(&shared),
@@ -803,7 +903,10 @@ mod tests {
 
     use flux_core::TrackId;
 
-    use super::{EngineError, EngineEvent, EngineHandle, FormatConverter, SampleSource, Shared};
+    use super::{
+        EngineError, EngineEvent, EngineHandle, FormatConverter, SampleSource, Shared,
+        WAVEFORM_WINDOW, WaveformReader,
+    };
     use crate::decode::{DecodeError, StreamInfo, open_decoder};
     use crate::output::{FillCallback, NullControl, OutputConfig};
 
@@ -904,6 +1007,79 @@ mod tests {
         // All 11_025 DC frames passed through (silence padding aside).
         assert_eq!(nonzero_frames(&control, 1), 11_025);
         assert!((engine.position().as_millis() as i64 - 250).abs() <= 12);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn waveform_tap_returns_latest_post_gain_output() {
+        let dir = TempDir::new("waveform-tap");
+        let path = write_dc_wav(&dir, "dc.wav", 44_100, 44_100, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_volume(0.5);
+
+        assert!(
+            engine.waveform().iter().all(|sample| *sample == 0.0),
+            "nothing has reached the output yet"
+        );
+
+        let id = TrackId::new(3);
+        engine.load(id, path);
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Loaded { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Loaded { .. })));
+        engine.play();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Started { .. })));
+
+        let mut waveform = engine.waveform();
+        for _ in 0..100 {
+            control.drain_frames(512);
+            waveform = engine.waveform();
+            if waveform
+                .iter()
+                .rev()
+                .take(1_000)
+                .all(|sample| (*sample - 0.2).abs() < 0.01)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(waveform.len(), WAVEFORM_WINDOW);
+        assert!(
+            waveform
+                .iter()
+                .rev()
+                .take(1_000)
+                .all(|sample| (*sample - 0.2).abs() < 0.01),
+            "the tap must expose post-gain output samples: {:?}",
+            &waveform[WAVEFORM_WINDOW - 8..]
+        );
+
+        engine.pause();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Paused { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Paused { .. })));
+        control.drain_frames(WAVEFORM_WINDOW * 2);
+        assert!(
+            engine.waveform().iter().all(|sample| *sample == 0.0),
+            "paused output must decay to the flat center line"
+        );
+
+        engine.stop();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Stopped)
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Stopped)));
+        control.drain_frames(WAVEFORM_WINDOW * 2);
+        assert!(
+            engine.waveform().iter().all(|sample| *sample == 0.0),
+            "stopped output must be silent"
+        );
         engine.shutdown();
     }
 
@@ -1729,10 +1905,13 @@ mod tests {
         use std::sync::Arc;
 
         let (mut producer, consumer) = ringbuf::HeapRb::<f32>::new(4096).split();
+        let (waveform, _waveform_consumer) =
+            ringbuf::HeapRb::<f32>::new(WAVEFORM_WINDOW * 2).split();
         let shared = Arc::new(Shared::new());
         shared.gate_open.store(true, Ordering::Release);
         let mut source = SampleSource {
             consumer,
+            waveform,
             shared: Arc::clone(&shared),
             channels: 2,
             seen_generation: 0,
@@ -1797,6 +1976,39 @@ mod tests {
         assert!(
             shared.drained.load(Ordering::Relaxed),
             "EOF with an empty ring signals end-of-track"
+        );
+    }
+
+    #[test]
+    fn waveform_tap_mixes_stereo_to_mono_and_keeps_signal_order() {
+        use ringbuf::traits::{Producer, Split};
+        use std::sync::Arc;
+
+        let (mut audio_producer, audio_consumer) = ringbuf::HeapRb::<f32>::new(64).split();
+        let (waveform, waveform_consumer) =
+            ringbuf::HeapRb::<f32>::new(WAVEFORM_WINDOW * 2).split();
+        let mut reader = WaveformReader::new(waveform_consumer);
+        let shared = Arc::new(Shared::new());
+        shared.gate_open.store(true, Ordering::Release);
+        let mut source = SampleSource {
+            consumer: audio_consumer,
+            waveform,
+            shared: Arc::clone(&shared),
+            channels: 2,
+            seen_generation: 0,
+        };
+
+        assert_eq!(
+            audio_producer.push_slice(&[0.2, 0.4, -0.2, -0.4, 0.8, 0.0]),
+            6
+        );
+        let mut out = [0.0; 6];
+        source.fill(&mut out);
+        let snapshot = reader.snapshot();
+        assert_eq!(
+            &snapshot[WAVEFORM_WINDOW - 3..],
+            &[0.3, -0.3, 0.4],
+            "stereo is averaged to mono in output order"
         );
     }
 

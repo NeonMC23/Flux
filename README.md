@@ -6,17 +6,18 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: Milestone M5 delivered; M6 reliability, queue, and
-visualization work in progress.**
+**Status: Milestone M5 delivered; M6 reliability and queue work in
+progress.**
 Both applications work end to end: scan a local music folder,
 browse/search the library, edit a persistent user-managed play queue,
 and play WAV, FLAC, MP3, AAC (ADTS streams and MP4/M4A files), Ogg
 Vorbis, and Opus with play/pause/stop, next/previous, volume, repeat
 modes, and automatic advancement, all coordinated by one shared
-controller. The GUI also has a state-reactive oscilloscope strip in
-the persistent player bar (synthetic today; the engine does not yet
-expose PCM samples). The library index (with stable track IDs) and the
-per-library queue persist between runs. The project owner
+controller. The GUI also has a real-time oscilloscope in the persistent
+player bar, driven by the same post-gain samples sent to the output
+device and reproducing Flow's Web Audio waveform processing. The
+library index (with stable track IDs) and the per-library queue persist
+between runs. The project owner
 has confirmed that real-device playback works on Nobara Linux; that is
 one machine and setup, not a claim that every codec or device has been
 independently verified — the development sandbox and CI have no audio
@@ -32,7 +33,7 @@ device, so see the verification checklist below and judge accordingly.
 | `flux-app` | library | The shared application controller: owns the library, `Player`, engine, volume, queue persistence, and index path; syncs the engine to the player's decisions; runs scans on a background thread; turns unsupported/missing/corrupt files into clear user-facing errors. Both front-ends drive this one controller and its queue operations. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution for Linux/XDG, macOS, and Windows (standard library only). |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application: folder scanning, searchable track list, interactive queue panel (play, add, play-next, remove, reorder), transport controls, volume, repeat, status/errors, and a synthetic state-reactive oscilloscope strip. |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application: folder scanning, searchable track list, interactive queue panel (play, add, play-next, remove, reorder), transport controls, volume, repeat, status/errors, and a real-time oscilloscope fed by actual post-gain output samples. |
 | `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, queue add/play-next/remove/reorder keys, full keyboard control, same controller semantics as the GUI. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + iced`,
@@ -88,6 +89,17 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   it into a fully user-managed queue that scans no longer modify.
   Entries whose tracks disappear from the library are retained and
   shown as missing until explicitly removed.
+- The oscilloscope is reproduced from Flow's
+  `src/javascript/effect.js` Web Audio time-domain analyser. Flux uses
+  a bounded lock-free tap of the real post-gain output and the same
+  4096-sample, 8-bit processing: RMS smoothing (`0.85/0.15`), a
+  `0.45 / RMS` gain target clamped to `1.0..=2.6`, attack/release
+  interpolation (`0.25/0.05`), a 48 px rounded canvas, dark background,
+  glow, and a `#ff66cc` 1 px line. Flux taps device-rate
+  post-resampling output, so sample values are not bit-for-bit identical
+  to a browser's Web Audio graph. The waveform algorithm, gain envelope,
+  colors, dimensions, and playback-state behavior mirror Flow; native
+  rasterization and pixel-level antialiasing necessarily differ.
 
 ### Playable vs. indexed formats
 
@@ -146,12 +158,12 @@ A minimal no-UI check is also available:
 ## What does not exist yet
 
 Seeking, playlists, artwork, gapless playback, crossfade, EQ,
-real-PCM/spectrum visualizers (the current oscilloscope is
-state-reactive and synthetic), still-more formats/codecs (AIFF, APE,
-WavPack, ALAC, surround Opus), folder watching, streaming providers,
-accounts, lyrics, installers, and updaters are future milestones.
-Nothing in this repository makes network requests, collects telemetry,
-or requires an account.
+frequency/spectrum visualizers (the current oscilloscope is a
+time-domain waveform), still-more formats/codecs (AIFF, APE, WavPack,
+ALAC, surround Opus), folder watching, streaming providers, accounts,
+lyrics, installers, and updaters are future milestones. Nothing in
+this repository makes network requests, collects telemetry, or
+requires an account.
 
 ## Building
 

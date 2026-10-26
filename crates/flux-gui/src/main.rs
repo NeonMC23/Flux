@@ -14,16 +14,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use flux_app::{
-    AudioStatus, Controller, MigrationPlan, ReconcileReport, StorageMode, default_index_path,
-    format_duration, is_track_playable,
+    AudioStatus, Controller, MigrationPlan, ReconcileReport, StorageMode, WAVEFORM_WINDOW,
+    default_index_path, format_duration, is_track_playable,
 };
 use flux_core::{APP_NAME, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId};
+use iced::advanced::Widget;
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::renderer::{self, Quad, Renderer as RendererTrait};
+use iced::advanced::widget::Tree;
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
     button, column, container, mouse_area, progress_bar, row, scrollable, slider, text, text_input,
 };
 use iced::{
-    Alignment, Border, Color, Element, Length, Shadow, Subscription, Task, Theme, mouse, window,
+    Alignment, Border, Color, Element, Length, Rectangle, Shadow, Subscription, Task, Theme, mouse,
+    window,
 };
 
 // ------------------------------------------------------------------ look ---
@@ -46,8 +51,12 @@ const TRACK_PAGE_SIZE: usize = 150;
 const GROUP_PAGE_SIZE: usize = 100;
 const QUEUE_PAGE_SIZE: usize = 8;
 const QUEUE_ROW_HEIGHT: f32 = 38.0;
-const WAVE_BARS: usize = 96;
-const WAVE_TICK: Duration = Duration::from_millis(70);
+const WAVE_TICK: Duration = Duration::from_millis(16);
+const OSC_HEIGHT: f32 = 48.0;
+const OSC_RADIUS: f32 = 14.0;
+const OSC_LINE_WIDTH: f32 = 1.0;
+const OSC_BACKGROUND: Color = Color::from_rgba8(6, 8, 12, 0.85);
+const OSC_COLOR: Color = Color::from_rgb8(0xff, 0x66, 0xcc);
 
 fn flux_theme() -> Theme {
     Theme::custom(
@@ -329,39 +338,181 @@ fn group_style(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// Deterministic synthetic oscilloscope shape.
+/// Flow's oscilloscope processing, reproduced from `src/javascript/effect.js`.
 ///
-/// The audio engine does not expose PCM samples today, so this is a
-/// state-reactive waveform, not a claim of real amplitude or frequency
-/// analysis. A future real-signal source can replace this function without
-/// changing the player layout.
-fn oscilloscope_samples(
-    phase: f32,
-    playing: bool,
-    paused: bool,
-    has_track: bool,
-) -> [f32; WAVE_BARS] {
-    use std::f32::consts::{PI, TAU};
+/// Flow reads 4096 byte time-domain samples from a Web Audio
+/// `AnalyserNode`, converts each byte back to a roughly -1..1 centred
+/// value, computes RMS, smooths it with `0.85/0.15`, derives a gain
+/// target of `0.45 / smoothRms` clamped to `1.0..=2.6`, and applies
+/// different attack/release interpolations (`0.25`/`0.05`). This state
+/// keeps the same per-frame calculations and the resulting normalized
+/// waveform consumed by the renderer.
+#[derive(Debug, Clone)]
+struct FlowScope {
+    samples: [f32; WAVEFORM_WINDOW],
+    smooth_rms: f32,
+    gain: f32,
+}
 
-    let amplitude = if playing {
-        1.0
-    } else if paused {
-        0.45
-    } else if has_track {
-        0.18
-    } else {
-        0.07
-    };
-    let mut samples = [0.0f32; WAVE_BARS];
-    for (index, sample) in samples.iter_mut().enumerate() {
-        let t = index as f32 / (WAVE_BARS - 1) as f32;
-        let envelope = (PI * t).sin().max(0.0);
-        let signal = (TAU * (t * 2.4 + phase * 0.35)).sin() * 0.55
-            + (TAU * (t * 6.1 - phase * 0.22)).sin() * 0.30
-            + (TAU * (t * 11.3 + phase * 0.11)).sin() * 0.15;
-        *sample = (signal * envelope * amplitude).clamp(-1.0, 1.0);
+impl Default for FlowScope {
+    fn default() -> Self {
+        Self {
+            samples: [0.0; WAVEFORM_WINDOW],
+            smooth_rms: 0.0,
+            gain: 1.0,
+        }
     }
-    samples
+}
+
+impl FlowScope {
+    fn update(&mut self, input: &[f32; WAVEFORM_WINDOW]) {
+        let mut sum = 0.0;
+        for (target, sample) in self.samples.iter_mut().zip(input) {
+            let centered = flow_centered(*sample);
+            *target = centered;
+            sum += centered * centered;
+        }
+
+        let rms = (sum / WAVEFORM_WINDOW as f32).sqrt();
+        self.smooth_rms = self.smooth_rms * 0.85 + rms * 0.15;
+        let target = if self.smooth_rms > 0.0001 {
+            0.45 / self.smooth_rms
+        } else {
+            1.0
+        }
+        .clamp(1.0, 2.6);
+        let rate = if target > self.gain { 0.25 } else { 0.05 };
+        self.gain += (target - self.gain) * rate;
+
+        for sample in &mut self.samples {
+            *sample *= self.gain;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.samples.fill(0.0);
+        self.smooth_rms = 0.0;
+        self.gain = 1.0;
+    }
+
+    fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+}
+
+/// Converts a float sample into Flow's Web Audio byte-domain value and
+/// back to the centred float Flow draws. Web Audio returns 8-bit time
+/// samples where 128 is silence.
+fn flow_centered(sample: f32) -> f32 {
+    let byte = (128.0 * (sample + 1.0)).clamp(0.0, 255.0) as u8;
+    byte as f32 / 128.0 - 1.0
+}
+
+struct FlowOscilloscope<'a> {
+    samples: &'a [f32],
+}
+
+impl<Message, Theme, R> Widget<Message, Theme, R> for FlowOscilloscope<'_>
+where
+    R: RendererTrait,
+{
+    fn size(&self) -> iced::Size<Length> {
+        iced::Size::new(Length::Fill, Length::Fixed(OSC_HEIGHT))
+    }
+
+    fn layout(&mut self, _tree: &mut Tree, _renderer: &R, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fixed(OSC_HEIGHT))
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        renderer: &mut R,
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        if bounds.width <= 0.0 || bounds.height <= 0.0 || self.samples.is_empty() {
+            return;
+        }
+        renderer.fill_quad(
+            Quad {
+                bounds,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: OSC_RADIUS.into(),
+                },
+                shadow: Shadow {
+                    color: Color::from_rgba8(0xff, 0x66, 0xcc, 0.20),
+                    offset: iced::Vector::ZERO,
+                    blur_radius: 18.0,
+                },
+                snap: false,
+            },
+            OSC_BACKGROUND,
+        );
+
+        let columns = bounds.width.ceil().max(1.0) as usize;
+        let center = bounds.y + bounds.height / 2.0;
+        let mut previous_y = center;
+
+        for column in 0..columns {
+            let t = if columns <= 1 {
+                0.0
+            } else {
+                column as f32 / (columns - 1) as f32
+            };
+            let index = (t * (self.samples.len() - 1) as f32).round() as usize;
+            let value = self.samples[index].clamp(-1.0, 1.0);
+            let y = center + value * (bounds.height / 2.0);
+            let top = previous_y.min(y);
+            let bottom = previous_y.max(y);
+            let height = (bottom - top + OSC_LINE_WIDTH).max(OSC_LINE_WIDTH);
+            renderer.fill_quad(
+                Quad {
+                    bounds: Rectangle {
+                        x: bounds.x + column as f32,
+                        y: top,
+                        width: OSC_LINE_WIDTH,
+                        height,
+                    },
+                    snap: false,
+                    ..Quad::default()
+                },
+                OSC_COLOR,
+            );
+            previous_y = y;
+        }
+
+        // Flow closes the path at the right edge with a final line back
+        // to the vertical center.
+        let x = bounds.x + bounds.width - OSC_LINE_WIDTH;
+        let top = previous_y.min(center);
+        let bottom = previous_y.max(center);
+        renderer.fill_quad(
+            Quad {
+                bounds: Rectangle {
+                    x,
+                    y: top,
+                    width: OSC_LINE_WIDTH,
+                    height: (bottom - top + OSC_LINE_WIDTH).max(OSC_LINE_WIDTH),
+                },
+                snap: false,
+                ..Quad::default()
+            },
+            OSC_COLOR,
+        );
+    }
+}
+
+impl<'a, Message> From<FlowOscilloscope<'a>> for Element<'a, Message> {
+    fn from(widget: FlowOscilloscope<'a>) -> Self {
+        Self::new(widget)
+    }
 }
 
 fn queue_drag_events(
@@ -581,10 +732,10 @@ struct FluxReady {
     queue_page: usize,
     queue_drag: Option<QueueDrag>,
     last_queue_current: Option<QueueEntryId>,
+    scope: FlowScope,
     show_setup: bool,
     queue_visible: bool,
     window_width: f32,
-    wave_phase: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -630,7 +781,7 @@ enum Message {
     VolumeChanged(f32),
     KeyPressed(Key, Modifiers),
     Tick,
-    AnimationTick,
+    WaveTick,
     WindowResized(f32),
     WindowCloseRequested(window::Id),
 }
@@ -657,10 +808,10 @@ impl FluxReady {
             queue_page,
             queue_drag: None,
             last_queue_current: current,
+            scope: FlowScope::default(),
             show_setup,
             queue_visible: true,
             window_width: 1_180.0,
-            wave_phase: 0.0,
         }
     }
 
@@ -680,7 +831,7 @@ impl FluxReady {
         if self.controller.player_state() == PlaybackState::Playing
             && self.controller.audio_status().is_ready()
         {
-            subscriptions.push(iced::time::every(WAVE_TICK).map(|_| Message::AnimationTick));
+            subscriptions.push(iced::time::every(WAVE_TICK).map(|_| Message::WaveTick));
         }
         Subscription::batch(subscriptions)
     }
@@ -696,7 +847,7 @@ impl FluxReady {
             .and_then(|entry| self.controller.queue_entry_index(entry))
             .map_or(0, |index| index / QUEUE_PAGE_SIZE);
         self.last_queue_current = current;
-        self.wave_phase = 0.0;
+        self.scope.reset();
         self.select_view(LibraryView::Tracks);
     }
 
@@ -1015,12 +1166,18 @@ impl FluxReady {
                 {
                     self.cancel_queue_drag();
                 }
+                if self.controller.player_state() != PlaybackState::Playing
+                    || !self.controller.audio_status().is_ready()
+                {
+                    self.scope.reset();
+                }
             }
-            Message::AnimationTick => {
+            Message::WaveTick => {
                 if self.controller.player_state() == PlaybackState::Playing
                     && self.controller.audio_status().is_ready()
                 {
-                    self.wave_phase = (self.wave_phase + 0.09) % 1_000.0;
+                    let waveform = self.controller.waveform();
+                    self.scope.update(&waveform);
                 }
             }
             Message::WindowResized(width) => {
@@ -1920,51 +2077,13 @@ impl FluxReady {
         .into()
     }
 
-    /// A compact, Iced-native oscilloscope strip. The samples are synthetic
-    /// and driven by playback state/phase; the engine does not expose PCM.
+    /// Flow's real-time oscilloscope, fed by post-gain output samples
+    /// captured through the engine's lock-free waveform tap.
     fn oscilloscope(&self) -> Element<'_, Message> {
-        let state = self.controller.player_state();
-        let audio_ready = self.controller.audio_status().is_ready();
-        let playing = state == PlaybackState::Playing && audio_ready;
-        let paused = state == PlaybackState::Paused && audio_ready;
-        let has_track = self.controller.current_id().is_some();
-        let samples = oscilloscope_samples(self.wave_phase, playing, paused, has_track);
-
-        let mut bars = row![]
-            .spacing(2)
-            .height(Length::Fixed(32.0))
-            .align_y(Alignment::Center);
-        for sample in samples {
-            let magnitude = sample.abs();
-            let height = 2.0 + magnitude * 26.0;
-            let color = if playing {
-                Color::from_rgba8(0xff, 0x66, 0xcc, 0.30 + magnitude * 0.60)
-            } else if paused {
-                Color::from_rgba8(0xff, 0x66, 0xcc, 0.22 + magnitude * 0.25)
-            } else {
-                Color::from_rgba8(0x99, 0x8f, 0xa6, 0.16 + magnitude * 0.16)
-            };
-            bars = bars.push(
-                container(
-                    iced::widget::Space::new()
-                        .width(Length::Fill)
-                        .height(Length::Fill),
-                )
-                .width(Length::FillPortion(1))
-                .height(Length::Fixed(height))
-                .style(move |_| {
-                    container::Style::default()
-                        .background(color)
-                        .border(iced::border::rounded(2.0))
-                }),
-            );
+        FlowOscilloscope {
+            samples: self.scope.samples(),
         }
-
-        container(bars)
-            .width(Length::Fill)
-            .height(Length::Fixed(34.0))
-            .padding([1, 0])
-            .into()
+        .into()
     }
 }
 
@@ -2335,10 +2454,10 @@ mod tests {
             queue_page: 0,
             queue_drag: None,
             last_queue_current,
+            scope: FlowScope::default(),
             show_setup: false,
             queue_visible: true,
             window_width: 1_180.0,
-            wave_phase: 0.0,
         }
     }
 
@@ -2589,34 +2708,39 @@ mod tests {
     }
 
     #[test]
-    fn oscilloscope_samples_are_deterministic_bounded_and_state_scaled() {
-        let playing = oscilloscope_samples(1.25, true, false, true);
-        let repeated = oscilloscope_samples(1.25, true, false, true);
-        assert_eq!(playing, repeated);
-        assert_eq!(playing.len(), WAVE_BARS);
-        assert!(playing.iter().all(|sample| sample.is_finite()));
-        assert!(playing.iter().all(|sample| sample.abs() <= 1.0));
+    fn flow_scope_uses_web_audio_byte_quantization() {
+        assert!((flow_centered(0.0) - 0.0).abs() < f32::EPSILON);
+        assert!((flow_centered(0.5) - 0.5).abs() < f32::EPSILON);
+        assert!((flow_centered(-0.5) + 0.5).abs() < f32::EPSILON);
+        assert!((flow_centered(-1.0) + 1.0).abs() < f32::EPSILON);
+        assert!((flow_centered(1.0) - 127.0 / 128.0).abs() < f32::EPSILON);
+    }
 
-        let paused = oscilloscope_samples(1.25, false, true, true);
-        let stopped = oscilloscope_samples(1.25, false, false, true);
-        let empty = oscilloscope_samples(1.25, false, false, false);
-        let peak = |samples: &[f32; WAVE_BARS]| {
-            samples
-                .iter()
-                .map(|sample| sample.abs())
-                .fold(0.0f32, f32::max)
-        };
+    #[test]
+    fn flow_scope_reproduces_rms_smoothing_gain_and_reset() {
+        let mut scope = FlowScope::default();
+        let loud = [0.5f32; WAVEFORM_WINDOW];
+        scope.update(&loud);
+
+        assert!((scope.smooth_rms - 0.075).abs() < 1e-6);
+        assert!((scope.gain - 1.4).abs() < 1e-6);
         assert!(
-            peak(&playing) > peak(&paused),
-            "paused state is visibly quieter"
+            scope
+                .samples()
+                .iter()
+                .all(|sample| (*sample - 0.7).abs() < 1e-6)
         );
-        assert!(peak(&paused) > peak(&stopped));
-        assert!(peak(&stopped) > peak(&empty));
-        assert_ne!(
-            playing,
-            oscilloscope_samples(2.25, true, false, true),
-            "phase advances the waveform"
-        );
+
+        let silence = [0.0f32; WAVEFORM_WINDOW];
+        scope.update(&silence);
+        assert!((scope.smooth_rms - 0.06375).abs() < 1e-6);
+        assert!((scope.gain - 1.7).abs() < 1e-6);
+        assert!(scope.samples().iter().all(|sample| *sample == 0.0));
+
+        scope.reset();
+        assert_eq!(scope.gain, 1.0);
+        assert_eq!(scope.smooth_rms, 0.0);
+        assert!(scope.samples().iter().all(|sample| *sample == 0.0));
     }
 
     fn minimal_wav() -> Vec<u8> {
