@@ -1174,6 +1174,53 @@ impl Controller {
         self.engine.waveform()
     }
 
+    /// The known duration of the current track, preferring the decoded
+    /// stream's facts over the catalogue metadata.
+    #[must_use]
+    pub fn current_duration(&self) -> Option<Duration> {
+        self.stream_info
+            .and_then(|info| info.duration)
+            .or_else(|| self.current_track().and_then(Track::duration))
+    }
+
+    /// Seeks the current track to `position`, clamped to its known
+    /// duration.
+    ///
+    /// The engine reopens and pre-rolls its decoder off the UI thread;
+    /// playback position is updated immediately and playback state is
+    /// preserved. A no-op with a clear error when no track or duration is
+    /// known. Returns the effective clamped position.
+    pub fn seek(&mut self, position: Duration) -> Result<Duration, String> {
+        let Some(id) = self.current_id() else {
+            let message = "Nothing is selected to seek.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let Some(duration) = self.current_duration() else {
+            let message = "This track has no known duration to seek within.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if duration.is_zero() {
+            let message = "This track has zero duration.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        }
+
+        let target = position.min(duration);
+        let had_loaded_track = self.engine_loaded == Some(id);
+        if !had_loaded_track && let Err(err) = self.load_into_engine(id, false) {
+            self.report_error(err.clone());
+            return Err(err);
+        }
+        let session = self.engine.seek(target);
+        self.engine_session = Some(session);
+        if self.player.state() == PlaybackState::Playing && !had_loaded_track {
+            self.engine.play();
+        }
+        Ok(target)
+    }
+
     /// The current volume, `0.0..=1.0`.
     #[must_use]
     pub fn volume(&self) -> f32 {
@@ -5918,6 +5965,51 @@ mod tests {
             PlaybackState::Playing,
             "play-now adds an absent track and starts it"
         );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_seek_clamps_and_preserves_playback_and_queue_state() {
+        let dir = TempDir::new("controller-seek");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let current = controller.current_queue_entry_id();
+        controller.play_track(a);
+        let total = controller.current_duration().expect("duration");
+
+        let target = controller
+            .seek(Duration::from_millis(100))
+            .expect("middle seek");
+        assert_eq!(target, Duration::from_millis(100));
+        assert!((controller.position().as_millis() as i64 - 100).abs() <= 2);
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_queue_entry_id(), current);
+
+        controller.pause();
+        let target = controller
+            .seek(Duration::from_secs(10))
+            .expect("clamped seek");
+        assert_eq!(target, total);
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert!((controller.position().as_millis() as i64 - total.as_millis() as i64).abs() <= 2);
+        assert_eq!(controller.current_queue_entry_id(), current);
+
+        controller.stop();
+        let target = controller
+            .seek(Duration::from_millis(50))
+            .expect("stopped seek");
+        assert_eq!(target, Duration::from_millis(50));
+        assert!((controller.position().as_millis() as i64 - 50).abs() <= 2);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.current_queue_entry_id(), current);
+
+        let queue = QueueStore::new(legacy_queue_file(&dir))
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert_eq!(queue.queue.current_entry_id(), current);
         controller.shutdown();
     }
 

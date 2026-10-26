@@ -172,6 +172,10 @@ enum Command {
         id: TrackId,
         path: PathBuf,
     },
+    Seek {
+        session: u64,
+        position: Duration,
+    },
     Play,
     Pause,
     Stop,
@@ -201,6 +205,10 @@ struct Shared {
     drained: AtomicBool,
     /// Device frames actually delivered for the current generation.
     played_frames: AtomicU64,
+    /// Device frames represented by an earlier seek. Reset on load/stop;
+    /// preserved across the callback's generation flush so a seek is
+    /// reflected immediately in [`EngineHandle::position`].
+    base_frames: AtomicU64,
 }
 
 impl Shared {
@@ -213,6 +221,7 @@ impl Shared {
             decoder_eof: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             played_frames: AtomicU64::new(0),
+            base_frames: AtomicU64::new(0),
         }
     }
 
@@ -494,6 +503,32 @@ impl EngineHandle {
         let _ = self.commands.send(Command::Stop);
     }
 
+    /// Seeks the loaded track to `position`.
+    ///
+    /// The return value is a new monotonic session for events emitted by
+    /// the seeked playback. Delayed events from the previous position are
+    /// ignored by the controller. The reported position changes
+    /// immediately; the worker reopens and fast-forwards the decoder off
+    /// the UI thread. Seeking while paused or stopped prepares the new
+    /// position without starting playback.
+    ///
+    /// The controller owns duration clamping; this layer accepts any
+    /// non-negative duration and safely reaches end-of-stream if it is
+    /// beyond the file.
+    #[must_use]
+    pub fn seek(&self, position: Duration) -> u64 {
+        let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            session != 0,
+            "playback session identifier exhausted after 2^64 requests"
+        );
+        let frames = (position.as_secs_f64() * f64::from(self.config.sample_rate)).round() as u64;
+        self.shared.base_frames.store(frames, Ordering::Release);
+        self.shared.played_frames.store(0, Ordering::Release);
+        let _ = self.commands.send(Command::Seek { session, position });
+        session
+    }
+
     /// Sets the playback gain, clamped to `0.0..=1.0` (`NaN` counts as
     /// 0). Applied immediately in the audio callback.
     pub fn set_volume(&self, volume: f32) {
@@ -514,7 +549,11 @@ impl EngineHandle {
         if self.config.sample_rate == 0 {
             return Duration::ZERO;
         }
-        let frames = self.shared.played_frames.load(Ordering::Relaxed);
+        let frames = self
+            .shared
+            .base_frames
+            .load(Ordering::Relaxed)
+            .saturating_add(self.shared.played_frames.load(Ordering::Relaxed));
         Duration::from_secs_f64(frames as f64 / f64::from(self.config.sample_rate))
     }
 
@@ -634,6 +673,8 @@ fn run_worker<F>(
             Ok(Command::Load { session, id, path }) => {
                 current_session = session;
                 current_generation = shared.bump_generation();
+                shared.base_frames.store(0, Ordering::Release);
+                shared.played_frames.store(0, Ordering::Release);
                 decoder = None;
                 current = None;
                 converter = None;
@@ -661,6 +702,120 @@ fn run_worker<F>(
                     }
                 }
             }
+            Ok(Command::Seek { session, position }) => {
+                let Some((id, path, info)) = current
+                    .as_ref()
+                    .map(|track| (track.id, track.path.clone(), track.info))
+                else {
+                    shared.base_frames.store(0, Ordering::Release);
+                    shared.played_frames.store(0, Ordering::Release);
+                    continue 'worker;
+                };
+
+                let total = info.duration;
+                let target = total.map_or(position, |duration| position.min(duration));
+                let output_rate = f64::from(config.sample_rate);
+                let source_rate = f64::from(info.sample_rate);
+                let target_output_frames = (target.as_secs_f64() * output_rate).round() as u64;
+
+                current_session = session;
+                current_generation = shared.bump_generation();
+                shared
+                    .base_frames
+                    .store(target_output_frames, Ordering::Release);
+                shared.played_frames.store(0, Ordering::Release);
+                decoder = None;
+                converter = None;
+                pending.clear();
+                pending_sent = 0;
+                ended_sent = false;
+                last_load_failed = false;
+
+                if total.is_some_and(|duration| target >= duration) {
+                    // The requested point is the end of the track. There
+                    // is no audio left to pre-roll; let the callback's
+                    // normal drained path report TrackEnded if playing.
+                    eof_reached = true;
+                    shared.decoder_eof.store(true, Ordering::Release);
+                    shared.gate_open.store(playing, Ordering::Release);
+                    continue 'worker;
+                }
+
+                let mut dec = match open_decoder(&path) {
+                    Ok(decoder) => decoder,
+                    Err(error) => {
+                        playing = false;
+                        shared.gate_open.store(false, Ordering::Release);
+                        ended_sent = true;
+                        eof_reached = true;
+                        send(EngineEvent::Error {
+                            session: Some(session),
+                            id: Some(id),
+                            error: error.into(),
+                        });
+                        continue 'worker;
+                    }
+                };
+
+                let source_frames = (target.as_secs_f64() * source_rate).round() as u64;
+                let channels = usize::from(info.channels);
+                let mut skipped = 0u64;
+                let mut hit_eof = false;
+                while skipped < source_frames {
+                    let want = (source_frames - skipped)
+                        .min(DECODE_CHUNK_FRAMES as u64)
+                        .max(1) as usize;
+                    match dec.next_chunk(want) {
+                        Ok(samples) if samples.is_empty() => {
+                            hit_eof = true;
+                            break;
+                        }
+                        Ok(samples) => {
+                            let frames = samples.len() / channels;
+                            if frames == 0 {
+                                hit_eof = true;
+                                break;
+                            }
+                            skipped = skipped.saturating_add(frames as u64);
+                        }
+                        Err(error) => {
+                            playing = false;
+                            shared.gate_open.store(false, Ordering::Release);
+                            ended_sent = true;
+                            eof_reached = true;
+                            send(EngineEvent::Error {
+                                session: Some(session),
+                                id: Some(id),
+                                error: error.into(),
+                            });
+                            continue 'worker;
+                        }
+                    }
+                }
+
+                let actual_source_frames = skipped.min(source_frames);
+                let actual_output_frames =
+                    (actual_source_frames as f64 / source_rate * output_rate).round() as u64;
+                let actual_target_frames = if hit_eof {
+                    actual_output_frames
+                } else {
+                    target_output_frames
+                };
+                shared
+                    .base_frames
+                    .store(actual_target_frames, Ordering::Release);
+                eof_reached = hit_eof;
+                decoder = Some(dec);
+                converter = Some(FormatConverter::new(&info, config));
+                if hit_eof {
+                    // The decoder is already at end-of-stream. Expose
+                    // the actual endpoint and let the normal drained
+                    // path decide whether playback ends.
+                    decoder = None;
+                    shared.decoder_eof.store(true, Ordering::Release);
+                }
+                shared.gate_open.store(playing, Ordering::Release);
+            }
             Ok(Command::Play) => match &current {
                 None => {
                     if !last_load_failed {
@@ -676,6 +831,8 @@ fn run_worker<F>(
                         // The track previously ended (or errored):
                         // pressing play restarts it from the beginning.
                         current_generation = shared.bump_generation();
+                        shared.base_frames.store(0, Ordering::Release);
+                        shared.played_frames.store(0, Ordering::Release);
                         pending.clear();
                         pending_sent = 0;
                         eof_reached = false;
@@ -717,6 +874,8 @@ fn run_worker<F>(
             }
             Ok(Command::Stop) => {
                 current_generation = shared.bump_generation();
+                shared.base_frames.store(0, Ordering::Release);
+                shared.played_frames.store(0, Ordering::Release);
                 current_session = 0;
                 last_load_failed = false;
                 decoder = None;
@@ -951,6 +1110,37 @@ mod tests {
         path
     }
 
+    /// A mono 16-bit WAV whose first `first_frames` samples are `first`
+    /// and whose remainder are `second`. Used to prove that seeking
+    /// really selects a later region of the source.
+    fn write_two_level_wav(
+        dir: &TempDir,
+        name: &str,
+        rate: u32,
+        first_frames: usize,
+        total_frames: usize,
+        first: f32,
+        second: f32,
+    ) -> PathBuf {
+        let path = dir.0.join(name);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        let a = (first * 32_767.0) as i32;
+        let b = (second * 32_767.0) as i32;
+        for index in 0..total_frames {
+            writer
+                .write_sample(if index < first_frames { a } else { b })
+                .expect("write sample");
+        }
+        writer.finalize().expect("finalize");
+        path
+    }
+
     /// Drains the null device and collects events until `done` returns
     /// true for one of them (or the iteration cap is hit). Convergence
     /// loop, not a timing assertion: the cap is generous and every
@@ -1079,6 +1269,90 @@ mod tests {
         assert!(
             engine.waveform().iter().all(|sample| *sample == 0.0),
             "stopped output must be silent"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn seek_repositions_the_source_and_preserves_paused_state() {
+        let dir = TempDir::new("seek");
+        let path = write_two_level_wav(&dir, "two-level.wav", 44_100, 44_100, 88_200, 0.2, -0.3);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let id = TrackId::new(7);
+        engine.load(id, path);
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Loaded { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Loaded { .. })));
+        engine.play();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Started { .. })));
+        control.drain_frames(2048);
+
+        let target = Duration::from_millis(1_500);
+        let _ = engine.seek(target);
+        assert!(
+            (engine.position().as_millis() as i64 - 1_500).abs() <= 2,
+            "seek must update the reported position immediately"
+        );
+        control.clear_captured();
+        for _ in 0..20 {
+            control.drain_frames(512);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let captured = control.captured();
+        assert!(
+            captured
+                .iter()
+                .filter(|sample| (**sample + 0.3).abs() < 0.01)
+                .count()
+                > 1_000,
+            "post-seek output must come from the later source region"
+        );
+
+        engine.pause();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Paused { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Paused { .. })));
+        let _ = engine.seek(Duration::from_millis(250));
+        assert!(
+            (engine.position().as_millis() as i64 - 250).abs() <= 2,
+            "a paused seek still updates position"
+        );
+        control.clear_captured();
+        control.drain_frames(4_096);
+        assert!(
+            control.captured().iter().all(|sample| *sample == 0.0),
+            "a paused seek remains silent"
+        );
+
+        engine.play();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        assert!(matches!(events.last(), Some(EngineEvent::Started { .. })));
+        control.clear_captured();
+        for _ in 0..50 {
+            control.drain_frames(512);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let captured = control.captured();
+        assert!(
+            captured
+                .iter()
+                .filter(|sample| (**sample - 0.2).abs() < 0.01)
+                .count()
+                > 1_000,
+            "resuming after a paused seek must start in the earlier source region"
+        );
+
+        let _ = engine.seek(Duration::from_secs(2));
+        assert!(
+            (engine.position().as_millis() as i64 - 2_000).abs() <= 2,
+            "seek must expose the requested endpoint"
         );
         engine.shutdown();
     }
