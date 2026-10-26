@@ -58,6 +58,8 @@ const OSC_RADIUS: f32 = 14.0;
 const OSC_LINE_WIDTH: f32 = 1.0;
 const OSC_BACKGROUND: Color = Color::from_rgba8(6, 8, 12, 0.85);
 const OSC_COLOR: Color = Color::from_rgb8(0xff, 0x66, 0xcc);
+const OSC_GLOW: Color = Color::from_rgba8(0xff, 0x66, 0xcc, 0.16);
+const OSC_GUIDE: Color = Color::from_rgba8(0xff, 0x66, 0xcc, 0.12);
 
 fn flux_theme() -> Theme {
     Theme::custom(
@@ -505,6 +507,26 @@ fn flow_centered(sample: f32) -> f32 {
     byte as f32 / 128.0 - 1.0
 }
 
+/// Samples the real waveform at a normalized horizontal position.
+///
+/// The oscilloscope has fewer horizontal pixels than the 4096-sample
+/// window on most layouts. Linear interpolation avoids the visible
+/// stair-stepping of nearest-neighbour sampling while preserving the
+/// measured peaks at the window edges.
+fn scope_sample(samples: &[f32], t: f32) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    if samples.len() == 1 {
+        return samples[0];
+    }
+    let position = t.clamp(0.0, 1.0) * (samples.len() - 1) as f32;
+    let low = position.floor() as usize;
+    let high = (low + 1).min(samples.len() - 1);
+    let fraction = position - low as f32;
+    samples[low] * (1.0 - fraction) + samples[high] * fraction
+}
+
 struct FlowOscilloscope<'a> {
     samples: &'a [f32],
 }
@@ -555,54 +577,76 @@ where
 
         let columns = bounds.width.ceil().max(1.0) as usize;
         let center = bounds.y + bounds.height / 2.0;
-        let mut previous_y = center;
 
-        for column in 0..columns {
-            let t = if columns <= 1 {
-                0.0
-            } else {
-                column as f32 / (columns - 1) as f32
-            };
-            let index = (t * (self.samples.len() - 1) as f32).round() as usize;
-            let value = self.samples[index].clamp(-1.0, 1.0);
-            let y = center + value * (bounds.height / 2.0);
-            let top = previous_y.min(y);
-            let bottom = previous_y.max(y);
-            let height = (bottom - top + OSC_LINE_WIDTH).max(OSC_LINE_WIDTH);
-            renderer.fill_quad(
-                Quad {
-                    bounds: Rectangle {
-                        x: bounds.x + column as f32,
-                        y: top,
-                        width: OSC_LINE_WIDTH,
-                        height,
-                    },
-                    snap: false,
-                    ..Quad::default()
-                },
-                OSC_COLOR,
-            );
-            previous_y = y;
-        }
-
-        // Flow closes the path at the right edge with a final line back
-        // to the vertical center.
-        let x = bounds.x + bounds.width - OSC_LINE_WIDTH;
-        let top = previous_y.min(center);
-        let bottom = previous_y.max(center);
+        // A restrained zero line makes quiet passages and the waveform
+        // envelope easier to read without competing with the signal.
         renderer.fill_quad(
             Quad {
                 bounds: Rectangle {
-                    x,
-                    y: top,
-                    width: OSC_LINE_WIDTH,
-                    height: (bottom - top + OSC_LINE_WIDTH).max(OSC_LINE_WIDTH),
+                    x: bounds.x + 8.0,
+                    y: center - 0.5,
+                    width: (bounds.width - 16.0).max(0.0),
+                    height: 1.0,
                 },
                 snap: false,
                 ..Quad::default()
             },
-            OSC_COLOR,
+            OSC_GUIDE,
         );
+
+        let mut draw_trace = |color: Color, width: f32, halo: f32| {
+            let mut previous_y = center;
+            for column in 0..columns {
+                let t = if columns <= 1 {
+                    0.0
+                } else {
+                    column as f32 / (columns - 1) as f32
+                };
+                let value = scope_sample(self.samples, t).clamp(-1.0, 1.0);
+                let y = center + value * (bounds.height / 2.0);
+                let top = previous_y.min(y);
+                let bottom = previous_y.max(y);
+                let height = (bottom - top + width + halo * 2.0).max(width);
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle {
+                            x: bounds.x + column as f32 - (width - 1.0).max(0.0) / 2.0,
+                            y: top - halo,
+                            width,
+                            height,
+                        },
+                        snap: false,
+                        ..Quad::default()
+                    },
+                    color,
+                );
+                previous_y = y;
+            }
+
+            // Flow closes the path at the right edge with a final line
+            // back to the vertical center.
+            let x = bounds.x + bounds.width - width;
+            let top = previous_y.min(center);
+            let bottom = previous_y.max(center);
+            renderer.fill_quad(
+                Quad {
+                    bounds: Rectangle {
+                        x,
+                        y: top - halo,
+                        width,
+                        height: (bottom - top + width + halo * 2.0).max(width),
+                    },
+                    snap: false,
+                    ..Quad::default()
+                },
+                color,
+            );
+        };
+
+        // A wider translucent pass gives the one-pixel Flow line a soft
+        // neon halo without changing the underlying measured samples.
+        draw_trace(OSC_GLOW, 3.0, 1.0);
+        draw_trace(OSC_COLOR, OSC_LINE_WIDTH, 0.0);
     }
 }
 
@@ -621,9 +665,11 @@ fn global_input_events(
         iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
             Some(Message::QueueDragRelease)
         }
-        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { .. }) => {
-            Some(Message::SeekCommit)
-        }
+        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+            key:
+                Key::Named(Named::ArrowLeft | Named::ArrowRight | Named::ArrowUp | Named::ArrowDown),
+            ..
+        }) => Some(Message::SeekCommit),
         iced::Event::Mouse(mouse::Event::CursorLeft) => Some(Message::QueueDragCancel),
         _ => None,
     }
@@ -1475,6 +1521,7 @@ impl FluxReady {
         );
         nav = nav.push(iced::widget::Space::new().height(Length::Fill));
         nav = nav.push(text("SPACE PLAY · N/P SKIP").size(8).color(MUTED));
+        nav = nav.push(text("←/→ SEEK · SHIFT ±30S").size(8).color(MUTED));
         nav = nav.push(text("1-4 VIEWS · L SETUP · / SEARCH").size(8).color(MUTED));
         nav = nav.push(iced::widget::Space::new().height(10));
 
@@ -3017,6 +3064,18 @@ mod tests {
         send(&mut gui, Message::Next);
         assert!(gui.seek_preview.is_none(), "track changes cancel a preview");
         gui.controller.shutdown();
+    }
+
+    #[test]
+    fn scope_sampling_interpolates_between_real_samples() {
+        let samples = [0.0, 0.5, 1.0];
+        assert!((scope_sample(&samples, 0.0) - 0.0).abs() < f32::EPSILON);
+        assert!((scope_sample(&samples, 1.0) - 1.0).abs() < f32::EPSILON);
+        assert!((scope_sample(&samples, 0.25) - 0.25).abs() < f32::EPSILON);
+        assert!((scope_sample(&samples, 0.75) - 0.75).abs() < f32::EPSILON);
+        assert!((scope_sample(&samples, -1.0) - 0.0).abs() < f32::EPSILON);
+        assert!((scope_sample(&samples, 2.0) - 1.0).abs() < f32::EPSILON);
+        assert!((scope_sample(&[], 0.5) - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]

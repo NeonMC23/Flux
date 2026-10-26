@@ -11,9 +11,9 @@ progress.**
 Both applications work end to end: scan a local music folder,
 browse/search the library, edit a persistent user-managed play queue,
 and play WAV, FLAC, MP3, AAC (ADTS streams and MP4/M4A files), Ogg
-Vorbis, and Opus with play/pause/stop, next/previous, volume, repeat
-modes, and automatic advancement, all coordinated by one shared
-controller. The GUI also has a real-time oscilloscope in the persistent
+Vorbis, and Opus with play/pause/stop, next/previous, real seeking,
+volume, repeat modes, and automatic advancement, all coordinated by one
+shared controller. The GUI also has a real-time oscilloscope in the persistent
 player bar, driven by the same post-gain samples sent to the output
 device and reproducing Flow's Web Audio waveform processing. The
 library index (with stable track IDs) and the per-library queue persist
@@ -68,6 +68,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   `Ctrl+↑`/`Ctrl+↓` moves the current entry from the keyboard, `×`
   removes an entry, and clicking a row plays it. `+` on a library row
   appends it to the queue; `→` inserts it after the current entry.
+  The bottom player’s progress bar is a real seek control: click it or
+  drag the thumb to preview a position, then release to seek. When the
+  search box is not focused, `←`/`→` seek by five seconds (hold
+  `Shift` for thirty seconds); the `Space`, `N`/`P`, and `S` transport
+  shortcuts remain available. Transport tooltips name each icon, and
+  actions that cannot run are visibly disabled.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, `o` scan a folder
   (type the path), `r` refresh, `/` search, `q` quit. For the queue,
@@ -89,6 +95,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   it into a fully user-managed queue that scans no longer modify.
   Entries whose tracks disappear from the library are retained and
   shown as missing until explicitly removed.
+- Seeking moves the actual decoder, not just the displayed timestamp.
+  The engine reopens the current file and pre-rolls to the target on its
+  worker thread, flushes buffered output from the old position, and
+  preserves playing, paused, or stopped state. On long files the
+  pre-roll is a short silent decode pass proportional to the target
+  time; the UI shows the intended position immediately.
 - The oscilloscope is reproduced from Flow's
   `src/javascript/effect.js` Web Audio time-domain analyser. Flux uses
   a bounded lock-free tap of the real post-gain output and the same
@@ -97,9 +109,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   interpolation (`0.25/0.05`), a 48 px rounded canvas, dark background,
   glow, and a `#ff66cc` 1 px line. Flux taps device-rate
   post-resampling output, so sample values are not bit-for-bit identical
-  to a browser's Web Audio graph. The waveform algorithm, gain envelope,
-  colors, dimensions, and playback-state behavior mirror Flow; native
-  rasterization and pixel-level antialiasing necessarily differ.
+  to a browser's Web Audio graph. The native renderer samples the real
+  window with linear interpolation per pixel column and adds a faint
+  zero guide plus a translucent halo; these are presentation changes
+  only, never a synthetic waveform. The waveform algorithm, gain
+  envelope, colors, dimensions, and playback-state behavior mirror Flow;
+  native rasterization and pixel-level antialiasing necessarily differ.
 
 ### Playable vs. indexed formats
 
@@ -157,7 +172,7 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Seeking, playlists, artwork, gapless playback, crossfade, EQ,
+Playlists, artwork, gapless playback, crossfade, EQ,
 frequency/spectrum visualizers (the current oscilloscope is a
 time-domain waveform), still-more formats/codecs (AIFF, APE, WavPack,
 ALAC, surround Opus), folder watching, streaming providers, accounts,
