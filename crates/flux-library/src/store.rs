@@ -12,12 +12,14 @@
 //!   versions, duplicate IDs, duplicate paths, and impossible counters
 //!   are typed errors ([`StoreError`]), never panics.
 //! - Saving writes to a sibling `<name>.tmp` file, flushes it, then
-//!   renames over the target. On Unix the rename is atomic; on Windows,
-//!   where renaming over an existing file fails, the old index is
-//!   removed first — a crash in that small window can lose the index
-//!   (a rescan can rebuild it; only the ID counter's history is lost).
-//!   A crash before the rename can leave a harmless `.tmp` file behind,
-//!   which the next save overwrites.
+//!   renames over the target. `fs::rename` replaces an existing file on
+//!   Unix and Windows, so a failed save leaves the previous index in
+//!   place; the old index is never deleted to make room. The parent
+//!   directory is not synced, so durability of the rename across a
+//!   power loss is not guaranteed (a rescan can rebuild the index, but
+//!   the ID counter's history would be lost). A crash before the rename
+//!   can leave a harmless `.tmp` file behind, which the next save
+//!   overwrites.
 //! - The caller supplies the path (typically under a `flux-platform`
 //!   data directory) and is responsible for the parent directory
 //!   existing; this module never picks locations itself.
@@ -36,6 +38,7 @@ use flux_core::{Track, TrackId, TrackSource};
 use serde::{Deserialize, Serialize};
 
 use crate::Library;
+use crate::fs_ops::replace_file;
 
 /// The only index schema version this build can read and write.
 pub const INDEX_VERSION: u32 = 1;
@@ -166,8 +169,9 @@ impl Library {
     /// versioned JSON index at `path`, replacing any existing file.
     ///
     /// The write goes through a sibling temporary file plus rename; see
-    /// the module docs for the exact durability guarantees and their
-    /// Windows caveat. The parent directory must already exist.
+    /// the module docs for the exact durability guarantees. A failed
+    /// replacement leaves any existing index untouched. The parent
+    /// directory must already exist.
     ///
     /// # Errors
     ///
@@ -204,21 +208,8 @@ impl Library {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            match fs::rename(&tmp_path, path) {
-                Ok(()) => Ok(()),
-                Err(first_err) => {
-                    // Renaming over an existing file fails on Windows;
-                    // fall back to remove-then-rename (see module docs
-                    // for the durability caveat of that window).
-                    if path.exists() {
-                        fs::remove_file(path)?;
-                        fs::rename(&tmp_path, path)?;
-                        Ok(())
-                    } else {
-                        Err(first_err.into())
-                    }
-                }
-            }
+            replace_file(&tmp_path, path)?;
+            Ok(())
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&tmp_path);

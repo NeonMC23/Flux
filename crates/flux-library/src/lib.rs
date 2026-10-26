@@ -53,22 +53,28 @@ use std::path::{Path, PathBuf};
 
 use flux_core::{Track, TrackId};
 
+mod fs_ops;
+pub mod library_lock;
 pub mod migrate;
 pub mod portable;
+pub mod queue_store;
 pub mod scan;
 pub mod store;
 
+pub use library_lock::{LibraryLock, LibraryLockError};
 pub use migrate::{
     ExclusionReason, IdGap, LegacyPath, MigrationDecision, MigrationError, MigrationPlan,
     MigrationReport, MigrationStage, PlannedRecord,
 };
 pub use portable::{
     Availability, EffectiveMetadata, FileFingerprint, ImportedTrack, MetadataOverrides,
-    OpenedStore, PORTABLE_SCHEMA_VERSION, PathCasePolicy, PathValidationError, PortableStore,
-    PortableStoreError, PortableSyncReport, PortableSyncSkipped, ReconcileOutcome, ReconcileReport,
-    RecoveryInfo, RelPath, RelinkCandidates, RelinkError, SegmentId, StoredTrack, TagSet,
-    reconcile_portable_store, refresh_library_from_portable_store, relink_portable_track,
+    OpenedStore, PORTABLE_SCHEMA_VERSION, PathCasePolicy, PathValidationError,
+    PortableRefreshReport, PortableStore, PortableStoreError, PortableSyncReport,
+    PortableSyncSkipped, ReconcileOutcome, ReconcileReport, RecoveryInfo, RelPath,
+    RelinkCandidates, RelinkError, SegmentId, StoredTrack, TagSet, reconcile_portable_store,
+    refresh_library_from_portable_store, relink_portable_track,
 };
+pub use queue_store::{LoadedQueue, QUEUE_SCHEMA_VERSION, QueueStore, QueueStoreError};
 pub use scan::{SUPPORTED_EXTENSIONS, ScanIssue, ScanReport};
 pub use store::{INDEX_VERSION, StoreError};
 

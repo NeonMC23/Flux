@@ -81,9 +81,12 @@
 //!   from rename; crash *durability* additionally relies on file and
 //!   directory `sync_all`. Directory synchronization is performed on
 //!   Unix; on Windows `std` offers no directory sync, so durability
-//!   there is best-effort plus the backup ladder (renaming *over* the
-//!   catalogue on Windows falls back to remove-then-rename, as in the
-//!   legacy store — the backup written just before covers that window).
+//!   there is best-effort plus the backup ladder. Catalogue replacement
+//!   uses a plain `fs::rename`, which replaces an existing file on both
+//!   Unix and Windows; a failed rename leaves the previously published
+//!   catalogue in place, and the backup written just before it covers a
+//!   crash in the publication window. Windows behavior is designed for
+//!   but not executed by this project's Linux-based test suite.
 //! - Validation detects torn/truncated files, stale-generation
 //!   references, count/order/uniqueness violations, and counter
 //!   regressions. It does not detect in-place bit-rot that keeps the
@@ -111,6 +114,7 @@ use flux_core::{Track, TrackId, TrackSource};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Library;
+use crate::fs_ops::replace_file;
 
 /// The `.flux` schema version this build reads and writes. (The legacy
 /// single-file index in [`crate::store`] is an independent format with
@@ -1463,25 +1467,6 @@ fn finalize_no_overwrite(
     }
     fs::rename(temp, &target)?;
     Ok(())
-}
-
-/// Renames `temp` over `target`, replacing it. On Unix the rename is
-/// atomic; on Windows renaming over an existing file fails in `std`,
-/// so fall back to remove-then-rename (the legacy store's approach) —
-/// callers order operations so a crash in that window is recoverable.
-fn replace_file(temp: &Path, target: &Path) -> Result<(), PortableStoreError> {
-    match fs::rename(temp, target) {
-        Ok(()) => Ok(()),
-        Err(first) => {
-            if target.exists() {
-                fs::remove_file(target)?;
-                fs::rename(temp, target)?;
-                Ok(())
-            } else {
-                Err(first.into())
-            }
-        }
-    }
 }
 
 // ----------------------------------------------------------------- store ---
@@ -3526,33 +3511,89 @@ pub fn relink_portable_track(
     Ok(observed)
 }
 
-/// Rebuilds the in-memory [`Library`] from the store (e.g. after
-/// reconciliation changed paths), while carrying over tracks that
-/// exist only in memory — ones a sync intentionally skipped
+/// The result of [`refresh_library_from_portable_store`].
+pub struct PortableRefreshReport {
+    /// The rebuilt runtime library: every store record this platform can
+    /// represent (with effective metadata and store precedence), followed
+    /// by the surviving in-memory-only tracks.
+    pub library: Library,
+    /// Store records whose relative path cannot be represented on this
+    /// platform, as in [`Library::from_portable_store`].
+    pub skipped_store_records: usize,
+    /// In-memory-only tracks that could not be carried over because a
+    /// store record already owns the same path under the store's path
+    /// case policy. The store record won; these IDs are reported instead
+    /// of creating a second runtime owner for one path.
+    pub dropped_memory_only: Vec<TrackId>,
+}
+
+/// The store's path-identity key for a runtime path inside the store
+/// root, or `None` for paths outside it (or paths the portable schema
+/// cannot represent, which therefore cannot collide with a stored path).
+fn runtime_path_key(path: &Path, store: &PortableStore) -> Option<PathKey> {
+    let relative = path.strip_prefix(store.root()).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    let relative = RelPath::from_os_path(relative).ok()?;
+    Some(path_key(&relative, store.case_policy()))
+}
+
+/// Rebuilds the in-memory [`Library`] from the store (e.g. after a
+/// portable scan, reconciliation, or relinking), while carrying over
+/// tracks that exist only in memory — ones a sync intentionally skipped
 /// (outside the root, unrepresentable, …) — so a refresh can never
-/// silently drop them. Store records win for shared IDs; the ID
-/// counter is the maximum of both. Returns the rebuilt library and
-/// how many store records this platform could not represent (as in
-/// [`Library::from_portable_store`]).
+/// silently drop them.
+///
+/// Precedence is explicit:
+///
+/// - A record in the store owns its `TrackId` and its path. Its
+///   effective metadata (overrides → embedded tags → folder/file
+///   fallbacks) is used, never a raw tag-derived runtime value.
+/// - A current track whose ID the store holds is replaced by the store
+///   record (the store is authoritative for persistent records).
+/// - A current track unknown to the store is carried over only if its
+///   path is not already owned by a store record under the store's path
+///   case policy. A conflicting memory-only track is reported in
+///   [`PortableRefreshReport::dropped_memory_only`] rather than creating
+///   duplicate path ownership in the rebuilt [`Library`].
+/// - The next-ID counter is the maximum of the store's and the current
+///   library's, so IDs issued to memory-only tracks are never reused.
 #[must_use]
 pub fn refresh_library_from_portable_store(
     current: &Library,
     store: &PortableStore,
-) -> (Library, usize) {
-    let (rebuilt, skipped) = Library::from_portable_store(store);
+) -> PortableRefreshReport {
+    let (rebuilt, skipped_store_records) = Library::from_portable_store(store);
     let (rebuilt_tracks, rebuilt_next) = rebuilt.parts();
     let mut tracks: Vec<(TrackId, Track)> = rebuilt_tracks.to_vec();
-    let mut present: HashSet<TrackId> = tracks.iter().map(|(id, _)| *id).collect();
+    let mut present_ids: HashSet<TrackId> = tracks.iter().map(|(id, _)| *id).collect();
+    let mut claimed_paths: HashSet<PathKey> = store
+        .iter()
+        .map(|record| path_key(record.path(), store.case_policy()))
+        .collect();
+    let mut dropped_memory_only = Vec::new();
+
     let (current_tracks, current_next) = current.parts();
     for (id, track) in current_tracks {
-        if store.get(*id).is_none() && present.insert(*id) {
-            tracks.push((*id, track.clone()));
+        if store.get(*id).is_some() || present_ids.contains(id) {
+            continue;
         }
+        if let Some(key) = runtime_path_key(track.source().path(), store)
+            && !claimed_paths.insert(key)
+        {
+            dropped_memory_only.push(*id);
+            continue;
+        }
+        present_ids.insert(*id);
+        tracks.push((*id, track.clone()));
     }
-    (
-        Library::from_parts(tracks, rebuilt_next.max(current_next)),
-        skipped,
-    )
+
+    PortableRefreshReport {
+        library: Library::from_parts(tracks, rebuilt_next.max(current_next)),
+        skipped_store_records,
+        dropped_memory_only,
+    }
 }
 
 #[cfg(test)]
@@ -3560,10 +3601,10 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use flux_core::TrackId;
+    use flux_core::{Track, TrackId, TrackSource};
 
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, flac_bytes};
 
     fn rel(path: &str) -> RelPath {
         RelPath::from_utf8(path).expect("valid relative path")
@@ -5912,9 +5953,10 @@ mod tests {
             .expect("move in store");
         store.commit().expect("publish");
 
-        let (refreshed, skipped) = refresh_library_from_portable_store(&library, &store);
-        assert_eq!(skipped, 0);
-        let (tracks_after, _) = refreshed.parts();
+        let refreshed = refresh_library_from_portable_store(&library, &store);
+        assert_eq!(refreshed.skipped_store_records, 0);
+        assert!(refreshed.dropped_memory_only.is_empty());
+        let (tracks_after, _) = refreshed.library.parts();
         assert_eq!(
             tracks_after.len(),
             2,
@@ -5933,5 +5975,162 @@ mod tests {
             tracks_after.iter().any(|(id, _)| *id == memory_only_id),
             "in-memory-only track preserved"
         );
+    }
+
+    #[test]
+    fn rescan_refreshes_tag_snapshot_without_losing_override() {
+        let dir = TempDir::new("override-rescan");
+        let song = dir.write("song.flac", &flac_bytes(&[("TITLE", "Tag One")]));
+        let id = TrackId::new(1);
+
+        let fingerprint = FileFingerprint {
+            size_bytes: 123,
+            modified_unix_ms: 456,
+        };
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let mut record = imported(1, "song.flac");
+        record.availability = Availability::Present;
+        record.file = Some(fingerprint);
+        record.tags = title_tags("Tag One");
+        record.overrides.set_title("User Title".to_owned());
+        store.import_tracks(vec![record], 2).expect("import");
+        store.commit().expect("commit");
+
+        let (mut library, _) = Library::from_portable_store(&store);
+        assert_eq!(
+            library.get(id).expect("track").title(),
+            "User Title",
+            "the store's effective metadata applies the override"
+        );
+
+        // The user changes the embedded tag, outside Flux. A scan reads
+        // the new tag; the portable sync must capture it as the tag
+        // snapshot without turning it into the effective title.
+        fs::write(&song, flac_bytes(&[("TITLE", "Tag Two")])).expect("rewrite tag");
+        let scan = library.scan(&[dir.path()]);
+        assert_eq!(scan.updated(), 1);
+        assert_eq!(
+            library.get(id).expect("track").title(),
+            "Tag Two",
+            "a raw scan updates the runtime view; the portable layer must reconcile it"
+        );
+
+        let sync = sync_library_to_portable_store(&library, &mut store).expect("sync");
+        assert_eq!(sync.updated, 1);
+        store.commit().expect("commit");
+
+        let stored = store.get(id).expect("stored");
+        assert_eq!(
+            stored.tags().title.as_deref(),
+            Some("Tag Two"),
+            "the embedded-tag snapshot was refreshed"
+        );
+        assert_eq!(
+            stored.overrides().title(),
+            Some(Some("User Title")),
+            "the user override was not replaced by the tag"
+        );
+        assert_eq!(
+            stored.availability(),
+            Availability::Present,
+            "a scan/sync does not rewrite availability"
+        );
+        assert_eq!(
+            stored.file(),
+            Some(fingerprint),
+            "a scan/sync does not rewrite the fingerprint"
+        );
+        assert_eq!(stored.added_unix_ms(), 111, "added time is preserved");
+        assert_eq!(stored.effective_metadata().title, "User Title");
+
+        let refreshed = refresh_library_from_portable_store(&library, &store);
+        assert!(refreshed.dropped_memory_only.is_empty());
+        assert_eq!(
+            refreshed.library.get(id).expect("track").title(),
+            "User Title",
+            "rebuilding from the store restores override precedence"
+        );
+
+        // Removing the override (not the explicit tri-state "cleared"
+        // value) reveals the refreshed underlying tag.
+        store
+            .set_overrides(id, MetadataOverrides::new())
+            .expect("remove override");
+        store.commit().expect("commit");
+        let refreshed = refresh_library_from_portable_store(&refreshed.library, &store);
+        assert_eq!(
+            refreshed.library.get(id).expect("track").title(),
+            "Tag Two",
+            "without an override the refreshed embedded tag applies"
+        );
+
+        // The explicit tri-state "cleared" value is different from
+        // removing the override: it deliberately suppresses the tag and
+        // keeps the documented filename fallback.
+        let mut cleared = MetadataOverrides::new();
+        cleared.clear_title();
+        store
+            .set_overrides(id, cleared)
+            .expect("set explicit clear");
+        store.commit().expect("commit");
+        let refreshed = refresh_library_from_portable_store(&refreshed.library, &store);
+        assert_eq!(
+            refreshed.library.get(id).expect("track").title(),
+            "song",
+            "an explicit clear keeps the filename fallback instead of the tag"
+        );
+    }
+
+    #[test]
+    fn refresh_store_path_wins_over_conflicting_memory_only_track() {
+        let dir = TempDir::new("refresh-path-conflict");
+        let memory_file = dir.write("memory.flac", b"memory");
+        dir.write("stored.flac", b"stored");
+
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let stored_id = store
+            .add_track(
+                rel("stored.flac"),
+                Availability::Present,
+                None,
+                title_tags("Stored"),
+            )
+            .expect("add stored");
+        store.commit().expect("commit");
+
+        let (mut library, _) = Library::from_portable_store(&store);
+        let memory_id = library.insert(Track::new("Memory only", TrackSource::local(&memory_file)));
+        assert_eq!(memory_id, TrackId::new(2));
+
+        // Simulate the store later claiming the memory-only track's
+        // path (for example an external catalogue change).
+        store
+            .set_path(stored_id, rel("memory.flac"))
+            .expect("move stored record onto the memory path");
+        store.commit().expect("commit");
+
+        let refreshed = refresh_library_from_portable_store(&library, &store);
+        assert_eq!(
+            refreshed.dropped_memory_only,
+            vec![memory_id],
+            "the conflicting memory-only track is reported, never silently ignored"
+        );
+        assert_eq!(refreshed.library.len(), 1, "one owner per path");
+        assert!(
+            refreshed.library.get(memory_id).is_none(),
+            "the persistent store record wins the path"
+        );
+        assert_eq!(
+            refreshed.library.id_for_path(&memory_file),
+            Some(stored_id),
+            "the store record owns the path and the index resolves it"
+        );
+        for (id, track) in refreshed.library.iter() {
+            assert_eq!(
+                refreshed.library.id_for_path(track.source().path()),
+                Some(id),
+                "the derived path index must mirror every rebuilt record"
+            );
+        }
     }
 }

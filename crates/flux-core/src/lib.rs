@@ -20,7 +20,7 @@ pub mod queue;
 pub mod track;
 
 pub use error::{Error, Result};
-pub use queue::{PlaybackState, Queue, RepeatMode};
+pub use queue::{PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode};
 pub use track::{Track, TrackId, TrackSource};
 
 /// Product name shown by every Flux entry point.

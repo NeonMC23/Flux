@@ -6,6 +6,7 @@
 
 use std::fmt;
 
+use crate::queue::QueueEntryId;
 use crate::track::TrackId;
 
 /// Result alias used throughout Flux's backend-independent logic.
@@ -29,6 +30,12 @@ pub enum Error {
         /// The track ID that could not be found in the queue.
         id: TrackId,
     },
+    /// A queue entry identity was expected to be in the queue, but was
+    /// not present (for example, it was already removed).
+    QueueEntryNotFound {
+        /// The entry ID that could not be found.
+        id: QueueEntryId,
+    },
 }
 
 impl fmt::Display for Error {
@@ -42,6 +49,9 @@ impl fmt::Display for Error {
                 )
             }
             Self::TrackNotInQueue { id } => write!(f, "track {id} is not in the queue"),
+            Self::QueueEntryNotFound { id } => {
+                write!(f, "queue entry {id} is not in the queue")
+            }
         }
     }
 }

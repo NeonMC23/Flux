@@ -17,15 +17,21 @@
 //! - `↑`/`k`, `↓`/`j` move; `PgUp`/`PgDn`, `g`/`G` jump
 //! - `Enter` play selected, `Space` play/pause, `s` stop
 //! - `n` next, `p` previous, `+`/`-` volume, `R` cycle repeat
+//! - `a` add selected track to the queue, `x` play it next,
+//!   `Delete` remove the current queue entry, `Ctrl+↑`/`Ctrl+↓`
+//!   reorder the current queue entry
 //! - `o` scan a folder (type a path), `r` refresh scanned folders
 //! - `/` search/filter, `Esc` clear search or cancel input
 //! - `q` or `Ctrl-C` quit (terminal state is always restored)
+//! - `U` preserve and replace an unreadable legacy app index (writes
+//!   are otherwise disabled so it can never be overwritten)
 //! - `O` open a portable library (type its folder), `C` create one,
 //!   `M` migrate a legacy index (type index file, then destination
-//!   folder; review the plan, `y` executes, `Esc` cancels; afterwards
-//!   `a` opens the migrated library), `B` switch back to the app
-//!   library index, `A` acknowledge a recovered library, `X`
-//!   reconcile the portable catalogue with the filesystem (refresh
+//!   folder; review the plan, `y` executes, `Esc` cancels; in the
+//!   migration-complete screen, `a` opens the migrated library), `B`
+//!   switch back to the app library index, `A` acknowledge a recovered
+//!   library, `X` reconcile the portable catalogue with the filesystem
+//!   (refresh
 //!   availability/fingerprints; missing records are kept and
 //!   possible new locations are only reported, never auto-applied)
 //!
@@ -136,13 +142,14 @@ struct Tui {
 }
 
 impl Tui {
-    /// The visible rows, owned so drawing/handling can mutate the UI
-    /// state while iterating (the call happens at most ~10×/s).
-    fn rows(&self) -> Vec<(TrackId, Track)> {
+    /// IDs of the visible rows. Only IDs are collected; track metadata
+    /// is looked up for the handful of rows actually drawn. Cloning every
+    /// `Track` on each redraw was unnecessary work for large libraries.
+    fn rows(&self) -> Vec<TrackId> {
         self.controller
             .search(&self.search)
             .into_iter()
-            .map(|(id, track)| (id, track.clone()))
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -172,6 +179,20 @@ impl Tui {
         if ctrl_c {
             return true;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Up | KeyCode::Down => {
+                    if let Some(entry) = self.controller.current_queue_entry_id() {
+                        let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                        let _ = self.controller.move_queue_entry_by(entry, delta);
+                    } else {
+                        self.lifecycle_msg = Some("The queue is empty.".to_owned());
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
         let len = self.rows().len();
         match key.code {
             KeyCode::Char('q') => return true,
@@ -186,12 +207,28 @@ impl Tui {
             KeyCode::Char('g') | KeyCode::Home => self.cursor = 0,
             KeyCode::Char('G') | KeyCode::End => self.cursor = len.saturating_sub(1),
             KeyCode::Enter => {
-                if let Some((id, _)) = self.rows().get(self.cursor) {
-                    let id = *id;
+                if let Some(id) = self.rows().get(self.cursor).copied() {
                     self.controller.play_track(id);
                 }
             }
             KeyCode::Char(' ') => self.controller.toggle_play_pause(),
+            KeyCode::Char('a') => {
+                if let Some(id) = self.rows().get(self.cursor).copied() {
+                    let _ = self.controller.enqueue_track(id);
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(id) = self.rows().get(self.cursor).copied() {
+                    let _ = self.controller.play_next_track(id);
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(entry) = self.controller.current_queue_entry_id() {
+                    let _ = self.controller.remove_queue_entry(entry);
+                } else {
+                    self.lifecycle_msg = Some("The queue is empty.".to_owned());
+                }
+            }
             KeyCode::Char('s') => self.controller.stop(),
             KeyCode::Char('n') => {
                 self.controller.next();
@@ -228,6 +265,22 @@ impl Tui {
                     .is_ok()
                 {
                     self.after_switch();
+                }
+            }
+            KeyCode::Char('U') => {
+                if !self.controller.legacy_index_write_protected() {
+                    self.lifecycle_msg =
+                        Some("The active library index is not write-protected.".to_owned());
+                } else {
+                    match self.controller.replace_unreadable_legacy_index() {
+                        Ok(backup) => {
+                            self.lifecycle_msg = Some(format!(
+                                "Unreadable index preserved as {}; scanning and saving are enabled.",
+                                backup.display()
+                            ));
+                        }
+                        Err(err) => self.lifecycle_msg = Some(err),
+                    }
                 }
             }
             KeyCode::Char('A') => {
@@ -407,7 +460,7 @@ impl Tui {
     /// After next/previous, put the cursor on the player's selection.
     fn follow_current(&mut self) {
         if let Some(current) = self.controller.current_id()
-            && let Some(pos) = self.rows().iter().position(|(id, _)| *id == current)
+            && let Some(pos) = self.rows().iter().position(|id| *id == current)
         {
             self.cursor = pos;
         }
@@ -444,21 +497,38 @@ impl Tui {
                 None => "library: portable".to_owned(),
             },
         };
-        let mut header = format!("Flux {MILESTONE} — terminal player   [{library_label}]");
+        let mut header = format!(
+            "Flux {MILESTONE} — terminal player   [{library_label}]   [queue {}]",
+            self.controller.queue_len()
+        );
         if self.controller.portable_recovery().is_some() {
             header.push_str("   [recovered — read-only, A acknowledges]");
         }
+        if self.controller.legacy_index_write_protected() {
+            header.push_str("   [index protected — U preserves & replaces]");
+        }
         if self.controller.is_scanning() {
             header.push_str("   [scanning…]");
-        }
-        if let Some(reason) = self.controller.audio_status().reason() {
-            header.push_str(&format!("   [audio: {reason}]"));
         }
         self.line(out, 0, &header, width, true)?;
 
         // Now playing.
         self.line(out, 1, &self.now_playing_line(width), width, false)?;
-        self.line(out, 2, "", width, false)?;
+        // Audio availability gets its own line so the reason remains
+        // readable on narrow terminals.
+        if let Some(reason) = self.controller.audio_status().reason() {
+            queue!(out, SetForegroundColor(Color::DarkYellow))?;
+            self.line(
+                out,
+                2,
+                &format!("Audio unavailable — {reason}"),
+                width,
+                false,
+            )?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+        } else {
+            self.line(out, 2, "", width, false)?;
+        }
 
         // Track list.
         if rows.is_empty() {
@@ -469,8 +539,11 @@ impl Tui {
             };
             self.line(out, list_top as u16, msg, width, false)?;
         }
-        for (row, (id, track)) in rows.iter().skip(self.offset).take(list_height).enumerate() {
+        for (row, id) in rows.iter().skip(self.offset).take(list_height).enumerate() {
             let index = self.offset + row;
+            let Some(track) = self.controller.track(*id) else {
+                continue;
+            };
             let mut text = format!(
                 "{} {} {}",
                 if index == self.cursor { ">" } else { " " },
@@ -506,9 +579,10 @@ impl Tui {
 
         // Help / input line.
         let help = match self.mode {
-            Mode::Normal => "Enter play · Space pause · s stop · n/p next/prev · +/- volume \
-                             · o scan · r refresh · / search · R repeat · O open library \
-                             · C create · M migrate · B app index · X reconcile · q quit"
+            Mode::Normal => "Enter play · Space pause · s stop · n/p skip · a add · x next \
+                             · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
+                             · / search · R repeat · O open · C create · M migrate \
+                             · B index · U fix · X reconcile · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
@@ -586,6 +660,9 @@ impl Tui {
                     format_duration(self.controller.position()),
                 )
             }
+            None if self.controller.current_queue_entry_id().is_some() => {
+                format!("{state_icon} Queue entry missing from the library    Vol {volume}%")
+            }
             None => format!("{state_icon} Nothing selected    Vol {volume}%"),
         }
     }
@@ -654,7 +731,8 @@ fn pad_with_right(left: &str, right: &str, width: usize) -> String {
 }
 
 fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
-    let mut controller = Controller::open_default();
+    let mut controller =
+        Controller::open_default().map_err(|err| std::io::Error::other(err.to_string()))?;
     if let Some(dir) = initial_dir {
         controller.begin_scan(dir);
     }
@@ -729,7 +807,8 @@ mod tests {
                 engine,
                 audio,
                 Some(dir.path().join("library-index.json")),
-            ),
+            )
+            .expect("controller opens the test library"),
             cursor: 0,
             offset: 0,
             mode: Mode::Normal,
@@ -890,6 +969,93 @@ mod tests {
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&0u32.to_le_bytes());
         wav
+    }
+
+    #[test]
+    fn protected_index_key_preserves_and_reenables_writes() {
+        let dir = TempDir::new("protected-index");
+        let index = dir.path().join("library-index.json");
+        std::fs::write(&index, b"not a valid index").expect("corrupt index");
+        let mut tui = tui(&dir);
+        assert!(tui.controller.legacy_index_write_protected());
+
+        key(&mut tui, KeyCode::Char('U'));
+        assert!(!tui.controller.legacy_index_write_protected());
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("preserved")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
+        tui.controller.save_index().expect("new index writes");
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn queue_keys_route_add_play_next_remove_and_reorder_through_controller() {
+        let dir = TempDir::new("queue-keys");
+        let root = dir.path().join("music");
+        std::fs::create_dir_all(&root).expect("music dir");
+        let one = root.join("one.wav");
+        let two = root.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        std::fs::write(&two, minimal_wav()).expect("two");
+        std::fs::write(
+            dir.path().join("library-index.json"),
+            format!(
+                r#"{{"version":1,"next_id":3,"tracks":[{{"id":1,"title":"One","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}},{{"id":2,"title":"Two","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
+                one.display(),
+                two.display()
+            ),
+        )
+        .expect("index");
+        let mut tui = tui(&dir);
+        assert_eq!(tui.controller.queue_len(), 2);
+
+        key(&mut tui, KeyCode::Char('a'));
+        assert_eq!(
+            tui.controller.queue_len(),
+            3,
+            "a appends the selected track"
+        );
+
+        key(&mut tui, KeyCode::Delete);
+        assert_eq!(
+            tui.controller.queue_len(),
+            2,
+            "Delete removes the current queue entry"
+        );
+        assert_eq!(
+            tui.controller.player_state(),
+            flux_core::PlaybackState::Stopped
+        );
+
+        key(&mut tui, KeyCode::Char('x'));
+        assert_eq!(
+            tui.controller.queue_len(),
+            3,
+            "x inserts the selected track after the current entry"
+        );
+        let current = tui
+            .controller
+            .current_queue_entry_id()
+            .expect("current after removal/reinsertion");
+        let before = tui
+            .controller
+            .queue_entry_index(current)
+            .expect("current index");
+        assert!(
+            !tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
+            "Ctrl+Down is not quit"
+        );
+        assert_eq!(
+            tui.controller.current_queue_entry_id(),
+            Some(current),
+            "reordering keeps the current entry identity"
+        );
+        assert_eq!(tui.controller.queue_entry_index(current), Some(before + 1));
+        tui.controller.shutdown();
     }
 
     #[test]

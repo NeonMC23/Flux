@@ -46,7 +46,7 @@ pub mod output;
 #[cfg(feature = "cpal")]
 pub mod cpal_output;
 
-use flux_core::{Error, PlaybackState, Queue, RepeatMode, Result, TrackId};
+use flux_core::{Error, PlaybackState, Queue, QueueEntryId, RepeatMode, Result, TrackId};
 
 /// A playback-control model with a single queue and state.
 ///
@@ -125,6 +125,12 @@ impl Player {
         self.queue.current()
     }
 
+    /// The stable identity of the current queue entry, if any.
+    #[must_use]
+    pub fn current_entry_id(&self) -> Option<QueueEntryId> {
+        self.queue.current_entry_id()
+    }
+
     /// Starts (or resumes) playback of the currently selected track.
     ///
     /// # Errors
@@ -147,6 +153,19 @@ impl Player {
     /// unchanged — if the track is not in the queue.
     pub fn play_track(&mut self, id: TrackId) -> Result<()> {
         self.queue.set_current_by_id(id)?;
+        self.state = PlaybackState::Playing;
+        Ok(())
+    }
+
+    /// Selects one specific queue entry and starts playing it. This is the
+    /// duplicate-safe counterpart of [`play_track`](Self::play_track).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::QueueEntryNotFound`] — leaving selection and state
+    /// unchanged — if the entry is not in the queue.
+    pub fn play_entry(&mut self, entry: QueueEntryId) -> Result<()> {
+        self.queue.set_current_entry(entry)?;
         self.state = PlaybackState::Playing;
         Ok(())
     }
@@ -220,7 +239,7 @@ impl Player {
 
 #[cfg(test)]
 mod tests {
-    use flux_core::{Error, PlaybackState, RepeatMode, TrackId};
+    use flux_core::{Error, PlaybackState, QueueEntryId, RepeatMode, TrackId};
 
     use super::Player;
 
@@ -298,6 +317,26 @@ mod tests {
         );
         assert_eq!(player.state(), PlaybackState::Playing);
         assert_eq!(player.current_track(), Some(TrackId::new(3)));
+    }
+
+    #[test]
+    fn play_entry_distinguishes_duplicate_tracks() {
+        let mut player = Player::new();
+        let first = player.queue_mut().push(TrackId::new(1));
+        let second = player.queue_mut().push(TrackId::new(1));
+        assert_ne!(first, second);
+
+        player.play_entry(second).expect("duplicate entry selected");
+        assert_eq!(player.current_entry_id(), Some(second));
+        assert_eq!(player.current_track(), Some(TrackId::new(1)));
+        assert_eq!(player.state(), PlaybackState::Playing);
+
+        let unknown = QueueEntryId::new(999);
+        assert_eq!(
+            player.play_entry(unknown),
+            Err(Error::QueueEntryNotFound { id: unknown })
+        );
+        assert_eq!(player.current_entry_id(), Some(second));
     }
 
     #[test]

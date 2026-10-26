@@ -107,6 +107,8 @@ impl From<DecodeError> for EngineError {
 pub enum EngineEvent {
     /// A track was opened successfully and is ready to play.
     Loaded {
+        /// The load session returned by [`EngineHandle::load`].
+        session: u64,
         /// The caller-supplied track ID.
         id: TrackId,
         /// The decoded stream's facts (file sample rate/channels).
@@ -114,11 +116,15 @@ pub enum EngineEvent {
     },
     /// Playback of the track started or resumed.
     Started {
+        /// The load session this playback belongs to.
+        session: u64,
         /// The track that started.
         id: TrackId,
     },
     /// Playback of the track paused.
     Paused {
+        /// The load session this playback belongs to.
+        session: u64,
         /// The track that paused.
         id: TrackId,
     },
@@ -127,13 +133,18 @@ pub enum EngineEvent {
     /// The track played to completion: every decoded sample has been
     /// consumed by the backend.
     TrackEnded {
+        /// The load session that ended.
+        session: u64,
         /// The track that ended.
         id: TrackId,
     },
-    /// Something failed. `id` is the track concerned, when applicable.
+    /// Something failed. `session` is the load attempt concerned when
+    /// applicable; `None` denotes a global output or command error.
     /// After a decode error the engine is stopped with nothing playing;
     /// the caller (via [`crate::Player`]) decides what happens next.
     Error {
+        /// The load session concerned, if any.
+        session: Option<u64>,
         /// The track concerned, if any.
         id: Option<TrackId>,
         /// What failed.
@@ -143,7 +154,11 @@ pub enum EngineEvent {
 
 /// Commands understood by the worker (handle methods enqueue these).
 enum Command {
-    Load { id: TrackId, path: PathBuf },
+    Load {
+        session: u64,
+        id: TrackId,
+        path: PathBuf,
+    },
     Play,
     Pause,
     Stop,
@@ -262,6 +277,10 @@ pub struct EngineHandle {
     shared: Arc<Shared>,
     config: OutputConfig,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Monotonic load-session allocator. A new value is minted for every
+    /// load request so delayed events can be correlated even when the
+    /// same track is loaded repeatedly.
+    next_session: AtomicU64,
 }
 
 impl EngineHandle {
@@ -298,6 +317,8 @@ impl EngineHandle {
                 shared,
                 config,
                 worker: Some(worker),
+                // 0 is reserved for "no session"; real sessions start at 1.
+                next_session: AtomicU64::new(1),
             }),
             Ok(Err(err)) => {
                 let _ = worker.join();
@@ -352,14 +373,30 @@ impl EngineHandle {
     /// (buffered samples of the old track are discarded). Does not
     /// start playback; listen for [`EngineEvent::Loaded`] (or
     /// [`EngineEvent::Error`]) and then call [`play`](Self::play).
-    pub fn load(&self, id: TrackId, path: PathBuf) {
-        let _ = self.commands.send(Command::Load { id, path });
+    ///
+    /// Returns the monotonically increasing **load session** that will
+    /// appear on events for this attempt. Comparing sessions lets a
+    /// caller ignore delayed events from an earlier load of the same
+    /// track.
+    pub fn load(&self, id: TrackId, path: PathBuf) -> u64 {
+        let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            session != 0,
+            "playback load-session identifier exhausted after 2^64 loads"
+        );
+        let _ = self.commands.send(Command::Load { session, id, path });
+        session
     }
 
     /// Starts or resumes playback of the loaded track. If the track
     /// previously played to completion, it restarts from the beginning.
-    /// Emits [`EngineEvent::Started`], or [`EngineEvent::Error`] with
-    /// [`EngineError::NoTrackLoaded`] when nothing is loaded.
+    /// Emits [`EngineEvent::Started`].
+    ///
+    /// If no track is loaded because the most recent load failed, the
+    /// original load error is the only failure reported; a redundant
+    /// [`EngineError::NoTrackLoaded`] is not emitted. A play request
+    /// with nothing loaded *and* no preceding load failure still reports
+    /// [`EngineError::NoTrackLoaded`].
     pub fn play(&self) {
         let _ = self.commands.send(Command::Play);
     }
@@ -457,6 +494,7 @@ fn run_worker<F>(
     let error_events = events.clone();
     let on_error = Box::new(move |message: String| {
         let _ = error_events.send(EngineEvent::Error {
+            session: None,
             id: None,
             error: EngineError::Output(message),
         });
@@ -485,10 +523,16 @@ fn run_worker<F>(
     // The generation this worker's decoder/pending state belongs to.
     // Only the worker bumps generations, so this mirror is exact.
     let mut current_generation = shared.generation.load(Ordering::Acquire);
+    // The session of the most recent Load attempt. 0 means none.
+    let mut current_session = 0u64;
+    // A failed load already reported the meaningful error; a Play that
+    // arrives immediately afterwards must not add NoTrackLoaded.
+    let mut last_load_failed = false;
 
     'worker: loop {
         match commands.recv_timeout(WORKER_TICK) {
-            Ok(Command::Load { id, path }) => {
+            Ok(Command::Load { session, id, path }) => {
+                current_session = session;
                 current_generation = shared.bump_generation();
                 decoder = None;
                 current = None;
@@ -498,25 +542,35 @@ fn run_worker<F>(
                 playing = false;
                 eof_reached = false;
                 ended_sent = false;
+                last_load_failed = false;
                 match open_decoder(&path) {
                     Ok(dec) => {
                         let info = *dec.info();
                         converter = Some(FormatConverter::new(&info, config));
                         decoder = Some(dec);
                         current = Some(LoadedTrack { id, path, info });
-                        send(EngineEvent::Loaded { id, info });
+                        send(EngineEvent::Loaded { session, id, info });
                     }
-                    Err(err) => send(EngineEvent::Error {
-                        id: Some(id),
-                        error: err.into(),
-                    }),
+                    Err(err) => {
+                        last_load_failed = true;
+                        send(EngineEvent::Error {
+                            session: Some(session),
+                            id: Some(id),
+                            error: err.into(),
+                        });
+                    }
                 }
             }
             Ok(Command::Play) => match &current {
-                None => send(EngineEvent::Error {
-                    id: None,
-                    error: EngineError::NoTrackLoaded,
-                }),
+                None => {
+                    if !last_load_failed {
+                        send(EngineEvent::Error {
+                            session: None,
+                            id: None,
+                            error: EngineError::NoTrackLoaded,
+                        });
+                    }
+                }
                 Some(track) => {
                     if decoder.is_none() {
                         // The track previously ended (or errored):
@@ -533,6 +587,7 @@ fn run_worker<F>(
                             }
                             Err(err) => {
                                 send(EngineEvent::Error {
+                                    session: Some(current_session),
                                     id: Some(track.id),
                                     error: err.into(),
                                 });
@@ -542,7 +597,10 @@ fn run_worker<F>(
                     }
                     playing = true;
                     shared.gate_open.store(true, Ordering::Release);
-                    send(EngineEvent::Started { id: track.id });
+                    send(EngineEvent::Started {
+                        session: current_session,
+                        id: track.id,
+                    });
                 }
             },
             Ok(Command::Pause) => {
@@ -550,12 +608,17 @@ fn run_worker<F>(
                     playing = false;
                     shared.gate_open.store(false, Ordering::Release);
                     if let Some(track) = &current {
-                        send(EngineEvent::Paused { id: track.id });
+                        send(EngineEvent::Paused {
+                            session: current_session,
+                            id: track.id,
+                        });
                     }
                 }
             }
             Ok(Command::Stop) => {
                 current_generation = shared.bump_generation();
+                current_session = 0;
+                last_load_failed = false;
                 decoder = None;
                 current = None;
                 converter = None;
@@ -607,6 +670,7 @@ fn run_worker<F>(
                     Err(err) => {
                         let id = current.as_ref().map(|t| t.id);
                         send(EngineEvent::Error {
+                            session: Some(current_session),
                             id,
                             error: err.into(),
                         });
@@ -632,7 +696,10 @@ fn run_worker<F>(
         // the callback through Shared::drained).
         if playing && !ended_sent && shared.drained.load(Ordering::Acquire) {
             if let Some(track) = &current {
-                send(EngineEvent::TrackEnded { id: track.id });
+                send(EngineEvent::TrackEnded {
+                    session: current_session,
+                    id: track.id,
+                });
             }
             ended_sent = true;
             playing = false;
@@ -823,7 +890,7 @@ mod tests {
             matches!(e, EngineEvent::Loaded { .. })
         });
         assert!(
-            matches!(events.last(), Some(EngineEvent::Loaded { id: got, info }) if *got == id && info.sample_rate == 44_100)
+            matches!(events.last(), Some(EngineEvent::Loaded { id: got, info, .. }) if *got == id && info.sample_rate == 44_100)
         );
 
         engine.play();
@@ -831,7 +898,7 @@ mod tests {
             matches!(e, EngineEvent::TrackEnded { .. })
         });
         assert!(
-            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got }) if *got == id),
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got, .. }) if *got == id),
             "expected TrackEnded, got {events:?}"
         );
         // All 11_025 DC frames passed through (silence padding aside).
@@ -957,7 +1024,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .all(|e| !matches!(e, EngineEvent::TrackEnded { id } if *id == id_a)),
+                .all(|e| !matches!(e, EngineEvent::TrackEnded { id, .. } if *id == id_a)),
             "track A must never report TrackEnded: {events:?}"
         );
         let captured = control.captured();
@@ -1025,7 +1092,7 @@ mod tests {
         engine.pause();
         let events = collect_events_until(&engine, |e| matches!(e, EngineEvent::Paused { .. }));
         assert!(
-            matches!(events.last(), Some(EngineEvent::Paused { id: got }) if *got == id),
+            matches!(events.last(), Some(EngineEvent::Paused { id: got, .. }) if *got == id),
             "expected Paused, got {events:?}"
         );
         assert_eq!(
@@ -1041,7 +1108,7 @@ mod tests {
             matches!(e, EngineEvent::TrackEnded { .. })
         });
         assert!(
-            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got }) if *got == id),
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got, .. }) if *got == id),
             "expected TrackEnded, got {events:?}"
         );
         assert_eq!(nonzero_frames(&control, 1), 44_100);
@@ -1067,7 +1134,7 @@ mod tests {
         engine.pause();
         let events = collect_events_until(&engine, |e| matches!(e, EngineEvent::Paused { .. }));
         assert!(
-            matches!(events.last(), Some(EngineEvent::Paused { id: got }) if *got == id_b),
+            matches!(events.last(), Some(EngineEvent::Paused { id: got, .. }) if *got == id_b),
             "expected Paused for track B, got {events:?}"
         );
         assert_eq!(
@@ -1081,13 +1148,13 @@ mod tests {
             matches!(e, EngineEvent::TrackEnded { .. })
         });
         assert!(
-            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got }) if *got == id_b),
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id: got, .. }) if *got == id_b),
             "expected TrackEnded for track B, got {events:?}"
         );
         assert!(
             events
                 .iter()
-                .all(|e| !matches!(e, EngineEvent::TrackEnded { id } if *id == id_a)),
+                .all(|e| !matches!(e, EngineEvent::TrackEnded { id, .. } if *id == id_a)),
             "track A must never report TrackEnded: {events:?}"
         );
         let captured = control.captured();
@@ -1098,6 +1165,66 @@ mod tests {
             "only silence or track B's DC level may appear"
         );
         assert_eq!(nonzero_frames(&control, 1), 11_025);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn every_load_mints_a_distinct_monotonic_session() {
+        let dir = TempDir::new("session-ids");
+        let path = write_dc_wav(&dir, "dc.wav", 44_100, 44_100, 0.4);
+        let (engine, _control) = EngineHandle::spawn_null(44_100, 1);
+        let id = TrackId::new(1);
+
+        let first = engine.load(id, path.clone());
+        let second = engine.load(id, path);
+        assert_ne!(first, 0, "0 is reserved for no session");
+        assert!(second > first, "sessions must increase: {first}, {second}");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn failed_load_does_not_emit_redundant_no_track_error() {
+        let dir = TempDir::new("failed-load-play");
+        let bad = dir.0.join("bad.wav");
+        fs::write(&bad, b"not a real wav").expect("bad fixture");
+        let good = write_dc_wav(&dir, "good.wav", 44_100, 44_100, 0.4);
+        let (engine, _control) = EngineHandle::spawn_null(44_100, 1);
+
+        let bad_id = TrackId::new(1);
+        let good_id = TrackId::new(2);
+        let bad_session = engine.load(bad_id, bad);
+        engine.play(); // the controller does this immediately after load
+        engine.load(good_id, good);
+        let events = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == good_id),
+        );
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Error {
+                    session: Some(session),
+                    id: Some(id),
+                    ..
+                } if *session == bad_session && *id == bad_id
+            )),
+            "the meaningful load error must remain: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Error {
+                    error: EngineError::NoTrackLoaded,
+                    ..
+                }
+            )),
+            "a failed load must not add a second NoTrackLoaded error: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Loaded { id, .. }) if *id == good_id),
+            "the follow-up load must succeed: {events:?}"
+        );
         engine.shutdown();
     }
 
@@ -1130,8 +1257,10 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(EngineEvent::Error {
+                session: Some(_),
                 id: Some(_),
-                error: EngineError::Decode(DecodeError::UnsupportedFormat { .. })
+                error: EngineError::Decode(DecodeError::UnsupportedFormat { .. }),
+                ..
             })
         ));
 
@@ -1201,7 +1330,7 @@ mod tests {
                 matches!(e, EngineEvent::Loaded { .. } | EngineEvent::Error { .. })
             });
             assert!(
-                matches!(events.last(), Some(EngineEvent::Loaded { id: got, info })
+                matches!(events.last(), Some(EngineEvent::Loaded { id: got, info, .. })
                     if *got == id && info.sample_rate == rate && info.channels == channels),
                 "{name}: unexpected load outcome {events:?}"
             );
@@ -1213,7 +1342,7 @@ mod tests {
                 )
             });
             assert!(
-                matches!(events.last(), Some(EngineEvent::TrackEnded { id: got }) if *got == id),
+                matches!(events.last(), Some(EngineEvent::TrackEnded { id: got, .. }) if *got == id),
                 "{name}: expected TrackEnded, got {events:?}"
             );
             let nonzero = nonzero_frames(&control, 1);
@@ -1273,13 +1402,13 @@ mod tests {
             )
         });
         assert!(
-            matches!(events.last(), Some(EngineEvent::TrackEnded { id }) if *id == mp3_id),
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id, .. }) if *id == mp3_id),
             "{events:?}"
         );
         assert!(
             events
                 .iter()
-                .all(|e| !matches!(e, EngineEvent::TrackEnded { id } if *id == ogg_id)),
+                .all(|e| !matches!(e, EngineEvent::TrackEnded { id, .. } if *id == ogg_id)),
             "replaced track must not report TrackEnded: {events:?}"
         );
         engine.shutdown();

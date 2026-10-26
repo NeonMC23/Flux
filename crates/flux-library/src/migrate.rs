@@ -95,10 +95,12 @@
 //!   concurrent filesystem changes. Migration is not a security
 //!   sandbox; containment reflects the filesystem at plan time.
 //! - Catalogue publication during the migration commit inherits the
-//!   portable store's platform behavior: atomic rename on Unix;
-//!   remove-then-rename (not atomic) on Windows, with the backup
-//!   catalogue rotated first so a crash in that window recovers to
-//!   the pre-commit state.
+//!   portable store's platform behavior: a single `fs::rename` replaces
+//!   the previous catalogue on Unix and Windows, and a failed rename
+//!   leaves it in place. The backup catalogue is rotated first so a
+//!   crash in the publication window recovers to the pre-commit state.
+//!   Windows directory durability remains best-effort and was not
+//!   executed by this project's Linux-based test suite.
 //! - Nothing here is wired into application startup: choosing when to
 //!   migrate (and which root to offer) is library-lifecycle work in a
 //!   later milestone. The legacy index remains the startup path.
@@ -110,6 +112,7 @@ use std::path::{Component, Path, PathBuf};
 
 use flux_core::TrackId;
 
+use crate::library_lock::{LibraryLock, LibraryLockError};
 use crate::portable::{
     Availability, CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, FileFingerprint,
     ImportedTrack, MetadataOverrides, PathCasePolicy, PathKey, PortableStore, PortableStoreError,
@@ -511,6 +514,8 @@ pub enum MigrationError {
         /// What was found (and why it does not validate).
         detail: String,
     },
+    /// Another Flux process owns the destination library.
+    DestinationLocked(LibraryLockError),
     /// The portable storage layer failed during creation, import,
     /// commit, or verification-reopen.
     Portable {
@@ -545,7 +550,8 @@ impl MigrationError {
             },
             Self::DestinationRootInvalid { .. }
             | Self::DestinationAlreadyInitialized { .. }
-            | Self::DestinationPartialOrInvalid { .. } => MigrationStage::CheckDestination,
+            | Self::DestinationPartialOrInvalid { .. }
+            | Self::DestinationLocked(_) => MigrationStage::CheckDestination,
             Self::Portable { stage, .. } => *stage,
             Self::Verification { .. } => MigrationStage::VerifyDestination,
         }
@@ -565,7 +571,8 @@ impl MigrationError {
             Self::Legacy(_)
             | Self::DestinationRootInvalid { .. }
             | Self::DestinationAlreadyInitialized { .. }
-            | Self::DestinationPartialOrInvalid { .. } => false,
+            | Self::DestinationPartialOrInvalid { .. }
+            | Self::DestinationLocked(_) => false,
         }
     }
 }
@@ -591,6 +598,9 @@ impl fmt::Display for MigrationError {
                 root.display(),
                 detail
             ),
+            Self::DestinationLocked(err) => {
+                write!(f, "the migration destination is not available: {err}")
+            }
             Self::Portable {
                 stage,
                 destination_created,
@@ -618,6 +628,7 @@ impl std::error::Error for MigrationError {
         match self {
             Self::Legacy(err) => Some(err),
             Self::Portable { error, .. } => Some(error),
+            Self::DestinationLocked(err) => Some(err),
             Self::DestinationRootInvalid { .. }
             | Self::DestinationAlreadyInitialized { .. }
             | Self::DestinationPartialOrInvalid { .. }
@@ -1221,8 +1232,13 @@ pub fn execute_migration(plan: &MigrationPlan) -> Result<MigrationReport, Migrat
 
     // Re-check: the destination may have changed since planning, and
     // `create` alone does not distinguish "valid library" from
-    // "partial leftovers" for the caller.
-    let _canonical_root = check_destination(root, plan.case_policy)?;
+    // "partial leftovers" for the caller. The first pass preserves the
+    // precise RootInvalid/AlreadyInitialized/Partial errors; the
+    // exclusive lease then makes the second pass authoritative.
+    let canonical_root = check_destination(root, plan.case_policy)?;
+    let _lease = LibraryLock::acquire_portable_root(&canonical_root)
+        .map_err(MigrationError::DestinationLocked)?;
+    check_destination(root, plan.case_policy)?;
 
     let mut store = PortableStore::create_with_case_policy(root, plan.case_policy)
         .map_err(|err| portable_failure(MigrationStage::CreateDestination, root, err))?;
@@ -1976,6 +1992,31 @@ mod tests {
         // The audio files were never touched.
         assert_eq!(fs::read(&a).expect("a"), b"a");
         assert_eq!(fs::read(&b).expect("b"), b"b");
+    }
+
+    #[test]
+    fn destination_owned_by_another_flux_is_refused_without_writes() {
+        let data = TempDir::new("mig-lock-data");
+        let root = TempDir::new("mig-lock-root");
+        let inside = root.write("inside.flac", b"in");
+        let index = write_index(&data, 2, vec![utf8_rec(1, "In", &inside)]);
+
+        let held = LibraryLock::acquire_portable_root(root.path()).expect("hold destination");
+        let err = migrate_legacy_index(&index, root.path()).expect_err("must refuse");
+        assert!(
+            matches!(err, MigrationError::DestinationLocked(_)),
+            "got {err:?}"
+        );
+        assert_eq!(err.stage(), MigrationStage::CheckDestination);
+        assert!(!err.destination_created());
+        assert!(
+            !root.path().join(FLUX_DIR_NAME).exists(),
+            "no catalogue was created while another owner held the destination"
+        );
+
+        drop(held);
+        let report = migrate_legacy_index(&index, root.path()).expect("migrates after release");
+        assert_eq!(report.plan().migrated_count(), 1);
     }
 
     #[test]

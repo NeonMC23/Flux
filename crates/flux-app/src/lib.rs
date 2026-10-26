@@ -32,8 +32,9 @@
 //! afterwards be replaced only through the explicit switch methods,
 //! which build and validate the candidate library first and swap
 //! atomically — a failed switch changes nothing, and queue/selection
-//! state never carries track IDs across libraries (playback stops
-//! and the queue is rebuilt from the new library):
+//! state never carries track IDs across libraries. Playback stops and
+//! the destination library's own persisted queue is loaded (or its
+//! whole-library default is derived when no queue file exists):
 //!
 //! - **Legacy** ([`Controller::new`] / [`Controller::open_default`],
 //!   later [`Controller::switch_to_legacy_index`]): the version-1
@@ -101,6 +102,7 @@
 //! corrupt files fail with a typed error — never a silent skip.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
@@ -109,12 +111,15 @@ use std::fmt;
 use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
 use flux_audio::engine::{EngineEvent, EngineHandle};
-use flux_core::{PlaybackState, RepeatMode, Track, TrackId};
+use flux_core::{PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId};
 use flux_library::portable::{
-    CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, OpenedStore, PortableStore,
-    reconcile_portable_store, refresh_library_from_portable_store, sync_library_to_portable_store,
+    CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, OpenedStore, PortableRefreshReport,
+    PortableStore, reconcile_portable_store, refresh_library_from_portable_store,
+    sync_library_to_portable_store,
 };
-use flux_library::{Library, PortableSyncReport, ScanReport};
+use flux_library::{
+    Library, LibraryLock, LibraryLockError, PortableSyncReport, QueueStore, ScanReport,
+};
 
 pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
 pub use flux_library::{
@@ -124,18 +129,22 @@ pub use flux_library::{
 
 /// Whether real device audio is available to this controller's engine.
 ///
-/// A controller is fully usable for browsing/scanning in the
-/// `Unavailable` state; only playback commands fail, with the reason
+/// A controller is fully usable for browsing/scanning unless the
+/// backend is ready; only playback commands fail, with the reason
 /// surfaced as the error message. This exists so a build without an
-/// audio backend (or a machine without an output device) says so
-/// plainly instead of pretending to play.
+/// audio backend and a machine whose device failed to initialize are
+/// both reported honestly and distinguishably instead of pretending to
+/// play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioStatus {
     /// The engine drives a working output (a real device, or a
     /// deliberately injected headless backend in tests).
     Ready,
-    /// Playback is not possible; the string says why, in user terms.
-    Unavailable(String),
+    /// This binary was compiled without an audio-output backend.
+    BuildWithoutBackend,
+    /// An output backend exists in this build, but device
+    /// initialization failed. The string is the user-facing reason.
+    DeviceUnavailable(String),
 }
 
 impl AudioStatus {
@@ -150,7 +159,10 @@ impl AudioStatus {
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Ready => None,
-            Self::Unavailable(reason) => Some(reason),
+            Self::BuildWithoutBackend => {
+                Some("this build has no audio output backend (compiled without the `cpal` feature)")
+            }
+            Self::DeviceUnavailable(reason) => Some(reason),
         }
     }
 }
@@ -166,6 +178,38 @@ pub enum StorageMode {
     Legacy,
     /// The portable `.flux` store at an explicit library root.
     Portable,
+}
+
+/// Why a controller could not open its initial legacy library.
+///
+/// A failure here is fatal for that startup attempt: no empty library
+/// is substituted, and no write is enabled without ownership.
+#[derive(Debug)]
+pub enum ControllerOpenError {
+    /// Exclusive ownership of the legacy library could not be acquired.
+    Lock(LibraryLockError),
+}
+
+impl fmt::Display for ControllerOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lock(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ControllerOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Lock(err) => Some(err),
+        }
+    }
+}
+
+impl From<LibraryLockError> for ControllerOpenError {
+    fn from(err: LibraryLockError) -> Self {
+        Self::Lock(err)
+    }
 }
 
 /// Why [`Controller::new_portable`] could not open its library.
@@ -185,6 +229,8 @@ pub enum PortableOpenError {
     /// store exists at the root — opening never creates one — or
     /// neither catalogue validates).
     Store(PortableStoreError),
+    /// Exclusive ownership of the portable library could not be acquired.
+    Lock(LibraryLockError),
 }
 
 impl fmt::Display for PortableOpenError {
@@ -196,6 +242,7 @@ impl fmt::Display for PortableOpenError {
                 root.display()
             ),
             Self::Store(err) => write!(f, "could not open the portable library: {err}"),
+            Self::Lock(err) => write!(f, "could not reserve the portable library: {err}"),
         }
     }
 }
@@ -204,6 +251,7 @@ impl std::error::Error for PortableOpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Store(err) => Some(err),
+            Self::Lock(err) => Some(err),
             Self::RootInvalid { .. } => None,
         }
     }
@@ -212,6 +260,12 @@ impl std::error::Error for PortableOpenError {
 impl From<PortableStoreError> for PortableOpenError {
     fn from(err: PortableStoreError) -> Self {
         Self::Store(err)
+    }
+}
+
+impl From<LibraryLockError> for PortableOpenError {
+    fn from(err: LibraryLockError) -> Self {
+        Self::Lock(err)
     }
 }
 
@@ -275,6 +329,8 @@ pub enum CreateLibraryError {
         /// What did not match a fresh empty library.
         detail: String,
     },
+    /// Another Flux process owns the destination.
+    Lock(LibraryLockError),
     /// A scan is in progress on the controller that was asked to
     /// create-and-switch; nothing was created. (Only returned by
     /// [`Controller::switch_to_new_portable_library`].)
@@ -305,6 +361,7 @@ impl fmt::Display for CreateLibraryError {
                 "the library created at {} did not verify as a fresh empty library: {detail}",
                 root.display()
             ),
+            Self::Lock(err) => write!(f, "{err}"),
             Self::ScanInProgress => {
                 write!(
                     f,
@@ -319,6 +376,7 @@ impl std::error::Error for CreateLibraryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Store(err) => Some(err),
+            Self::Lock(err) => Some(err),
             _ => None,
         }
     }
@@ -335,6 +393,7 @@ impl From<PortableOpenError> for CreateLibraryError {
         match err {
             PortableOpenError::RootInvalid { root, reason } => Self::RootInvalid { root, reason },
             PortableOpenError::Store(err) => Self::Store(err),
+            PortableOpenError::Lock(err) => Self::Lock(err),
         }
     }
 }
@@ -351,6 +410,8 @@ pub enum SwitchError {
     Portable(PortableOpenError),
     /// The legacy candidate index could not be loaded or validated.
     Legacy(StoreError),
+    /// Exclusive ownership of the legacy candidate could not be acquired.
+    Lock(LibraryLockError),
 }
 
 impl fmt::Display for SwitchError {
@@ -364,6 +425,7 @@ impl fmt::Display for SwitchError {
             }
             Self::Portable(err) => write!(f, "could not switch libraries: {err}"),
             Self::Legacy(err) => write!(f, "could not switch libraries: {err}"),
+            Self::Lock(err) => write!(f, "could not switch libraries: {err}"),
         }
     }
 }
@@ -374,6 +436,7 @@ impl std::error::Error for SwitchError {
             Self::ScanInProgress => None,
             Self::Portable(err) => Some(err),
             Self::Legacy(err) => Some(err),
+            Self::Lock(err) => Some(err),
         }
     }
 }
@@ -408,6 +471,19 @@ const PORTABLE_RECOVERY_READ_ONLY: &str = "The portable library was recovered fr
 const PORTABLE_STORE_UNAVAILABLE: &str = "The portable library store is unavailable because it \
      could not be reopened after the failed scan; changes cannot be saved.";
 
+/// Message used when an existing legacy index could not be read at
+/// startup. Scanning and saving are blocked until the user explicitly
+/// preserves and replaces it, so a transient read failure or a
+/// repairable corrupt file is never overwritten by an empty library.
+const LEGACY_INDEX_WRITE_PROTECTED: &str = "The saved library index could not be read. Flux will \
+     not overwrite it; scanning and saving are disabled until you explicitly preserve and replace it.";
+
+/// Defensive message for a persistence backend without its ownership
+/// lease. Constructors and switches always pair the two; if this ever
+/// fires, refusing the write is safer than proceeding unprotected.
+const LIBRARY_NOT_OWNED: &str = "This Flux window does not own the active library, so it will not \
+     write to it. Close and reopen the library.";
+
 /// Notifications produced by [`Controller::poll`]. Front-ends treat
 /// these as "re-read controller state now" signals; `Error`/`Status`
 /// also carry the message (mirrored in
@@ -417,6 +493,8 @@ const PORTABLE_STORE_UNAVAILABLE: &str = "The portable library store is unavaila
 pub enum ControllerEvent {
     /// The track collection changed (scan finished, index loaded…).
     LibraryChanged,
+    /// The playback queue's entries, order, or current entry changed.
+    QueueChanged,
     /// Playback state, selection, or stream info changed.
     PlaybackChanged,
     /// An informational message for the user.
@@ -452,6 +530,9 @@ struct ScanWork {
     library: Library,
     roots: Vec<PathBuf>,
     persistence: ScanPersistence,
+    /// Keep the OS lease alive even if the controller is dropped while
+    /// this worker is still scanning or publishing.
+    lease: Option<Arc<LibraryLock>>,
 }
 
 /// The result of one background scan, delivered to the controller.
@@ -471,10 +552,11 @@ struct ScanOutcome {
 /// Creates the engine a Flux application should use, together with its
 /// honest [`AudioStatus`].
 ///
-/// With the `cpal` feature, this opens the default output device; on
-/// any failure (or in a build without the feature) it returns a
-/// headless null engine plus `Unavailable(reason)`, so the application
-/// can still run and browse while telling the user exactly why
+/// With the `cpal` feature, this opens the default output device; a
+/// device/initialization failure returns a headless null engine plus
+/// [`AudioStatus::DeviceUnavailable`]. A build without the feature
+/// returns [`AudioStatus::BuildWithoutBackend`]. In both cases the
+/// application can still browse while telling the user exactly why
 /// playback will not work. The null engine is never presented as a
 /// real device — playback commands check the status first.
 #[must_use]
@@ -487,7 +569,7 @@ pub fn default_engine() -> (EngineHandle, AudioStatus) {
                 let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
                 return (
                     engine,
-                    AudioStatus::Unavailable(format!("audio output unavailable: {err}")),
+                    AudioStatus::DeviceUnavailable(format!("audio output unavailable: {err}")),
                 );
             }
         }
@@ -495,13 +577,7 @@ pub fn default_engine() -> (EngineHandle, AudioStatus) {
     #[allow(unreachable_code)]
     {
         let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
-        (
-            engine,
-            AudioStatus::Unavailable(
-                "this build has no audio output backend (compiled without the `cpal` feature)"
-                    .to_owned(),
-            ),
-        )
+        (engine, AudioStatus::BuildWithoutBackend)
     }
 }
 
@@ -591,6 +667,11 @@ pub fn create_portable_library(root: &Path) -> Result<CreatedLibrary, CreateLibr
     let canonical = std::fs::canonicalize(root)
         .map_err(|err| root_invalid(format!("it cannot be canonicalized: {err}")))?;
 
+    check_creatable_destination(root, &canonical)?;
+    let _lease =
+        LibraryLock::acquire_portable_root(&canonical).map_err(CreateLibraryError::Lock)?;
+    // The first pass gives precise destination errors; this second pass
+    // is authoritative under exclusive ownership.
     check_creatable_destination(root, &canonical)?;
 
     let created = PortableStore::create(&canonical)?;
@@ -725,11 +806,34 @@ pub struct Controller {
     /// load. Not a selection — `Player` owns that; this only decides
     /// "resume vs. load" when syncing.
     engine_loaded: Option<TrackId>,
+    /// The load session of `engine_loaded`. Every explicit load gets a
+    /// new monotonic session from the engine, so delayed events from an
+    /// older attempt (even for the same track) cannot affect the
+    /// current one.
+    engine_session: Option<u64>,
     /// Stream facts for `engine_loaded`, once the engine confirms it.
     stream_info: Option<StreamInfo>,
     volume: f32,
     /// The persistence backend, fixed at construction.
     storage: StorageBackend,
+    /// The queue file for the active library, when persistence is
+    /// available. The queue is separate from the catalogue and tags.
+    queue_store: Option<QueueStore>,
+    /// The existing queue file was malformed or unreadable. Its bytes are
+    /// preserved and this session never writes over it.
+    queue_write_protected: bool,
+    /// True while the queue is still the library-derived default and may
+    /// receive newly scanned tracks. Cleared permanently by structural
+    /// queue edits.
+    queue_auto_library: bool,
+    /// Exclusive OS ownership of the active library's catalogue. Held
+    /// for the controller's lifetime and cloned into any scan worker so
+    /// a dying UI cannot release the lock while background code writes.
+    library_lock: Option<Arc<LibraryLock>>,
+    /// An existing legacy index could not be loaded at startup. Writes
+    /// to that path (scan saves and explicit saves) are refused until
+    /// `replace_unreadable_legacy_index` preserves it and clears this.
+    legacy_index_write_protected: bool,
     /// The portable store in portable mode — `None` in legacy mode,
     /// while a scan thread owns it, or if it was lost with a scan
     /// thread and could not be reopened (saves then fail visibly).
@@ -745,45 +849,99 @@ pub struct Controller {
     last_status: Option<String>,
 }
 
+/// Initial state for a controller, assembled by the fallible
+/// constructors once the candidate library and its ownership lease are
+/// known.
+struct LibrarySeed {
+    library: Library,
+    storage: StorageBackend,
+    library_lock: Option<Arc<LibraryLock>>,
+    portable_store: Option<PortableStore>,
+    portable_recovery: Option<RecoveryInfo>,
+    roots: Vec<PathBuf>,
+    queue: Queue,
+    queue_store: Option<QueueStore>,
+    queue_write_protected: bool,
+    queue_auto_library: bool,
+}
+
 impl Controller {
     /// Creates a controller around an already-spawned engine.
     ///
     /// If `index_path` names an existing file, the library index is
     /// loaded from it (this reads and parses a file, so call this
     /// before starting the UI event loop). A missing file simply
-    /// starts an empty library; an unreadable/corrupt one also starts
-    /// empty but records a user-facing error in
-    /// [`last_error`](Self::last_error). The play queue is built from
-    /// the library in library order.
-    #[must_use]
-    pub fn new(engine: EngineHandle, audio: AudioStatus, index_path: Option<PathBuf>) -> Self {
-        let (library, last_error) = match &index_path {
+    /// starts an empty library and remains writable. An
+    /// unreadable/corrupt existing file starts an empty library, records
+    /// a user-facing error, and enters legacy write-protection: scans
+    /// and saves are refused until
+    /// [`replace_unreadable_legacy_index`](Self::replace_unreadable_legacy_index)
+    /// preserves the old file. The library's persisted queue is loaded;
+    /// when none exists, a default whole-library queue is derived. A
+    /// malformed queue file is reported and preserved, and queue writes
+    /// are disabled for that session.
+    ///
+    /// # Errors
+    ///
+    /// [`ControllerOpenError::Lock`] when another Flux process owns the
+    /// index (or the exclusive lock cannot be created). No library is
+    /// loaded, no empty library is substituted, and no write occurs.
+    pub fn new(
+        engine: EngineHandle,
+        audio: AudioStatus,
+        index_path: Option<PathBuf>,
+    ) -> Result<Self, ControllerOpenError> {
+        // Acquire ownership before reading: another Flux process may be
+        // publishing this index right now.
+        let library_lock = match &index_path {
+            Some(path) => Some(Arc::new(LibraryLock::acquire_legacy_index(path)?)),
+            None => None,
+        };
+        let (library, last_error, write_protected) = match &index_path {
             Some(path) if path.exists() => match Library::load_from_path(path) {
-                Ok(library) => (library, None),
+                Ok(library) => (library, None, false),
                 Err(err) => (
                     Library::new(),
                     Some(format!(
                         "Could not load the saved library index ({}): {err}. \
-                         Starting with an empty library.",
+                         The file is preserved; scanning and saving are disabled \
+                         until you explicitly replace it.",
                         path.display()
                     )),
+                    true,
                 ),
             },
-            _ => (Library::new(), None),
+            _ => (Library::new(), None, false),
         };
+        let queue_store = library_lock
+            .as_ref()
+            .map(|lock| QueueStore::new(legacy_queue_path(lock.identity())));
+        let (queue, queue_auto_library, queue_write_protected, queue_error) =
+            load_queue(queue_store.as_ref(), &library);
         let mut controller = Self::assemble(
             engine,
             audio,
-            library,
-            StorageBackend::Legacy { index_path },
-            None,
-            None,
-            Vec::new(),
+            LibrarySeed {
+                library,
+                storage: StorageBackend::Legacy { index_path },
+                library_lock,
+                portable_store: None,
+                portable_recovery: None,
+                roots: Vec::new(),
+                queue,
+                queue_store,
+                queue_write_protected,
+                queue_auto_library,
+            },
         );
+        controller.legacy_index_write_protected = write_protected;
         if let Some(error) = last_error {
             controller.report_error(error);
         }
-        controller
+        if let Some(error) = queue_error {
+            controller.report_error(error);
+        }
+        Ok(controller)
     }
 
     /// Creates a controller whose persistence backend is the portable
@@ -812,17 +970,27 @@ impl Controller {
         audio: AudioStatus,
         library_root: &Path,
     ) -> Result<Self, PortableOpenError> {
-        let (root, opened, library, skipped) = open_portable_candidate(library_root)?;
+        let (root, lock, opened, library, skipped) = open_portable_candidate(library_root)?;
         let recovery = opened.recovery;
+        let queue_store = Some(QueueStore::new(portable_queue_path(&root)));
+        let (queue, queue_auto_library, queue_write_protected, queue_error) =
+            load_queue(queue_store.as_ref(), &library);
 
         let mut controller = Self::assemble(
             engine,
             audio,
-            library,
-            StorageBackend::Portable { root: root.clone() },
-            Some(opened.store),
-            recovery,
-            vec![root],
+            LibrarySeed {
+                library,
+                storage: StorageBackend::Portable { root: root.clone() },
+                library_lock: Some(Arc::new(lock)),
+                portable_store: Some(opened.store),
+                portable_recovery: recovery,
+                roots: vec![root],
+                queue,
+                queue_store,
+                queue_write_protected,
+                queue_auto_library,
+            },
         );
         if skipped > 0 {
             controller.report_status(skipped_unrepresentable_message(skipped));
@@ -830,31 +998,46 @@ impl Controller {
         if controller.portable_recovery.is_some() {
             controller.report_error(PORTABLE_RECOVERY_READ_ONLY.to_owned());
         }
+        if let Some(error) = queue_error {
+            controller.report_error(error);
+        }
         Ok(controller)
     }
 
     /// Shared construction once the initial library and backend are
     /// known: snapshot, playback model, queue, and engine volume are
     /// set up identically for both backends.
-    fn assemble(
-        engine: EngineHandle,
-        audio: AudioStatus,
-        library: Library,
-        storage: StorageBackend,
-        portable_store: Option<PortableStore>,
-        portable_recovery: Option<RecoveryInfo>,
-        roots: Vec<PathBuf>,
-    ) -> Self {
-        let mut controller = Self {
+    fn assemble(engine: EngineHandle, audio: AudioStatus, seed: LibrarySeed) -> Self {
+        let LibrarySeed {
+            library,
+            storage,
+            library_lock,
+            portable_store,
+            portable_recovery,
+            roots,
+            queue,
+            queue_store,
+            queue_write_protected,
+            queue_auto_library,
+        } = seed;
+        let mut player = Player::new();
+        *player.queue_mut() = queue;
+        let controller = Self {
             tracks: snapshot(&library),
             library: Some(library),
-            player: Player::new(),
+            player,
             engine,
             audio,
             engine_loaded: None,
+            engine_session: None,
             stream_info: None,
             volume: 1.0,
             storage,
+            queue_store,
+            queue_write_protected,
+            queue_auto_library,
+            library_lock,
+            legacy_index_write_protected: false,
             portable_store,
             portable_recovery,
             roots,
@@ -863,7 +1046,6 @@ impl Controller {
             last_error: None,
             last_status: None,
         };
-        controller.rebuild_queue();
         controller.engine.set_volume(controller.volume);
         controller
     }
@@ -872,8 +1054,10 @@ impl Controller {
     /// [`default_index_path`] (legacy backend, as before — portable
     /// mode is always an explicit choice via
     /// [`new_portable`](Self::new_portable)).
-    #[must_use]
-    pub fn open_default() -> Self {
+    ///
+    /// Returns the same ownership error as [`Controller::new`] rather
+    /// than starting with a writable empty library.
+    pub fn open_default() -> Result<Self, ControllerOpenError> {
         let (engine, audio) = default_engine();
         Self::new(engine, audio, default_index_path())
     }
@@ -921,6 +1105,37 @@ impl Controller {
     #[must_use]
     pub fn player_state(&self) -> PlaybackState {
         self.player.state()
+    }
+
+    /// The queue's entries, in playback order. Duplicate tracks appear as
+    /// distinct entries with their own identities.
+    #[must_use]
+    pub fn queue_entries(&self) -> &[QueueEntry] {
+        self.player.queue().entries()
+    }
+
+    /// The number of entries in the queue.
+    #[must_use]
+    pub fn queue_len(&self) -> usize {
+        self.player.queue().len()
+    }
+
+    /// The stable identity of the current queue entry.
+    #[must_use]
+    pub fn current_queue_entry_id(&self) -> Option<QueueEntryId> {
+        self.player.current_entry_id()
+    }
+
+    /// The current queue entry.
+    #[must_use]
+    pub fn current_queue_entry(&self) -> Option<QueueEntry> {
+        self.player.queue().current_entry()
+    }
+
+    /// The position of an entry in the queue.
+    #[must_use]
+    pub fn queue_entry_index(&self, entry: QueueEntryId) -> Option<usize> {
+        self.player.queue().entry_index(entry)
     }
 
     /// The currently selected track's ID, if any.
@@ -986,6 +1201,36 @@ impl Controller {
         }
     }
 
+    /// Whether this controller holds the ownership lease for a
+    /// persistent backend. A session-only legacy library has nothing to
+    /// protect and counts as owned.
+    fn active_library_is_owned(&self) -> bool {
+        match &self.storage {
+            StorageBackend::Legacy { index_path: None } => true,
+            StorageBackend::Legacy {
+                index_path: Some(_),
+            }
+            | StorageBackend::Portable { .. } => self.library_lock.is_some(),
+        }
+    }
+
+    fn ownership_guard(&self) -> Result<(), String> {
+        if self.active_library_is_owned() {
+            Ok(())
+        } else {
+            Err(LIBRARY_NOT_OWNED.to_owned())
+        }
+    }
+
+    /// Whether the active legacy index could not be read and is being
+    /// protected from overwrite. While true, scans and saves are
+    /// refused until [`replace_unreadable_legacy_index`](Self::replace_unreadable_legacy_index)
+    /// explicitly preserves the old file.
+    #[must_use]
+    pub fn legacy_index_write_protected(&self) -> bool {
+        self.legacy_index_write_protected
+    }
+
     /// The library root in portable mode (canonical), `None` in
     /// legacy mode.
     #[must_use]
@@ -1018,6 +1263,7 @@ impl Controller {
     /// progress, when no recovery is pending, or when the store
     /// operation itself fails.
     pub fn acknowledge_portable_recovery(&mut self) -> Result<(), String> {
+        self.ownership_guard()?;
         if matches!(self.storage, StorageBackend::Legacy { .. }) {
             return Err(
                 "This controller uses the legacy library index; there is no portable \
@@ -1040,6 +1286,7 @@ impl Controller {
             .acknowledge_recovery()
             .map_err(|err| format!("Could not acknowledge the portable library recovery: {err}"))?;
         self.portable_recovery = None;
+        self.persist_queue();
         self.report_status(
             "Portable library recovery acknowledged; scanning and saving are enabled.".to_owned(),
         );
@@ -1055,9 +1302,9 @@ impl Controller {
     /// playback state are completely unchanged, and the audio engine
     /// is never restarted (the same engine serves both libraries).
     ///
-    /// On success playback stops and the queue is rebuilt from the
-    /// new library: track IDs are unique only within one library, so
-    /// the old selection is discarded rather than ever being
+    /// On success playback stops and the destination library's own
+    /// queue is loaded: track IDs are unique only within one library,
+    /// so the old selection is discarded rather than ever being
     /// reinterpreted. Unsaved changes of the outgoing library (for
     /// example a portable sync whose commit previously failed) are
     /// discarded — switching never writes to the old backend as a
@@ -1071,7 +1318,22 @@ impl Controller {
             self.report_error(SwitchError::ScanInProgress.to_string());
             return Err(SwitchError::ScanInProgress);
         }
-        let (root, opened, library, skipped) = match open_portable_candidate(library_root) {
+        let root = match canonical_portable_root(library_root) {
+            Ok(root) => root,
+            Err(err) => {
+                let err = SwitchError::from(err);
+                self.report_error(err.to_string());
+                return Err(err);
+            }
+        };
+        if self.portable_root() == Some(root.as_path()) {
+            self.report_status(format!(
+                "Already using the portable library at {}.",
+                root.display()
+            ));
+            return Ok(());
+        }
+        let (lock, opened, library, skipped) = match open_portable_candidate_at(&root) {
             Ok(candidate) => candidate,
             Err(err) => {
                 let err = SwitchError::from(err);
@@ -1080,13 +1342,21 @@ impl Controller {
             }
         };
         let recovery = opened.recovery;
-        self.install_library(
+        let queue_store = Some(QueueStore::new(portable_queue_path(&root)));
+        let (queue, queue_auto_library, queue_write_protected, queue_error) =
+            load_queue(queue_store.as_ref(), &library);
+        self.install_library(LibrarySeed {
             library,
-            StorageBackend::Portable { root: root.clone() },
-            Some(opened.store),
-            recovery,
-        );
-        self.roots = vec![root.clone()];
+            storage: StorageBackend::Portable { root: root.clone() },
+            library_lock: Some(Arc::new(lock)),
+            portable_store: Some(opened.store),
+            portable_recovery: recovery,
+            roots: vec![root.clone()],
+            queue,
+            queue_store,
+            queue_write_protected,
+            queue_auto_library,
+        });
         if skipped > 0 {
             self.report_status(skipped_unrepresentable_message(skipped));
         }
@@ -1097,6 +1367,9 @@ impl Controller {
                 "Switched to the portable library at {}.",
                 root.display()
             ));
+        }
+        if let Some(error) = queue_error {
+            self.report_error(error);
         }
         Ok(())
     }
@@ -1154,8 +1427,8 @@ impl Controller {
     /// that leniency is a *startup* behavior of
     /// [`Controller::new`], not of switching). A missing index file
     /// means an empty legacy library, matching legacy startup.
-    /// Playback stops and the queue is rebuilt from the new library,
-    /// as with every switch.
+    /// Playback stops and the destination index's own persisted queue
+    /// is loaded, as with every switch.
     pub fn switch_to_legacy_index(
         &mut self,
         index_path: Option<PathBuf>,
@@ -1164,6 +1437,31 @@ impl Controller {
             self.report_error(SwitchError::ScanInProgress.to_string());
             return Err(SwitchError::ScanInProgress);
         }
+        if let (
+            StorageBackend::Legacy {
+                index_path: Some(current),
+            },
+            Some(candidate),
+        ) = (&self.storage, &index_path)
+            && same_library_path(current, candidate)
+        {
+            self.report_status("Already using that legacy library index.".to_owned());
+            return Ok(());
+        }
+
+        // Acquire ownership before reading; scanning is refused above,
+        // so the outgoing backend has no worker that could still write.
+        let candidate_lock = match &index_path {
+            Some(path) => match LibraryLock::acquire_legacy_index(path) {
+                Ok(lock) => Some(Arc::new(lock)),
+                Err(err) => {
+                    let err = SwitchError::Lock(err);
+                    self.report_error(err.to_string());
+                    return Err(err);
+                }
+            },
+            None => None,
+        };
         let library = match &index_path {
             Some(path) if path.exists() => match Library::load_from_path(path) {
                 Ok(library) => library,
@@ -1175,49 +1473,74 @@ impl Controller {
             },
             _ => Library::new(),
         };
+        let queue_store = candidate_lock
+            .as_ref()
+            .map(|lock| QueueStore::new(legacy_queue_path(lock.identity())));
+        let (queue, queue_auto_library, queue_write_protected, queue_error) =
+            load_queue(queue_store.as_ref(), &library);
         let shown = index_path
             .as_ref()
             .map(|path| format!(" at {}", path.display()))
             .unwrap_or_default();
-        self.install_library(library, StorageBackend::Legacy { index_path }, None, None);
-        self.roots = Vec::new();
+        self.install_library(LibrarySeed {
+            library,
+            storage: StorageBackend::Legacy { index_path },
+            library_lock: candidate_lock,
+            portable_store: None,
+            portable_recovery: None,
+            roots: Vec::new(),
+            queue,
+            queue_store,
+            queue_write_protected,
+            queue_auto_library,
+        });
         self.report_status(format!("Switched to the legacy library index{shown}."));
+        if let Some(error) = queue_error {
+            self.report_error(error);
+        }
         Ok(())
     }
 
     /// The single commit point of a library switch: stops playback,
     /// forgets the engine's loaded track, discards the outgoing
-    /// library/store, and installs the already-validated candidate.
-    /// The queue is rebuilt from the new library with the *new*
-    /// library's first track selected (or none) — the outgoing
-    /// selection is never carried over, because an ID from one
-    /// library must never be read as an ID from another. Volume and
-    /// repeat mode are user preferences, not library state, and are
-    /// kept.
-    fn install_library(
-        &mut self,
-        library: Library,
-        storage: StorageBackend,
-        portable_store: Option<PortableStore>,
-        portable_recovery: Option<RecoveryInfo>,
-    ) {
+    /// library/store, and installs the already-validated candidate and
+    /// its independently persisted queue. The outgoing queue selection
+    /// is never carried over. Volume and repeat mode are user
+    /// preferences, not library state, and are kept.
+    fn install_library(&mut self, seed: LibrarySeed) {
+        let LibrarySeed {
+            library,
+            storage,
+            library_lock,
+            portable_store,
+            portable_recovery,
+            roots,
+            queue,
+            queue_store,
+            queue_write_protected,
+            queue_auto_library,
+        } = seed;
         self.player.stop();
         self.engine.stop();
         self.engine_loaded = None;
+        self.engine_session = None;
         self.stream_info = None;
 
         self.tracks = snapshot(&library);
         self.library = Some(library);
         self.storage = storage;
+        self.library_lock = library_lock;
+        self.legacy_index_write_protected = false;
         self.portable_store = portable_store;
         self.portable_recovery = portable_recovery;
+        self.roots = roots;
+        self.queue_store = queue_store;
+        self.queue_write_protected = queue_write_protected;
+        self.queue_auto_library = queue_auto_library;
+        *self.player.queue_mut() = queue;
 
-        let queue = self.player.queue_mut();
-        queue.clear();
-        for (id, _) in &self.tracks {
-            queue.push(*id);
-        }
         self.outbox.push(ControllerEvent::LibraryChanged);
+        self.outbox.push(ControllerEvent::QueueChanged);
         self.outbox.push(ControllerEvent::PlaybackChanged);
     }
 
@@ -1329,6 +1652,7 @@ impl Controller {
         if self.is_scanning() {
             return Err("A library scan is in progress; try again when it finishes.".to_owned());
         }
+        self.ownership_guard()?;
         if matches!(self.storage, StorageBackend::Legacy { .. }) {
             return Err(
                 "This applies to portable libraries; the active library uses the legacy index."
@@ -1361,22 +1685,41 @@ impl Controller {
         }
     }
 
-    /// Refreshes the runtime library/snapshot from the portable
-    /// store after catalogue maintenance, carrying over
-    /// in-memory-only tracks and preserving the queue selection
-    /// (same library, same IDs — unlike a library switch).
-    fn refresh_from_store(&mut self) {
-        let (Some(current), Some(store)) = (self.library.as_ref(), self.portable_store.as_ref())
-        else {
-            return;
-        };
-        let (library, skipped) = refresh_library_from_portable_store(current, store);
+    /// Rebuilds the runtime library from the active portable store,
+    /// carrying over in-memory-only tracks and preserving the queue
+    /// selection (same library, same IDs — unlike a library switch).
+    fn rebuilt_from_store(&self) -> Option<PortableRefreshReport> {
+        let current = self.library.as_ref()?;
+        let store = self.portable_store.as_ref()?;
+        Some(refresh_library_from_portable_store(current, store))
+    }
+
+    /// Installs an already-merged runtime library without changing
+    /// playback state or the user-managed queue. Stable track IDs mean
+    /// queue entries keep referring to the same tracks; newly discovered
+    /// tracks are appended only while the queue is still auto-derived.
+    fn install_library_snapshot(&mut self, library: Library) {
         self.tracks = snapshot(&library);
         self.library = Some(library);
-        self.rebuild_queue();
+    }
+
+    /// Refreshes the runtime library/snapshot from the portable store
+    /// after catalogue maintenance, preserving the queue selection and
+    /// reporting any tracks that could not be represented or carried
+    /// over.
+    fn refresh_from_store(&mut self) {
+        let Some(report) = self.rebuilt_from_store() else {
+            return;
+        };
+        let PortableRefreshReport {
+            library,
+            skipped_store_records,
+            dropped_memory_only,
+        } = report;
+        self.install_library_snapshot(library);
         self.outbox.push(ControllerEvent::LibraryChanged);
-        if skipped > 0 {
-            self.report_status(skipped_unrepresentable_message(skipped));
+        if let Some(note) = refresh_skip_note(skipped_store_records, &dropped_memory_only) {
+            self.report_status(note);
         }
     }
 
@@ -1400,15 +1743,144 @@ impl Controller {
 
     // ------------------------------------------------------- commands ---
 
-    /// Starts playing the given track (which must be in the library).
-    /// Restarting the already-playing track restarts it. Failures
-    /// (unknown track, unsupported format, unavailable audio) set
-    /// [`last_error`](Self::last_error) and leave playback stopped.
+    /// Plays a library track immediately.
+    ///
+    /// If the track already has queue entries, the first one is selected
+    /// (duplicates remain individually addressable through
+    /// [`play_queue_entry`](Self::play_queue_entry)). Otherwise the track
+    /// is appended to the queue and selected. The queue order is not
+    /// otherwise changed, and the entry is persisted when possible.
     pub fn play_track(&mut self, id: TrackId) {
-        match self.player.play_track(id) {
-            Ok(()) => self.sync_engine(true),
-            Err(err) => self.report_error(format!("Cannot play that track: {err}")),
+        let Some(title) = self.track(id).map(|track| track.title().to_owned()) else {
+            self.report_error("That track is no longer in the library.".to_owned());
+            return;
+        };
+        let before_entry = self.current_queue_entry_id();
+        let before_len = self.queue_len();
+        let entry = {
+            let queue = self.player.queue_mut();
+            match queue.entry_for_track(id) {
+                Some(entry) => entry.id(),
+                None => queue.push(id),
+            }
+        };
+        if let Err(err) = self.player.play_entry(entry) {
+            self.report_error(format!("Cannot play \"{title}\": {err}"));
+            return;
         }
+        if before_len != self.queue_len() {
+            self.queue_auto_library = false;
+            self.after_queue_change();
+        } else if before_entry != self.current_queue_entry_id() {
+            self.after_queue_change();
+        }
+        self.sync_engine(true);
+    }
+
+    /// Plays one specific queue entry, including a particular duplicate.
+    pub fn play_queue_entry(&mut self, entry: QueueEntryId) -> Result<(), String> {
+        if self.player.queue().entry(entry).is_none() {
+            let message = format!("Queue entry {entry} is no longer in the queue.");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let before = self.current_queue_entry_id();
+        self.player
+            .play_entry(entry)
+            .map_err(|err| format!("Cannot play that queue entry: {err}"))?;
+        if before != self.current_queue_entry_id() {
+            self.after_queue_change();
+        }
+        self.sync_engine(true);
+        Ok(())
+    }
+
+    /// Appends a library track to the queue without changing playback.
+    pub fn enqueue_track(&mut self, id: TrackId) -> Result<QueueEntryId, String> {
+        let Some(title) = self.track(id).map(|track| track.title().to_owned()) else {
+            let message = "That track is no longer in the library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let entry = self.player.queue_mut().push(id);
+        self.queue_auto_library = false;
+        self.after_queue_change();
+        self.report_status(format!("Added \"{title}\" to the queue."));
+        Ok(entry)
+    }
+
+    /// Inserts a library track immediately after the current entry without
+    /// starting it. With an empty queue it becomes the current entry.
+    pub fn play_next_track(&mut self, id: TrackId) -> Result<QueueEntryId, String> {
+        let Some(title) = self.track(id).map(|track| track.title().to_owned()) else {
+            let message = "That track is no longer in the library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let entry = self.player.queue_mut().insert_next(id);
+        self.queue_auto_library = false;
+        self.after_queue_change();
+        self.report_status(format!("Will play \"{title}\" next."));
+        Ok(entry)
+    }
+
+    /// Removes one queue entry by its stable identity.
+    ///
+    /// Removing the current entry stops playback and selects the following
+    /// entry (or the new last entry); removing any other entry leaves the
+    /// current track and playback state untouched.
+    pub fn remove_queue_entry(&mut self, entry: QueueEntryId) -> Result<bool, String> {
+        let was_current = self.current_queue_entry_id() == Some(entry);
+        let Some(removed) = self.player.queue_mut().remove_entry(entry) else {
+            return Ok(false);
+        };
+        if was_current {
+            self.player.stop();
+            self.engine.stop();
+            self.engine_loaded = None;
+            self.engine_session = None;
+            self.stream_info = None;
+            self.outbox.push(ControllerEvent::PlaybackChanged);
+        }
+        self.queue_auto_library = false;
+        self.after_queue_change();
+        self.report_status(format!("Removed track {} from the queue.", removed.track()));
+        Ok(true)
+    }
+
+    /// Moves one queue entry to a target position, clamping to the queue.
+    /// The current track and playback state are unaffected.
+    pub fn move_queue_entry(
+        &mut self,
+        entry: QueueEntryId,
+        target_index: usize,
+    ) -> Result<bool, String> {
+        if self.player.queue().entry(entry).is_none() {
+            return Ok(false);
+        }
+        let moved = self.player.queue_mut().move_entry(entry, target_index);
+        if moved {
+            self.queue_auto_library = false;
+            self.after_queue_change();
+        }
+        Ok(moved)
+    }
+
+    /// Moves one queue entry by a relative offset, clamping to the queue.
+    pub fn move_queue_entry_by(
+        &mut self,
+        entry: QueueEntryId,
+        delta: isize,
+    ) -> Result<bool, String> {
+        if self.player.queue().entry(entry).is_none() {
+            return Ok(false);
+        }
+        let moved = self.player.queue_mut().move_entry_by(entry, delta);
+        if moved {
+            self.queue_auto_library = false;
+            self.after_queue_change();
+        }
+        Ok(moved)
     }
 
     /// Starts or resumes playback of the current selection.
@@ -1443,13 +1915,21 @@ impl Controller {
     /// Skips to the next track; at the end of the queue (repeat off)
     /// playback stops. While paused, the new track is loaded paused.
     pub fn next(&mut self) {
+        let before = self.current_queue_entry_id();
         self.player.next_track();
+        if before != self.current_queue_entry_id() {
+            self.after_queue_change();
+        }
         self.sync_engine(true);
     }
 
     /// Skips to the previous track; on the first track, restarts it.
     pub fn previous(&mut self) {
+        let before = self.current_queue_entry_id();
         self.player.previous_track();
+        if before != self.current_queue_entry_id() {
+            self.after_queue_change();
+        }
         self.sync_engine(true);
     }
 
@@ -1535,6 +2015,7 @@ impl Controller {
     /// acknowledgement or unavailable. In legacy mode without an
     /// index path this is a no-op success.
     pub fn save_index(&mut self) -> Result<(), String> {
+        self.ownership_guard()?;
         let Some(library) = self.library.as_ref() else {
             return Err(match self.storage {
                 StorageBackend::Legacy { .. } => {
@@ -1547,10 +2028,15 @@ impl Controller {
             .into());
         };
         match &self.storage {
-            StorageBackend::Legacy { index_path } => match index_path {
-                Some(path) => save_library(library, path),
-                None => Ok(()),
-            },
+            StorageBackend::Legacy { index_path } => {
+                if self.legacy_index_write_protected {
+                    return Err(LEGACY_INDEX_WRITE_PROTECTED.to_owned());
+                }
+                match index_path {
+                    Some(path) => save_library(library, path),
+                    None => Ok(()),
+                }
+            }
             StorageBackend::Portable { .. } => {
                 if self
                     .portable_store
@@ -1565,6 +2051,70 @@ impl Controller {
                 }
             }
         }
+    }
+
+    /// Explicitly resolves a protected unreadable legacy index: renames
+    /// the existing file to a sibling `<name>.unreadable` (or
+    /// `.unreadable-N` if taken), preserves its bytes, clears the write
+    /// protection, and enables scanning and saving again.
+    ///
+    /// This is the only way out of the protected state. Nothing is
+    /// deleted and nothing is overwritten; if the rename fails, the
+    /// file is untouched and protection remains active.
+    ///
+    /// # Errors
+    ///
+    /// A user-facing message when no protected legacy index exists, a
+    /// scan is running, or the file cannot be renamed. In the last case
+    /// the original file is left intact and protected.
+    pub fn replace_unreadable_legacy_index(&mut self) -> Result<PathBuf, String> {
+        self.ownership_guard()?;
+        if self.is_scanning() {
+            return Err("A library scan is in progress; try again when it finishes.".to_owned());
+        }
+        if !self.legacy_index_write_protected {
+            return Err(
+                "The active library index is not write-protected; there is nothing to replace."
+                    .to_owned(),
+            );
+        }
+        let StorageBackend::Legacy {
+            index_path: Some(index_path),
+        } = &self.storage
+        else {
+            return Err(
+                "The protected index is not a legacy library index with a file path.".to_owned(),
+            );
+        };
+        let index_path = index_path.clone();
+        if !index_path.exists() {
+            self.legacy_index_write_protected = false;
+            self.last_error = None;
+            self.persist_queue();
+            self.report_status(format!(
+                "The unreadable library index at {} no longer exists; scanning and saving are enabled.",
+                index_path.display()
+            ));
+            return Ok(index_path);
+        }
+
+        let backup = preserved_legacy_index_path(&index_path)?;
+        std::fs::rename(&index_path, &backup).map_err(|err| {
+            format!(
+                "Could not preserve the unreadable library index at {}: {err}. \
+                 The file was left untouched and remains protected.",
+                index_path.display()
+            )
+        })?;
+
+        self.legacy_index_write_protected = false;
+        self.last_error = None;
+        self.persist_queue();
+        self.report_status(format!(
+            "Preserved the unreadable library index as {}. Scanning and saving are enabled.",
+            backup.display()
+        ));
+        Ok(backup)
     }
 
     /// Clean shutdown: waits for any running scan to finish (its save
@@ -1657,63 +2207,134 @@ impl Controller {
             drained
         };
         for event in engine_events {
-            match event {
-                EngineEvent::Loaded { id, info } => {
-                    if self.engine_loaded == Some(id) {
-                        self.stream_info = Some(info);
-                        events.push(ControllerEvent::PlaybackChanged);
-                    }
-                }
-                EngineEvent::Started { .. } | EngineEvent::Paused { .. } | EngineEvent::Stopped => {
-                    events.push(ControllerEvent::PlaybackChanged)
-                }
-                EngineEvent::TrackEnded { id } => {
-                    // Accept only the end of the track we loaded and
-                    // the model still considers current — stale events
-                    // can never advance the wrong queue position (the
-                    // engine's generations already prevent them; this
-                    // is the controller-side belt to that suspenders).
-                    if self.engine_loaded == Some(id) && self.player.current_track() == Some(id) {
-                        if self.player.on_track_ended().is_some() {
-                            self.sync_engine(true);
-                        }
-                        events.push(ControllerEvent::PlaybackChanged);
-                    }
-                }
-                EngineEvent::Error { id, error } => {
-                    let message = match id.and_then(|i| self.track(i)) {
-                        Some(track) => {
-                            format!("Playback failed for \"{}\": {error}", track.title())
-                        }
-                        None => format!("Audio error: {error}"),
-                    };
-                    self.player.stop();
-                    self.engine_loaded = None;
-                    self.stream_info = None;
-                    self.report_error(message);
-                    events.push(ControllerEvent::PlaybackChanged);
-                }
-            }
+            self.handle_engine_event(event, &mut events);
         }
 
         events.append(&mut self.outbox);
         events
     }
 
+    /// Handles exactly one engine event. Session correlation lives here
+    /// so delayed events can be ignored deterministically and tests can
+    /// inject controlled event ordering without sleeping.
+    fn handle_engine_event(&mut self, event: EngineEvent, events: &mut Vec<ControllerEvent>) {
+        match event {
+            EngineEvent::Loaded { session, id, info } => {
+                if self.engine_session == Some(session) && self.engine_loaded == Some(id) {
+                    self.stream_info = Some(info);
+                    events.push(ControllerEvent::PlaybackChanged);
+                }
+            }
+            EngineEvent::Started { session, .. } | EngineEvent::Paused { session, .. } => {
+                if self.engine_session == Some(session) {
+                    events.push(ControllerEvent::PlaybackChanged);
+                }
+            }
+            EngineEvent::Stopped => events.push(ControllerEvent::PlaybackChanged),
+            EngineEvent::TrackEnded { session, id } => {
+                if self.engine_session == Some(session)
+                    && self.engine_loaded == Some(id)
+                    && self.player.current_track() == Some(id)
+                    && self.player.state() == PlaybackState::Playing
+                {
+                    // Advance (or stop at the end), then reconcile the
+                    // engine to the model. At the end of the queue this
+                    // clears the sync ledger so a later Play performs a
+                    // fresh load instead of restarting an old session.
+                    let before = self.current_queue_entry_id();
+                    self.player.on_track_ended();
+                    if before != self.current_queue_entry_id() {
+                        self.after_queue_change();
+                    }
+                    self.sync_engine(true);
+                    events.push(ControllerEvent::PlaybackChanged);
+                }
+            }
+            EngineEvent::Error { session, id, error } => {
+                // A session-qualified error is current only when it
+                // belongs to the load attempt the controller is still
+                // tracking. None is a global output failure and always
+                // matters.
+                if session.is_some() && session != self.engine_session {
+                    return;
+                }
+                let message = match id.and_then(|i| self.track(i)) {
+                    Some(track) => {
+                        format!("Playback failed for \"{}\": {error}", track.title())
+                    }
+                    None => format!("Audio error: {error}"),
+                };
+                self.player.stop();
+                self.engine.stop();
+                self.engine_loaded = None;
+                self.engine_session = None;
+                self.stream_info = None;
+                self.report_error(message);
+                events.push(ControllerEvent::PlaybackChanged);
+            }
+        }
+    }
+
     // -------------------------------------------------------- internals ---
 
-    /// Rebuilds the player's queue as "the whole library, in library
-    /// order", preserving the current selection when it still exists.
-    fn rebuild_queue(&mut self) {
-        let previous = self.player.current_track();
-        let ids: Vec<TrackId> = self.tracks.iter().map(|(id, _)| *id).collect();
-        let queue = self.player.queue_mut();
-        queue.clear();
-        for id in ids {
-            queue.push(id);
+    fn queue_persistence_allowed(&self) -> bool {
+        !self.queue_write_protected
+            && !self.legacy_index_write_protected
+            && self.portable_recovery.is_none()
+    }
+
+    /// Publishes a queue mutation to front-ends and persists it when the
+    /// active library state permits writes. A malformed loaded queue file
+    /// or a protected/recovered catalogue leaves the original file
+    /// untouched.
+    fn after_queue_change(&mut self) {
+        self.persist_queue();
+        self.outbox.push(ControllerEvent::QueueChanged);
+    }
+
+    fn persist_queue(&mut self) {
+        if !self.queue_persistence_allowed() {
+            return;
         }
-        if let Some(id) = previous {
-            let _ = queue.set_current_by_id(id);
+        let Some(store) = &self.queue_store else {
+            return;
+        };
+        let result = store.save(self.player.queue(), self.queue_auto_library);
+        if let Err(error) = result {
+            let message = format!(
+                "Could not save the playback queue ({}): {error}. \
+                 The queue remains in memory and will be retried on the next change.",
+                store.path().display()
+            );
+            self.report_error(message);
+        }
+    }
+
+    /// While the queue is still the library-derived default, append tracks
+    /// discovered by a scan. Existing entries, identities, and the current
+    /// selection are untouched. Once the user structurally edits the queue
+    /// this never runs again.
+    fn sync_default_queue(&mut self) {
+        if !self.queue_auto_library {
+            return;
+        }
+        let ids: Vec<TrackId> = self.tracks.iter().map(|(id, _)| *id).collect();
+        let mut present: std::collections::HashSet<TrackId> = self
+            .player
+            .queue()
+            .entries()
+            .iter()
+            .map(|entry| entry.track())
+            .collect();
+        let mut added = false;
+        for id in ids {
+            if present.insert(id) {
+                self.player.queue_mut().push(id);
+                added = true;
+            }
+        }
+        if added {
+            self.after_queue_change();
         }
     }
 
@@ -1750,6 +2371,7 @@ impl Controller {
             PlaybackState::Stopped => {
                 self.engine.stop();
                 self.engine_loaded = None;
+                self.engine_session = None;
                 self.stream_info = None;
             }
         }
@@ -1760,8 +2382,8 @@ impl Controller {
     /// format) are returned for the caller to surface; decode/IO
     /// failures arrive asynchronously as engine error events.
     fn load_into_engine(&mut self, id: TrackId, autoplay: bool) -> Result<(), String> {
-        if let AudioStatus::Unavailable(reason) = &self.audio {
-            return Err(reason.clone());
+        if let Some(reason) = self.audio.reason() {
+            return Err(reason.to_owned());
         }
         let Some(track) = self.track(id) else {
             return Err("That track is no longer in the library.".to_owned());
@@ -1774,12 +2396,13 @@ impl Controller {
                  Opus, and M4A/MP4 (AAC) files. The file stays in the library, indexed."
             ));
         }
-        self.engine.load(id, path);
+        let session = self.engine.load(id, path);
+        self.engine_loaded = Some(id);
+        self.engine_session = Some(session);
+        self.stream_info = None;
         if autoplay {
             self.engine.play();
         }
-        self.engine_loaded = Some(id);
-        self.stream_info = None;
         Ok(())
     }
 
@@ -1789,6 +2412,7 @@ impl Controller {
         self.player.stop();
         self.engine.stop();
         self.engine_loaded = None;
+        self.engine_session = None;
         self.stream_info = None;
         self.report_error(message);
     }
@@ -1796,6 +2420,22 @@ impl Controller {
     fn begin_scan_roots(&mut self, roots: Vec<PathBuf>) {
         if self.scan_rx.is_some() {
             self.report_error("A library scan is already in progress.".to_owned());
+            return;
+        }
+        let scan_writes = match &self.storage {
+            StorageBackend::Legacy { index_path } => index_path.is_some(),
+            StorageBackend::Portable { .. } => self.portable_store.is_some(),
+        };
+        if scan_writes && !self.active_library_is_owned() {
+            self.report_error(LIBRARY_NOT_OWNED.to_owned());
+            return;
+        }
+        // A scan's completion always saves. If the existing legacy
+        // index could not be read, running the scan would either make
+        // no durable progress or tempt a later write to replace it;
+        // refuse until the user explicitly preserves and replaces it.
+        if self.legacy_index_write_protected {
+            self.report_error(LEGACY_INDEX_WRITE_PROTECTED.to_owned());
             return;
         }
         // A recovered portable store is read-only, and a scan's
@@ -1857,10 +2497,12 @@ impl Controller {
                 None => ScanPersistence::PortableUnavailable,
             },
         };
+        let lease = self.library_lock.clone();
         let work = ScanWork {
             library,
             roots,
             persistence,
+            lease,
         };
         let (work_tx, work_rx) = std::sync::mpsc::channel::<ScanWork>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<ScanOutcome>();
@@ -1873,8 +2515,12 @@ impl Controller {
                     mut library,
                     roots,
                     mut persistence,
+                    lease,
                 }) = work_rx.recv()
                 {
+                    // Bind (rather than `_`) so the lease lives until
+                    // this closure returns, after the save attempt.
+                    let _lease = lease;
                     let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
                     let report = library.scan(&root_refs);
                     let (saved, sync_report) = match &mut persistence {
@@ -1961,33 +2607,72 @@ impl Controller {
     }
 
     fn finish_scan(&mut self, outcome: ScanOutcome) {
-        self.tracks = snapshot(&outcome.library);
-        self.library = Some(outcome.library);
-        if let ScanPersistence::Portable(store) = outcome.persistence {
+        let ScanOutcome {
+            library,
+            report: scan_report,
+            persistence,
+            saved,
+            sync_report,
+        } = outcome;
+        self.library = Some(library);
+        if let ScanPersistence::Portable(store) = persistence {
             self.portable_store = Some(*store);
         }
-        self.rebuild_queue();
-        let report = &outcome.report;
+
+        // In portable mode the store is authoritative for effective
+        // metadata after the scan's sync: it holds the newly read tag
+        // snapshots *and* the user overrides, with the override
+        // precedence applied by `StoredTrack::effective_metadata`.
+        // Rebuilding here keeps overrides visible in the live session;
+        // a legacy scan (or a portable scan whose store is unavailable)
+        // uses the scanned library unchanged.
+        let refresh_note = match self.rebuilt_from_store() {
+            Some(report) => {
+                let PortableRefreshReport {
+                    library,
+                    skipped_store_records,
+                    dropped_memory_only,
+                } = report;
+                let note = refresh_skip_note(skipped_store_records, &dropped_memory_only);
+                self.install_library_snapshot(library);
+                note
+            }
+            None => {
+                let library = self
+                    .library
+                    .take()
+                    .expect("scan library was just installed");
+                self.install_library_snapshot(library);
+                None
+            }
+        };
+
+        self.sync_default_queue();
+
         let mut message = format!(
             "Scan complete: {} added, {} updated, {} already indexed, {} skipped, {} failed. {} track(s) in the library.",
-            report.added(),
-            report.updated(),
-            report.deduplicated(),
-            report.skipped().len(),
-            report.failed().len(),
+            scan_report.added(),
+            scan_report.updated(),
+            scan_report.deduplicated(),
+            scan_report.skipped().len(),
+            scan_report.failed().len(),
             self.tracks.len(),
         );
-        if let Some(sync_report) = &outcome.sync_report
+        if let Some(note) = refresh_note {
+            message.push(' ');
+            message.push_str(&note);
+        }
+        if let Some(sync_report) = &sync_report
             && !sync_report.skipped.is_empty()
         {
             message += &format!(
-                " {} track(s) could not be stored in the portable library and \
-                 are kept for this session only.",
+                " {} track(s) could not be stored in the portable library; they remain \
+                 in memory for this session unless a path conflict is reported.",
                 sync_report.skipped.len()
             );
         }
         self.report_status(message);
-        if let Some(Err(message)) = outcome.saved {
+        if let Some(Err(message)) = saved {
             self.report_error(message);
         }
     }
@@ -2025,13 +2710,12 @@ impl Controller {
             Some(library) => {
                 self.tracks = snapshot(&library);
                 self.library = Some(library);
-                self.rebuild_queue();
+                self.sync_default_queue();
                 true
             }
             None => {
                 self.library = Some(Library::new());
                 self.tracks.clear();
-                self.rebuild_queue();
                 false
             }
         }
@@ -2093,9 +2777,57 @@ fn validate_scan_root(root: &Path) -> Result<(), String> {
 /// represent. Used identically by construction ([`Controller::new_portable`])
 /// and by switching ([`Controller::switch_to_portable`]), so a
 /// candidate is judged by exactly the same rules in both.
-fn open_portable_candidate(
-    library_root: &Path,
-) -> Result<(PathBuf, OpenedStore, Library, usize), PortableOpenError> {
+/// The queue file for a canonical legacy index: a sibling
+/// `<index>.queue.json`, kept separate from the catalogue.
+fn legacy_queue_path(canonical_index: &Path) -> PathBuf {
+    let mut name = canonical_index.as_os_str().to_os_string();
+    name.push(".queue.json");
+    PathBuf::from(name)
+}
+
+/// The queue file for a portable library: inside a private subdirectory
+/// of `.flux`, away from immutable segments and from the store's GC
+/// patterns.
+fn portable_queue_path(root: &Path) -> PathBuf {
+    root.join(FLUX_DIR_NAME).join("queue").join("queue.json")
+}
+
+fn default_queue(library: &Library) -> Queue {
+    let mut queue = Queue::new();
+    for (id, _) in library.iter() {
+        queue.push(id);
+    }
+    queue
+}
+
+/// Loads the queue for `library`, or derives the initial whole-library
+/// queue when no queue file exists. Returns the queue, whether persistence
+/// is write-protected, and a load error to report.
+fn load_queue(
+    store: Option<&QueueStore>,
+    library: &Library,
+) -> (Queue, bool, bool, Option<String>) {
+    let Some(store) = store else {
+        return (default_queue(library), true, false, None);
+    };
+    match store.load() {
+        Ok(Some(loaded)) => (loaded.queue, loaded.auto_library, false, None),
+        Ok(None) => (default_queue(library), true, false, None),
+        Err(error) => (
+            default_queue(library),
+            true,
+            true,
+            Some(format!(
+                "Could not load the saved playback queue ({}): {error}. \
+                 The queue file is preserved; queue changes will not be saved \
+                 during this session.",
+                store.path().display()
+            )),
+        ),
+    }
+}
+
+fn canonical_portable_root(library_root: &Path) -> Result<PathBuf, PortableOpenError> {
     let root_invalid = |reason: String| PortableOpenError::RootInvalid {
         root: library_root.to_owned(),
         reason,
@@ -2109,12 +2841,28 @@ fn open_portable_candidate(
             )));
         }
     }
-    let root = std::fs::canonicalize(library_root)
-        .map_err(|err| root_invalid(format!("it cannot be canonicalized: {err}")))?;
+    std::fs::canonicalize(library_root)
+        .map_err(|err| root_invalid(format!("it cannot be canonicalized: {err}")))
+}
 
-    let opened = PortableStore::open(&root)?;
+/// Opens an already-canonical portable root under an exclusive lease.
+/// The lease is returned to the caller so it can outlive construction
+/// and be cloned into background workers.
+fn open_portable_candidate_at(
+    root: &Path,
+) -> Result<(LibraryLock, OpenedStore, Library, usize), PortableOpenError> {
+    let lock = LibraryLock::acquire_portable_root(root)?;
+    let opened = PortableStore::open(root)?;
     let (library, skipped) = Library::from_portable_store(&opened.store);
-    Ok((root, opened, library, skipped))
+    Ok((lock, opened, library, skipped))
+}
+
+fn open_portable_candidate(
+    library_root: &Path,
+) -> Result<(PathBuf, LibraryLock, OpenedStore, Library, usize), PortableOpenError> {
+    let root = canonical_portable_root(library_root)?;
+    let (lock, opened, library, skipped) = open_portable_candidate_at(&root)?;
+    Ok((root, lock, opened, library, skipped))
 }
 
 /// The status text shown when some records of an opened portable
@@ -2125,6 +2873,27 @@ fn skipped_unrepresentable_message(skipped: usize) -> String {
          because their file paths are not representable here. They are \
          preserved unchanged in the library files."
     )
+}
+
+/// A single status sentence for the parts of a store refresh that could
+/// not appear in the runtime library: unrepresentable store records and
+/// memory-only tracks whose path a persistent record now owns.
+fn refresh_skip_note(
+    skipped_store_records: usize,
+    dropped_memory_only: &[TrackId],
+) -> Option<String> {
+    let mut notes = Vec::new();
+    if skipped_store_records > 0 {
+        notes.push(skipped_unrepresentable_message(skipped_store_records));
+    }
+    if !dropped_memory_only.is_empty() {
+        notes.push(format!(
+            "{} in-memory track(s) could not be kept because the portable library \
+             already owns their path; the persistent record won.",
+            dropped_memory_only.len()
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
 }
 
 /// The portable save: sync the in-memory library into the store,
@@ -2147,6 +2916,43 @@ fn persist_portable(
     Ok(report)
 }
 
+/// A non-existing sibling path that preserves an unreadable legacy
+/// index without overwriting an earlier preserved copy.
+fn preserved_legacy_index_path(index_path: &Path) -> Result<PathBuf, String> {
+    for attempt in 0..1_000u32 {
+        let mut name = index_path.as_os_str().to_os_string();
+        if attempt == 0 {
+            name.push(".unreadable");
+        } else {
+            name.push(format!(".unreadable-{}", attempt + 1));
+        }
+        let candidate = PathBuf::from(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "Could not find an unused preservation name next to {}; the original file was left untouched.",
+        index_path.display()
+    ))
+}
+
+/// Whether two library locations name the same file/root. Used only to
+/// make "open the already-active library" a friendly no-op instead of a
+/// self-conflict with our own lock.
+fn same_library_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        return a == b;
+    }
+    match (std::path::absolute(a), std::path::absolute(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Creates parent directories, then writes the versioned index
 /// (flushing the "parent must exist" precondition of
 /// `Library::save_to_path`).
@@ -2167,14 +2973,15 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use flux_audio::engine::EngineHandle;
+    use flux_audio::engine::{EngineError, EngineEvent, EngineHandle};
     use flux_audio::output::NullControl;
-    use flux_core::{PlaybackState, RepeatMode, TrackId};
+    use flux_core::{PlaybackState, Queue, QueueEntryId, RepeatMode, Track, TrackId};
+    use flux_library::QueueStore;
 
     use super::{
         AudioStatus, Controller, ControllerEvent, CreateLibraryError, PortableOpenError,
-        ScanOutcome, StorageMode, SwitchError, create_portable_library, execute_legacy_migration,
-        is_track_playable, migrate_legacy_library, plan_legacy_migration,
+        ScanOutcome, StorageMode, SwitchError, create_portable_library, default_engine,
+        execute_legacy_migration, is_track_playable, migrate_legacy_library, plan_legacy_migration,
     };
 
     struct TempDir(PathBuf);
@@ -2244,8 +3051,32 @@ mod tests {
         let (engine, control) = EngineHandle::spawn_null(44_100, 1);
         let index = dir.path().join("state").join("library-index.json");
         (
-            Controller::new(engine, AudioStatus::Ready, Some(index)),
+            Controller::new(engine, AudioStatus::Ready, Some(index))
+                .expect("controller opens the test library"),
             control,
+        )
+    }
+
+    fn legacy_queue_file(dir: &TempDir) -> PathBuf {
+        dir.path()
+            .join("state")
+            .join("library-index.json.queue.json")
+    }
+
+    fn portable_queue_file(root: &Path) -> PathBuf {
+        root.join(".flux").join("queue").join("queue.json")
+    }
+
+    fn queue_snapshot(
+        controller: &Controller,
+    ) -> (Vec<(QueueEntryId, TrackId)>, Option<QueueEntryId>) {
+        (
+            controller
+                .queue_entries()
+                .iter()
+                .map(|entry| (entry.id(), entry.track()))
+                .collect(),
+            controller.current_queue_entry_id(),
         )
     }
 
@@ -2834,15 +3665,205 @@ mod tests {
     }
 
     #[test]
+    fn stale_engine_errors_never_stop_current_playback() {
+        let dir = TempDir::new("stale-errors");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+
+        // Model a current Playing session on track B without starting
+        // the real worker; event delivery is then fully controlled.
+        controller.player.play_track(b).expect("select b");
+        controller.engine_loaded = Some(b);
+        controller.engine_session = Some(77);
+
+        let mut events = Vec::new();
+        controller.handle_engine_event(
+            EngineEvent::Error {
+                session: Some(76),
+                id: Some(a),
+                error: EngineError::Output("old track failed".to_owned()),
+            },
+            &mut events,
+        );
+        assert!(events.is_empty());
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.engine_session, Some(77));
+        assert!(controller.last_error().is_none());
+
+        // Earlier attempt for the *same* track: still stale.
+        controller.handle_engine_event(
+            EngineEvent::Error {
+                session: Some(76),
+                id: Some(b),
+                error: EngineError::Output("earlier attempt failed".to_owned()),
+            },
+            &mut events,
+        );
+        assert!(events.is_empty());
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.engine_session, Some(77));
+        assert!(controller.last_error().is_none());
+
+        // A genuine current-session failure is reported and stopped.
+        controller.handle_engine_event(
+            EngineEvent::Error {
+                session: Some(77),
+                id: Some(b),
+                error: EngineError::Output("current session failed".to_owned()),
+            },
+            &mut events,
+        );
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None);
+        assert_eq!(controller.engine_session, None);
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|message| message.contains("Playback failed")),
+            "{:?}",
+            controller.last_error()
+        );
+        assert!(events.contains(&ControllerEvent::PlaybackChanged));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn global_audio_errors_stop_an_active_session() {
+        let dir = TempDir::new("global-audio-error");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.player.play_track(a).expect("select a");
+        controller.engine_loaded = Some(a);
+        controller.engine_session = Some(5);
+
+        let mut events = Vec::new();
+        controller.handle_engine_event(
+            EngineEvent::Error {
+                session: None,
+                id: None,
+                error: EngineError::Output("device disappeared".to_owned()),
+            },
+            &mut events,
+        );
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_session, None);
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|message| message.contains("device disappeared")),
+            "{:?}",
+            controller.last_error()
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn stale_track_end_does_not_advance_but_current_end_does() {
+        let dir = TempDir::new("stale-end");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let ids = track_ids(&controller);
+        let a = TrackId::new(ids[0]);
+        let b = TrackId::new(ids[1]);
+        controller.player.play_track(a).expect("select a");
+        controller.engine_loaded = Some(a);
+        controller.engine_session = Some(10);
+
+        let mut events = Vec::new();
+        controller.handle_engine_event(EngineEvent::TrackEnded { session: 9, id: a }, &mut events);
+        assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+
+        controller.handle_engine_event(EngineEvent::TrackEnded { session: 10, id: a }, &mut events);
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn failed_load_then_new_track_plays_without_a_delayed_error() {
+        let dir = TempDir::new("failed-load-then-play");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let bad = root.join("bad.wav");
+        fs::write(&bad, b"not a real wav").expect("bad fixture");
+        let good = write_dc_wav(&root, "good.wav", 441_000, 0.4);
+
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let bad_id = id_of(&controller, &bad);
+        let good_id = id_of(&controller, &good);
+
+        controller.play_track(bad_id);
+        controller.play_track(good_id);
+        let events = drive(&mut controller, &control, |controller, _| {
+            controller.stream_info().is_some()
+                && controller.player_state() == PlaybackState::Playing
+                && controller.current_id() == Some(good_id)
+        });
+
+        assert_eq!(controller.current_id(), Some(good_id));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert!(
+            controller.last_error().is_none(),
+            "the old load failure must not surface: {:?}",
+            controller.last_error()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ControllerEvent::Error(_))),
+            "stale/duplicate errors reached the UI: {events:?}"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn audio_status_distinguishes_build_and_device_failures() {
+        assert!(AudioStatus::Ready.is_ready());
+        assert!(AudioStatus::Ready.reason().is_none());
+
+        let build = AudioStatus::BuildWithoutBackend;
+        assert!(!build.is_ready());
+        assert!(
+            build
+                .reason()
+                .is_some_and(|reason| reason.contains("compiled without"))
+        );
+
+        let device = AudioStatus::DeviceUnavailable("no output device".to_owned());
+        assert!(!device.is_ready());
+        assert_eq!(device.reason(), Some("no output device"));
+    }
+
+    #[cfg(not(feature = "cpal"))]
+    #[test]
+    fn default_engine_does_not_claim_ready_without_a_backend() {
+        let (engine, status) = default_engine();
+        assert_eq!(status, AudioStatus::BuildWithoutBackend);
+        assert!(!status.is_ready());
+        engine.shutdown();
+    }
+
+    #[test]
     fn unavailable_audio_refuses_playback_but_still_browses() {
         let dir = TempDir::new("noaudio");
         let fx = fixtures(&dir);
         let (engine, control) = EngineHandle::spawn_null(44_100, 1);
         let mut controller = Controller::new(
             engine,
-            AudioStatus::Unavailable("no output device in this test".to_owned()),
+            AudioStatus::DeviceUnavailable("no output device in this test".to_owned()),
             None,
-        );
+        )
+        .expect("session-only controller");
         scanned(&mut controller, &control, fx.root.clone());
         assert_eq!(controller.tracks().len(), 4, "browsing works without audio");
 
@@ -2946,6 +3967,7 @@ mod tests {
                 library,
                 roots: vec![fx.root.clone()],
                 persistence: super::ScanPersistence::None,
+                lease: None,
             })
             .expect_err("send to a dropped receiver must fail");
         controller.scan_start_failed(err.0, "The library scan could not be started.".to_owned());
@@ -3038,7 +4060,8 @@ mod tests {
         let dir = TempDir::new("lost_scan_no_index");
         let fx = fixtures(&dir);
         let (engine, control) = EngineHandle::spawn_null(44_100, 1);
-        let mut controller = Controller::new(engine, AudioStatus::Ready, None);
+        let mut controller =
+            Controller::new(engine, AudioStatus::Ready, None).expect("session-only controller");
         scanned(&mut controller, &control, fx.root.clone());
         assert_eq!(controller.tracks().len(), 4);
 
@@ -3150,6 +4173,99 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_legacy_index_is_never_overwritten_by_save_or_scan() {
+        let dir = TempDir::new("s7-legacy-protected");
+        let index = dir.path().join("library-index.json");
+        let original = b"this is not a valid Flux index";
+        fs::write(&index, original).expect("corrupt index fixture");
+
+        let (mut controller, _control) = boot_legacy_at(Some(index.clone()));
+        assert!(
+            controller.legacy_index_write_protected(),
+            "an existing unreadable index must enter write protection"
+        );
+
+        let error = controller
+            .save_index()
+            .expect_err("explicit save must refuse");
+        assert!(
+            error.contains("will not overwrite"),
+            "message should explain the protection: {error}"
+        );
+        assert_eq!(
+            fs::read(&index).expect("index still present"),
+            original,
+            "an explicit save must not overwrite the unreadable index"
+        );
+
+        let root = two_track_dir(&dir, "music");
+        controller.begin_scan(root);
+        assert!(
+            !controller.is_scanning(),
+            "a scan must be refused before it can save over the index"
+        );
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|message| message.contains("will not overwrite")),
+            "the refusal must be visible"
+        );
+        assert_eq!(
+            fs::read(&index).expect("index still present"),
+            original,
+            "a scan must not overwrite the unreadable index"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn replacing_unreadable_legacy_index_preserves_bytes_and_reenables_writes() {
+        let dir = TempDir::new("s7-legacy-replace");
+        let index = dir.path().join("library-index.json");
+        let original = b"unreadable index payload";
+        fs::write(&index, original).expect("corrupt index fixture");
+
+        // An earlier preserved copy must never be overwritten.
+        let mut earlier_name = index.as_os_str().to_os_string();
+        earlier_name.push(".unreadable");
+        let earlier = PathBuf::from(earlier_name);
+        fs::write(&earlier, b"earlier preserved copy").expect("earlier backup");
+
+        let (mut controller, _control) = boot_legacy_at(Some(index.clone()));
+        assert!(controller.legacy_index_write_protected());
+
+        let backup = controller
+            .replace_unreadable_legacy_index()
+            .expect("preserve and replace succeeds");
+        assert_ne!(backup, index);
+        assert_eq!(
+            fs::read(&backup).expect("preserved copy"),
+            original,
+            "the unreadable bytes are preserved exactly"
+        );
+        assert_eq!(
+            fs::read(&earlier).expect("earlier backup"),
+            b"earlier preserved copy",
+            "an earlier preserved copy is never overwritten"
+        );
+        assert!(
+            !index.exists(),
+            "the original path is freed for a new index"
+        );
+        assert!(!controller.legacy_index_write_protected());
+        assert!(
+            controller.last_error().is_none(),
+            "the resolved protection error is cleared"
+        );
+
+        controller.save_index().expect("new empty index writes");
+        let loaded =
+            flux_library::Library::load_from_path(&index).expect("new index is valid and empty");
+        assert!(loaded.is_empty());
+        controller.shutdown();
+    }
+
+    #[test]
     fn portable_mode_opens_store_and_reconstructs_records() {
         let dir = TempDir::new("s4-portable-open");
         let root = dir.path().join("library");
@@ -3182,6 +4298,192 @@ mod tests {
             "portable mode never writes the legacy index"
         );
         controller.shutdown();
+    }
+
+    #[test]
+    fn two_controllers_cannot_own_the_same_legacy_index() {
+        let dir = TempDir::new("s7-lock-legacy");
+        let index = dir.path().join("library-index.json");
+        let mut library = flux_library::Library::new();
+        library.insert(Track::new(
+            "One",
+            flux_core::TrackSource::local("/music/one.flac"),
+        ));
+        library.save_to_path(&index).expect("seed index");
+        let bytes = fs::read(&index).expect("index bytes");
+
+        let (first, _control) = boot_legacy_at(Some(index.clone()));
+        let (engine, _control2) = EngineHandle::spawn_null(44_100, 1);
+        let error = Controller::new(engine, AudioStatus::Ready, Some(index.clone()))
+            .err()
+            .expect("second controller must be refused");
+        assert!(
+            matches!(
+                error,
+                super::ControllerOpenError::Lock(flux_library::LibraryLockError::Busy { .. })
+            ),
+            "got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("already open"),
+            "message must be actionable: {error}"
+        );
+        assert_eq!(
+            fs::read(&index).expect("index bytes"),
+            bytes,
+            "lock contention must not modify the catalogue"
+        );
+
+        // Re-opening the active library is a no-op, not a self-conflict.
+        let mut first = first;
+        first
+            .switch_to_legacy_index(Some(index.clone()))
+            .expect("same library is a no-op");
+
+        first.shutdown();
+        let (reopened, _control3) = boot_legacy_at(Some(index));
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn two_controllers_cannot_own_the_same_portable_library() {
+        let dir = TempDir::new("s7-lock-portable");
+        let root = seeded_root(&dir, "portable");
+        let catalog = catalog_path(&root);
+        let bytes = fs::read(&catalog).expect("catalogue bytes");
+
+        let (first, _control) = boot_portable_at(&root).expect("first controller");
+        let (engine, _control2) = EngineHandle::spawn_null(44_100, 1);
+        let error = Controller::new_portable(engine, AudioStatus::Ready, &root)
+            .err()
+            .expect("second controller must be refused");
+        assert!(
+            matches!(
+                error,
+                PortableOpenError::Lock(flux_library::LibraryLockError::Busy { .. })
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            fs::read(&catalog).expect("catalogue bytes"),
+            bytes,
+            "lock contention must not touch the catalogue"
+        );
+
+        first.shutdown();
+        let (reopened, _control3) = boot_portable_at(&root).expect("reopened after release");
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn creating_a_library_respects_another_owners_lease() {
+        let dir = TempDir::new("s7-lock-create");
+        let root = dir.path().join("destination");
+        fs::create_dir_all(&root).expect("root");
+        let held =
+            flux_library::LibraryLock::acquire_portable_root(&root).expect("hold destination");
+
+        let error = create_portable_library(&root).expect_err("must refuse owned destination");
+        assert!(
+            matches!(
+                error,
+                CreateLibraryError::Lock(flux_library::LibraryLockError::Busy { .. })
+            ),
+            "got {error:?}"
+        );
+        assert!(
+            !root.join(".flux").exists(),
+            "creation must not run while another process owns the destination"
+        );
+
+        drop(held);
+        create_portable_library(&root).expect("creation after release");
+    }
+
+    #[test]
+    fn failed_portable_initialization_releases_its_lock() {
+        let dir = TempDir::new("s7-lock-failed-init");
+        let root = dir.path().join("empty-root");
+        fs::create_dir_all(&root).expect("root");
+        let (engine, _control) = EngineHandle::spawn_null(44_100, 1);
+        let error = Controller::new_portable(engine, AudioStatus::Ready, &root)
+            .err()
+            .expect("no store exists");
+        assert!(
+            matches!(error, PortableOpenError::Store(_)),
+            "got {error:?}"
+        );
+
+        // The failed attempt must not leave its lease behind.
+        let lease = flux_library::LibraryLock::acquire_portable_root(&root)
+            .expect("failed initialization released the lease");
+        drop(lease);
+    }
+
+    #[test]
+    fn switching_libraries_respects_other_owners_and_releases_the_old_lease() {
+        let dir = TempDir::new("s7-lock-switch");
+        let root_a = seeded_root(&dir, "a");
+        let root_b = seeded_root(&dir, "b");
+        let root_c = dir.path().join("c");
+        fs::create_dir_all(&root_c).expect("root c");
+        create_portable_library(&root_c).expect("create free destination");
+
+        let (mut a, _control_a) = boot_portable_at(&root_a).expect("open a");
+        let (b, _control_b) = boot_portable_at(&root_b).expect("open b");
+        let canonical_a = fs::canonicalize(&root_a).expect("canonical a");
+
+        // Same library: friendly no-op. Different owned library: refused
+        // without changing the active backend.
+        a.switch_to_portable(&root_a).expect("same library no-op");
+        let error = a.switch_to_portable(&root_b).expect_err("b is owned");
+        assert!(
+            matches!(
+                error,
+                SwitchError::Portable(PortableOpenError::Lock(
+                    flux_library::LibraryLockError::Busy { .. }
+                ))
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(a.portable_root(), Some(canonical_a.as_path()));
+
+        // A free destination can be adopted; that releases root A.
+        a.switch_to_portable(&root_c)
+            .expect("adopt free destination");
+        b.shutdown();
+        a.shutdown();
+
+        let (reopened_a, _control) = boot_portable_at(&root_a).expect("root A released");
+        reopened_a.shutdown();
+        let (reopened_c, _control) = boot_portable_at(&root_c).expect("root C released");
+        reopened_c.shutdown();
+    }
+
+    #[test]
+    fn background_scan_keeps_the_library_leased_until_completion() {
+        let dir = TempDir::new("s7-lock-scan");
+        let root = seeded_root(&dir, "portable");
+        let (mut controller, control) = boot_portable_at(&root).expect("open");
+        controller.begin_scan(root.clone());
+        assert!(controller.is_scanning());
+
+        let (engine, _control2) = EngineHandle::spawn_null(44_100, 1);
+        let error = Controller::new_portable(engine, AudioStatus::Ready, &root)
+            .err()
+            .expect("scanning controller still owns the library");
+        assert!(
+            matches!(
+                error,
+                PortableOpenError::Lock(flux_library::LibraryLockError::Busy { .. })
+            ),
+            "got {error:?}"
+        );
+
+        let _ = drive(&mut controller, &control, |c, _| !c.is_scanning());
+        controller.shutdown();
+        let (reopened, _control3) = boot_portable_at(&root).expect("released after scan");
+        reopened.shutdown();
     }
 
     #[test]
@@ -3239,6 +4541,238 @@ mod tests {
             !dir.path().join("state").join("library-index.json").exists(),
             "no legacy index was ever written"
         );
+    }
+
+    #[test]
+    fn portable_scan_keeps_override_effective_and_adds_new_tracks() {
+        use flux_library::{Availability, PortableStore};
+
+        let dir = TempDir::new("s6-scan-override");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 44_100, 0.4);
+
+        let mut record = imported_record(1, "a.wav", Availability::Present, "Tag A");
+        record.overrides.set_title("User Title".to_owned());
+        let mut store = PortableStore::create(&root).expect("create");
+        store.import_tracks(vec![record], 2).expect("seed");
+        store.commit().expect("seed commit");
+        drop(store);
+
+        let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
+        let id = TrackId::new(1);
+        assert_eq!(
+            controller.track(id).expect("track").title(),
+            "User Title",
+            "the override is effective before the scan"
+        );
+        assert_eq!(controller.current_id(), Some(id));
+
+        let new_file = write_dc_wav(&root, "b.wav", 4_410, 0.3);
+        scanned(&mut controller, &control, root.clone());
+
+        assert_eq!(
+            controller.track(id).expect("track").title(),
+            "User Title",
+            "a scan must not replace the override with scanned metadata"
+        );
+        let new_id = id_of(
+            &controller,
+            &fs::canonicalize(&new_file).expect("canonical new file"),
+        );
+        assert_eq!(
+            controller.track(new_id).expect("new track").title(),
+            "b",
+            "newly discovered tracks keep their scanned fallback metadata"
+        );
+        assert_eq!(track_ids(&controller), vec![1, 2]);
+        assert_eq!(
+            controller.current_id(),
+            Some(id),
+            "the refresh keeps the same library's selection"
+        );
+        controller.shutdown();
+
+        // The store kept the override and captured the scan's tag
+        // snapshot (a filename fallback here, since the WAV is untagged).
+        let store = PortableStore::open(&root).expect("reopen store").store;
+        let stored = store.get(id).expect("stored record");
+        assert_eq!(
+            stored.overrides().title(),
+            Some(Some("User Title")),
+            "the persistent override is untouched"
+        );
+        assert_eq!(
+            stored.tags().title.as_deref(),
+            Some("a"),
+            "the scan refreshed the embedded-tag snapshot"
+        );
+        assert_eq!(stored.effective_metadata().title, "User Title");
+        assert_eq!(
+            store
+                .get(new_id)
+                .expect("new record")
+                .tags()
+                .title
+                .as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn portable_scan_preserves_selection_and_paused_state() {
+        use flux_library::{Availability, PortableStore};
+
+        let dir = TempDir::new("s6-scan-selection");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 441_000, 0.4); // 10 seconds: no natural end
+
+        let mut store = PortableStore::create(&root).expect("create");
+        store
+            .import_tracks(
+                vec![imported_record(1, "a.wav", Availability::Present, "Aye")],
+                2,
+            )
+            .expect("seed");
+        store.commit().expect("seed commit");
+        drop(store);
+
+        let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
+        let id = TrackId::new(1);
+        controller.play_track(id);
+        controller.pause();
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+
+        write_dc_wav(&root, "b.wav", 4_410, 0.3);
+        scanned(&mut controller, &control, root.clone());
+
+        assert_eq!(controller.current_id(), Some(id));
+        assert_eq!(
+            controller.player_state(),
+            PlaybackState::Paused,
+            "a same-library refresh must not alter playback state"
+        );
+        assert_eq!(controller.player.queue().len(), 2);
+        assert_eq!(controller.player.queue().current(), Some(id));
+        controller.stop();
+        controller.shutdown();
+    }
+
+    #[test]
+    fn portable_scan_preserves_memory_only_tracks_without_path_duplicates() {
+        use std::collections::HashSet;
+
+        use flux_library::{Availability, PortableStore};
+
+        let dir = TempDir::new("s6-scan-memory-only");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 44_100, 0.4);
+        let mut store = PortableStore::create(&root).expect("create");
+        store
+            .import_tracks(
+                vec![imported_record(1, "a.wav", Availability::Present, "Aye")],
+                2,
+            )
+            .expect("seed");
+        store.commit().expect("seed commit");
+        drop(store);
+        let outside = two_track_dir(&dir, "outside");
+
+        let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
+        // White-box, like the existing scan-handoff tests: inject tracks
+        // a portable sync cannot store, as a previous outside-root scan
+        // would have left them.
+        let mut library = controller.library.take().expect("library present");
+        library.scan(&[outside.as_path()]);
+        controller.tracks = super::snapshot(&library);
+        controller.library = Some(library);
+        let before = track_ids(&controller);
+        assert_eq!(before.len(), 3);
+        let memory_only: Vec<u64> = before.iter().copied().filter(|id| *id != 1).collect();
+
+        write_dc_wav(&root, "b.wav", 4_410, 0.3);
+        scanned(&mut controller, &control, root.clone());
+
+        let after = track_ids(&controller);
+        assert_eq!(after.len(), 4, "new track added, memory-only tracks kept");
+        for id in &memory_only {
+            assert!(
+                after.contains(id),
+                "memory-only track {id} was dropped by the refresh"
+            );
+        }
+        let paths: HashSet<PathBuf> = controller
+            .tracks()
+            .iter()
+            .map(|(_, track)| track.source().path().to_path_buf())
+            .collect();
+        assert_eq!(
+            paths.len(),
+            controller.tracks().len(),
+            "every runtime track must own a distinct path"
+        );
+        controller.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_scan_failed_commit_keeps_override_and_retry_persists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use flux_library::{Availability, PortableStore};
+
+        let dir = TempDir::new("s6-scan-failed-commit");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        write_dc_wav(&root, "a.wav", 44_100, 0.4);
+
+        let mut record = imported_record(1, "a.wav", Availability::Present, "Tag A");
+        record.overrides.set_title("User Title".to_owned());
+        let mut store = PortableStore::create(&root).expect("create");
+        store.import_tracks(vec![record], 2).expect("seed");
+        store.commit().expect("seed commit");
+        drop(store);
+
+        let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
+        let id = TrackId::new(1);
+        let flux_dir = root.join(".flux");
+        fs::set_permissions(&flux_dir, fs::Permissions::from_mode(0o555))
+            .expect("make .flux read-only");
+        scanned(&mut controller, &control, root.clone());
+        fs::set_permissions(&flux_dir, fs::Permissions::from_mode(0o755))
+            .expect("restore .flux permissions");
+
+        assert_eq!(
+            controller.track(id).expect("track").title(),
+            "User Title",
+            "a failed commit must not expose raw scanned metadata"
+        );
+        let error = controller.last_error().expect("commit failure is visible");
+        assert!(
+            error.contains("Could not save the portable library"),
+            "{error}"
+        );
+
+        // The store holds the synced changes pending; the existing save
+        // path retries the commit without a rescan.
+        controller.save_index().expect("retry publishes");
+        controller.shutdown();
+
+        let store = PortableStore::open(&root).expect("reopen store").store;
+        let stored = store.get(id).expect("stored record");
+        assert_eq!(
+            stored.overrides().title(),
+            Some(Some("User Title")),
+            "the retry preserves the override"
+        );
+        assert_eq!(
+            stored.tags().title.as_deref(),
+            Some("a"),
+            "the retry publishes the tag snapshot captured before the failed commit"
+        );
+        assert_eq!(stored.effective_metadata().title, "User Title");
     }
 
     #[test]
@@ -3558,7 +5092,11 @@ mod tests {
     /// A legacy controller with a caller-chosen index path (or none).
     fn boot_legacy_at(index: Option<PathBuf>) -> (Controller, NullControl) {
         let (engine, control) = EngineHandle::spawn_null(44_100, 1);
-        (Controller::new(engine, AudioStatus::Ready, index), control)
+        (
+            Controller::new(engine, AudioStatus::Ready, index)
+                .expect("controller opens the test library"),
+            control,
+        )
     }
 
     /// A folder with exactly two scannable tracks (IDs 1 and 2 after
@@ -3685,10 +5223,12 @@ mod tests {
         );
         // The outgoing legacy index was not written as a side effect.
         assert_eq!(fs::read(&index_path).expect("index"), index_before);
+        // The active controller owns the new library, so a second
+        // opener must wait until it closes.
+        controller.shutdown();
         // And the new library is a real, reopenable store.
         let (again, _c2) = boot_portable_at(&new_root).expect("created library reopens");
         again.shutdown();
-        controller.shutdown();
     }
 
     #[test]
@@ -4165,7 +5705,6 @@ mod tests {
         library.scan(&[outside.as_path()]);
         controller.tracks = super::snapshot(&library);
         controller.library = Some(library);
-        controller.rebuild_queue();
         let with_memory_only = track_ids(&controller);
         assert_eq!(
             with_memory_only.len(),
@@ -4186,5 +5725,569 @@ mod tests {
         // The store still holds only its own two records.
         let reopened = PortableStore::open(&root).expect("reopen").store;
         assert_eq!(reopened.len(), 2);
+    }
+
+    #[test]
+    fn queue_mutations_preserve_current_and_duplicate_identity() {
+        let dir = TempDir::new("queue-mutations");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        let queue_file = legacy_queue_file(&dir);
+        assert!(
+            queue_file.exists(),
+            "the auto-derived queue is persisted after a scan"
+        );
+
+        controller.play_track(a);
+        let current = controller.current_queue_entry_id().expect("current");
+        let current_index = controller.queue_entry_index(current).expect("index");
+        let initial_len = controller.queue_len();
+
+        let first_duplicate = controller.enqueue_track(a).expect("append duplicate");
+        let second_duplicate = controller
+            .enqueue_track(a)
+            .expect("append second duplicate");
+        assert_ne!(first_duplicate, current);
+        assert_ne!(first_duplicate, second_duplicate);
+        assert_eq!(controller.queue_len(), initial_len + 2);
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(
+            controller.queue_entries().last().map(|entry| entry.track()),
+            Some(a)
+        );
+
+        let next_entry = controller.play_next_track(b).expect("play next");
+        assert_eq!(
+            controller.queue_entry_index(next_entry),
+            Some(current_index + 1)
+        );
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+
+        controller
+            .move_queue_entry_by(current, 1)
+            .expect("move current");
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_eq!(
+            controller.queue_entry_index(current),
+            Some(current_index + 1),
+            "the current entry moves by identity, not by index"
+        );
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+
+        // Removing a non-current duplicate changes neither selection nor
+        // playback, and leaves the other duplicate distinct.
+        controller
+            .remove_queue_entry(first_duplicate)
+            .expect("remove one duplicate");
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert!(
+            controller
+                .queue_entries()
+                .iter()
+                .any(|entry| entry.id() == second_duplicate)
+        );
+
+        let before_remove: Vec<QueueEntryId> = controller
+            .queue_entries()
+            .iter()
+            .map(|entry| entry.id())
+            .collect();
+        let removed_index = controller
+            .queue_entry_index(current)
+            .expect("current index");
+        let replacement = if removed_index + 1 < before_remove.len() {
+            Some(before_remove[removed_index + 1])
+        } else if before_remove.len() > 1 {
+            Some(before_remove[before_remove.len() - 2])
+        } else {
+            None
+        };
+        controller
+            .remove_queue_entry(current)
+            .expect("remove current");
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.current_queue_entry_id(), replacement);
+
+        let loaded = QueueStore::new(&queue_file)
+            .load()
+            .expect("queue file loads")
+            .expect("queue file exists");
+        assert!(
+            !loaded.auto_library,
+            "a structural edit disables auto-follow"
+        );
+        assert_eq!(loaded.queue.current_entry_id(), replacement);
+        assert_eq!(
+            loaded
+                .queue
+                .entries()
+                .iter()
+                .map(|entry| (entry.id(), entry.track()))
+                .collect::<Vec<_>>(),
+            queue_snapshot(&controller).0
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn play_track_appends_when_absent_and_prefers_the_first_duplicate() {
+        let dir = TempDir::new("queue-play-track");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+
+        controller.play_track(a);
+        let first = controller.current_queue_entry_id().expect("first entry");
+        let duplicate = controller.enqueue_track(a).expect("duplicate");
+        assert_ne!(first, duplicate);
+        controller.play_track(a);
+        assert_eq!(
+            controller.current_queue_entry_id(),
+            Some(first),
+            "library play selects the first matching entry"
+        );
+
+        let entries: Vec<QueueEntryId> = controller
+            .queue_entries()
+            .iter()
+            .map(|entry| entry.id())
+            .collect();
+        for entry in entries {
+            controller
+                .remove_queue_entry(entry)
+                .expect("empty the queue");
+        }
+        assert_eq!(controller.queue_len(), 0);
+
+        controller
+            .play_next_track(a)
+            .expect("insert next into empty queue");
+        assert_eq!(controller.queue_len(), 1);
+        assert!(controller.current_queue_entry_id().is_some());
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        let empty_current = controller.current_queue_entry_id().expect("current");
+        controller
+            .remove_queue_entry(empty_current)
+            .expect("empty again");
+
+        controller.play_track(a);
+        assert_eq!(controller.queue_len(), 1);
+        assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(
+            controller.player_state(),
+            PlaybackState::Playing,
+            "play-now adds an absent track and starts it"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn queue_removal_switches_current_and_emptying_stops_cleanly() {
+        let dir = TempDir::new("queue-empty");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        let entries: Vec<QueueEntryId> = controller
+            .queue_entries()
+            .iter()
+            .map(|entry| entry.id())
+            .collect();
+        assert!(entries.len() >= 2);
+
+        for entry in entries {
+            controller
+                .remove_queue_entry(entry)
+                .expect("queue entry removal is infallible once found");
+        }
+        assert_eq!(controller.queue_len(), 0);
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+
+        controller.play();
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|error| error.contains("Nothing to play"))
+        );
+        controller.next();
+        controller.previous();
+        assert_eq!(controller.current_queue_entry_id(), None);
+
+        let loaded = QueueStore::new(legacy_queue_file(&dir))
+            .load()
+            .expect("empty queue loads")
+            .expect("queue file exists");
+        assert!(!loaded.auto_library);
+        assert!(loaded.queue.is_empty());
+        assert_eq!(loaded.queue.current_entry_id(), None);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn queue_navigation_uses_entry_identity_and_persists_selection() {
+        let dir = TempDir::new("queue-navigation");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        let first = controller.current_queue_entry_id().expect("first");
+        let duplicate = controller.enqueue_track(a).expect("duplicate at end");
+        controller
+            .play_queue_entry(duplicate)
+            .expect("played duplicate entry");
+        assert_eq!(controller.current_queue_entry_id(), Some(duplicate));
+
+        let before_duplicate = controller.queue_entries()[controller
+            .queue_entry_index(duplicate)
+            .expect("duplicate index")
+            - 1]
+        .id();
+        controller.previous();
+        assert_eq!(
+            controller.current_queue_entry_id(),
+            Some(before_duplicate),
+            "previous navigates by entry position, not by track ID"
+        );
+
+        controller.set_repeat_mode(RepeatMode::All);
+        controller
+            .play_queue_entry(duplicate)
+            .expect("played duplicate entry");
+        controller.next();
+        assert_eq!(
+            controller.current_queue_entry_id(),
+            Some(first),
+            "repeat-all wraps from the duplicate to the first entry"
+        );
+
+        controller.set_repeat_mode(RepeatMode::Off);
+        controller
+            .play_queue_entry(duplicate)
+            .expect("played duplicate entry");
+        controller.next();
+        assert_eq!(
+            controller.current_queue_entry_id(),
+            Some(duplicate),
+            "repeat-off keeps the selection at the last entry"
+        );
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+
+        let loaded = QueueStore::new(legacy_queue_file(&dir))
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert_eq!(loaded.queue.current_entry_id(), Some(duplicate));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn queue_order_and_current_survive_restart() {
+        let dir = TempDir::new("queue-restart");
+        let fx = fixtures(&dir);
+        let a;
+        let b;
+        let expected;
+        {
+            let (mut controller, control) = boot(&dir);
+            scanned(&mut controller, &control, fx.root.clone());
+            a = id_of(&controller, &fx.a);
+            b = id_of(&controller, &fx.b);
+            controller.play_track(a);
+            controller.enqueue_track(a).expect("duplicate");
+            controller.play_next_track(b).expect("next");
+            controller
+                .move_queue_entry_by(controller.current_queue_entry_id().expect("current"), -1)
+                .expect("reorder");
+            expected = queue_snapshot(&controller);
+            controller.shutdown();
+        }
+
+        let (controller, _control) = boot(&dir);
+        assert_eq!(queue_snapshot(&controller), expected);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        let expected_track = expected.1.and_then(|entry| {
+            controller
+                .queue_entries()
+                .iter()
+                .find(|candidate| candidate.id() == entry)
+                .map(|candidate| candidate.track())
+        });
+        assert_eq!(controller.current_id(), expected_track);
+        let loaded = QueueStore::new(legacy_queue_file(&dir))
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert!(!loaded.auto_library);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn malformed_queue_file_is_reported_preserved_and_never_overwritten() {
+        let dir = TempDir::new("queue-malformed");
+        let state = dir.path().join("state");
+        fs::create_dir_all(&state).expect("state dir");
+        let queue_file = legacy_queue_file(&dir);
+        let original = b"{ this is not a queue";
+        fs::write(&queue_file, original).expect("malformed queue fixture");
+
+        let (mut controller, control) = boot(&dir);
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|error| error.contains("playback queue"))
+        );
+        let fx = fixtures(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        assert!(controller.queue_len() > 0, "library is still usable");
+        let a = id_of(&controller, &fx.a);
+        controller
+            .enqueue_track(a)
+            .expect("queue still mutable in memory");
+        assert_eq!(
+            fs::read(&queue_file).expect("original bytes remain"),
+            original,
+            "a malformed queue file is never replaced during the session"
+        );
+        assert!(QueueStore::new(&queue_file).load().is_err());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn missing_and_unplayable_queue_entries_are_kept_without_corruption() {
+        let dir = TempDir::new("queue-missing");
+        let fx = fixtures(&dir);
+        let a;
+        let unplayable_entry;
+        {
+            let (mut controller, control) = boot(&dir);
+            scanned(&mut controller, &control, fx.root.clone());
+            a = id_of(&controller, &fx.a);
+            let missing_path = fx.root.join("c.aif");
+            unplayable_entry = controller
+                .queue_entries()
+                .iter()
+                .find(|entry| {
+                    controller
+                        .track(entry.track())
+                        .is_some_and(|track| track.source().path() == missing_path)
+                })
+                .map(|entry| entry.id())
+                .expect("indexed non-playable track is in the default queue");
+            let len = controller.queue_len();
+            controller
+                .play_queue_entry(unplayable_entry)
+                .expect("selecting an indexed entry is not a queue error");
+            assert_eq!(controller.player_state(), PlaybackState::Stopped);
+            assert_eq!(controller.queue_len(), len);
+            assert_eq!(controller.current_queue_entry_id(), Some(unplayable_entry));
+            assert!(
+                controller
+                    .last_error()
+                    .is_some_and(|error| error.contains("cannot be played"))
+            );
+
+            // Replace the persisted queue with one that also references a
+            // track ID absent from this library. Reopening must keep it.
+            let mut queue = Queue::new();
+            queue.push(a);
+            let missing = queue.push(TrackId::new(999));
+            queue.set_current_entry(missing).expect("missing current");
+            QueueStore::new(legacy_queue_file(&dir))
+                .save(&queue, false)
+                .expect("write missing-entry queue");
+            controller.shutdown();
+        }
+
+        let (mut controller, _control) = boot(&dir);
+        assert_eq!(controller.queue_len(), 2);
+        assert_eq!(
+            controller.current_queue_entry_id(),
+            Some(QueueEntryId::new(2))
+        );
+        assert!(controller.current_queue_entry_id().is_some());
+        assert_eq!(controller.current_track(), None);
+        assert!(
+            controller
+                .queue_entries()
+                .iter()
+                .any(|entry| entry.track() == TrackId::new(999))
+        );
+        let a = id_of(&controller, &fx.a);
+        controller
+            .enqueue_track(a)
+            .expect("existing track still addable");
+        assert!(
+            controller
+                .queue_entries()
+                .iter()
+                .any(|entry| entry.track() == TrackId::new(999))
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn queue_auto_follows_scans_until_the_user_edits_it() {
+        let dir = TempDir::new("queue-auto");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let before = controller.queue_len();
+        write_dc_wav(&fx.root, "e.wav", 4_410, 0.2);
+        scanned(&mut controller, &control, fx.root.clone());
+        assert_eq!(
+            controller.queue_len(),
+            before + 1,
+            "an untouched default queue follows new scan results"
+        );
+
+        let a = id_of(&controller, &fx.a);
+        controller.enqueue_track(a).expect("structural edit");
+        let after_edit = controller.queue_len();
+        write_dc_wav(&fx.root, "f.wav", 4_410, 0.2);
+        scanned(&mut controller, &control, fx.root.clone());
+        assert_eq!(
+            controller.queue_len(),
+            after_edit,
+            "a user-managed queue is not silently extended by scanning"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn queue_is_isolated_between_legacy_and_portable_libraries() {
+        let dir = TempDir::new("queue-isolation");
+        let fx = fixtures(&dir);
+        let index = dir.path().join("state").join("library-index.json");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        controller.enqueue_track(a).expect("legacy duplicate");
+        let legacy_snapshot = queue_snapshot(&controller);
+
+        let portable_root = dir.path().join("portable");
+        fs::create_dir_all(&portable_root).expect("portable root");
+        controller
+            .switch_to_new_portable_library(&portable_root)
+            .expect("portable created and activated");
+        assert_eq!(controller.queue_len(), 0, "new library starts empty");
+        let portable_music = portable_root.join("music");
+        fs::create_dir_all(&portable_music).expect("portable music dir");
+        write_dc_wav(&portable_music, "a.wav", 11_025, 0.4);
+        write_dc_wav(&portable_music, "b.wav", 11_025, 0.3);
+        scanned(&mut controller, &control, portable_music.clone());
+        assert_eq!(controller.queue_len(), 2);
+        let b = id_of(&controller, &portable_music.join("b.wav"));
+        controller.play_track(b);
+        controller.enqueue_track(b).expect("portable duplicate");
+        let portable_snapshot = queue_snapshot(&controller);
+
+        controller
+            .switch_to_legacy_index(Some(index.clone()))
+            .expect("legacy switch");
+        assert_eq!(queue_snapshot(&controller), legacy_snapshot);
+        let legacy_loaded = QueueStore::new(legacy_queue_file(&dir))
+            .load()
+            .expect("legacy queue loads")
+            .expect("legacy queue exists");
+        assert!(!legacy_loaded.auto_library);
+
+        controller
+            .switch_to_portable(&portable_root)
+            .expect("portable switch");
+        assert_eq!(queue_snapshot(&controller), portable_snapshot);
+        let portable_loaded = QueueStore::new(portable_queue_file(&portable_root))
+            .load()
+            .expect("portable queue loads")
+            .expect("portable queue exists");
+        assert!(!portable_loaded.auto_library);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn protected_index_blocks_queue_writes_until_explicit_recovery() {
+        let dir = TempDir::new("queue-protected");
+        let state = dir.path().join("state");
+        fs::create_dir_all(&state).expect("state dir");
+        let index = state.join("library-index.json");
+        fs::write(&index, b"not a valid index").expect("unreadable index");
+        let queue_file = legacy_queue_file(&dir);
+        let mut queue = Queue::new();
+        let entry = queue.push(TrackId::new(1));
+        QueueStore::new(&queue_file)
+            .save(&queue, false)
+            .expect("queue fixture");
+
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.legacy_index_write_protected());
+        assert_eq!(controller.queue_len(), 1);
+        controller
+            .remove_queue_entry(entry)
+            .expect("queue is editable in memory");
+        assert_eq!(controller.queue_len(), 0);
+
+        let preserved = QueueStore::new(&queue_file)
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert_eq!(
+            preserved.queue.len(),
+            1,
+            "protected state blocks queue writes"
+        );
+
+        controller
+            .replace_unreadable_legacy_index()
+            .expect("explicit recovery");
+        assert!(!controller.legacy_index_write_protected());
+        let flushed = QueueStore::new(&queue_file)
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert!(flushed.queue.is_empty());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn read_only_player_changes_do_not_write_the_queue() {
+        let dir = TempDir::new("queue-write-only-changes");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let queue_file = legacy_queue_file(&dir);
+        assert!(queue_file.exists());
+        fs::remove_file(&queue_file).expect("remove queue for observation");
+
+        controller.set_volume(0.42);
+        controller.cycle_repeat_mode();
+        controller.toggle_play_pause();
+        controller.stop();
+        controller.pause();
+        assert!(
+            !queue_file.exists(),
+            "volume, repeat, pause, and stop are not queue writes"
+        );
+
+        controller.next();
+        assert!(queue_file.exists(), "a selection change is persisted");
+        let loaded = QueueStore::new(&queue_file)
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert_eq!(
+            loaded.queue.current_entry_id(),
+            controller.current_queue_entry_id()
+        );
+        controller.shutdown();
     }
 }
