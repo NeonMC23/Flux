@@ -14,18 +14,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use flux_app::{
-    AudioStatus, Controller, MigrationPlan, ReconcileReport, StorageMode, WAVEFORM_WINDOW,
-    default_index_path, format_duration, is_track_playable,
+    Artist, AudioStatus, Availability, Controller, MigrationPlan, ReconcileReport, RelPath,
+    StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, default_index_path, format_duration,
+    is_track_playable,
 };
-use flux_core::{APP_NAME, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId};
+use flux_core::{
+    APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
+};
 use iced::advanced::Widget;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad, Renderer as RendererTrait};
 use iced::advanced::widget::Tree;
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
-    button, column, container, mouse_area, progress_bar, row, scrollable, slider, text, text_input,
-    tooltip,
+    button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, slider, text,
+    text_input, tooltip,
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Rectangle, Shadow, Subscription, Task, Theme, mouse,
@@ -712,6 +715,22 @@ fn nonempty(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn nonempty_string(value: &str) -> Option<String> {
+    nonempty(Some(value))
+}
+
+fn parse_optional_number(value: &str, field: &str) -> Result<Option<u32>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        value
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("The {field} must be a non-negative whole number."))
+    }
+}
+
 fn display_artist(track: &Track) -> String {
     nonempty(track.artist()).unwrap_or_else(|| "Unknown artist".to_owned())
 }
@@ -807,23 +826,40 @@ fn pagination_footer(
     .into()
 }
 
+const ARTIST_KEY_SEPARATOR: char = '\u{1f}';
+
+fn artist_group_key(artist_id: Option<ArtistId>, track: &Track) -> String {
+    format!(
+        "{}{ARTIST_KEY_SEPARATOR}{}",
+        display_artist(track),
+        artist_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_owned())
+    )
+}
+
+fn artist_key_parts(key: &str) -> (&str, &str) {
+    key.split_once(ARTIST_KEY_SEPARATOR)
+        .unwrap_or((key, "none"))
+}
+
 fn group_key(view: LibraryView, track: &Track) -> Option<String> {
     match view {
         LibraryView::Tracks => None,
-        LibraryView::Artists => Some(display_artist(track)),
+        LibraryView::Artists => Some(artist_group_key(None, track)),
         LibraryView::Albums => Some(display_album(track)),
         LibraryView::Folders => Some(display_folder(track)),
     }
 }
 
 fn group_title(view: LibraryView, key: &str) -> String {
-    if view == LibraryView::Folders {
-        Path::new(key)
+    match view {
+        LibraryView::Artists => artist_key_parts(key).0.to_owned(),
+        LibraryView::Folders => Path::new(key)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| key.to_owned())
-    } else {
-        key.to_owned()
+            .unwrap_or_else(|| key.to_owned()),
+        LibraryView::Tracks | LibraryView::Albums => key.to_owned(),
     }
 }
 
@@ -863,11 +899,41 @@ struct QueueDrag {
     moved: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtistChoice {
+    id: Option<ArtistId>,
+    label: String,
+}
+
+impl std::fmt::Display for ArtistChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TrackEditor {
+    id: TrackId,
+    title: String,
+    album: String,
+    track_number: String,
+    disc_number: String,
+    artist_id: Option<ArtistId>,
+    new_artist: String,
+    error: Option<String>,
+}
+
 struct FluxReady {
     controller: Controller,
     dir_input: String,
     search: String,
     lib_input: String,
+    import_input: String,
+    track_editor: Option<TrackEditor>,
+    artist_selected: Option<ArtistId>,
+    artist_name_input: String,
+    artist_rename_input: String,
+    last_reconcile: Option<ReconcileReport>,
     migrate_source: String,
     pending_plan: Option<MigrationPlan>,
     migrated_dest: Option<PathBuf>,
@@ -889,6 +955,24 @@ struct FluxReady {
 enum Message {
     DirInputChanged(String),
     LibInputChanged(String),
+    ImportInputChanged(String),
+    ImportPressed(bool),
+    EditTrack(TrackId),
+    EditorTitleChanged(String),
+    EditorAlbumChanged(String),
+    EditorTrackNumberChanged(String),
+    EditorDiscNumberChanged(String),
+    EditorArtistChanged(Option<ArtistChoice>),
+    EditorNewArtistChanged(String),
+    EditorCreateArtist,
+    EditorSave,
+    EditorCancel,
+    ArtistSelected(Option<ArtistChoice>),
+    ArtistNameChanged(String),
+    ArtistCreatePressed,
+    ArtistRenameNameChanged(String),
+    ArtistRenamePressed,
+    RelinkTrack(TrackId, RelPath),
     OpenLibraryPressed,
     CreateLibraryPressed,
     UseLegacyIndexPressed,
@@ -947,6 +1031,12 @@ impl FluxReady {
             dir_input: String::new(),
             search: String::new(),
             lib_input: String::new(),
+            import_input: String::new(),
+            track_editor: None,
+            artist_selected: None,
+            artist_name_input: String::new(),
+            artist_rename_input: String::new(),
+            last_reconcile: None,
             migrate_source: String::new(),
             pending_plan: None,
             migrated_dest: None,
@@ -993,6 +1083,11 @@ impl FluxReady {
         self.lifecycle_msg = None;
         self.queue_drag = None;
         self.seek_preview = None;
+        self.track_editor = None;
+        self.artist_selected = None;
+        self.artist_name_input.clear();
+        self.artist_rename_input.clear();
+        self.last_reconcile = None;
         let current = self.controller.current_queue_entry_id();
         self.queue_page = current
             .and_then(|entry| self.controller.queue_entry_index(entry))
@@ -1080,6 +1175,159 @@ impl FluxReady {
         }
     }
 
+    fn artist_choices(&self) -> Vec<ArtistChoice> {
+        let artists: Vec<Artist> = self.controller.artists();
+        let mut counts = BTreeMap::new();
+        for artist in &artists {
+            *counts.entry(artist.name().to_owned()).or_insert(0usize) += 1;
+        }
+        artists
+            .into_iter()
+            .map(|artist| {
+                let duplicate = counts.get(artist.name()).copied().unwrap_or(0) > 1;
+                ArtistChoice {
+                    id: Some(artist.id()),
+                    label: if duplicate {
+                        format!("{} (ID {})", artist.name(), artist.id())
+                    } else {
+                        artist.name().to_owned()
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn editor_artist_choices(&self) -> Vec<ArtistChoice> {
+        let mut choices = vec![ArtistChoice {
+            id: None,
+            label: "No stable artist (use tags/fallback)".to_owned(),
+        }];
+        choices.extend(self.artist_choices());
+        choices
+    }
+
+    fn start_track_editor(&mut self, id: TrackId) {
+        let Some(track) = self.controller.track(id) else {
+            return;
+        };
+        self.track_editor = Some(TrackEditor {
+            id,
+            title: track.title().to_owned(),
+            album: track.album().unwrap_or_default().to_owned(),
+            track_number: track
+                .track_number()
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            disc_number: track
+                .disc_number()
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            artist_id: self.controller.track_artist_id(id),
+            new_artist: String::new(),
+            error: None,
+        });
+        self.show_setup = false;
+    }
+
+    fn save_track_editor(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let id = editor.id;
+        let edit = match (
+            parse_optional_number(&editor.track_number, "track number"),
+            parse_optional_number(&editor.disc_number, "disc number"),
+        ) {
+            (Ok(track_number), Ok(disc_number)) => TrackMetadataEdit {
+                title: nonempty_string(&editor.title),
+                artist_id: editor.artist_id,
+                album: nonempty_string(&editor.album),
+                track_number,
+                disc_number,
+            },
+            (Err(error), _) | (_, Err(error)) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+                return;
+            }
+        };
+        match self.controller.edit_track_metadata(id, edit) {
+            Ok(()) => {
+                self.track_editor = None;
+                self.lifecycle_msg = Some(format!("Saved metadata for track {id}."));
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn create_artist_from_editor(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let name = editor.new_artist.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        match self.controller.create_artist(&name) {
+            Ok(id) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.artist_id = Some(id);
+                    editor.new_artist.clear();
+                    editor.error = None;
+                }
+                self.lifecycle_msg = Some(format!("Created artist {name} (ID {id})."));
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn import_files(&mut self, copy: bool) {
+        let paths: Vec<PathBuf> = self
+            .import_input
+            .split(';')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if paths.is_empty() {
+            self.lifecycle_msg = Some("Enter at least one audio file path.".to_owned());
+            return;
+        }
+        match self.controller.import_files(&paths, copy) {
+            Ok(report) => {
+                let mut summary = format!(
+                    "Import: {} added, {} updated, {} already indexed, {} copied, {} issue(s).",
+                    report.added,
+                    report.updated,
+                    report.deduplicated,
+                    report.copied.len(),
+                    report.issues.len()
+                );
+                if let Some(issue) = report.issues.first() {
+                    summary.push_str(&format!(
+                        " First issue: {} — {}",
+                        issue.path().display(),
+                        issue.reason()
+                    ));
+                }
+                if report.issues.is_empty() {
+                    self.import_input.clear();
+                }
+                self.lifecycle_msg = Some(summary);
+            }
+            Err(error) => self.lifecycle_msg = Some(error),
+        }
+    }
+
     fn seek_relative(&mut self, seconds: f32) {
         let Some(total) = self.controller.current_duration() else {
             return;
@@ -1114,6 +1362,92 @@ impl FluxReady {
         match message {
             Message::DirInputChanged(value) => self.dir_input = value,
             Message::LibInputChanged(value) => self.lib_input = value,
+            Message::ImportInputChanged(value) => self.import_input = value,
+            Message::ImportPressed(copy) => self.import_files(copy),
+            Message::EditTrack(id) => self.start_track_editor(id),
+            Message::EditorTitleChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.title = value;
+                }
+            }
+            Message::EditorAlbumChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.album = value;
+                }
+            }
+            Message::EditorTrackNumberChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.track_number = value;
+                }
+            }
+            Message::EditorDiscNumberChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.disc_number = value;
+                }
+            }
+            Message::EditorArtistChanged(choice) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.artist_id = choice.and_then(|choice| choice.id);
+                }
+            }
+            Message::EditorNewArtistChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.new_artist = value;
+                }
+            }
+            Message::EditorCreateArtist => self.create_artist_from_editor(),
+            Message::EditorSave => self.save_track_editor(),
+            Message::EditorCancel => self.track_editor = None,
+            Message::ArtistSelected(choice) => {
+                self.artist_selected = choice.as_ref().and_then(|choice| choice.id);
+                self.artist_rename_input = self
+                    .artist_selected
+                    .and_then(|id| self.controller.artist(id))
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_default();
+            }
+            Message::ArtistNameChanged(value) => self.artist_name_input = value,
+            Message::ArtistCreatePressed => {
+                let name = self.artist_name_input.trim().to_owned();
+                if !name.is_empty() {
+                    match self.controller.create_artist(&name) {
+                        Ok(id) => {
+                            self.artist_selected = Some(id);
+                            self.artist_name_input.clear();
+                            self.artist_rename_input = name.clone();
+                            self.lifecycle_msg = Some(format!("Created artist {name} (ID {id})."));
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                }
+            }
+            Message::ArtistRenameNameChanged(value) => self.artist_rename_input = value,
+            Message::ArtistRenamePressed => {
+                if let Some(id) = self.artist_selected {
+                    let name = self.artist_rename_input.trim().to_owned();
+                    if !name.is_empty() {
+                        match self.controller.rename_artist(id, &name) {
+                            Ok(()) => {
+                                self.lifecycle_msg =
+                                    Some(format!("Renamed artist {id} to {name}."));
+                            }
+                            Err(error) => self.lifecycle_msg = Some(error),
+                        }
+                    }
+                }
+            }
+            Message::RelinkTrack(id, candidate) => {
+                match self.controller.relink_portable_track(id, &candidate) {
+                    Ok(()) => {
+                        self.last_reconcile = None;
+                        self.lifecycle_msg = Some(format!(
+                            "Relinked track {id} to {}.",
+                            candidate.display_lossy()
+                        ));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
             Message::OpenLibraryPressed => {
                 let path = PathBuf::from(self.lib_input.trim());
                 if self.controller.switch_to_portable(&path).is_ok() {
@@ -1204,6 +1538,7 @@ impl FluxReady {
             Message::ReconcilePressed => {
                 if let Ok(report) = self.controller.reconcile_portable_library() {
                     self.lifecycle_msg = Some(reconcile_summary(&report));
+                    self.last_reconcile = Some(report);
                 }
             }
             Message::ScanPressed => {
@@ -1344,6 +1679,11 @@ impl FluxReady {
                     Key::Character("n") => self.controller.next(),
                     Key::Character("p") => self.controller.previous(),
                     Key::Character("s") => self.controller.stop(),
+                    Key::Character("e") => {
+                        if let Some(id) = self.controller.current_id() {
+                            self.start_track_editor(id);
+                        }
+                    }
                     Key::Named(Named::ArrowLeft) => {
                         let step = if modifiers.contains(Modifiers::SHIFT) {
                             -30.0
@@ -1371,6 +1711,9 @@ impl FluxReady {
                     Key::Character("4") => self.select_view(LibraryView::Folders),
                     Key::Character("l") => self.toggle_setup(),
                     Key::Named(Named::Escape) => {
+                        if self.track_editor.take().is_some() {
+                            return Task::none();
+                        }
                         self.cancel_queue_drag();
                         self.search.clear();
                         self.selected_group = None;
@@ -1434,19 +1777,18 @@ impl FluxReady {
     }
 
     fn nav_counts(&self) -> (usize, usize, usize, usize) {
-        let mut artists: HashSet<Option<&str>> = HashSet::new();
+        let mut artists: HashSet<String> = HashSet::new();
         let mut albums: HashSet<Option<&str>> = HashSet::new();
         let mut folders: HashSet<Option<&Path>> = HashSet::new();
-        for (_, track) in self.controller.tracks() {
-            let artist = track
-                .artist()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
+        for (id, track) in self.controller.tracks() {
             let album = track
                 .album()
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            artists.insert(artist);
+            artists.insert(artist_group_key(
+                self.controller.track_artist_id(*id),
+                track,
+            ));
             albums.insert(album);
             folders.insert(track.source().path().parent());
         }
@@ -1572,6 +1914,14 @@ impl FluxReady {
                 "Library setup".to_owned(),
                 "Choose what Flux scans and where it keeps the catalogue.".to_owned(),
             )
+        } else if let Some(editor) = &self.track_editor {
+            (
+                "Edit track metadata".to_owned(),
+                format!(
+                    "Track {} · Flux stores overrides; the audio file and its tags stay untouched.",
+                    editor.id
+                ),
+            )
         } else if let Some(group) = &self.selected_group {
             let rows = self.filtered_tracks();
             (
@@ -1624,7 +1974,7 @@ impl FluxReady {
         );
         bar = bar.push(iced::widget::Space::new().width(Length::Fill));
 
-        if !self.show_setup {
+        if !self.show_setup && self.track_editor.is_none() {
             bar = bar.push(
                 text_input("Search title, artist, album…", &self.search)
                     .id(iced::widget::Id::new("flux-search"))
@@ -1633,7 +1983,7 @@ impl FluxReady {
                     .width(Length::Fixed(250.0)),
             );
         }
-        if self.window_width >= 1_080.0 {
+        if self.window_width >= 1_080.0 && self.track_editor.is_none() {
             bar = bar.push(
                 button(text("Queue").size(11))
                     .style(nav_style(self.queue_visible))
@@ -1641,12 +1991,14 @@ impl FluxReady {
                     .on_press(Message::ToggleQueue),
             );
         }
-        bar = bar.push(
-            button(text(if self.show_setup { "Close" } else { "Setup" }).size(11))
-                .style(nav_style(self.show_setup))
-                .padding([6, 10])
-                .on_press(Message::ToggleSetup),
-        );
+        if self.track_editor.is_none() {
+            bar = bar.push(
+                button(text(if self.show_setup { "Close" } else { "Setup" }).size(11))
+                    .style(nav_style(self.show_setup))
+                    .padding([6, 10])
+                    .on_press(Message::ToggleSetup),
+            );
+        }
 
         bar.into()
     }
@@ -1687,6 +2039,9 @@ impl FluxReady {
     }
 
     fn library_view(&self) -> Element<'_, Message> {
+        if self.track_editor.is_some() {
+            return self.track_editor_view();
+        }
         if self.controller.tracks().is_empty() {
             return self.empty_library();
         }
@@ -1724,10 +2079,134 @@ impl FluxReady {
             .into()
     }
 
+    fn track_editor_view(&self) -> Element<'_, Message> {
+        let Some(editor) = &self.track_editor else {
+            return self.empty_library();
+        };
+        let choices = self.editor_artist_choices();
+        let selected = choices
+            .iter()
+            .find(|choice| choice.id == editor.artist_id)
+            .cloned()
+            .or_else(|| choices.first().cloned());
+        let source_path = self
+            .controller
+            .track(editor.id)
+            .map(|track| track.source().path().display().to_string())
+            .unwrap_or_else(|| "track no longer in the library".to_owned());
+        let missing = matches!(
+            self.controller.track_availability(editor.id),
+            Some(Availability::Missing)
+        );
+
+        let artist_row = row![
+            pick_list(choices, selected, |choice| Message::EditorArtistChanged(
+                Some(choice)
+            ))
+            .text_size(12)
+            .padding([7, 9])
+            .width(Length::Fill),
+        ]
+        .spacing(8);
+        let new_artist_row = row![
+            text_input("New artist name…", &editor.new_artist)
+                .on_input(Message::EditorNewArtistChanged)
+                .on_submit(Message::EditorCreateArtist)
+                .style(input_style)
+                .width(Length::Fill),
+            button(text("Create & select").size(11))
+                .style(ghost_style)
+                .padding([7, 10])
+                .on_press_maybe(
+                    (!editor.new_artist.trim().is_empty()).then_some(Message::EditorCreateArtist)
+                ),
+        ]
+        .spacing(8);
+
+        let mut body = column![
+            text("Flux-owned overrides").size(9).color(ACCENT),
+            text("These values are stored in the portable library. The audio file and its embedded tags are never rewritten.")
+                .size(10)
+                .color(MUTED),
+            text(source_path).size(10).color(MUTED),
+        ]
+        .spacing(6);
+        if missing {
+            body = body.push(
+                text("This file is currently missing. Metadata can still be edited; playback will fail until it is relinked or restored.")
+                    .size(10)
+                    .color(DANGER),
+            );
+        }
+        body = body.push(
+            text_input("Track title…", &editor.title)
+                .on_input(Message::EditorTitleChanged)
+                .style(input_style)
+                .width(Length::Fill),
+        );
+        body = body.push(
+            text_input("Album…", &editor.album)
+                .on_input(Message::EditorAlbumChanged)
+                .style(input_style)
+                .width(Length::Fill),
+        );
+        body = body.push(
+            row![
+                text_input("Track number", &editor.track_number)
+                    .on_input(Message::EditorTrackNumberChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+                text_input("Disc number", &editor.disc_number)
+                    .on_input(Message::EditorDiscNumberChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+            ]
+            .spacing(8),
+        );
+        body = body.push(text("Artist identity").size(9).color(MUTED));
+        body = body.push(artist_row);
+        body = body.push(new_artist_row);
+        body = body.push(
+            text("Clear album or number fields to fall back to source metadata. The title always has a filename fallback.")
+                .size(9)
+                .color(MUTED),
+        );
+        if let Some(error) = &editor.error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        body = body.push(
+            row![
+                button(text("Save metadata").size(12))
+                    .style(accent_button_style)
+                    .padding([8, 14])
+                    .on_press(Message::EditorSave),
+                button(text("Cancel").size(11))
+                    .style(ghost_style)
+                    .padding([8, 12])
+                    .on_press(Message::EditorCancel),
+            ]
+            .spacing(8),
+        );
+
+        container(scrollable(body).height(Length::Fill))
+            .padding(18)
+            .width(Length::Fill)
+            .style(card_style)
+            .into()
+    }
+
+    fn group_key_for(&self, view: LibraryView, id: TrackId, track: &Track) -> Option<String> {
+        if view == LibraryView::Artists {
+            Some(artist_group_key(self.controller.track_artist_id(id), track))
+        } else {
+            group_key(view, track)
+        }
+    }
+
     fn groups_for(&self, view: LibraryView) -> Vec<(String, usize)> {
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-        for (_, track) in self.controller.tracks() {
-            if let Some(key) = group_key(view, track) {
+        for (id, track) in self.controller.tracks() {
+            if let Some(key) = self.group_key_for(view, *id, track) {
                 *groups.entry(key).or_default() += 1;
             }
         }
@@ -1755,6 +2234,13 @@ impl FluxReady {
             let title = group_title(self.view, key);
             let subtitle = if self.view == LibraryView::Folders {
                 format!("{count} track(s) · {key}")
+            } else if self.view == LibraryView::Artists {
+                let (_, artist_id) = artist_key_parts(key);
+                if artist_id == "none" {
+                    format!("{count} track(s) · no stable artist")
+                } else {
+                    format!("{count} track(s) · artist {artist_id}")
+                }
             } else {
                 format!("{count} track(s)")
             };
@@ -1802,8 +2288,8 @@ impl FluxReady {
     fn filtered_tracks(&self) -> Vec<(TrackId, &Track)> {
         let mut rows = self.controller.search(&self.search);
         if let Some(group) = &self.selected_group {
-            rows.retain(|(_, track)| {
-                group_key(self.view, track).as_deref() == Some(group.as_str())
+            rows.retain(|(id, track)| {
+                self.group_key_for(self.view, *id, track).as_deref() == Some(group.as_str())
             });
         }
         rows
@@ -1838,6 +2324,7 @@ impl FluxReady {
         let start = page * TRACK_PAGE_SIZE;
         let end = (start + TRACK_PAGE_SIZE).min(total);
         let current = self.controller.current_id();
+        let editable = self.controller.storage_mode() == StorageMode::Portable;
 
         let header = row![
             text("#").size(9).color(MUTED).width(Length::Fixed(28.0)),
@@ -1852,13 +2339,25 @@ impl FluxReady {
             text("TIME").size(9).color(MUTED).width(Length::Fixed(48.0)),
             text("+").size(9).color(MUTED).width(Length::Fixed(26.0)),
             text("NEXT").size(9).color(MUTED).width(Length::Fixed(34.0)),
+            text("EDIT").size(9).color(MUTED).width(Length::Fixed(36.0)),
         ]
         .spacing(8)
         .padding([2, 10]);
 
         let mut list = column![].spacing(1);
         for (offset, (id, track)) in rows[start..end].iter().enumerate() {
-            list = list.push(track_row(start + offset + 1, *id, track, current));
+            let missing = matches!(
+                self.controller.track_availability(*id),
+                Some(Availability::Missing)
+            );
+            list = list.push(track_row(
+                start + offset + 1,
+                *id,
+                track,
+                current,
+                missing,
+                editable,
+            ));
         }
 
         column![
@@ -1929,6 +2428,52 @@ impl FluxReady {
             .spacing(8),
         ));
 
+        let portable = self.controller.storage_mode() == StorageMode::Portable;
+        let import_ready =
+            portable && !scanning && !protected && !self.import_input.trim().is_empty();
+        let mut import_body = column![
+            text_input(
+                "Audio file paths, separated by ; (no native file picker in this build)",
+                &self.import_input,
+            )
+            .on_input(Message::ImportInputChanged)
+            .style(input_style)
+            .width(Length::Fill),
+            row![
+                button(text("Copy & import").size(11))
+                    .style(accent_button_style)
+                    .padding([7, 12])
+                    .on_press_maybe(import_ready.then_some(Message::ImportPressed(true))),
+                button(text("Import in place").size(11))
+                    .style(ghost_style)
+                    .padding([7, 12])
+                    .on_press_maybe(import_ready.then_some(Message::ImportPressed(false))),
+            ]
+            .spacing(8),
+            text(if !portable {
+                "Import requires a portable library. Create or open one below."
+            } else {
+                "Copy imports into this library without moving or overwriting originals. \
+                 In-place accepts files already inside the library folder. Repeated imports \
+                 are deduplicated."
+            })
+            .size(10)
+            .color(if portable { MUTED } else { DANGER }),
+        ]
+        .spacing(8);
+        if !portable {
+            import_body = import_body.push(
+                text("The current app index is a compatibility backend; metadata edits and artist relationships live only in a portable library.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        }
+        setup = setup.push(setup_card(
+            "IMPORT AUDIO FILES",
+            "Add one or many individual files. Imported files are real catalogue records, not UI-only rows.",
+            import_body,
+        ));
+
         let library_label = match self.controller.storage_mode() {
             StorageMode::Legacy => match self.controller.legacy_index_path() {
                 Some(path) => format!("Active: app index — {}", path.display()),
@@ -1962,17 +2507,10 @@ impl FluxReady {
 
         if self.controller.storage_mode() == StorageMode::Portable {
             portable_body = portable_body.push(
-                row![
-                    button(text("Use app index").size(11))
-                        .style(ghost_style)
-                        .padding([6, 10])
-                        .on_press_maybe((!scanning).then_some(Message::UseLegacyIndexPressed)),
-                    button(text("Reconcile").size(11))
-                        .style(ghost_style)
-                        .padding([6, 10])
-                        .on_press_maybe((!scanning).then_some(Message::ReconcilePressed)),
-                ]
-                .spacing(8),
+                button(text("Use app index").size(11))
+                    .style(ghost_style)
+                    .padding([6, 10])
+                    .on_press_maybe((!scanning).then_some(Message::UseLegacyIndexPressed)),
             );
         }
         if self.controller.portable_recovery().is_some() {
@@ -1989,6 +2527,132 @@ impl FluxReady {
             "A portable library keeps its catalogue in a .flux folder beside your music, \
              so the whole library can move with the folder.",
             portable_body,
+        ));
+
+        let choices = self.artist_choices();
+        let selected_artist = self
+            .artist_selected
+            .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned());
+        let artist_editable = portable && !scanning;
+        let mut artist_body = column![
+            text(
+                "Stable artist identities are catalogue data. Renaming one updates every \
+                 related track without changing its overrides or audio; equal display names \
+                 remain distinct identities."
+            )
+            .size(10)
+            .color(MUTED),
+            pick_list(choices, selected_artist, |choice| Message::ArtistSelected(
+                Some(choice)
+            ))
+            .text_size(12)
+            .padding([7, 9])
+            .width(Length::Fill),
+            row![
+                text_input("New artist name…", &self.artist_name_input)
+                    .on_input(Message::ArtistNameChanged)
+                    .on_submit(Message::ArtistCreatePressed)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Create artist").size(11))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press_maybe(
+                        (artist_editable && !self.artist_name_input.trim().is_empty())
+                            .then_some(Message::ArtistCreatePressed)
+                    ),
+            ]
+            .spacing(8),
+            row![
+                text_input("Rename selected artist…", &self.artist_rename_input)
+                    .on_input(Message::ArtistRenameNameChanged)
+                    .on_submit(Message::ArtistRenamePressed)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Rename").size(11))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press_maybe(
+                        (artist_editable
+                            && self.artist_selected.is_some()
+                            && !self.artist_rename_input.trim().is_empty())
+                        .then_some(Message::ArtistRenamePressed)
+                    ),
+            ]
+            .spacing(8),
+        ]
+        .spacing(8);
+        if !portable {
+            artist_body = artist_body.push(
+                text("Artist management requires a portable library.")
+                    .size(10)
+                    .color(DANGER),
+            );
+        }
+        setup = setup.push(setup_card(
+            "ARTISTS",
+            "Create, select, and rename stable artist identities.",
+            artist_body,
+        ));
+
+        let mut health_body = column![
+            row![
+                button(text("Reconcile library").size(11))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press_maybe(
+                        (portable && !scanning && self.controller.portable_recovery().is_none())
+                            .then_some(Message::ReconcilePressed)
+                    ),
+                text("Checks every recorded file for changes, missing files, and safe move candidates. Nothing is moved automatically.")
+                    .size(10)
+                    .color(MUTED),
+            ]
+            .spacing(8),
+        ]
+        .spacing(8);
+        if let Some(report) = &self.last_reconcile {
+            health_body = health_body.push(text(reconcile_summary(report)).size(10).color(MUTED));
+            for candidates in &report.relink_candidates {
+                if let [candidate] = candidates.candidates.as_slice() {
+                    let title = self
+                        .controller
+                        .track(candidates.id)
+                        .map(|track| track.title().to_owned())
+                        .unwrap_or_else(|| format!("Track {}", candidates.id));
+                    health_body = health_body.push(
+                        row![
+                            column![
+                                text(title).size(11).color(TEXT),
+                                text(candidate.display_lossy()).size(9).color(MUTED),
+                            ]
+                            .spacing(2)
+                            .width(Length::Fill),
+                            button(text("Relink").size(10))
+                                .style(ghost_style)
+                                .padding([5, 9])
+                                .on_press(Message::RelinkTrack(candidates.id, candidate.clone())),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
+                } else {
+                    health_body = health_body.push(
+                        text(format!(
+                            "Track {} has {} possible locations; resolve the ambiguity outside Flux first.",
+                            candidates.id,
+                            candidates.candidates.len()
+                        ))
+                        .size(9)
+                        .color(DANGER),
+                    );
+                }
+            }
+        }
+        setup = setup.push(setup_card(
+            "LIBRARY HEALTH",
+            "Missing records are retained with their IDs and metadata.",
+            health_body,
         ));
 
         let mut migration_body = column![
@@ -2448,6 +3112,8 @@ fn track_row<'a>(
     id: TrackId,
     track: &'a Track,
     current: Option<TrackId>,
+    missing: bool,
+    editable: bool,
 ) -> Element<'a, Message> {
     let selected = current == Some(id);
     let marker = if selected {
@@ -2459,16 +3125,15 @@ fn track_row<'a>(
     let duration = track.duration().map(format_duration).unwrap_or_default();
     let playable = is_track_playable(track);
 
-    let title = row![
-        text(track.title()).size(13).color(title_color),
-        if playable {
-            Element::from(iced::widget::Space::new().width(0))
-        } else {
-            text("indexed, not playable").size(9).color(MUTED).into()
-        },
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    let mut title = row![text(track.title()).size(13).color(title_color)]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    if missing {
+        title = title.push(text("missing").size(9).color(DANGER));
+    }
+    if !playable {
+        title = title.push(text("indexed, not playable").size(9).color(MUTED));
+    }
 
     let content = row![
         text(marker)
@@ -2503,8 +3168,29 @@ fn track_row<'a>(
         .style(ghost_style)
         .padding([5, 7])
         .on_press(Message::PlayNextTrack(id));
+    let edit = button(text("✎").size(11))
+        .style(ghost_style)
+        .padding([5, 7])
+        .on_press_maybe(editable.then_some(Message::EditTrack(id)));
+    let edit = tooltip(
+        edit,
+        container(
+            text(if editable {
+                "Edit metadata"
+            } else {
+                "Use a portable library to edit"
+            })
+            .size(10)
+            .color(TEXT),
+        )
+        .padding([4, 7])
+        .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(6)
+    .delay(Duration::from_millis(350));
 
-    row![main, add, next]
+    row![main, add, next, edit]
         .spacing(2)
         .align_y(Alignment::Center)
         .into()
@@ -2759,6 +3445,12 @@ mod tests {
             dir_input: String::new(),
             search: String::new(),
             lib_input: String::new(),
+            import_input: String::new(),
+            track_editor: None,
+            artist_selected: None,
+            artist_name_input: String::new(),
+            artist_rename_input: String::new(),
+            last_reconcile: None,
             migrate_source: String::new(),
             pending_plan: None,
             migrated_dest: None,
@@ -3020,6 +3712,80 @@ mod tests {
         send(&mut gui, Message::QueueDragHover(0));
         send(&mut gui, Message::QueueDragRelease);
         assert_eq!(gui.controller.queue_len(), 0);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn import_edit_and_artist_messages_persist_through_the_gui_state() {
+        let dir = TempDir::new("gui-manage-flow");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("library root");
+        flux_app::create_portable_library(&root).expect("create portable library");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = gui(&dir);
+
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+        send(
+            &mut gui,
+            Message::ImportInputChanged(source.display().to_string()),
+        );
+        send(&mut gui, Message::ImportPressed(true));
+        assert_eq!(gui.controller.tracks().len(), 1);
+        assert!(gui.import_input.is_empty());
+        let id = gui.controller.tracks()[0].0;
+
+        send(&mut gui, Message::EditTrack(id));
+        assert!(gui.track_editor.is_some());
+        send(
+            &mut gui,
+            Message::EditorTitleChanged("Edited title".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::EditorAlbumChanged("Edited album".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::EditorNewArtistChanged("GUI Artist".to_owned()),
+        );
+        send(&mut gui, Message::EditorCreateArtist);
+        let artist_id = gui
+            .track_editor
+            .as_ref()
+            .and_then(|editor| editor.artist_id)
+            .expect("artist selected");
+        send(&mut gui, Message::EditorSave);
+        assert!(gui.track_editor.is_none());
+        let track = gui.controller.track(id).expect("edited track");
+        assert_eq!(track.title(), "Edited title");
+        assert_eq!(track.artist(), Some("GUI Artist"));
+        assert_eq!(track.album(), Some("Edited album"));
+
+        send(
+            &mut gui,
+            Message::ArtistSelected(Some(ArtistChoice {
+                id: Some(artist_id),
+                label: "GUI Artist".to_owned(),
+            })),
+        );
+        send(
+            &mut gui,
+            Message::ArtistRenameNameChanged("Renamed Artist".to_owned()),
+        );
+        send(&mut gui, Message::ArtistRenamePressed);
+        assert_eq!(
+            gui.controller.track(id).and_then(Track::artist),
+            Some("Renamed Artist")
+        );
+        assert_eq!(gui.controller.track_artist_id(id), Some(artist_id));
         gui.controller.shutdown();
     }
 
