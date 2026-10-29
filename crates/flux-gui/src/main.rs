@@ -6,8 +6,10 @@
 //! panels); every playback, library, and persistence decision stays in
 //! the controller.
 //!
-//! Real audio output requires a build with `--features cpal`; otherwise
-//! the player bar says so and playback attempts report why.
+//! The review-first Import Manager owns candidate selection/review state but
+//! delegates all catalogue, duplicate, copy, and publication policy to
+//! [`flux_app`]. Real audio output requires a build with `--features cpal`;
+//! otherwise the player bar says so and playback attempts report why.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1743,6 +1745,10 @@ impl FluxReady {
             manager.error = Some("Review a selection before importing.".to_owned());
             return Task::none();
         };
+        if manager.number_error.is_some() {
+            manager.error = Some("Fix the highlighted track/disc number first.".to_owned());
+            return Task::none();
+        }
         if !plan.can_import() {
             manager.error = Some(
                 plan.blocking_reason()
@@ -3065,6 +3071,28 @@ impl FluxReady {
         if manager.stage == ImportUiStage::Scanning {
             body = body.push(self.import_progress_view(manager));
         }
+        body = body.push(
+            container(
+                column![
+                    text("REVIEW FIRST").size(9).color(ACCENT),
+                    text("Nothing is written to the catalogue until you approve the reviewed list.")
+                        .size(10)
+                        .color(MUTED),
+                    text("NON-DESTRUCTIVE").size(9).color(ACCENT),
+                    text("Audio files and embedded tags are never rewritten; originals are never moved.")
+                        .size(10)
+                        .color(MUTED),
+                    text("DUPLICATE-AWARE").size(9).color(ACCENT),
+                    text("Exact paths, possible identical content, and similar metadata remain distinct decisions.")
+                        .size(10)
+                        .color(MUTED),
+                ]
+                .spacing(4),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .style(card_style),
+        );
         if let Some(error) = &manager.error {
             body = body.push(text(error).size(11).color(DANGER));
         }
@@ -3435,7 +3463,12 @@ impl FluxReady {
             column![
                 text(status).size(9).color(color),
                 text(format!(
-                    "{} · {}",
+                    "{} · {} · {}",
+                    candidate
+                        .source_track()
+                        .duration()
+                        .map(format_duration)
+                        .unwrap_or_else(|| "--:--".to_owned()),
                     candidate.format(),
                     human_size(candidate.file_size())
                 ))
@@ -3449,6 +3482,9 @@ impl FluxReady {
         .align_y(Alignment::Center);
         if candidate.metadata_incomplete() {
             title = title.push(text("incomplete").size(8).color(MUTED));
+        }
+        if !flux_app::is_track_playable(candidate.source_track()) {
+            title = title.push(text("indexed, not playable").size(8).color(MUTED));
         }
         button(title)
             .width(Length::Fill)
@@ -3511,6 +3547,13 @@ impl FluxReady {
         ]
         .spacing(5);
 
+        if !flux_app::is_track_playable(candidate.source_track()) {
+            body = body.push(
+                text("This format can be indexed but is not playable by the current engine.")
+                    .size(9)
+                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+            );
+        }
         match candidate.status() {
             CandidateStatus::ExistingPath(id) => {
                 body = body.push(
@@ -3792,10 +3835,13 @@ impl FluxReady {
                 body = body.push(
                     row![
                         text(state).size(9).color(color).width(Length::Fixed(56.0)),
-                        text(item.message.clone())
-                            .size(10)
-                            .color(MUTED)
-                            .width(Length::Fill),
+                        text(match item.track_id {
+                            Some(id) => format!("Track {id}"),
+                            None => item.message.clone(),
+                        })
+                        .size(10)
+                        .color(MUTED)
+                        .width(Length::Fill),
                     ]
                     .spacing(8),
                 );
@@ -5750,6 +5796,71 @@ mod tests {
         send(&mut gui, Message::QueueDragHover(0));
         send(&mut gui, Message::QueueDragRelease);
         assert_eq!(gui.controller.queue_len(), 0);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn drop_and_flux_browser_messages_prepare_a_scan() {
+        let dir = TempDir::new("gui-import-entry");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("library root");
+        flux_app::create_portable_library(&root).expect("create portable library");
+        let source = root.join("drop.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportFileHovered);
+        assert!(gui.import_manager.as_ref().expect("manager").drop_hover);
+        send(&mut gui, Message::ImportFileHoverLeft);
+        assert!(!gui.import_manager.as_ref().expect("manager").drop_hover);
+        send(&mut gui, Message::ImportDropPath(source.clone()));
+        assert_eq!(
+            gui.import_manager
+                .as_ref()
+                .expect("manager")
+                .pending_drops
+                .len(),
+            1
+        );
+        gui.import_manager.as_mut().expect("manager").drop_deadline =
+            Some(Instant::now() - Duration::from_millis(300));
+        send(&mut gui, Message::Tick);
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").stage,
+            ImportUiStage::Scanning
+        );
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").sources,
+            vec![source.clone()]
+        );
+
+        send(&mut gui, Message::ImportClose);
+        assert!(gui.import_manager.is_none());
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportBrowserOpenFiles);
+        assert!(
+            gui.import_manager
+                .as_ref()
+                .and_then(|manager| manager.browser.as_ref())
+                .is_some()
+        );
+        send(&mut gui, Message::ImportBrowserToggle(source.clone()));
+        assert!(
+            gui.import_manager
+                .as_ref()
+                .and_then(|manager| manager.browser.as_ref())
+                .is_some_and(|browser| browser.selected.contains(&source))
+        );
+        send(&mut gui, Message::ImportBrowserConfirm);
+        let manager = gui.import_manager.as_ref().expect("manager");
+        assert_eq!(manager.stage, ImportUiStage::Scanning);
+        assert_eq!(manager.sources, vec![source]);
         gui.controller.shutdown();
     }
 
