@@ -26,6 +26,18 @@ one machine and setup, not a claim that every codec or device has been
 independently verified — the development sandbox and CI have no audio
 device, so see the verification checklist below and judge accordingly.
 
+## Canonical storage foundation (in progress)
+
+The library crate now contains a canonical, self-contained storage engine and an
+isolated migration planner (`docs/canonical-library.md`). It is **not yet the
+GUI/TUI runtime backend**: the Controller still opens the legacy index or the
+schema-v3 portable catalogue, and existing import metadata still reads audio
+tags. The canonical format owns relative managed audio, stable artist/album/
+track IDs, per-entity `.flux` records, managed lyrics/cover primitives,
+playlists/ratings, transactional publication and recovery. Do not treat the
+migration as complete until the runtime integration listed in that document is
+finished and tested.
+
 ## Crates
 
 | Crate | Kind | Responsibility |

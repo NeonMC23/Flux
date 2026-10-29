@@ -1126,6 +1126,12 @@ impl CanonicalLibrary {
                     "{file} has an invalid cover file name"
                 )));
             }
+            if let Some(cover) = &dto.cover {
+                reject_symlink_escape(
+                    &root,
+                    &RelPath::from_utf8(&format!("{}/{}", rel.display_lossy(), cover))?,
+                )?;
+            }
             let mut order = Vec::with_capacity(dto.track_order.len());
             let mut seen = HashSet::new();
             for raw in dto.track_order {
@@ -1234,6 +1240,24 @@ impl CanonicalLibrary {
                 return Err(CanonicalError::Invalid(format!(
                     "{file} has an invalid lyrics file name"
                 )));
+            }
+            if let Some(lyrics) = &dto.lyrics {
+                let Some(record_rel) = track_records.get(&id) else {
+                    return Err(CanonicalError::Invalid(
+                        "missing track record path".to_owned(),
+                    ));
+                };
+                reject_symlink_escape(
+                    &root,
+                    &RelPath::from_utf8(&format!(
+                        "{}/{}",
+                        record_rel
+                            .display_lossy()
+                            .rsplit_once('/')
+                            .map_or("", |(dir, _)| dir),
+                        lyrics
+                    ))?,
+                )?;
             }
             tracks.insert(
                 id,
