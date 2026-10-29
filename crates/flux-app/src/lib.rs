@@ -76,6 +76,17 @@
 //! moves, deletes, or retags anything by itself, and never runs
 //! implicitly at startup or after a scan.
 //!
+//! Portable-library management is also deliberately explicit:
+//! [`Controller::import_files`] adds individual files (copying external
+//! files into the library root or referencing files already inside it),
+//! [`Controller::edit_track_metadata`] writes Flux-owned overrides,
+//! and [`Controller::create_artist`] / [`Controller::rename_artist`]
+//! maintain stable artist identities. These operations never rewrite
+//! embedded audio tags, never move/delete originals, preserve track IDs
+//! and queue entries, and require the portable backend. The legacy index
+//! remains a compatibility backend for playback/browsing; management is
+//! intentionally not faked there.
+//!
 //! # Threading
 //!
 //! All `Controller` methods are synchronous and, except where noted,

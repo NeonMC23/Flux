@@ -15,15 +15,15 @@
 //!   OS-specific application directories (that is `flux-platform`'s job,
 //!   and the two crates are deliberately independent).
 //! - [`portable`]: the segmented `.flux` storage engine for a portable
-//!   library root — catalog + generation-qualified track segments,
+//!   library root — catalogue + generation-qualified track segments,
 //!   crash-safe publication, backup recovery, byte-exact relative
-//!   paths, and sparse metadata overrides.
+//!   paths, sparse metadata overrides, stable artist identities, and
+//!   explicit availability/relink maintenance. [`flux-app`] exposes this
+//!   as an explicit backend (`new_portable`); the legacy index remains
+//!   the compatibility startup default.
 //! - [`migrate`]: explicit, plan-first migration from the legacy index
 //!   to a portable store at a caller-supplied root, preserving track
-//!   IDs and the ID counter. Neither the portable store nor migration
-//!   is wired into application startup yet — the legacy index above
-//!   remains the startup path until the library lifecycle milestone;
-//!   both are exposed and tested independently.
+//!   IDs, the ID counter, and creating stable artists from legacy names.
 //!
 //! # Stale-ID boundary
 //!

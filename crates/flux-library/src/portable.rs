@@ -11,18 +11,20 @@
 //!   tracks-<segment_id>@<generation>.flux   immutable track segments
 //! ```
 //!
-//! The catalogue holds the schema version, the library identity, the
-//! ID/segment counters, and a descriptor (logical segment ID, file
-//! name, generation, record count, ID bounds) for every segment of the
-//! committed generation — never the track records themselves. Segment
-//! files hold the actual records: stable [`TrackId`], library-relative
-//! path ([`RelPath`], byte-exact), last-known availability, a file
-//! size/mtime change-detection fingerprint, a snapshot of the embedded
-//! tags, and sparse user metadata [`MetadataOverrides`] (Flux never
-//! writes audio tags back). Physical placement is *not* stable: records
-//! may move between segments when repacked, and rewritten segments get
-//! new generation-qualified file names. `TrackId`s never change and are
-//! never reused.
+//! The catalogue holds the schema version (currently 3), the library
+//! identity, the ID/segment/artist counters, the stable artist table
+//! ([`ArtistId`] → canonical name and aliases), and a descriptor
+//! (logical segment ID, file name, generation, record count, ID bounds)
+//! for every segment of the committed generation — never the track
+//! records themselves. Segment files hold the actual records: stable
+//! [`TrackId`], library-relative path ([`RelPath`], byte-exact),
+//! last-known availability, a file size/mtime change-detection
+//! fingerprint, a snapshot of the embedded tags, sparse user metadata
+//! [`MetadataOverrides`], and an optional stable artist relationship
+//! (Flux never writes audio tags back). Physical placement is *not*
+//! stable: records may move between segments when repacked, and rewritten
+//! segments get new generation-qualified file names. `TrackId`s and
+//! `ArtistId`s never change and are never reused.
 //!
 //! # Publication protocol
 //!
@@ -50,8 +52,10 @@
 //!
 //! [`PortableStore::open`] loads and fully validates the primary
 //! catalogue and every segment it references (schema version, file
-//! kind, library identity, counters, segment descriptors vs. contents,
-//! global track-ID uniqueness and ordering, duplicate path keys). If
+//! kind, library identity, counters, artist IDs/references, segment
+//! descriptors vs. contents, global track-ID uniqueness and ordering,
+//! duplicate path keys). Version-2 catalogues remain readable; the first
+//! successful commit upgrades them to version 3. If
 //! the primary is missing or invalid, the backup catalogue is tried the
 //! same way; a valid backup yields a store in an explicitly reported
 //! read-only recovered state ([`OpenedStore::recovery`]) until
@@ -6754,6 +6758,20 @@ mod tests {
         assert_eq!(
             rebuilt.get(second_id).and_then(Track::artist),
             Some("Renamed Shared")
+        );
+
+        // An ordinary save/sync sees the renamed effective metadata and must
+        // not mint a new artist or move either track back to the source tag.
+        sync_library_to_portable_store(&rebuilt, &mut store).expect("post-rename sync");
+        store.commit().expect("commit post-rename sync");
+        assert_eq!(store.artists().count(), 1);
+        assert_eq!(
+            store.get(first_id).and_then(StoredTrack::artist_id),
+            Some(artist_id)
+        );
+        assert_eq!(
+            store.get(second_id).and_then(StoredTrack::artist_id),
+            Some(artist_id)
         );
     }
 
