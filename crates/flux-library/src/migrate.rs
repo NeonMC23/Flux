@@ -1263,6 +1263,7 @@ pub fn execute_migration(plan: &MigrationPlan) -> Result<MigrationReport, Migrat
                 file: *fingerprint,
                 tags: tags.clone(),
                 overrides: MetadataOverrides::new(),
+                artist_id: None,
                 added_unix_ms: now,
                 updated_unix_ms: now,
             }),

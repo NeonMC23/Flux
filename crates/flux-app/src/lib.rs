@@ -4184,6 +4184,7 @@ mod tests {
                 ..TagSet::default()
             },
             overrides: MetadataOverrides::new(),
+            artist_id: None,
             added_unix_ms: 1,
             updated_unix_ms: 1,
         }

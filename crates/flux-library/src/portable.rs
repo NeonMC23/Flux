@@ -110,17 +110,24 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flux_core::{Track, TrackId, TrackSource};
+use flux_core::{ArtistId, Track, TrackId, TrackSource};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Library;
 use crate::fs_ops::replace_file;
 
-/// The `.flux` schema version this build reads and writes. (The legacy
-/// single-file index in [`crate::store`] is an independent format with
-/// its own version 1; the portable format starts at 2 so the two are
-/// never confused.)
-pub const PORTABLE_SCHEMA_VERSION: u32 = 2;
+/// The `.flux` schema version this build writes. (The legacy single-file
+/// index in [`crate::store`] is an independent format with its own version
+/// 1; the portable format starts at 2 so the two are never confused.)
+///
+/// Version 3 adds the stable artist table and track-to-artist references.
+/// Version 2 catalogues and segments remain readable; the first successful
+/// commit upgrades them to version 3 without changing track IDs, paths,
+/// tags, or overrides.
+pub const PORTABLE_SCHEMA_VERSION: u32 = 3;
+
+/// The oldest portable schema this build can read and migrate forward.
+pub const PORTABLE_MIN_READABLE_SCHEMA_VERSION: u32 = 2;
 
 /// Name of the storage directory inside a library root.
 pub const FLUX_DIR_NAME: &str = ".flux";
@@ -166,6 +173,43 @@ impl SegmentId {
 impl fmt::Display for SegmentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+// ------------------------------------------------------------- artists ---
+
+/// One Flux-owned artist identity.
+///
+/// The canonical display name is mutable through
+/// [`PortableStore::rename_artist`]; tracks reference the stable
+/// [`ArtistId`], so a rename updates every related track without rewriting
+/// their records. Distinct artists may deliberately share the same display
+/// name; the catalogue never merges them automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artist {
+    id: ArtistId,
+    name: String,
+    aliases: Vec<String>,
+}
+
+impl Artist {
+    /// The stable identity.
+    #[must_use]
+    pub fn id(&self) -> ArtistId {
+        self.id
+    }
+
+    /// The canonical display name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Additional searchable names (metadata only; never used to merge
+    /// identities automatically).
+    #[must_use]
+    pub fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 }
 
@@ -684,6 +728,10 @@ pub struct StoredTrack {
     file: Option<FileFingerprint>,
     tags: TagSet,
     overrides: MetadataOverrides,
+    /// Stable relationship to an artist in the same catalogue. The
+    /// canonical artist name is resolved at display time, so renaming the
+    /// artist does not rewrite this record.
+    artist_id: Option<ArtistId>,
     added_unix_ms: u64,
     updated_unix_ms: u64,
 }
@@ -693,6 +741,12 @@ impl StoredTrack {
     #[must_use]
     pub fn id(&self) -> TrackId {
         self.id
+    }
+
+    /// The stable artist relationship, when assigned.
+    #[must_use]
+    pub fn artist_id(&self) -> Option<ArtistId> {
+        self.artist_id
     }
 
     /// The library-relative locator (mutable only via
@@ -742,8 +796,25 @@ impl StoredTrack {
     /// Folder fallback for artist/album uses the two parent components
     /// of a UTF-8 relative path (`Artist/Album/…`); raw-byte paths get
     /// the title fallback only.
+    ///
+    /// This record-local view cannot resolve an artist relationship; use
+    /// [`PortableStore::effective_metadata`] when the catalogue is
+    /// available so a renamed artist's canonical name is displayed.
     #[must_use]
     pub fn effective_metadata(&self) -> EffectiveMetadata {
+        self.effective_metadata_with_artist(None)
+    }
+
+    /// Resolves effective metadata with an already-resolved canonical
+    /// artist name. A present artist relationship takes precedence over the
+    /// legacy text artist override, because the relationship is the
+    /// Flux-owned identity that survives renames; otherwise the normal
+    /// override → tag → folder precedence applies.
+    #[must_use]
+    pub fn effective_metadata_with_artist(
+        &self,
+        canonical_artist: Option<&str>,
+    ) -> EffectiveMetadata {
         fn pick<'a>(
             override_: Option<Option<&'a str>>,
             tag: Option<&'a String>,
@@ -782,11 +853,13 @@ impl StoredTrack {
 
         EffectiveMetadata {
             title,
-            artist: pick(
-                self.overrides.artist(),
-                self.tags.artist.as_ref(),
-                folder_artist,
-            ),
+            artist: canonical_artist.map(ToOwned::to_owned).or_else(|| {
+                pick(
+                    self.overrides.artist(),
+                    self.tags.artist.as_ref(),
+                    folder_artist,
+                )
+            }),
             album: pick(
                 self.overrides.album(),
                 self.tags.album.as_ref(),
@@ -825,6 +898,8 @@ pub struct ImportedTrack {
     pub tags: TagSet,
     /// The sparse user overrides.
     pub overrides: MetadataOverrides,
+    /// The stable artist relationship, when already known.
+    pub artist_id: Option<ArtistId>,
     /// When the record was added (ms since the Unix epoch).
     pub added_unix_ms: u64,
     /// When the record last changed (ms since the Unix epoch).
@@ -946,6 +1021,13 @@ pub enum PortableStoreError {
         /// The unknown ID.
         id: TrackId,
     },
+    /// A mutation named an artist that is not in the store.
+    ArtistNotFound {
+        /// The unknown ID.
+        id: ArtistId,
+    },
+    /// An artist name was empty after trimming.
+    InvalidArtistName,
     /// The path of a record whose stored path cannot be represented
     /// on this platform was about to be mutated; such records' paths
     /// are frozen here (their metadata may still be edited).
@@ -1037,6 +1119,8 @@ impl fmt::Display for PortableStoreError {
                 ),
             },
             Self::TrackNotFound { id } => write!(f, "track {id} is not in this library"),
+            Self::ArtistNotFound { id } => write!(f, "artist {id} is not in this library"),
+            Self::InvalidArtistName => write!(f, "an artist name must not be empty"),
             Self::UnrepresentablePath { id } => write!(
                 f,
                 "track {id}'s stored path cannot be represented on this platform; its path is frozen here"
@@ -1087,8 +1171,25 @@ struct CatalogDto {
     generation: u64,
     next_track_id: u64,
     next_segment_id: u64,
+    /// Version 3+. Absent in version 2 catalogues (no artists yet).
+    #[serde(default = "default_next_artist_id")]
+    next_artist_id: u64,
+    #[serde(default)]
+    artists: Vec<ArtistDto>,
     #[serde(default)]
     segments: Vec<SegmentDescriptorDto>,
+}
+
+fn default_next_artist_id() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ArtistDto {
+    id: u64,
+    name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1121,6 +1222,8 @@ struct TrackRecordDto {
     tags: TagSetDto,
     #[serde(default)]
     overrides: OverridesDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artist_id: Option<u64>,
     added_unix_ms: u64,
     updated_unix_ms: u64,
 }
@@ -1264,6 +1367,7 @@ impl From<&StoredTrack> for TrackRecordDto {
                 track_number: track.overrides.track_number,
                 disc_number: track.overrides.disc_number,
             },
+            artist_id: track.artist_id.map(ArtistId::get),
             added_unix_ms: track.added_unix_ms,
             updated_unix_ms: track.updated_unix_ms,
         }
@@ -1304,6 +1408,15 @@ impl TrackRecordDto {
                 album_artist: self.overrides.album_artist,
                 track_number: self.overrides.track_number,
                 disc_number: self.overrides.disc_number,
+            },
+            artist_id: match self.artist_id {
+                Some(0) => {
+                    return Err(PortableStoreError::InvalidStore(
+                        "a track references artist ID 0 (IDs start at 1)".to_owned(),
+                    ));
+                }
+                Some(raw) => Some(ArtistId::new(raw)),
+                None => None,
             },
             added_unix_ms: self.added_unix_ms,
             updated_unix_ms: self.updated_unix_ms,
@@ -1510,6 +1623,15 @@ pub struct PortableStore {
     generation: u64,
     next_track_id: u64,
     next_segment_id: u64,
+    next_artist_id: u64,
+    /// Artist identities in ascending ID order.
+    artists: Vec<Artist>,
+    /// Artist-table changes are catalogue changes even when no track
+    /// segment is dirty.
+    artists_changed: bool,
+    /// An older readable schema was opened; the next commit republishes
+    /// the catalogue in the current format.
+    schema_upgrade_pending: bool,
     /// Segments in catalogue order; concatenating their records yields
     /// strictly ascending track IDs (insertion order).
     segments: Vec<Segment>,
@@ -1570,6 +1692,8 @@ impl PortableStore {
             generation: 1,
             next_track_id: 1,
             next_segment_id: 1,
+            next_artist_id: 1,
+            artists: Vec::new(),
             segments: Vec::new(),
         };
         let bytes =
@@ -1593,6 +1717,10 @@ impl PortableStore {
             generation: 1,
             next_track_id: 1,
             next_segment_id: 1,
+            next_artist_id: 1,
+            artists: Vec::new(),
+            artists_changed: false,
+            schema_upgrade_pending: false,
             segments: Vec::new(),
             track_segment: HashMap::new(),
             path_index: HashMap::new(),
@@ -1685,6 +1813,17 @@ impl PortableStore {
                 path_index.insert(path_key(&record.path, policy), record.id);
             }
         }
+        let schema_upgrade_pending = loaded.catalog.schema_version < PORTABLE_SCHEMA_VERSION;
+        let artists = loaded
+            .catalog
+            .artists
+            .into_iter()
+            .map(|artist| Artist {
+                id: ArtistId::new(artist.id),
+                name: artist.name,
+                aliases: artist.aliases,
+            })
+            .collect();
         Self {
             root: root.to_owned(),
             flux_dir,
@@ -1695,6 +1834,10 @@ impl PortableStore {
             generation: loaded.catalog.generation,
             next_track_id: loaded.catalog.next_track_id,
             next_segment_id: loaded.catalog.next_segment_id,
+            next_artist_id: loaded.catalog.next_artist_id,
+            artists,
+            artists_changed: false,
+            schema_upgrade_pending,
             segments: loaded.segments,
             track_segment,
             path_index,
@@ -1749,6 +1892,46 @@ impl PortableStore {
         self.next_track_id
     }
 
+    /// The raw value the next allocated [`ArtistId`] will have.
+    #[must_use]
+    pub fn next_artist_id(&self) -> u64 {
+        self.next_artist_id
+    }
+
+    /// All artist identities in ascending ID order.
+    pub fn artists(&self) -> impl Iterator<Item = &Artist> {
+        self.artists.iter()
+    }
+
+    /// Looks up an artist by stable identity.
+    #[must_use]
+    pub fn artist(&self, id: ArtistId) -> Option<&Artist> {
+        self.artists.iter().find(|artist| artist.id == id)
+    }
+
+    /// Artist identities whose canonical display name equals `name`
+    /// exactly (case-sensitive). More than one distinct artist may share a
+    /// name; callers must not treat name equality as identity equality.
+    #[must_use]
+    pub fn artists_named(&self, name: &str) -> Vec<ArtistId> {
+        self.artists
+            .iter()
+            .filter(|artist| artist.name == name)
+            .map(|artist| artist.id)
+            .collect()
+    }
+
+    /// Resolves a record's effective metadata using its artist relationship
+    /// (when present), then overrides, tags, and fallbacks.
+    #[must_use]
+    pub fn effective_metadata(&self, track: &StoredTrack) -> EffectiveMetadata {
+        let canonical_artist = track
+            .artist_id
+            .and_then(|id| self.artist(id))
+            .map(Artist::name);
+        track.effective_metadata_with_artist(canonical_artist)
+    }
+
     /// The active path case policy.
     #[must_use]
     pub fn case_policy(&self) -> PathCasePolicy {
@@ -1764,7 +1947,10 @@ impl PortableStore {
     /// Whether mutations are waiting for [`commit`](Self::commit).
     #[must_use]
     pub fn has_uncommitted_changes(&self) -> bool {
-        self.pending_structure_change || self.segments.iter().any(|s| s.dirty)
+        self.pending_structure_change
+            || self.artists_changed
+            || self.schema_upgrade_pending
+            || self.segments.iter().any(|s| s.dirty)
     }
 
     /// Number of track records in the store.
@@ -1828,6 +2014,170 @@ impl PortableStore {
         }
     }
 
+    // --------------------------------------------------------- artists ---
+
+    /// Creates a new stable artist identity with a canonical name.
+    ///
+    /// Duplicate display names are allowed: names are labels, never
+    /// identities. Use [`artists_named`](Self::artists_named) when a UI
+    /// needs to present the ambiguity rather than silently merging it.
+    ///
+    /// # Errors
+    ///
+    /// [`PortableStoreError::InvalidArtistName`] for an empty/whitespace
+    /// name; [`PortableStoreError::ReadOnlyRecovered`] in the recovered
+    /// state.
+    pub fn create_artist(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<ArtistId, PortableStoreError> {
+        self.create_artist_with_aliases(name, Vec::new())
+    }
+
+    /// [`create_artist`](Self::create_artist) with optional aliases.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`create_artist`](Self::create_artist).
+    pub fn create_artist_with_aliases(
+        &mut self,
+        name: impl Into<String>,
+        aliases: Vec<String>,
+    ) -> Result<ArtistId, PortableStoreError> {
+        self.ensure_writable()?;
+        let name = name.into().trim().to_owned();
+        if name.is_empty() {
+            return Err(PortableStoreError::InvalidArtistName);
+        }
+        let id = ArtistId::new(self.next_artist_id);
+        self.next_artist_id = self.next_artist_id.checked_add(1).ok_or_else(|| {
+            PortableStoreError::InvalidCounter {
+                reason: "artist ID counter overflow".to_owned(),
+            }
+        })?;
+        self.artists.push(Artist {
+            id,
+            name,
+            aliases: aliases
+                .into_iter()
+                .map(|alias| alias.trim().to_owned())
+                .filter(|alias| !alias.is_empty())
+                .collect(),
+        });
+        self.artists_changed = true;
+        Ok(id)
+    }
+
+    /// Renames an artist's canonical display name. Track records are not
+    /// touched; every track referencing this artist displays the new name.
+    ///
+    /// # Errors
+    ///
+    /// [`PortableStoreError::ArtistNotFound`],
+    /// [`PortableStoreError::InvalidArtistName`], or the recovered
+    /// read-only state.
+    pub fn rename_artist(
+        &mut self,
+        id: ArtistId,
+        name: impl Into<String>,
+    ) -> Result<(), PortableStoreError> {
+        self.ensure_writable()?;
+        let name = name.into().trim().to_owned();
+        if name.is_empty() {
+            return Err(PortableStoreError::InvalidArtistName);
+        }
+        let artist = self
+            .artists
+            .iter_mut()
+            .find(|artist| artist.id == id)
+            .ok_or(PortableStoreError::ArtistNotFound { id })?;
+        if artist.name != name {
+            artist.name = name;
+            self.artists_changed = true;
+        }
+        Ok(())
+    }
+
+    /// Replaces an artist's aliases (metadata only).
+    ///
+    /// # Errors
+    ///
+    /// [`PortableStoreError::ArtistNotFound`] or the recovered read-only
+    /// state.
+    pub fn set_artist_aliases(
+        &mut self,
+        id: ArtistId,
+        aliases: Vec<String>,
+    ) -> Result<(), PortableStoreError> {
+        self.ensure_writable()?;
+        let artist = self
+            .artists
+            .iter_mut()
+            .find(|artist| artist.id == id)
+            .ok_or(PortableStoreError::ArtistNotFound { id })?;
+        artist.aliases = aliases
+            .into_iter()
+            .map(|alias| alias.trim().to_owned())
+            .filter(|alias| !alias.is_empty())
+            .collect();
+        self.artists_changed = true;
+        Ok(())
+    }
+
+    /// Assigns (or clears) a track's stable artist relationship. The
+    /// audio tags and the record's tag snapshot are untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`PortableStoreError::TrackNotFound`],
+    /// [`PortableStoreError::ArtistNotFound`], or the recovered
+    /// read-only state.
+    pub fn set_track_artist(
+        &mut self,
+        id: TrackId,
+        artist_id: Option<ArtistId>,
+    ) -> Result<(), PortableStoreError> {
+        self.ensure_writable()?;
+        if let Some(artist_id) = artist_id
+            && self.artist(artist_id).is_none()
+        {
+            return Err(PortableStoreError::ArtistNotFound { id: artist_id });
+        }
+        let record = self.record_mut(id)?;
+        if record.artist_id != artist_id {
+            record.artist_id = artist_id;
+            record.updated_unix_ms = now_unix_ms();
+            self.touch_segment(id);
+        }
+        Ok(())
+    }
+
+    /// Resolves an exact canonical name to an artist, or creates a new
+    /// identity when the name is unknown or ambiguous.
+    ///
+    /// One exact match is reused. Zero matches creates one artist. Two or
+    /// more distinct artists sharing the name are deliberately treated as
+    /// ambiguous and a new identity is created rather than merging the
+    /// caller's track into an arbitrary one.
+    ///
+    /// # Errors
+    ///
+    /// [`PortableStoreError::InvalidArtistName`] or the recovered
+    /// read-only state.
+    pub fn resolve_or_create_artist(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<ArtistId, PortableStoreError> {
+        let name = name.into().trim().to_owned();
+        if name.is_empty() {
+            return Err(PortableStoreError::InvalidArtistName);
+        }
+        match self.artists_named(&name).as_slice() {
+            [only] => Ok(*only),
+            _ => self.create_artist(name),
+        }
+    }
+
     // -------------------------------------------------------- mutations ---
 
     /// Adds a track record and returns its freshly allocated stable ID.
@@ -1863,6 +2213,7 @@ impl PortableStore {
             file,
             tags,
             overrides: MetadataOverrides::new(),
+            artist_id: None,
             added_unix_ms: now,
             updated_unix_ms: now,
         };
@@ -1952,6 +2303,11 @@ impl PortableStore {
                 )));
             }
             greatest_id = raw_id;
+            if let Some(artist_id) = record.artist_id
+                && self.artist(artist_id).is_none()
+            {
+                return Err(PortableStoreError::ArtistNotFound { id: artist_id });
+            }
             let key = path_key(&record.path, self.policy);
             if let Some(existing) = self.path_index.get(&key) {
                 return Err(PortableStoreError::DuplicatePath {
@@ -1996,6 +2352,7 @@ impl PortableStore {
                 file: record.file,
                 tags: record.tags,
                 overrides: record.overrides,
+                artist_id: record.artist_id,
                 added_unix_ms: record.added_unix_ms,
                 updated_unix_ms: record.updated_unix_ms,
             };
@@ -2250,6 +2607,16 @@ impl PortableStore {
             generation: new_generation,
             next_track_id: self.next_track_id,
             next_segment_id: self.next_segment_id,
+            next_artist_id: self.next_artist_id,
+            artists: self
+                .artists
+                .iter()
+                .map(|artist| ArtistDto {
+                    id: artist.id.get(),
+                    name: artist.name.clone(),
+                    aliases: artist.aliases.clone(),
+                })
+                .collect(),
             segments: descriptors,
         };
         let catalog_bytes =
@@ -2282,6 +2649,8 @@ impl PortableStore {
         }
         self.segments.retain(|s| !s.records.is_empty());
         self.pending_structure_change = false;
+        self.artists_changed = false;
+        self.schema_upgrade_pending = false;
 
         // 7. Garbage-collect unreferenced internal files (best effort).
         self.collect_garbage();
@@ -2393,7 +2762,9 @@ fn load_generation(
             file: catalog_file.to_owned(),
             message: err.to_string(),
         })?;
-    if catalog.schema_version != PORTABLE_SCHEMA_VERSION {
+    if !(PORTABLE_MIN_READABLE_SCHEMA_VERSION..=PORTABLE_SCHEMA_VERSION)
+        .contains(&catalog.schema_version)
+    {
         return Err(PortableStoreError::UnsupportedVersion {
             file: catalog_file.to_owned(),
             found: catalog.schema_version,
@@ -2426,6 +2797,48 @@ fn load_generation(
         return Err(PortableStoreError::InvalidCounter {
             reason: "next_segment_id is 0 (segment IDs start at 1)".to_owned(),
         });
+    }
+    if catalog.next_artist_id == 0 {
+        return Err(PortableStoreError::InvalidCounter {
+            reason: "next_artist_id is 0 (artist IDs start at 1)".to_owned(),
+        });
+    }
+
+    let mut seen_artists: HashSet<u64> = HashSet::new();
+    let mut previous_artist_id = 0u64;
+    for artist in &catalog.artists {
+        if artist.id == 0 {
+            return Err(PortableStoreError::InvalidStore(
+                "an artist record has ID 0 (IDs start at 1)".to_owned(),
+            ));
+        }
+        if !seen_artists.insert(artist.id) {
+            return Err(PortableStoreError::InvalidStore(format!(
+                "artist ID {} appears more than once",
+                artist.id
+            )));
+        }
+        if artist.id <= previous_artist_id {
+            return Err(PortableStoreError::InvalidStore(format!(
+                "artist IDs are not in strictly ascending order (…, {previous_artist_id}, {})",
+                artist.id
+            )));
+        }
+        previous_artist_id = artist.id;
+        if artist.id >= catalog.next_artist_id {
+            return Err(PortableStoreError::InvalidCounter {
+                reason: format!(
+                    "next_artist_id {} would reuse existing artist ID {}",
+                    catalog.next_artist_id, artist.id
+                ),
+            });
+        }
+        if artist.name.trim().is_empty() {
+            return Err(PortableStoreError::InvalidStore(format!(
+                "artist {} has an empty canonical name",
+                artist.id
+            )));
+        }
     }
 
     let mut seen_segments: HashSet<u64> = HashSet::new();
@@ -2488,7 +2901,9 @@ fn load_generation(
                 message: err.to_string(),
             }
         })?;
-        if segment_dto.schema_version != PORTABLE_SCHEMA_VERSION {
+        if !(PORTABLE_MIN_READABLE_SCHEMA_VERSION..=PORTABLE_SCHEMA_VERSION)
+            .contains(&segment_dto.schema_version)
+        {
             return Err(PortableStoreError::UnsupportedVersion {
                 file: expected_file.clone(),
                 found: segment_dto.schema_version,
@@ -2531,6 +2946,14 @@ fn load_generation(
         let mut records = Vec::with_capacity(segment_dto.records.len());
         for record_dto in segment_dto.records {
             let record = record_dto.into_runtime()?;
+            if let Some(artist_id) = record.artist_id
+                && !seen_artists.contains(&artist_id.get())
+            {
+                return Err(PortableStoreError::InvalidStore(format!(
+                    "track {} references missing artist {artist_id}",
+                    record.id
+                )));
+            }
             let raw_id = record.id.get();
             if !seen_tracks.insert(raw_id) {
                 return Err(PortableStoreError::DuplicateTrackId { id: raw_id });
@@ -2600,9 +3023,13 @@ fn load_generation(
 /// metadata (overrides → tags → fallbacks) and the absolute path
 /// under `root`. `None` when the record's relative path cannot be
 /// represented on this platform (opaque Unix bytes off Unix).
-fn track_from_stored(root: &Path, stored: &StoredTrack) -> Option<Track> {
+fn track_from_stored(
+    root: &Path,
+    stored: &StoredTrack,
+    canonical_artist: Option<&str>,
+) -> Option<Track> {
     let rel_os = stored.path().to_os_path()?;
-    let meta = stored.effective_metadata();
+    let meta = stored.effective_metadata_with_artist(canonical_artist);
     let mut track = Track::new(meta.title, TrackSource::local(root.join(rel_os)));
     if let Some(artist) = meta.artist {
         track = track.with_artist(artist);
@@ -2641,7 +3068,11 @@ impl Library {
         let mut tracks = Vec::with_capacity(store.len());
         let mut skipped = 0;
         for stored in store.iter() {
-            match track_from_stored(root, stored) {
+            let canonical_artist = stored
+                .artist_id()
+                .and_then(|id| store.artist(id))
+                .map(Artist::name);
+            match track_from_stored(root, stored, canonical_artist) {
                 Some(track) => tracks.push((stored.id(), track)),
                 None => skipped += 1,
             }
@@ -2689,8 +3120,12 @@ fn tags_from_track(track: &Track, album_artist: Option<String>) -> TagSet {
 
 /// Whether the runtime track's metadata differs from what the stored
 /// record's effective view produces (i.e. a scan refreshed it).
-fn track_differs_from_stored(track: &Track, stored: &StoredTrack) -> bool {
-    let meta = stored.effective_metadata();
+fn track_differs_from_stored(
+    track: &Track,
+    stored: &StoredTrack,
+    canonical_artist: Option<&str>,
+) -> bool {
+    let meta = stored.effective_metadata_with_artist(canonical_artist);
     track.title() != meta.title
         || track.artist() != meta.artist.as_deref()
         || track.album() != meta.album.as_deref()
@@ -2806,9 +3241,22 @@ pub fn sync_library_to_portable_store(
 
         match store.get(id) {
             Some(stored) => {
-                if track_differs_from_stored(track, stored) {
-                    let candidate = tags_from_track(track, stored.tags().album_artist.clone());
-                    if candidate != *stored.tags() {
+                let existing_artist_id = stored.artist_id();
+                let canonical_artist = existing_artist_id
+                    .and_then(|artist_id| store.artist(artist_id))
+                    .map(|artist| artist.name().to_owned());
+                let album_artist = stored.tags().album_artist.clone();
+                let stored_tags = stored.tags().clone();
+                let differs = track_differs_from_stored(track, stored, canonical_artist.as_deref());
+                if existing_artist_id.is_none()
+                    && let Some(name) = track.artist()
+                {
+                    let artist_id = store.resolve_or_create_artist(name)?;
+                    store.set_track_artist(id, Some(artist_id))?;
+                }
+                if differs {
+                    let candidate = tags_from_track(track, album_artist);
+                    if candidate != stored_tags {
                         updates.push((id, candidate));
                     }
                 }
@@ -2841,6 +3289,10 @@ pub fn sync_library_to_portable_store(
                 }
                 import_keys.insert(key, id);
                 let (availability, fingerprint) = availability_of(absolute);
+                let artist_id = track
+                    .artist()
+                    .map(|name| store.resolve_or_create_artist(name))
+                    .transpose()?;
                 imports.push(ImportedTrack {
                     id,
                     path: relative_path,
@@ -2848,6 +3300,7 @@ pub fn sync_library_to_portable_store(
                     file: fingerprint,
                     tags: tags_from_track(track, None),
                     overrides: MetadataOverrides::new(),
+                    artist_id,
                     added_unix_ms: now,
                     updated_unix_ms: now,
                 });
@@ -4925,6 +5378,7 @@ mod tests {
             file: None,
             tags: TagSet::default(),
             overrides: MetadataOverrides::new(),
+            artist_id: None,
             added_unix_ms: 111,
             updated_unix_ms: 222,
         }
@@ -6078,6 +6532,264 @@ mod tests {
             refreshed.library.get(id).expect("track").title(),
             "song",
             "an explicit clear keeps the filename fallback instead of the tag"
+        );
+    }
+
+    #[test]
+    fn artist_rename_persists_and_updates_every_related_track_without_rewriting_it() {
+        let dir = TempDir::new("artist-rename");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let artist = store.create_artist("Old Name").expect("artist");
+        let track = store
+            .add_track(
+                rel("one.flac"),
+                Availability::Present,
+                None,
+                TagSet {
+                    title: Some("One".to_owned()),
+                    artist: Some("Tag Artist".to_owned()),
+                    ..TagSet::default()
+                },
+            )
+            .expect("track");
+        store.set_track_artist(track, Some(artist)).expect("assign");
+        store.commit().expect("commit");
+
+        let stored_override_before = store.get(track).expect("stored").overrides().clone();
+        let (library, _) = Library::from_portable_store(&store);
+        assert_eq!(library.get(track).and_then(Track::artist), Some("Old Name"));
+
+        store
+            .rename_artist(artist, "Renamed Artist")
+            .expect("rename");
+        assert_eq!(
+            store.get(track).expect("stored").overrides(),
+            &stored_override_before,
+            "a rename must not rewrite track overrides"
+        );
+        store.commit().expect("commit rename");
+        drop(store);
+
+        let reopened = PortableStore::open(dir.path()).expect("reopen").store;
+        assert_eq!(
+            reopened.artist(artist).map(Artist::name),
+            Some("Renamed Artist")
+        );
+        assert_eq!(
+            reopened.next_artist_id(),
+            2,
+            "the artist counter is persisted"
+        );
+        let (library, _) = Library::from_portable_store(&reopened);
+        assert_eq!(
+            library.get(track).and_then(Track::artist),
+            Some("Renamed Artist")
+        );
+    }
+
+    #[test]
+    fn distinct_artists_may_share_a_display_name_and_are_never_auto_merged() {
+        let dir = TempDir::new("artist-duplicate-name");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let first = store.create_artist("Same Name").expect("first");
+        let second = store.create_artist("Same Name").expect("second");
+        assert_ne!(first, second);
+        assert_eq!(store.artists_named("Same Name"), vec![first, second]);
+
+        let resolved = store
+            .resolve_or_create_artist("Same Name")
+            .expect("ambiguous resolution");
+        assert_ne!(resolved, first);
+        assert_ne!(resolved, second);
+        assert_eq!(
+            store.artists_named("Same Name").len(),
+            3,
+            "an ambiguous name creates a distinct identity rather than merging"
+        );
+
+        let one = store
+            .add_track(
+                rel("one.flac"),
+                Availability::Present,
+                None,
+                title_tags("One"),
+            )
+            .expect("one");
+        let two = store
+            .add_track(
+                rel("two.flac"),
+                Availability::Present,
+                None,
+                title_tags("Two"),
+            )
+            .expect("two");
+        store
+            .set_track_artist(one, Some(first))
+            .expect("one artist");
+        store
+            .set_track_artist(two, Some(second))
+            .expect("two artist");
+        store.rename_artist(first, "First Renamed").expect("rename");
+        assert_eq!(
+            store
+                .effective_metadata(store.get(one).expect("one"))
+                .artist,
+            Some("First Renamed".to_owned())
+        );
+        assert_eq!(
+            store
+                .effective_metadata(store.get(two).expect("two"))
+                .artist,
+            Some("Same Name".to_owned())
+        );
+    }
+
+    #[test]
+    fn version_two_catalogue_loads_and_first_commit_upgrades_to_artists() {
+        let dir = TempDir::new("portable-v2");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        store
+            .add_track(
+                rel("legacy.flac"),
+                Availability::Present,
+                None,
+                TagSet {
+                    title: Some("Legacy".to_owned()),
+                    artist: Some("Tag Artist".to_owned()),
+                    ..TagSet::default()
+                },
+            )
+            .expect("track");
+        store.commit().expect("commit v3");
+
+        // Rewrite the published generation as a genuine version-2
+        // catalogue: no artist table, no art references, old version.
+        let catalog_path = flux_dir(&dir).join(CATALOG_FILE_NAME);
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
+                .expect("catalog json");
+        catalog["schema_version"] = serde_json::json!(2);
+        catalog.as_object_mut().expect("object").remove("artists");
+        catalog
+            .as_object_mut()
+            .expect("object")
+            .remove("next_artist_id");
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("catalog bytes"),
+        )
+        .expect("write catalog");
+        for name in segment_files(&dir) {
+            let path = flux_dir(&dir).join(&name);
+            let mut segment: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).expect("segment")).expect("segment json");
+            segment["schema_version"] = serde_json::json!(2);
+            for record in segment["records"].as_array_mut().expect("records") {
+                record.as_object_mut().expect("record").remove("artist_id");
+            }
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&segment).expect("segment bytes"),
+            )
+            .expect("write segment");
+        }
+
+        let mut opened = PortableStore::open(dir.path()).expect("v2 opens");
+        assert_eq!(opened.store.artists().count(), 0);
+        let (library, _) = Library::from_portable_store(&opened.store);
+        assert_eq!(
+            library.get(TrackId::new(1)).and_then(Track::artist),
+            Some("Tag Artist"),
+            "v2 has no relationship, so the tag remains the display source"
+        );
+        opened.store.commit().expect("first commit upgrades");
+        drop(opened.store);
+
+        let reopened = PortableStore::open(dir.path()).expect("v3 reopens").store;
+        assert_eq!(reopened.next_artist_id(), 1);
+        let catalog = catalog_value(&dir);
+        assert_eq!(
+            catalog["schema_version"].as_u64(),
+            Some(u64::from(PORTABLE_SCHEMA_VERSION))
+        );
+        assert!(catalog["artists"].as_array().is_some());
+    }
+
+    #[test]
+    fn sync_creates_reuses_and_persists_stable_artist_relationships() {
+        let dir = TempDir::new("artist-sync");
+        let first = dir.write("first.flac", b"first");
+        let second = dir.write("second.flac", b"second");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        let mut library = Library::new();
+        let first_id = library
+            .insert(Track::new("First", TrackSource::local(&first)).with_artist("Shared Artist"));
+        let second_id = library
+            .insert(Track::new("Second", TrackSource::local(&second)).with_artist("Shared Artist"));
+
+        sync_library_to_portable_store(&library, &mut store).expect("sync");
+        store.commit().expect("commit");
+        let artists = store.artists().cloned().collect::<Vec<_>>();
+        assert_eq!(artists.len(), 1, "same unambiguous name is reused");
+        let artist_id = artists[0].id();
+        assert_eq!(
+            store.get(first_id).and_then(StoredTrack::artist_id),
+            Some(artist_id)
+        );
+        assert_eq!(
+            store.get(second_id).and_then(StoredTrack::artist_id),
+            Some(artist_id)
+        );
+
+        let (rebuilt, _) = Library::from_portable_store(&store);
+        assert_eq!(
+            rebuilt.get(first_id).and_then(Track::artist),
+            Some("Shared Artist")
+        );
+        store
+            .rename_artist(artist_id, "Renamed Shared")
+            .expect("rename");
+        store.commit().expect("commit rename");
+        let (rebuilt, _) = Library::from_portable_store(&store);
+        assert_eq!(
+            rebuilt.get(second_id).and_then(Track::artist),
+            Some("Renamed Shared")
+        );
+    }
+
+    #[test]
+    fn malformed_artist_table_recovers_from_backup_without_rewriting() {
+        let dir = TempDir::new("artist-malformed");
+        let mut store = PortableStore::create(dir.path()).expect("create");
+        store.create_artist("A").expect("artist");
+        store.commit().expect("commit");
+        // Publish a second generation so the backup actually carries the
+        // artist table rather than the initial empty catalogue.
+        store.create_artist("B").expect("second artist");
+        store.commit().expect("second commit");
+        drop(store);
+
+        let catalog_path = flux_dir(&dir).join(CATALOG_FILE_NAME);
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("catalog")).expect("json");
+        catalog["next_artist_id"] = serde_json::json!(1);
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("bytes"),
+        )
+        .expect("write");
+        let before = fs::read(&catalog_path).expect("before");
+        let opened = PortableStore::open(dir.path()).expect("backup recovery");
+        assert!(
+            opened.recovery.is_some(),
+            "the invalid primary is recovered from the valid backup"
+        );
+        assert!(opened.store.is_recovered_read_only());
+        assert_eq!(opened.store.artists().count(), 1);
+        assert_eq!(
+            fs::read(&catalog_path).expect("after"),
+            before,
+            "opening never rewrites invalid data"
         );
     }
 

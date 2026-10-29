@@ -67,12 +67,12 @@ pub use migrate::{
     MigrationReport, MigrationStage, PlannedRecord,
 };
 pub use portable::{
-    Availability, EffectiveMetadata, FileFingerprint, ImportedTrack, MetadataOverrides,
-    OpenedStore, PORTABLE_SCHEMA_VERSION, PathCasePolicy, PathValidationError,
-    PortableRefreshReport, PortableStore, PortableStoreError, PortableSyncReport,
-    PortableSyncSkipped, ReconcileOutcome, ReconcileReport, RecoveryInfo, RelPath,
-    RelinkCandidates, RelinkError, SegmentId, StoredTrack, TagSet, reconcile_portable_store,
-    refresh_library_from_portable_store, relink_portable_track,
+    Artist, Availability, EffectiveMetadata, FileFingerprint, ImportedTrack, MetadataOverrides,
+    OpenedStore, PORTABLE_MIN_READABLE_SCHEMA_VERSION, PORTABLE_SCHEMA_VERSION, PathCasePolicy,
+    PathValidationError, PortableRefreshReport, PortableStore, PortableStoreError,
+    PortableSyncReport, PortableSyncSkipped, ReconcileOutcome, ReconcileReport, RecoveryInfo,
+    RelPath, RelinkCandidates, RelinkError, SegmentId, StoredTrack, TagSet,
+    reconcile_portable_store, refresh_library_from_portable_store, relink_portable_track,
 };
 pub use queue_store::{LoadedQueue, QUEUE_SCHEMA_VERSION, QueueStore, QueueStoreError};
 pub use scan::{SUPPORTED_EXTENSIONS, ScanIssue, ScanReport};

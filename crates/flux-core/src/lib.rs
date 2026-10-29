@@ -15,10 +15,12 @@
 //! There is still no library scanning, persistence, provider, or audio
 //! output behavior anywhere in this crate.
 
+pub mod artist;
 pub mod error;
 pub mod queue;
 pub mod track;
 
+pub use artist::ArtistId;
 pub use error::{Error, Result};
 pub use queue::{PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode};
 pub use track::{Track, TrackId, TrackSource};
