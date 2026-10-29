@@ -75,7 +75,7 @@ pub use portable::{
     reconcile_portable_store, refresh_library_from_portable_store, relink_portable_track,
 };
 pub use queue_store::{LoadedQueue, QUEUE_SCHEMA_VERSION, QueueStore, QueueStoreError};
-pub use scan::{SUPPORTED_EXTENSIONS, ScanIssue, ScanReport};
+pub use scan::{SUPPORTED_EXTENSIONS, ScanIssue, ScanReport, is_supported_audio_path, read_track};
 pub use store::{INDEX_VERSION, StoreError};
 
 /// An in-memory, insertion-ordered track collection.

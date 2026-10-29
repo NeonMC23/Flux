@@ -151,7 +151,7 @@ impl Library {
                             // Traversal continues into it; nothing to record.
                         } else if file_type.is_file() {
                             let path = entry.into_path();
-                            if is_supported(&path) {
+                            if is_supported_audio_path(&path) {
                                 candidates.push(path);
                             } else {
                                 report.skipped.push(ScanIssue::new(
@@ -237,7 +237,8 @@ impl Library {
 }
 
 /// Whether `path` has a supported audio extension.
-fn is_supported(path: &Path) -> bool {
+/// Whether `path` has an extension Flux treats as an audio candidate.
+pub fn is_supported_audio_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
@@ -254,7 +255,12 @@ fn is_supported(path: &Path) -> bool {
 /// *failed*. Once a file opens, any tag/content problem (malformed
 /// audio, unreadable tags) falls back to a filename-derived title
 /// instead — an opened file is always importable at this milestone.
-fn read_track(path: &Path) -> Result<Track, String> {
+/// Reads one audio file into a [`Track`] without touching a library.
+///
+/// This is the same metadata path used by folder scans: embedded tags win,
+/// with a filename-derived title fallback. The only error is that the file
+/// cannot be opened; malformed tags fall back exactly as during a scan.
+pub fn read_track(path: &Path) -> Result<Track, String> {
     // Distinguish "cannot read the file" (failed entry) from "cannot
     // parse its tags" (fallback title): lofty reports some parse
     // failures as IO-kind errors (e.g. unexpected EOF), so the probe's
@@ -594,8 +600,8 @@ mod tests {
             );
         }
         let supported = Path::new("x.FlAc");
-        assert!(super::is_supported(supported));
-        assert!(!super::is_supported(Path::new("x.txt")));
-        assert!(!super::is_supported(Path::new("noextension")));
+        assert!(super::is_supported_audio_path(supported));
+        assert!(!super::is_supported_audio_path(Path::new("x.txt")));
+        assert!(!super::is_supported_audio_path(Path::new("noextension")));
     }
 }

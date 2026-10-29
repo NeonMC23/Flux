@@ -101,6 +101,8 @@
 //! a playable extension the engine still validates the contents, and
 //! corrupt files fail with a typed error — never a silent skip.
 
+use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -112,7 +114,9 @@ use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
 pub use flux_audio::engine::WAVEFORM_WINDOW;
 use flux_audio::engine::{EngineEvent, EngineHandle};
-use flux_core::{PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId};
+use flux_core::{
+    ArtistId, PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
+};
 use flux_library::portable::{
     CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, OpenedStore, PortableRefreshReport,
     PortableStore, reconcile_portable_store, refresh_library_from_portable_store,
@@ -124,8 +128,8 @@ use flux_library::{
 
 pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
 pub use flux_library::{
-    PortableStoreError, ReconcileOutcome, ReconcileReport, RecoveryInfo, RelPath, RelinkCandidates,
-    RelinkError, StoreError,
+    Artist, Availability, MetadataOverrides, PortableStoreError, ReconcileOutcome, ReconcileReport,
+    RecoveryInfo, RelPath, RelinkCandidates, RelinkError, StoreError,
 };
 
 /// Whether real device audio is available to this controller's engine.
@@ -179,6 +183,73 @@ pub enum StorageMode {
     Legacy,
     /// The portable `.flux` store at an explicit library root.
     Portable,
+}
+
+/// A complete track metadata edit from a user-facing form.
+///
+/// `None` means "no Flux override for this field" for album, track number,
+/// and disc number (the embedded tag or fallback shows again). For the
+/// title, `None` falls back to the source title but the display title is
+/// still guaranteed non-empty. `artist_id` assigns one of the catalogue's
+/// stable artists; `None` removes the relationship and leaves any legacy
+/// text override in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackMetadataEdit {
+    /// User-visible title override, or `None` to use source metadata.
+    pub title: Option<String>,
+    /// Stable artist identity, or `None` to remove the relationship.
+    pub artist_id: Option<ArtistId>,
+    /// Album title override.
+    pub album: Option<String>,
+    /// Track number override.
+    pub track_number: Option<u32>,
+    /// Disc number override.
+    pub disc_number: Option<u32>,
+}
+
+/// One path that an import request could not add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportIssue {
+    path: PathBuf,
+    reason: String,
+}
+
+impl ImportIssue {
+    /// The rejected source path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A user-facing reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// The outcome of one [`Controller::import_files`] request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Newly indexed tracks.
+    pub added: usize,
+    /// Existing indexed tracks whose source tags were refreshed.
+    pub updated: usize,
+    /// Files already represented by the same path (no duplicate entry).
+    pub deduplicated: usize,
+    /// Copies made into the selected portable library.
+    pub copied: Vec<PathBuf>,
+    /// Sources that were rejected individually; successful paths still
+    /// imported.
+    pub issues: Vec<ImportIssue>,
+}
+
+impl ImportReport {
+    /// Number of files considered (successful plus rejected).
+    #[must_use]
+    pub fn considered(&self) -> usize {
+        self.added + self.updated + self.deduplicated + self.issues.len()
+    }
 }
 
 /// Why a controller could not open its initial legacy library.
@@ -1102,6 +1173,44 @@ impl Controller {
             .collect()
     }
 
+    /// All stable artist identities in the active portable catalogue,
+    /// ascending by ID. Empty in legacy mode or when no portable store is
+    /// available. Duplicate display names are intentionally preserved.
+    #[must_use]
+    pub fn artists(&self) -> Vec<Artist> {
+        self.portable_store
+            .as_ref()
+            .map(|store| store.artists().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Looks up one stable artist identity.
+    #[must_use]
+    pub fn artist(&self, id: ArtistId) -> Option<Artist> {
+        self.portable_store
+            .as_ref()
+            .and_then(|store| store.artist(id).cloned())
+    }
+
+    /// The stable artist relationship for a track, when one is assigned.
+    #[must_use]
+    pub fn track_artist_id(&self, id: TrackId) -> Option<ArtistId> {
+        self.portable_store
+            .as_ref()
+            .and_then(|store| store.get(id))
+            .and_then(|track| track.artist_id())
+    }
+
+    /// Last-known availability of a portable track. `None` in legacy mode,
+    /// for unknown IDs, or when no store is available.
+    #[must_use]
+    pub fn track_availability(&self, id: TrackId) -> Option<Availability> {
+        self.portable_store
+            .as_ref()
+            .and_then(|store| store.get(id))
+            .map(|track| track.availability())
+    }
+
     /// The playback model's state.
     #[must_use]
     pub fn player_state(&self) -> PlaybackState {
@@ -1699,6 +1808,261 @@ impl Controller {
             "Relinked track {id} to {}.",
             candidate.display_lossy()
         ));
+        Ok(())
+    }
+
+    /// Creates a new stable artist in the active portable catalogue.
+    /// Duplicate display names are allowed.
+    ///
+    /// The catalogue is committed immediately; no audio tag is touched.
+    pub fn create_artist(&mut self, name: &str) -> Result<ArtistId, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.portable_store.as_mut() else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let id = match store.create_artist(name) {
+            Ok(id) => id,
+            Err(err) => {
+                let message = format!("Could not create artist: {err}");
+                self.report_error(message.clone());
+                return Err(message);
+            }
+        };
+        self.commit_portable_changes()?;
+        self.refresh_from_store();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Created artist {} (ID {}).", name.trim(), id));
+        Ok(id)
+    }
+
+    /// Renames one stable artist. Every related track displays the new
+    /// canonical name; their overrides and audio tags are untouched.
+    pub fn rename_artist(&mut self, id: ArtistId, name: &str) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.portable_store.as_mut() else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if let Err(err) = store.rename_artist(id, name) {
+            let message = format!("Could not rename artist: {err}");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.commit_portable_changes()?;
+        self.refresh_from_store();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Renamed artist {} to {}.", id, name.trim()));
+        Ok(())
+    }
+
+    /// Applies a full user metadata edit to one portable track without
+    /// touching its audio file or embedded tags.
+    ///
+    /// The existing overrides are updated field by field, so fields the
+    /// edit does not carry (notably `album_artist`, which the current UI
+    /// does not expose) are preserved. When an artist ID is supplied, the
+    /// stable relationship is set and the legacy text artist override is
+    /// removed; `None` clears the relationship but leaves any legacy text
+    /// override in place.
+    pub fn edit_track_metadata(
+        &mut self,
+        id: TrackId,
+        edit: TrackMetadataEdit,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.portable_store.as_mut() else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let Some(stored) = store.get(id) else {
+            let message = format!("Track {id} is not in the portable catalogue.");
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if let Some(artist_id) = edit.artist_id
+            && store.artist(artist_id).is_none()
+        {
+            let message = format!("Artist {artist_id} is not in this library.");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let mut overrides = stored.overrides().clone();
+        match edit.title {
+            Some(value) if !value.trim().is_empty() => overrides.set_title(value.trim().to_owned()),
+            _ => overrides.revert_title(),
+        }
+        match edit.album {
+            Some(value) if !value.trim().is_empty() => overrides.set_album(value.trim().to_owned()),
+            _ => overrides.revert_album(),
+        }
+        match edit.track_number {
+            Some(value) => overrides.set_track_number(value),
+            None => overrides.revert_track_number(),
+        }
+        match edit.disc_number {
+            Some(value) => overrides.set_disc_number(value),
+            None => overrides.revert_disc_number(),
+        }
+        if edit.artist_id.is_some() {
+            overrides.revert_artist();
+        }
+        if let Err(err) = store.set_overrides(id, overrides) {
+            let message = format!("Could not update track metadata: {err}");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        if let Err(err) = store.set_track_artist(id, edit.artist_id) {
+            let message = format!("Could not update the track artist: {err}");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.commit_portable_changes()?;
+        self.refresh_from_store();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Updated metadata for track {id}."));
+        Ok(())
+    }
+
+    /// Imports individual audio files into the active portable library.
+    ///
+    /// With `copy = true`, files outside the library root are copied into
+    /// the library root under a collision-free name; originals are never
+    /// moved, deleted, or overwritten. Files already inside the root are
+    /// referenced in place. With `copy = false`, only files already inside
+    /// the library root are accepted. Repeated imports of the same source
+    /// reuse an identical existing copy instead of creating a duplicate
+    /// catalogue entry.
+    ///
+    /// Tag reading, duplicate/path checks, stable IDs, artist creation, and
+    /// persistence all go through the existing library/portable pipeline.
+    /// Individual bad paths are reported and do not abort the batch.
+    pub fn import_files(&mut self, paths: &[PathBuf], copy: bool) -> Result<ImportReport, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(root) = self.portable_root().map(Path::to_path_buf) else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if self.library.is_none() {
+            let message =
+                "A library scan is in progress; import files when it finishes.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        }
+
+        let mut report = ImportReport::default();
+        let mut effective_paths: Vec<PathBuf> = Vec::new();
+        for source in paths {
+            match self.prepare_import_source(source, &root, copy, &mut report) {
+                Ok(path) => effective_paths.push(path),
+                Err(reason) => report.issues.push(ImportIssue {
+                    path: source.clone(),
+                    reason,
+                }),
+            }
+        }
+
+        if !effective_paths.is_empty() {
+            let Some(library) = self.library.as_mut() else {
+                unreachable!("library existence was checked above");
+            };
+            for path in &effective_paths {
+                let scan = library.scan(&[path.as_path()]);
+                report.added += scan.added();
+                report.updated += scan.updated();
+                report.deduplicated += scan.deduplicated();
+                for issue in scan.skipped().iter().chain(scan.failed()) {
+                    report.issues.push(ImportIssue {
+                        path: issue.path().to_path_buf(),
+                        reason: issue.reason().to_owned(),
+                    });
+                }
+            }
+            self.publish_portable()?;
+            self.refresh_from_store();
+            self.sync_default_queue();
+            self.outbox.push(ControllerEvent::LibraryChanged);
+        }
+
+        let message = format!(
+            "Import complete: {} added, {} updated, {} already indexed, {} copied, {} issue(s).",
+            report.added,
+            report.updated,
+            report.deduplicated,
+            report.copied.len(),
+            report.issues.len()
+        );
+        self.report_status(message);
+        Ok(report)
+    }
+
+    fn prepare_import_source(
+        &self,
+        source: &Path,
+        root: &Path,
+        copy: bool,
+        report: &mut ImportReport,
+    ) -> Result<PathBuf, String> {
+        let metadata = std::fs::symlink_metadata(source)
+            .map_err(|err| format!("cannot inspect the file: {err}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("symbolic links are never imported; use the real file path".to_owned());
+        }
+        if !metadata.is_file() {
+            return Err("not a regular file".to_owned());
+        }
+        if !flux_library::is_supported_audio_path(source) {
+            return Err("unsupported or missing audio extension".to_owned());
+        }
+        let canonical = std::fs::canonicalize(source)
+            .map_err(|err| format!("cannot resolve the file path: {err}"))?;
+        if canonical.starts_with(root) {
+            return Ok(canonical);
+        }
+        if !copy {
+            return Err(format!(
+                "the file is outside this portable library ({}); enable Copy to import it",
+                root.display()
+            ));
+        }
+        let destination = copy_into_library(root, &canonical)?;
+        if destination.was_copied {
+            report.copied.push(destination.path.clone());
+        }
+        Ok(destination.path)
+    }
+
+    /// Commits catalogue changes without re-syncing the runtime snapshot
+    /// into tags first. Used by direct user edits (metadata/artist), where
+    /// the store is authoritative and the old runtime metadata must not be
+    /// mistaken for a scan refresh.
+    fn commit_portable_changes(&mut self) -> Result<(), String> {
+        let Some(store) = self.portable_store.as_mut() else {
+            let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if let Err(err) = store.commit() {
+            let message = format!("Could not save the portable catalogue: {err}");
+            self.report_error(message.clone());
+            return Err(message);
+        }
         Ok(())
     }
 
@@ -2819,6 +3183,111 @@ fn snapshot(library: &Library) -> Vec<(TrackId, Track)> {
         .collect()
 }
 
+struct CopiedPath {
+    path: PathBuf,
+    was_copied: bool,
+}
+
+/// Copies one external source into the library root, never overwriting.
+///
+/// An existing file with identical bytes is reused (so importing the same
+/// source repeatedly does not duplicate the catalogue); any other name
+/// collision gets a numeric suffix. The source is only read. Keeping copies
+/// at the root also keeps the portable folder-fallback metadata (`Artist/
+/// Album/…`) from inventing an album named after an import staging folder.
+fn copy_into_library(root: &Path, source: &Path) -> Result<CopiedPath, String> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| "the source has no file name".to_owned())?;
+    let source_path = Path::new(file_name);
+    let stem = source_path.file_stem().unwrap_or(file_name);
+    let extension = source_path.extension();
+
+    for attempt in 0..10_000u32 {
+        let candidate_name = if attempt == 0 {
+            file_name.to_os_string()
+        } else {
+            let mut name = OsString::from(stem);
+            name.push(format!(" ({attempt})"));
+            if let Some(extension) = extension {
+                name.push(".");
+                name.push(extension);
+            }
+            name
+        };
+        let candidate = root.join(candidate_name);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => {
+                if files_equal(source, &candidate)? {
+                    return Ok(CopiedPath {
+                        path: candidate,
+                        was_copied: false,
+                    });
+                }
+                continue;
+            }
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("could not inspect the copy destination: {err}")),
+        }
+
+        let mut input = std::fs::File::open(source)
+            .map_err(|err| format!("could not read the source file: {err}"))?;
+        let mut output = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("could not create the copy: {err}")),
+        };
+        if let Err(err) = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(format!("could not finish the copy: {err}"));
+        }
+        let canonical = std::fs::canonicalize(&candidate)
+            .map_err(|err| format!("copied file cannot be resolved: {err}"))?;
+        return Ok(CopiedPath {
+            path: canonical,
+            was_copied: true,
+        });
+    }
+    Err("could not choose a collision-free copy name".to_owned())
+}
+
+fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
+    let left_len = std::fs::metadata(left)
+        .map_err(|err| format!("could not inspect {}: {err}", left.display()))?
+        .len();
+    let right_len = std::fs::metadata(right)
+        .map_err(|err| format!("could not inspect {}: {err}", right.display()))?
+        .len();
+    if left_len != right_len {
+        return Ok(false);
+    }
+    let mut left_file = std::fs::File::open(left)
+        .map_err(|err| format!("could not read {}: {err}", left.display()))?;
+    let mut right_file = std::fs::File::open(right)
+        .map_err(|err| format!("could not read {}: {err}", right.display()))?;
+    let mut left_buffer = [0u8; 8192];
+    let mut right_buffer = [0u8; 8192];
+    loop {
+        let left_read = left_file
+            .read(&mut left_buffer)
+            .map_err(|err| format!("could not read {}: {err}", left.display()))?;
+        let right_read = right_file
+            .read(&mut right_buffer)
+            .map_err(|err| format!("could not read {}: {err}", right.display()))?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 fn repeat_label(mode: RepeatMode) -> &'static str {
     match mode {
         RepeatMode::Off => "off",
@@ -3060,8 +3529,9 @@ mod tests {
 
     use super::{
         AudioStatus, Controller, ControllerEvent, CreateLibraryError, PortableOpenError,
-        ScanOutcome, StorageMode, SwitchError, create_portable_library, default_engine,
-        execute_legacy_migration, is_track_playable, migrate_legacy_library, plan_legacy_migration,
+        ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit, create_portable_library,
+        default_engine, execute_legacy_migration, is_track_playable, migrate_legacy_library,
+        plan_legacy_migration,
     };
 
     struct TempDir(PathBuf);
@@ -6477,6 +6947,341 @@ mod tests {
             .expect("queue exists");
         assert!(flushed.queue.is_empty());
         controller.shutdown();
+    }
+
+    #[test]
+    fn portable_import_copies_multiple_files_and_dedupes_reimports() {
+        let dir = TempDir::new("portable-import");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        create_portable_library(&root).expect("create portable library");
+        let canonical_root = root.canonicalize().expect("canonical root");
+        let (mut controller, _control) = boot_portable_at(&root).expect("portable boot");
+
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        let song = write_dc_wav(&outside, "café.wav", 4_410, 0.2);
+        let other = write_dc_wav(&outside, "other.wav", 4_410, 0.3);
+        let original_bytes = fs::read(&song).expect("read source");
+
+        let report = controller
+            .import_files(&[song.clone(), other.clone()], true)
+            .expect("copy imports");
+        assert_eq!(report.added, 2);
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.deduplicated, 0);
+        assert_eq!(report.copied.len(), 2);
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert_eq!(fs::read(&song).expect("source unchanged"), original_bytes);
+        assert_eq!(
+            fs::read(&other).expect("source unchanged"),
+            fs::read(other).expect("other")
+        );
+
+        let copied = controller
+            .tracks()
+            .iter()
+            .find(|(_, track)| track.title() == "café")
+            .map(|(_, track)| track.source().path().to_path_buf())
+            .expect("imported café track");
+        assert!(copied.starts_with(&canonical_root));
+        assert!(copied.starts_with(&canonical_root));
+        assert_eq!(fs::read(&copied).expect("copied"), original_bytes);
+        assert_eq!(controller.tracks().len(), 2);
+
+        let ids_before: Vec<_> = controller.tracks().iter().map(|(id, _)| *id).collect();
+        let again = controller
+            .import_files(&[song], true)
+            .expect("reimport same source");
+        assert_eq!(again.added, 0);
+        assert_eq!(again.deduplicated, 1, "{again:?}");
+        assert_eq!(again.copied.len(), 0);
+        assert!(again.issues.is_empty());
+        assert_eq!(controller.tracks().len(), 2);
+        assert_eq!(
+            controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            ids_before,
+            "reimport must not mint a duplicate track ID"
+        );
+
+        // Without copy, an external file is refused with no write.
+        let outside_again = write_dc_wav(&outside, "refused.wav", 4_410, 0.1);
+        let refused = controller
+            .import_files(&[outside_again], false)
+            .expect("partial import report");
+        assert_eq!(refused.added, 0);
+        assert_eq!(refused.issues.len(), 1);
+        assert!(refused.issues[0].reason().contains("outside"));
+        assert_eq!(controller.tracks().len(), 2);
+
+        // A file already inside the library root is referenced in place.
+        let inside = write_dc_wav(&canonical_root, "inside.wav", 4_410, 0.4);
+        let linked = controller
+            .import_files(std::slice::from_ref(&inside), false)
+            .expect("in-place import");
+        assert_eq!(linked.added, 1);
+        assert_eq!(linked.copied.len(), 0);
+        assert_eq!(controller.tracks().len(), 3);
+        assert!(
+            controller
+                .tracks()
+                .iter()
+                .any(|(_, track)| track.source().path() == inside)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn portable_track_edits_persist_without_touching_audio_or_track_ids() {
+        let dir = TempDir::new("portable-edit");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        create_portable_library(&root).expect("create portable library");
+        let canonical_root = root.canonicalize().expect("canonical");
+        let first = write_dc_wav(&canonical_root, "first.wav", 4_410, 0.2);
+        let second = write_dc_wav(&canonical_root, "second.wav", 4_410, 0.3);
+        let (mut controller, _control) = boot_portable_at(&root).expect("portable boot");
+        controller
+            .import_files(&[first.clone(), second.clone()], false)
+            .expect("import");
+        let ids: Vec<_> = controller.tracks().iter().map(|(id, _)| *id).collect();
+        let first_id = controller
+            .tracks()
+            .iter()
+            .find(|(_, track)| track.source().path() == first)
+            .map(|(id, _)| *id)
+            .expect("first id");
+        let second_id = controller
+            .tracks()
+            .iter()
+            .find(|(_, track)| track.source().path() == second)
+            .map(|(id, _)| *id)
+            .expect("second id");
+        let current = controller.current_queue_entry_id();
+        let first_audio = fs::read(&first).expect("first audio");
+
+        let artist = controller.create_artist("Old Name").expect("artist");
+        controller
+            .edit_track_metadata(
+                first_id,
+                TrackMetadataEdit {
+                    title: Some("Edited Title".to_owned()),
+                    artist_id: Some(artist),
+                    album: Some("Edited Album".to_owned()),
+                    track_number: Some(4),
+                    disc_number: Some(2),
+                },
+            )
+            .expect("edit first");
+        controller
+            .edit_track_metadata(
+                second_id,
+                TrackMetadataEdit {
+                    title: Some("Second Title".to_owned()),
+                    artist_id: Some(artist),
+                    ..TrackMetadataEdit::default()
+                },
+            )
+            .expect("edit second");
+
+        assert_eq!(fs::read(&first).expect("audio unchanged"), first_audio);
+        let edited = controller.track(first_id).expect("edited track");
+        assert_eq!(edited.title(), "Edited Title");
+        assert_eq!(edited.artist(), Some("Old Name"));
+        assert_eq!(edited.album(), Some("Edited Album"));
+        assert_eq!(edited.track_number(), Some(4));
+        assert_eq!(edited.disc_number(), Some(2));
+        assert_eq!(controller.track_artist_id(first_id), Some(artist));
+        assert_eq!(controller.current_queue_entry_id(), current);
+        assert_eq!(
+            controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+
+        controller
+            .rename_artist(artist, "Renamed Artist")
+            .expect("rename artist");
+        assert_eq!(
+            controller.track(first_id).and_then(Track::artist),
+            Some("Renamed Artist")
+        );
+        assert_eq!(
+            controller.track(second_id).and_then(Track::artist),
+            Some("Renamed Artist")
+        );
+        assert_eq!(
+            controller.track_artist_id(second_id),
+            Some(artist),
+            "renaming changes the canonical name, not the stable identity"
+        );
+        controller.shutdown();
+
+        let (reopened, _control) = boot_portable_at(&root).expect("reopen");
+        assert_eq!(
+            reopened
+                .tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(
+            reopened.track(first_id).map(Track::title),
+            Some("Edited Title")
+        );
+        assert_eq!(
+            reopened.track(first_id).and_then(Track::artist),
+            Some("Renamed Artist")
+        );
+        assert_eq!(reopened.track_artist_id(first_id), Some(artist));
+        assert_eq!(
+            reopened.artist(artist).map(|a| a.name().to_owned()),
+            Some("Renamed Artist".to_owned())
+        );
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn portable_same_named_artists_keep_distinct_tracks() {
+        let dir = TempDir::new("portable-artist-duplicates");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        create_portable_library(&root).expect("create portable library");
+        let canonical_root = root.canonicalize().expect("canonical");
+        let first = write_dc_wav(&canonical_root, "one.wav", 4_410, 0.2);
+        let second = write_dc_wav(&canonical_root, "two.wav", 4_410, 0.3);
+        let (mut controller, _control) = boot_portable_at(&root).expect("portable boot");
+        controller
+            .import_files(&[first, second], false)
+            .expect("import");
+        let ids: Vec<_> = controller.tracks().iter().map(|(id, _)| *id).collect();
+        let first_artist = controller.create_artist("Same Name").expect("first");
+        let second_artist = controller.create_artist("Same Name").expect("second");
+        assert_ne!(first_artist, second_artist);
+        controller
+            .edit_track_metadata(
+                ids[0],
+                TrackMetadataEdit {
+                    title: Some("One".to_owned()),
+                    artist_id: Some(first_artist),
+                    ..TrackMetadataEdit::default()
+                },
+            )
+            .expect("edit first");
+        controller
+            .edit_track_metadata(
+                ids[1],
+                TrackMetadataEdit {
+                    title: Some("Two".to_owned()),
+                    artist_id: Some(second_artist),
+                    ..TrackMetadataEdit::default()
+                },
+            )
+            .expect("edit second");
+        controller
+            .rename_artist(first_artist, "First Identity")
+            .expect("rename first");
+        assert_eq!(
+            controller.track(ids[0]).and_then(Track::artist),
+            Some("First Identity")
+        );
+        assert_eq!(
+            controller.track(ids[1]).and_then(Track::artist),
+            Some("Same Name"),
+            "renaming one same-named artist must not touch the other"
+        );
+        assert_eq!(controller.track_artist_id(ids[1]), Some(second_artist));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn portable_import_never_overwrites_a_name_collision() {
+        let dir = TempDir::new("portable-import-collision");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        create_portable_library(&root).expect("create portable library");
+        let canonical_root = root.canonicalize().expect("canonical");
+        let first = dir.path().join("first-source");
+        let second = dir.path().join("second-source");
+        fs::create_dir_all(&first).expect("first source dir");
+        fs::create_dir_all(&second).expect("second source dir");
+        let first_audio = write_dc_wav(&first, "same.wav", 4_410, 0.2);
+        let second_audio = write_dc_wav(&second, "same.wav", 4_410, -0.4);
+        let first_bytes = fs::read(&first_audio).expect("first bytes");
+        let second_bytes = fs::read(&second_audio).expect("second bytes");
+        let (mut controller, _control) = boot_portable_at(&root).expect("portable boot");
+
+        controller
+            .import_files(std::slice::from_ref(&first_audio), true)
+            .expect("first import");
+        let second_report = controller
+            .import_files(std::slice::from_ref(&second_audio), true)
+            .expect("second import");
+        assert_eq!(second_report.added, 1);
+        assert_eq!(second_report.copied.len(), 1);
+        let copied_second = &second_report.copied[0];
+        assert_ne!(copied_second, &canonical_root.join("same.wav"));
+        assert_eq!(
+            fs::read(canonical_root.join("same.wav")).expect("first copy"),
+            first_bytes,
+            "the existing copy must not be overwritten"
+        );
+        assert_eq!(fs::read(copied_second).expect("second copy"), second_bytes);
+        assert_eq!(controller.tracks().len(), 2);
+        assert_eq!(
+            controller
+                .import_files(std::slice::from_ref(&second_audio), true)
+                .expect("second reimport")
+                .deduplicated,
+            1
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn portable_import_missing_file_is_retained_as_missing_and_edit_is_portable_only() {
+        let dir = TempDir::new("portable-missing");
+        let root = dir.path().join("library");
+        fs::create_dir_all(&root).expect("library root");
+        create_portable_library(&root).expect("create portable library");
+        let canonical_root = root.canonicalize().expect("canonical");
+        let file = write_dc_wav(&canonical_root, "gone.wav", 4_410, 0.2);
+        let (mut controller, _control) = boot_portable_at(&root).expect("portable boot");
+        controller
+            .import_files(std::slice::from_ref(&file), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+
+        fs::remove_file(&file).expect("remove audio");
+        let report = controller.reconcile_portable_library().expect("reconcile");
+        assert_eq!(report.missing_count(), 1);
+        assert_eq!(
+            controller.track_availability(id),
+            Some(flux_library::Availability::Missing)
+        );
+        assert!(
+            controller.track(id).is_some(),
+            "missing records are retained"
+        );
+        controller.shutdown();
+
+        let (mut legacy, _control) = boot(&dir);
+        assert!(legacy.create_artist("Nope").is_err());
+        assert!(
+            legacy
+                .import_files(&[file], true)
+                .expect_err("legacy import is refused")
+                .contains("portable")
+        );
+        legacy.shutdown();
     }
 
     #[test]
