@@ -21,6 +21,10 @@
 //!   `Delete` remove the current queue entry, `Ctrl+↑`/`Ctrl+↓`
 //!   reorder the current queue entry
 //! - `o` scan a folder (type a path), `r` refresh scanned folders
+//! - `i` copy-import paths, `I` import paths already inside the portable
+//!   library, `e` edit the selected track, `P` create an artist,
+//!   `Y` rename an artist (`artist-id|new-name`), `V` list artist IDs,
+//!   `X` reconcile, `L` relink a unique reported move candidate
 //! - `/` search/filter, `Esc` clear search or cancel input
 //! - `q` or `Ctrl-C` quit (terminal state is always restored)
 //! - `U` preserve and replace an unreadable legacy app index (writes
@@ -51,9 +55,10 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use flux_app::{
-    Controller, MigrationPlan, StorageMode, default_index_path, format_duration, is_track_playable,
+    Controller, MigrationPlan, ReconcileReport, StorageMode, TrackMetadataEdit, default_index_path,
+    format_duration, is_track_playable,
 };
-use flux_core::{MILESTONE, PlaybackState, Track, TrackId};
+use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
 
 fn main() -> ExitCode {
     let initial_dir = std::env::args_os().nth(1).map(PathBuf::from);
@@ -108,6 +113,14 @@ enum Mode {
     OpenInput,
     /// Typing a folder for a new portable library (`C`).
     CreateInput,
+    /// Typing semicolon-separated audio file paths (`i` copy / `I` in place).
+    ImportInput,
+    /// Editing the selected track as `title|album|track|disc|artist-id`.
+    TrackEditInput,
+    /// Creating a stable artist by name (`P`).
+    ArtistCreateInput,
+    /// Renaming an artist as `artist-id|new-name` (`Y`).
+    ArtistRenameInput,
     /// Typing the legacy index file to migrate (`M`, step 1).
     MigrateSourceInput,
     /// Typing the migration destination folder (`M`, step 2).
@@ -139,6 +152,10 @@ struct Tui {
     migrated_dest: Option<PathBuf>,
     /// Latest library-lifecycle outcome (plan summary, errors, …).
     lifecycle_msg: Option<String>,
+    /// Whether the current import input will copy external files.
+    import_copy: bool,
+    /// Last reconciliation, used by the explicit `L` unique-relink action.
+    last_reconcile: Option<ReconcileReport>,
 }
 
 impl Tui {
@@ -245,6 +262,51 @@ impl Tui {
                 self.mode = Mode::ScanInput;
                 self.input.clear();
             }
+            KeyCode::Char('i') => {
+                self.mode = Mode::ImportInput;
+                self.import_copy = true;
+                self.input.clear();
+            }
+            KeyCode::Char('I') => {
+                self.mode = Mode::ImportInput;
+                self.import_copy = false;
+                self.input.clear();
+            }
+            KeyCode::Char('e') => {
+                if let Some(id) = self.rows().get(self.cursor).copied()
+                    && let Some(track) = self.controller.track(id)
+                {
+                    self.input = track_edit_form(&self.controller, id, track);
+                    self.mode = Mode::TrackEditInput;
+                } else {
+                    self.lifecycle_msg = Some("Select a track to edit.".to_owned());
+                }
+            }
+            KeyCode::Char('P') => {
+                self.mode = Mode::ArtistCreateInput;
+                self.input.clear();
+            }
+            KeyCode::Char('Y') => {
+                self.mode = Mode::ArtistRenameInput;
+                self.input.clear();
+            }
+            KeyCode::Char('V') => {
+                let artists = self.controller.artists();
+                self.lifecycle_msg = Some(if artists.is_empty() {
+                    "No stable artists yet (artist metadata requires a portable library)."
+                        .to_owned()
+                } else {
+                    format!(
+                        "Artists: {}",
+                        artists
+                            .iter()
+                            .map(|artist| format!("{}={}", artist.id(), artist.name()))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                });
+            }
+            KeyCode::Char('L') => self.relink_first_unique(),
             KeyCode::Char('r') => self.controller.refresh(),
             KeyCode::Char('O') => {
                 self.mode = Mode::OpenInput;
@@ -295,6 +357,7 @@ impl Tui {
                 // detailed summary replaces the lifecycle message.
                 if let Ok(report) = self.controller.reconcile_portable_library() {
                     self.lifecycle_msg = Some(reconcile_summary(&report));
+                    self.last_reconcile = Some(report);
                 }
             }
             KeyCode::Char('/') => {
@@ -358,6 +421,88 @@ impl Tui {
                     Mode::SearchInput => {
                         self.search = text;
                         self.cursor = 0;
+                    }
+                    Mode::ImportInput => {
+                        let paths: Vec<PathBuf> = text
+                            .split(';')
+                            .map(str::trim)
+                            .filter(|path| !path.is_empty())
+                            .map(PathBuf::from)
+                            .collect();
+                        if paths.is_empty() {
+                            self.lifecycle_msg =
+                                Some("Enter at least one audio file path.".to_owned());
+                        } else {
+                            match self.controller.import_files(&paths, self.import_copy) {
+                                Ok(report) => {
+                                    let mut summary = format!(
+                                        "Import: {} added, {} updated, {} already indexed, {} copied, {} issue(s).",
+                                        report.added,
+                                        report.updated,
+                                        report.deduplicated,
+                                        report.copied.len(),
+                                        report.issues.len()
+                                    );
+                                    if let Some(issue) = report.issues.first() {
+                                        summary.push_str(&format!(
+                                            " First issue: {} — {}",
+                                            issue.path().display(),
+                                            issue.reason()
+                                        ));
+                                    }
+                                    self.lifecycle_msg = Some(summary);
+                                }
+                                Err(err) => self.lifecycle_msg = Some(err),
+                            }
+                        }
+                    }
+                    Mode::TrackEditInput => match parse_track_edit_form(&text) {
+                        Ok(edit) => {
+                            let id = self.rows().get(self.cursor).copied();
+                            if let Some(id) = id {
+                                match self.controller.edit_track_metadata(id, edit) {
+                                    Ok(()) => {
+                                        self.lifecycle_msg =
+                                            Some(format!("Saved metadata for track {id}."));
+                                    }
+                                    Err(err) => self.lifecycle_msg = Some(err),
+                                }
+                            } else {
+                                self.lifecycle_msg = Some("The selected track is gone.".to_owned());
+                            }
+                        }
+                        Err(err) => self.lifecycle_msg = Some(err),
+                    },
+                    Mode::ArtistCreateInput => {
+                        if let Err(err) = self.controller.create_artist(text.trim()) {
+                            self.lifecycle_msg = Some(err);
+                        } else {
+                            self.lifecycle_msg = Some(format!("Created artist {}.", text.trim()));
+                        }
+                    }
+                    Mode::ArtistRenameInput => {
+                        let Some((id, name)) = text.split_once('|') else {
+                            self.lifecycle_msg =
+                                Some("Use artist-id|new name for rename.".to_owned());
+                            self.mode = Mode::Normal;
+                            return false;
+                        };
+                        match id.trim().parse::<u64>() {
+                            Ok(raw) => {
+                                if let Err(err) = self
+                                    .controller
+                                    .rename_artist(ArtistId::new(raw), name.trim())
+                                {
+                                    self.lifecycle_msg = Some(err);
+                                } else {
+                                    self.lifecycle_msg = Some(format!("Renamed artist {raw}."));
+                                }
+                            }
+                            Err(_) => {
+                                self.lifecycle_msg =
+                                    Some("Artist ID must be a whole number.".to_owned());
+                            }
+                        }
                     }
                     Mode::OpenInput => {
                         let path = PathBuf::from(text.trim());
@@ -444,6 +589,45 @@ impl Tui {
         }
     }
 
+    /// Applies the safe relink suggested by the last reconciliation when
+    /// exactly one candidate exists for a missing track. Multiple
+    /// candidates remain a manual choice (the GUI exposes each one).
+    fn relink_first_unique(&mut self) {
+        let Some(report) = self.last_reconcile.take() else {
+            self.lifecycle_msg =
+                Some("Reconcile with X before relinking a missing file.".to_owned());
+            return;
+        };
+        let Some(candidate) = report
+            .relink_candidates
+            .iter()
+            .find(|candidates| candidates.is_unique())
+            .and_then(|candidates| candidates.candidates.first())
+            .cloned()
+        else {
+            self.lifecycle_msg = Some(
+                "No unique relink candidate is available; X reports ambiguous ones.".to_owned(),
+            );
+            return;
+        };
+        let track = report
+            .relink_candidates
+            .iter()
+            .find(|candidates| candidates.is_unique())
+            .map(|candidates| candidates.id);
+        if let Some(id) = track {
+            match self.controller.relink_portable_track(id, &candidate) {
+                Ok(()) => {
+                    self.lifecycle_msg = Some(format!(
+                        "Relinked track {id} to {}.",
+                        candidate.display_lossy()
+                    ));
+                }
+                Err(err) => self.lifecycle_msg = Some(err),
+            }
+        }
+    }
+
     /// Housekeeping after a successful library switch: cursor,
     /// search, and pending migration state referred to the old
     /// library. (The controller already stopped playback and rebuilt
@@ -455,6 +639,7 @@ impl Tui {
         self.pending_plan = None;
         self.migrated_dest = None;
         self.lifecycle_msg = None;
+        self.last_reconcile = None;
     }
 
     /// After next/previous, put the cursor on the player's selection.
@@ -553,6 +738,12 @@ impl Tui {
             if !is_track_playable(track) {
                 text.push_str("  [indexed — not playable yet]");
             }
+            if matches!(
+                self.controller.track_availability(*id),
+                Some(flux_app::Availability::Missing)
+            ) {
+                text.push_str("  [missing]");
+            }
             let duration = track.duration().map(format_duration).unwrap_or_default();
             let text = pad_with_right(&text, &duration, width);
             let y = (list_top + row) as u16;
@@ -581,14 +772,33 @@ impl Tui {
         let help = match self.mode {
             Mode::Normal => "Enter play · Space pause · s stop · n/p skip · a add · x next \
                              · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
+                             · i copy-import · I in-place import · e edit track · V artists \
+                             · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
-                             · B index · U fix · X reconcile · q quit"
+                             · B index · U fix · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
                 self.input
             ),
             Mode::SearchInput => format!("Search (Enter to apply, Esc to cancel): {}_", self.input),
+            Mode::ImportInput => format!(
+                "{} import paths separated by ; (Enter to import, Esc to cancel): {}_",
+                if self.import_copy { "Copy" } else { "In-place" },
+                self.input
+            ),
+            Mode::TrackEditInput => format!(
+                "Edit selected track as title|album|track|disc|artist-id (Enter save, Esc cancel): {}_",
+                self.input
+            ),
+            Mode::ArtistCreateInput => format!(
+                "New artist name (Enter to create, Esc to cancel): {}_",
+                self.input
+            ),
+            Mode::ArtistRenameInput => format!(
+                "Rename artist as artist-id|new-name (Enter to rename, Esc to cancel): {}_",
+                self.input
+            ),
             Mode::OpenInput => format!(
                 "Open portable library folder (Enter to switch, Esc to cancel): {}_",
                 self.input
@@ -710,6 +920,60 @@ fn migration_plan_summary(plan: &MigrationPlan) -> String {
     )
 }
 
+fn track_edit_form(controller: &Controller, id: TrackId, track: &Track) -> String {
+    format!(
+        "{} | {} | {} | {} | {}",
+        track.title(),
+        track.album().unwrap_or_default(),
+        track
+            .track_number()
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        track
+            .disc_number()
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        controller
+            .track_artist_id(id)
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+fn parse_track_edit_form(input: &str) -> Result<TrackMetadataEdit, String> {
+    let fields: Vec<&str> = input.split('|').map(str::trim).collect();
+    if fields.len() != 5 {
+        return Err(
+            "Track edit format: title|album|track-number|disc-number|artist-id (artist ID may be empty)."
+                .to_owned(),
+        );
+    }
+    let number = |value: &str, field: &str| -> Result<Option<u32>, String> {
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            value
+                .parse::<u32>()
+                .map(Some)
+                .map_err(|_| format!("{field} must be a whole number."))
+        }
+    };
+    let artist_id = if fields[4].is_empty() {
+        None
+    } else {
+        Some(ArtistId::new(fields[4].parse::<u64>().map_err(|_| {
+            "artist ID must be a whole number.".to_owned()
+        })?))
+    };
+    Ok(TrackMetadataEdit {
+        title: (!fields[0].is_empty()).then(|| fields[0].to_owned()),
+        album: (!fields[1].is_empty()).then(|| fields[1].to_owned()),
+        track_number: number(fields[2], "track number")?,
+        disc_number: number(fields[3], "disc number")?,
+        artist_id,
+    })
+}
+
 fn display_title(track: &Track) -> String {
     match track.artist() {
         Some(artist) => format!("{} — {artist}", track.title()),
@@ -756,6 +1020,8 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         pending_plan: None,
         migrated_dest: None,
         lifecycle_msg: None,
+        import_copy: true,
+        last_reconcile: None,
     };
     let mut stdout = std::io::stdout();
     let result = tui.event_loop(&mut stdout);
@@ -767,7 +1033,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, Tui, pad_with_right};
+    use super::{Mode, StorageMode, Track, Tui, pad_with_right};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -818,6 +1084,8 @@ mod tests {
             pending_plan: None,
             migrated_dest: None,
             lifecycle_msg: None,
+            import_copy: true,
+            last_reconcile: None,
         }
     }
 
@@ -830,6 +1098,13 @@ mod tests {
 
     fn type_path(tui: &mut Tui, path: &std::path::Path) {
         for c in path.display().to_string().chars() {
+            key(tui, KeyCode::Char(c));
+        }
+        key(tui, KeyCode::Enter);
+    }
+
+    fn type_text(tui: &mut Tui, text: &str) {
+        for c in text.chars() {
             key(tui, KeyCode::Char(c));
         }
         key(tui, KeyCode::Enter);
@@ -859,6 +1134,115 @@ mod tests {
         assert_eq!(tui.mode, Mode::Normal);
         assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
         assert!(root.join(".flux").exists(), "store created via flux-app");
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn import_edit_and_artist_keys_use_the_shared_controller() {
+        let dir = TempDir::new("tui-manage");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut tui = tui(&dir);
+
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+
+        key(&mut tui, KeyCode::Char('i'));
+        assert_eq!(tui.mode, Mode::ImportInput);
+        assert!(tui.import_copy);
+        type_path(&mut tui, &source);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        let id = tui.controller.tracks()[0].0;
+        let source_message = tui.lifecycle_msg.clone().expect("import summary");
+        assert!(source_message.contains("1 added"), "{source_message}");
+
+        key(&mut tui, KeyCode::Char('P'));
+        type_text(&mut tui, "Tui Artist");
+        assert_eq!(tui.controller.artists().len(), 1);
+        let artist = tui.controller.artists()[0].id();
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|m| m.contains("Tui Artist"))
+        );
+
+        key(&mut tui, KeyCode::Char('e'));
+        assert_eq!(tui.mode, Mode::TrackEditInput);
+        tui.input = format!("Tui Title | Tui Album | 3 | 1 | {artist}");
+        key(&mut tui, KeyCode::Enter);
+        let track = tui.controller.track(id).expect("edited");
+        assert_eq!(track.title(), "Tui Title");
+        assert_eq!(track.album(), Some("Tui Album"));
+        assert_eq!(track.artist(), Some("Tui Artist"));
+        assert_eq!(tui.controller.track_artist_id(id), Some(artist));
+
+        key(&mut tui, KeyCode::Char('V'));
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|m| m.contains(&format!("{artist}=Tui Artist")))
+        );
+
+        key(&mut tui, KeyCode::Char('Y'));
+        assert_eq!(tui.mode, Mode::ArtistRenameInput);
+        tui.input = format!("{artist}|Renamed Tui Artist");
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(
+            tui.controller.track(id).and_then(Track::artist),
+            Some("Renamed Tui Artist")
+        );
+
+        let outside_refused = source_dir.join("refused.wav");
+        std::fs::write(&outside_refused, minimal_wav()).expect("outside");
+        key(&mut tui, KeyCode::Char('I'));
+        type_path(&mut tui, &outside_refused);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|m| m.contains("issue"))
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn reconcile_then_relink_unique_candidate_keeps_the_track_id() {
+        let dir = TempDir::new("tui-relink");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let file = root.join("missing.wav");
+        std::fs::write(&file, minimal_wav()).expect("audio");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('I'));
+        type_path(&mut tui, &file);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        let id = tui.controller.tracks()[0].0;
+
+        let moved = root.join("moved.wav");
+        std::fs::rename(&file, &moved).expect("move audio");
+        key(&mut tui, KeyCode::Char('X'));
+        assert!(tui.last_reconcile.is_some());
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("possible new locations"))
+        );
+        key(&mut tui, KeyCode::Char('L'));
+        assert_eq!(
+            tui.controller
+                .track(id)
+                .map(|track| track.source().path().to_path_buf()),
+            Some(moved),
+            "the explicit unique-candidate action relinks the same TrackId"
+        );
+        assert!(tui.last_reconcile.is_none());
         tui.controller.shutdown();
     }
 
