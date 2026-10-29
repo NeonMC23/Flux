@@ -137,10 +137,19 @@ use flux_library::{
     Library, LibraryLock, LibraryLockError, PortableSyncReport, QueueStore, ScanReport,
 };
 
+pub mod import;
+
+pub use import::{
+    AppliedImportItem, CandidateStatus, ImportApplyReport, ImportCandidate, ImportDecision,
+    ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
+    PreparedImport, PreparedImportItem, apply_import_plan, prepare_import_files,
+    prepare_import_plan,
+};
+
 pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
 pub use flux_library::{
     Artist, Availability, MetadataOverrides, PortableStoreError, ReconcileOutcome, ReconcileReport,
-    RecoveryInfo, RelPath, RelinkCandidates, RelinkError, StoreError,
+    RecoveryInfo, RelPath, RelinkCandidates, RelinkError, StoreError, is_supported_audio_path,
 };
 
 /// Whether real device audio is available to this controller's engine.
