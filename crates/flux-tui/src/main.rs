@@ -21,8 +21,9 @@
 //!   `Delete` remove the current queue entry, `Ctrl+↑`/`Ctrl+↓`
 //!   reorder the current queue entry
 //! - `o` scan a folder (type a path), `r` refresh scanned folders
-//! - `i` copy-import paths, `I` import paths already inside the portable
-//!   library, `e` edit the selected track, `P` create an artist,
+//! - `i` quick copy-import paths, `I` quick-import paths already inside
+//!   the portable library (the GUI has the full review-first Import
+//!   Manager), `e` edit the selected track, `P` create an artist,
 //!   `Y` rename an artist (`artist-id|new-name`), `V` list artist IDs,
 //!   `X` reconcile, `L` relink a unique reported move candidate
 //! - `/` search/filter, `Esc` clear search or cancel input
@@ -772,7 +773,7 @@ impl Tui {
         let help = match self.mode {
             Mode::Normal => "Enter play · Space pause · s stop · n/p skip · a add · x next \
                              · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
-                             · i copy-import · I in-place import · e edit track · V artists \
+                             · i quick copy-import · I quick in-place · e edit track · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
                              · B index · U fix · q quit"

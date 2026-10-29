@@ -2101,4 +2101,23 @@ mod tests {
         );
         controller.shutdown();
     }
+
+    #[test]
+    fn cancellation_before_scanning_returns_a_cancelled_plan_without_writes() {
+        let dir = TempDir::new("cancel-scan");
+        let root = dir.path().join("library");
+        let (controller, _control) = portable_controller(&root);
+        let source = wav(&dir.path().join("source"), "scan.wav", 441, 0.1);
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let plan = prepare_import_plan(
+            request(&controller, vec![source], false, ImportStorage::Copy),
+            progress,
+            cancel,
+        );
+        assert!(plan.cancelled);
+        assert!(plan.candidates.is_empty());
+        assert_eq!(controller.tracks().len(), 0);
+        controller.shutdown();
+    }
 }

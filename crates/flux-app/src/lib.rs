@@ -77,9 +77,11 @@
 //! implicitly at startup or after a scan.
 //!
 //! Portable-library management is also deliberately explicit:
-//! [`Controller::import_files`] adds individual files (copying external
-//! files into the library root or referencing files already inside it),
-//! [`Controller::edit_track_metadata`] writes Flux-owned overrides,
+//! the [`import`] module provides a review-first, cancellable import plan
+//! (discovery, metadata, duplicate decisions, copy/reference storage, and
+//! per-item results); [`Controller::import_files`] remains the direct
+//! single-step API used by the TUI, [`Controller::edit_track_metadata`]
+//! writes Flux-owned overrides,
 //! and [`Controller::create_artist`] / [`Controller::rename_artist`]
 //! maintain stable artist identities. These operations never rewrite
 //! embedded audio tags, never move/delete originals, preserve track IDs
