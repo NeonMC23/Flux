@@ -11,12 +11,16 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use flux_app::{
-    Artist, AudioStatus, Availability, Controller, MigrationPlan, ReconcileReport, RelPath,
-    StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, default_index_path, format_duration,
-    is_track_playable,
+    Artist, AudioStatus, Availability, CandidateStatus, Controller, ImportApplyReport,
+    ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage,
+    ImportStorage, MigrationPlan, PreparedImport, ReconcileReport, RelPath, StorageMode,
+    TrackMetadataEdit, WAVEFORM_WINDOW, default_index_path, format_duration, is_track_playable,
+    prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
     APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
@@ -27,8 +31,8 @@ use iced::advanced::renderer::{self, Quad, Renderer as RendererTrait};
 use iced::advanced::widget::Tree;
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, slider, text,
-    text_input, tooltip,
+    button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, slider, stack,
+    text, text_input, tooltip,
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Rectangle, Shadow, Subscription, Task, Theme, mouse,
@@ -108,6 +112,25 @@ fn player_style(_: &Theme) -> container::Style {
 
 fn rule_style(_: &Theme) -> container::Style {
     container::Style::default().background(BORDER)
+}
+
+fn modal_backdrop_style(_: &Theme) -> container::Style {
+    container::Style::default().background(Color::from_rgba8(0, 0, 0, 0.70))
+}
+
+fn import_panel_style(_: &Theme) -> container::Style {
+    container::Style::default()
+        .background(SIDEBAR)
+        .border(Border {
+            color: ACCENT_BORDER,
+            width: 1.0,
+            radius: 14.0.into(),
+        })
+        .shadow(Shadow {
+            color: Color::from_rgba8(0, 0, 0, 0.55),
+            offset: iced::Vector::new(0.0, 10.0),
+            blur_radius: 28.0,
+        })
 }
 
 fn error_banner_style(_: &Theme) -> container::Style {
@@ -673,6 +696,11 @@ fn global_input_events(
                 Key::Named(Named::ArrowLeft | Named::ArrowRight | Named::ArrowUp | Named::ArrowDown),
             ..
         }) => Some(Message::SeekCommit),
+        iced::Event::Window(window::Event::FileHovered(_)) => Some(Message::ImportFileHovered),
+        iced::Event::Window(window::Event::FileDropped(path)) => {
+            Some(Message::ImportDropPath(path))
+        }
+        iced::Event::Window(window::Event::FilesHoveredLeft) => Some(Message::ImportFileHoverLeft),
         iced::Event::Mouse(mouse::Event::CursorLeft) => Some(Message::QueueDragCancel),
         _ => None,
     }
@@ -717,6 +745,126 @@ fn nonempty(value: Option<&str>) -> Option<String> {
 
 fn nonempty_string(value: &str) -> Option<String> {
     nonempty(Some(value))
+}
+
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn new_browser(mode: BrowserMode, start: PathBuf) -> FileBrowser {
+    let start = if start.is_dir() {
+        start
+    } else {
+        start.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    let mut browser = FileBrowser {
+        mode,
+        current: start,
+        entries: Vec::new(),
+        selected: HashSet::new(),
+        path_input: String::new(),
+        error: None,
+    };
+    refresh_import_browser_data(&mut browser);
+    browser
+}
+
+fn refresh_browser(browser: &mut FileBrowser) {
+    refresh_import_browser_data(browser);
+}
+
+fn refresh_import_browser_data(browser: &mut FileBrowser) {
+    browser.path_input = browser.current.display().to_string();
+    browser.error = None;
+    let entries = match std::fs::read_dir(&browser.current) {
+        Ok(entries) => entries,
+        Err(err) => {
+            browser.entries.clear();
+            browser.error = Some(format!("Could not read this folder: {err}"));
+            return;
+        }
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if metadata.is_dir() {
+            if name == ".flux" {
+                continue;
+            }
+            rows.push(BrowserEntry {
+                path,
+                name,
+                is_dir: true,
+                supported: true,
+                size: 0,
+            });
+        } else if metadata.is_file() && browser.mode == BrowserMode::Files {
+            rows.push(BrowserEntry {
+                path: path.clone(),
+                name,
+                is_dir: false,
+                supported: flux_app::is_supported_audio_path(&path),
+                size: metadata.len(),
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    browser.entries = rows;
+}
+
+fn browser_enter(browser: &mut FileBrowser, path: PathBuf) {
+    if path.is_dir() {
+        browser.current = path;
+        browser.selected.clear();
+        refresh_import_browser_data(browser);
+    }
+}
+
+fn browser_up(browser: &mut FileBrowser) {
+    if let Some(parent) = browser.current.parent() {
+        browser.current = parent.to_path_buf();
+        browser.selected.clear();
+        refresh_import_browser_data(browser);
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn status_description(status: &CandidateStatus) -> &'static str {
+    match status {
+        CandidateStatus::New => "No path, content, or metadata conflict was found.",
+        CandidateStatus::ExistingPath(_) => {
+            "The exact source path is already registered. Updating keeps its stable TrackId."
+        }
+        CandidateStatus::SameContent { .. } => {
+            "A different path appears to hold identical content. Skipping avoids a duplicate; importing separately is an explicit choice."
+        }
+        CandidateStatus::SimilarMetadata(_) => {
+            "A different audio file shares title/artist/album metadata. That alone is not treated as the same track."
+        }
+    }
 }
 
 fn parse_optional_number(value: &str, field: &str) -> Result<Option<u32>, String> {
@@ -923,13 +1071,144 @@ struct TrackEditor {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportUiStage {
+    Choose,
+    Scanning,
+    Review,
+    Importing,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserMode {
+    Files,
+    Folder,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    supported: bool,
+    size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FileBrowser {
+    mode: BrowserMode,
+    current: PathBuf,
+    entries: Vec<BrowserEntry>,
+    selected: HashSet<PathBuf>,
+    path_input: String,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct ImportManager {
+    stage: ImportUiStage,
+    sources: Vec<PathBuf>,
+    recursive: bool,
+    storage: ImportStorage,
+    plan: Option<ImportPlan>,
+    selected: Option<usize>,
+    browser: Option<FileBrowser>,
+    progress: Arc<Mutex<ImportProgress>>,
+    cancel: Arc<AtomicBool>,
+    progress_view: ImportProgress,
+    prepared: Option<PreparedImport>,
+    report: Option<ImportApplyReport>,
+    error: Option<String>,
+    drop_hover: bool,
+    pending_drops: Vec<PathBuf>,
+    drop_deadline: Option<Instant>,
+    manual_input: String,
+    edit_title: String,
+    edit_artist: String,
+    edit_album: String,
+    edit_track_number: String,
+    edit_disc_number: String,
+    number_error: Option<String>,
+}
+
+impl ImportManager {
+    fn new() -> Self {
+        Self {
+            stage: ImportUiStage::Choose,
+            sources: Vec::new(),
+            recursive: true,
+            storage: ImportStorage::Copy,
+            plan: None,
+            selected: None,
+            browser: None,
+            progress: Arc::new(Mutex::new(ImportProgress::default())),
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress_view: ImportProgress::default(),
+            prepared: None,
+            report: None,
+            error: None,
+            drop_hover: false,
+            pending_drops: Vec::new(),
+            drop_deadline: None,
+            manual_input: String::new(),
+            edit_title: String::new(),
+            edit_artist: String::new(),
+            edit_album: String::new(),
+            edit_track_number: String::new(),
+            edit_disc_number: String::new(),
+            number_error: None,
+        }
+    }
+
+    fn reset_for_selection(&mut self) {
+        self.stage = ImportUiStage::Scanning;
+        self.plan = None;
+        self.selected = None;
+        self.browser = None;
+        self.prepared = None;
+        self.report = None;
+        self.error = None;
+        self.progress = Arc::new(Mutex::new(ImportProgress::default()));
+        self.progress_view = ImportProgress::default();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.number_error = None;
+    }
+
+    fn select_candidate(&mut self, index: usize) {
+        let Some(candidate) = self
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.candidates.get(index))
+        else {
+            return;
+        };
+        self.selected = Some(index);
+        self.edit_title = candidate.title().to_owned();
+        self.edit_artist = candidate.artist_name().unwrap_or_default().to_owned();
+        self.edit_album = candidate.album().unwrap_or_default().to_owned();
+        self.edit_track_number = candidate
+            .track_number()
+            .map(|number| number.to_string())
+            .unwrap_or_default();
+        self.edit_disc_number = candidate
+            .disc_number()
+            .map(|number| number.to_string())
+            .unwrap_or_default();
+        self.number_error = None;
+    }
+}
+
 struct FluxReady {
     controller: Controller,
     dir_input: String,
     search: String,
     lib_input: String,
-    import_input: String,
     track_editor: Option<TrackEditor>,
+    import_manager: Option<ImportManager>,
+    external_drag_hover: bool,
     artist_selected: Option<ArtistId>,
     artist_name_input: String,
     artist_rename_input: String,
@@ -955,8 +1234,6 @@ struct FluxReady {
 enum Message {
     DirInputChanged(String),
     LibInputChanged(String),
-    ImportInputChanged(String),
-    ImportPressed(bool),
     EditTrack(TrackId),
     EditorTitleChanged(String),
     EditorAlbumChanged(String),
@@ -973,6 +1250,48 @@ enum Message {
     ArtistRenameNameChanged(String),
     ArtistRenamePressed,
     RelinkTrack(TrackId, RelPath),
+    ImportOpen,
+    ImportOpenSetup,
+    ImportClose,
+    ImportReset,
+    ImportNoop,
+    ImportNativeFiles,
+    ImportNativeFolder,
+    ImportNativeFilesPicked(Result<Option<Vec<PathBuf>>, String>),
+    ImportNativeFolderPicked(Result<Option<PathBuf>, String>),
+    ImportBrowserOpenFiles,
+    ImportBrowserOpenFolder,
+    ImportBrowserUp,
+    ImportBrowserEnter(PathBuf),
+    ImportBrowserToggle(PathBuf),
+    ImportBrowserSelectAll,
+    ImportBrowserConfirm,
+    ImportBrowserCancel,
+    ImportBrowserRefresh,
+    ImportBrowserPathChanged(String),
+    ImportBrowserPathSubmit,
+    ImportRecursiveToggled,
+    ImportStorageChanged(ImportStorage),
+    ImportPlanReady(Box<ImportPlan>),
+    ImportPrepared(Box<PreparedImport>),
+    ImportSelect(usize),
+    ImportDecisionChanged(usize, ImportDecision),
+    ImportBulkSkip,
+    ImportBulkImport,
+    ImportBulkUpdate,
+    ImportTitleChanged(String),
+    ImportArtistChanged(String),
+    ImportAlbumChanged(String),
+    ImportTrackNumberChanged(String),
+    ImportDiscNumberChanged(String),
+    ImportArtistPicked(Option<ArtistChoice>),
+    ImportManualChanged(String),
+    ImportManualAdd,
+    ImportDropPath(PathBuf),
+    ImportFileHovered,
+    ImportFileHoverLeft,
+    ImportApply,
+    ImportCancel,
     OpenLibraryPressed,
     CreateLibraryPressed,
     UseLegacyIndexPressed,
@@ -1031,8 +1350,9 @@ impl FluxReady {
             dir_input: String::new(),
             search: String::new(),
             lib_input: String::new(),
-            import_input: String::new(),
             track_editor: None,
+            import_manager: None,
+            external_drag_hover: false,
             artist_selected: None,
             artist_name_input: String::new(),
             artist_rename_input: String::new(),
@@ -1290,42 +1610,298 @@ impl FluxReady {
         }
     }
 
-    fn import_files(&mut self, copy: bool) {
-        let paths: Vec<PathBuf> = self
-            .import_input
-            .split(';')
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .collect();
-        if paths.is_empty() {
-            self.lifecycle_msg = Some("Enter at least one audio file path.".to_owned());
+    fn open_import_manager(&mut self) {
+        if self.import_manager.is_none() {
+            self.import_manager = Some(ImportManager::new());
+        }
+        self.show_setup = false;
+        self.track_editor = None;
+        self.external_drag_hover = false;
+    }
+
+    fn close_import_manager(&mut self) {
+        if let Some(manager) = &self.import_manager {
+            manager.cancel.store(true, Ordering::Release);
+        }
+        self.import_manager = None;
+        self.external_drag_hover = false;
+    }
+
+    fn start_import_scan(&mut self) -> Task<Message> {
+        let Some(manager) = self.import_manager.as_mut() else {
+            return Task::none();
+        };
+        if manager.sources.is_empty() {
+            manager.error = Some("Choose at least one audio file or folder.".to_owned());
+            manager.stage = ImportUiStage::Choose;
+            return Task::none();
+        }
+        if self.controller.storage_mode() != StorageMode::Portable {
+            manager.error = Some(
+                "Importing requires a portable library. Close this dialog and create or open \
+                 one in Library setup."
+                    .to_owned(),
+            );
+            manager.stage = ImportUiStage::Failed;
+            return Task::none();
+        }
+        let Some(root) = self.controller.portable_root().map(Path::to_path_buf) else {
+            manager.error = Some("The portable library is unavailable.".to_owned());
+            manager.stage = ImportUiStage::Failed;
+            return Task::none();
+        };
+        let request = ImportRequest {
+            sources: manager.sources.clone(),
+            recursive: manager.recursive,
+            storage: manager.storage,
+            library_root: root,
+            existing_tracks: self.controller.tracks().to_vec(),
+            existing_artists: self
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| {
+                    self.controller
+                        .track_artist_id(*id)
+                        .map(|artist| (*id, artist))
+                })
+                .collect(),
+        };
+        manager.reset_for_selection();
+        manager.stage = ImportUiStage::Scanning;
+        let progress = Arc::clone(&manager.progress);
+        let cancel = Arc::clone(&manager.cancel);
+        Task::perform(
+            async move { prepare_import_plan(request, progress, cancel) },
+            |plan| Message::ImportPlanReady(Box::new(plan)),
+        )
+    }
+
+    fn handle_import_key(&mut self, key: &Key, modifiers: &Modifiers) -> Task<Message> {
+        let Some(manager) = self.import_manager.as_mut() else {
+            return Task::none();
+        };
+        if manager.browser.is_some() {
+            if matches!(key, Key::Named(Named::Escape)) {
+                manager.browser = None;
+            } else if matches!(key, Key::Named(Named::Enter)) {
+                return self.update(Message::ImportBrowserConfirm);
+            }
+            return Task::none();
+        }
+        if matches!(key, Key::Named(Named::Escape)) {
+            return self.update(Message::ImportCancel);
+        }
+        if manager.stage == ImportUiStage::Review {
+            if let Some(selected) = manager.selected {
+                let count = manager
+                    .plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.candidates.len());
+                match key.as_ref() {
+                    Key::Named(Named::ArrowUp) => {
+                        manager.select_candidate(selected.saturating_sub(1));
+                        return Task::none();
+                    }
+                    Key::Named(Named::ArrowDown) => {
+                        manager.select_candidate((selected + 1).min(count.saturating_sub(1)));
+                        return Task::none();
+                    }
+                    Key::Character("s") => {
+                        return self.update(Message::ImportDecisionChanged(
+                            selected,
+                            ImportDecision::Skip,
+                        ));
+                    }
+                    Key::Character("i") => {
+                        return self.update(Message::ImportDecisionChanged(
+                            selected,
+                            ImportDecision::ImportNew,
+                        ));
+                    }
+                    Key::Character("u") => {
+                        return self.update(Message::ImportDecisionChanged(
+                            selected,
+                            ImportDecision::UpdateExisting,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if modifiers.contains(Modifiers::CTRL) && matches!(key, Key::Named(Named::Enter)) {
+                return self.start_import_copy();
+            }
+        }
+        Task::none()
+    }
+
+    fn start_import_copy(&mut self) -> Task<Message> {
+        let Some(manager) = self.import_manager.as_mut() else {
+            return Task::none();
+        };
+        let Some(plan) = manager.plan.clone() else {
+            manager.error = Some("Review a selection before importing.".to_owned());
+            return Task::none();
+        };
+        if !plan.can_import() {
+            manager.error = Some(
+                plan.blocking_reason()
+                    .unwrap_or("There is nothing selected to import.")
+                    .to_owned(),
+            );
+            return Task::none();
+        }
+        manager.stage = ImportUiStage::Importing;
+        manager.prepared = None;
+        manager.report = None;
+        manager.error = None;
+        manager.progress = Arc::new(Mutex::new(ImportProgress {
+            stage: ImportStage::Copying,
+            message: "Preparing selected files…".to_owned(),
+            ..ImportProgress::default()
+        }));
+        manager.progress_view = ImportProgress {
+            stage: ImportStage::Copying,
+            message: "Preparing selected files…".to_owned(),
+            ..ImportProgress::default()
+        };
+        manager.cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::clone(&manager.progress);
+        let cancel = Arc::clone(&manager.cancel);
+        Task::perform(
+            async move { prepare_import_files(&plan, progress, cancel) },
+            |prepared| Message::ImportPrepared(Box::new(prepared)),
+        )
+    }
+
+    fn apply_import_review(&mut self, prepared: PreparedImport) {
+        let Some(manager) = self.import_manager.as_mut() else {
+            return;
+        };
+        if prepared.cancelled {
+            manager.stage = ImportUiStage::Cancelled;
+            manager.progress_view.stage = ImportStage::Cancelled;
+            manager.progress_view.message =
+                "Import cancelled; no catalogue changes were made.".to_owned();
+            manager.prepared = Some(prepared);
             return;
         }
-        match self.controller.import_files(&paths, copy) {
+        let Some(plan) = manager.plan.clone() else {
+            manager.error = Some("The reviewed plan is unavailable.".to_owned());
+            manager.stage = ImportUiStage::Failed;
+            return;
+        };
+        manager.progress_view.stage = ImportStage::WritingCatalogue;
+        manager.progress_view.message = "Writing catalogue changes…".to_owned();
+        match self.controller.apply_import_plan(&plan, &prepared) {
             Ok(report) => {
-                let mut summary = format!(
-                    "Import: {} added, {} updated, {} already indexed, {} copied, {} issue(s).",
-                    report.added,
-                    report.updated,
-                    report.deduplicated,
-                    report.copied.len(),
-                    report.issues.len()
-                );
-                if let Some(issue) = report.issues.first() {
-                    summary.push_str(&format!(
-                        " First issue: {} — {}",
-                        issue.path().display(),
-                        issue.reason()
-                    ));
-                }
-                if report.issues.is_empty() {
-                    self.import_input.clear();
-                }
-                self.lifecycle_msg = Some(summary);
+                manager.report = Some(report);
+                manager.prepared = Some(prepared);
+                manager.stage = ImportUiStage::Completed;
+                manager.progress_view.stage = ImportStage::Completed;
+                manager.progress_view.message = "Import complete.".to_owned();
             }
-            Err(error) => self.lifecycle_msg = Some(error),
+            Err(error) => {
+                manager.error = Some(error.clone());
+                manager.prepared = Some(prepared);
+                manager.stage = ImportUiStage::Failed;
+                manager.progress_view.stage = ImportStage::Failed;
+                manager.progress_view.message = error;
+            }
         }
+    }
+
+    fn native_files_task(&mut self) -> Task<Message> {
+        let start = self
+            .controller
+            .portable_root()
+            .map(Path::to_path_buf)
+            .or_else(home_directory);
+        self.open_import_manager();
+        Task::perform(
+            async move { flux_platform::pick_audio_files_in(start.as_deref()) },
+            Message::ImportNativeFilesPicked,
+        )
+    }
+
+    fn native_folder_task(&mut self) -> Task<Message> {
+        let start = self
+            .controller
+            .portable_root()
+            .map(Path::to_path_buf)
+            .or_else(home_directory);
+        self.open_import_manager();
+        Task::perform(
+            async move { flux_platform::pick_folder_in(start.as_deref()) },
+            Message::ImportNativeFolderPicked,
+        )
+    }
+
+    fn open_import_browser(&mut self, mode: BrowserMode) {
+        self.open_import_manager();
+        let Some(manager) = self.import_manager.as_mut() else {
+            return;
+        };
+        let start = self
+            .controller
+            .portable_root()
+            .map(Path::to_path_buf)
+            .or_else(home_directory)
+            .unwrap_or_else(|| PathBuf::from("."));
+        manager.browser = Some(new_browser(mode, start));
+    }
+
+    fn refresh_import_browser(&mut self) {
+        if let Some(manager) = self.import_manager.as_mut()
+            && let Some(browser) = manager.browser.as_mut()
+        {
+            refresh_browser(browser);
+        }
+    }
+
+    fn start_import_from_selection(
+        &mut self,
+        sources: Vec<PathBuf>,
+        mode: BrowserMode,
+    ) -> Task<Message> {
+        let Some(manager) = self.import_manager.as_mut() else {
+            return Task::none();
+        };
+        manager.browser = None;
+        manager.sources = sources;
+        let _ = mode;
+        self.start_import_scan()
+    }
+
+    fn queue_external_drop(&mut self, path: PathBuf) -> Task<Message> {
+        if self.controller.storage_mode() != StorageMode::Portable {
+            self.open_import_manager();
+            if let Some(manager) = self.import_manager.as_mut() {
+                manager.stage = ImportUiStage::Failed;
+                manager.error = Some(
+                    "Importing requires a portable library. Create or open one in Library \
+                     setup, then drop the files again."
+                        .to_owned(),
+                );
+            }
+            return Task::none();
+        }
+        self.open_import_manager();
+        let Some(manager) = self.import_manager.as_mut() else {
+            return Task::none();
+        };
+        if !matches!(manager.stage, ImportUiStage::Choose | ImportUiStage::Failed) {
+            manager.error = Some(
+                "Finish or cancel the current import review before adding more files.".to_owned(),
+            );
+            return Task::none();
+        }
+        manager.stage = ImportUiStage::Choose;
+        manager.error = None;
+        manager.plan = None;
+        manager.pending_drops.push(path);
+        manager.drop_deadline = Some(Instant::now());
+        Task::none()
     }
 
     fn seek_relative(&mut self, seconds: f32) {
@@ -1362,8 +1938,6 @@ impl FluxReady {
         match message {
             Message::DirInputChanged(value) => self.dir_input = value,
             Message::LibInputChanged(value) => self.lib_input = value,
-            Message::ImportInputChanged(value) => self.import_input = value,
-            Message::ImportPressed(copy) => self.import_files(copy),
             Message::EditTrack(id) => self.start_track_editor(id),
             Message::EditorTitleChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
@@ -1446,6 +2020,393 @@ impl FluxReady {
                         ));
                     }
                     Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::ImportOpen => {
+                self.open_import_manager();
+            }
+            Message::ImportOpenSetup => {
+                self.close_import_manager();
+                self.show_setup = true;
+            }
+            Message::ImportClose => self.close_import_manager(),
+            Message::ImportReset => {
+                self.open_import_manager();
+                if let Some(manager) = self.import_manager.as_mut() {
+                    let recursive = manager.recursive;
+                    let storage = manager.storage;
+                    *manager = ImportManager::new();
+                    manager.recursive = recursive;
+                    manager.storage = storage;
+                }
+            }
+            Message::ImportNoop => {}
+            Message::ImportNativeFiles => return self.native_files_task(),
+            Message::ImportNativeFolder => return self.native_folder_task(),
+            Message::ImportNativeFilesPicked(result) => match result {
+                Ok(Some(paths)) => {
+                    if let Some(manager) = self.import_manager.as_mut() {
+                        manager.browser = None;
+                        manager.sources = paths;
+                        manager.error = None;
+                    }
+                    return self.start_import_scan();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.open_import_browser(BrowserMode::Files);
+                    if let Some(manager) = self.import_manager.as_mut() {
+                        manager.error =
+                            Some(format!("{error} The Flux Browser is available below."));
+                    }
+                }
+            },
+            Message::ImportNativeFolderPicked(result) => match result {
+                Ok(Some(folder)) => {
+                    if let Some(manager) = self.import_manager.as_mut() {
+                        manager.browser = None;
+                        manager.sources = vec![folder];
+                        manager.error = None;
+                    }
+                    return self.start_import_scan();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.open_import_browser(BrowserMode::Folder);
+                    if let Some(manager) = self.import_manager.as_mut() {
+                        manager.error =
+                            Some(format!("{error} The Flux Browser is available below."));
+                    }
+                }
+            },
+            Message::ImportBrowserOpenFiles => self.open_import_browser(BrowserMode::Files),
+            Message::ImportBrowserOpenFolder => self.open_import_browser(BrowserMode::Folder),
+            Message::ImportBrowserUp => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(browser) = manager.browser.as_mut()
+                {
+                    browser_up(browser);
+                }
+            }
+            Message::ImportBrowserEnter(path) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(browser) = manager.browser.as_mut()
+                {
+                    browser_enter(browser, path);
+                }
+            }
+            Message::ImportBrowserToggle(path) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(browser) = manager.browser.as_mut()
+                {
+                    if browser.selected.contains(&path) {
+                        browser.selected.remove(&path);
+                    } else if browser.mode == BrowserMode::Files {
+                        browser.selected.insert(path);
+                    }
+                }
+            }
+            Message::ImportBrowserSelectAll => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(browser) = manager.browser.as_mut()
+                    && browser.mode == BrowserMode::Files
+                {
+                    browser.selected = browser
+                        .entries
+                        .iter()
+                        .filter(|entry| !entry.is_dir && entry.supported)
+                        .map(|entry| entry.path.clone())
+                        .collect();
+                }
+            }
+            Message::ImportBrowserConfirm => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let Some(browser) = manager.browser.as_mut() else {
+                    return Task::none();
+                };
+                let (sources, mode) = match browser.mode {
+                    BrowserMode::Files => {
+                        let mut sources: Vec<PathBuf> = browser.selected.iter().cloned().collect();
+                        sources.sort();
+                        if sources.is_empty() {
+                            browser.error =
+                                Some("Select at least one supported audio file.".to_owned());
+                            return Task::none();
+                        }
+                        (sources, BrowserMode::Files)
+                    }
+                    BrowserMode::Folder => (vec![browser.current.clone()], BrowserMode::Folder),
+                };
+                return self.start_import_from_selection(sources, mode);
+            }
+            Message::ImportBrowserCancel => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.browser = None;
+                }
+            }
+            Message::ImportBrowserRefresh => self.refresh_import_browser(),
+            Message::ImportBrowserPathChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(browser) = manager.browser.as_mut()
+                {
+                    browser.path_input = value;
+                }
+            }
+            Message::ImportBrowserPathSubmit => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(browser) = manager.browser.as_mut()
+                {
+                    let path = PathBuf::from(browser.path_input.trim());
+                    if path.is_dir() {
+                        browser_enter(browser, path);
+                    } else {
+                        browser.error = Some("That path is not a directory.".to_owned());
+                    }
+                }
+            }
+            Message::ImportRecursiveToggled => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.recursive = !manager.recursive;
+                }
+            }
+            Message::ImportStorageChanged(storage) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    manager.storage = storage;
+                    if let Some(plan) = manager.plan.as_mut() {
+                        plan.set_storage(storage);
+                    }
+                }
+            }
+            Message::ImportPlanReady(plan) => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                manager.progress_view = manager
+                    .progress
+                    .lock()
+                    .map(|progress| progress.clone())
+                    .unwrap_or_default();
+                if plan.cancelled {
+                    manager.stage = ImportUiStage::Cancelled;
+                    manager.progress_view.stage = ImportStage::Cancelled;
+                    manager.progress_view.message =
+                        "Import cancelled; no catalogue changes were made.".to_owned();
+                    manager.plan = Some(*plan);
+                    return Task::none();
+                }
+                let empty = plan.candidates.is_empty();
+                manager.plan = Some(*plan);
+                manager.stage = if empty {
+                    ImportUiStage::Failed
+                } else {
+                    ImportUiStage::Review
+                };
+                if empty {
+                    manager.error = Some(
+                        "No importable audio files were found. Check the issue list and try \
+                         another selection."
+                            .to_owned(),
+                    );
+                } else {
+                    manager.select_candidate(0);
+                }
+            }
+            Message::ImportPrepared(prepared) => self.apply_import_review(*prepared),
+            Message::ImportSelect(index) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.select_candidate(index);
+                }
+            }
+            Message::ImportDecisionChanged(index, decision) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    candidate.set_decision(decision);
+                }
+            }
+            Message::ImportBulkSkip => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                {
+                    plan.bulk_skip();
+                }
+            }
+            Message::ImportBulkImport => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                {
+                    plan.bulk_import_separate();
+                }
+            }
+            Message::ImportBulkUpdate => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                {
+                    plan.bulk_update_existing();
+                }
+            }
+            Message::ImportTitleChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    manager.edit_title = value;
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.set_title(manager.edit_title.clone());
+                    }
+                }
+            }
+            Message::ImportArtistChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    manager.edit_artist = value;
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.set_artist_id(None, None);
+                        candidate.set_artist_name(nonempty_string(&manager.edit_artist));
+                    }
+                }
+            }
+            Message::ImportAlbumChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    manager.edit_album = value;
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.set_album(nonempty_string(&manager.edit_album));
+                    }
+                }
+            }
+            Message::ImportTrackNumberChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    manager.edit_track_number = value;
+                    match parse_optional_number(&manager.edit_track_number, "track number") {
+                        Ok(number) => {
+                            manager.number_error = None;
+                            if let Some(plan) = manager.plan.as_mut()
+                                && let Some(index) = manager.selected
+                                && let Some(candidate) = plan.candidates.get_mut(index)
+                            {
+                                candidate.set_track_number(number);
+                            }
+                        }
+                        Err(error) => manager.number_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportDiscNumberChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    manager.edit_disc_number = value;
+                    match parse_optional_number(&manager.edit_disc_number, "disc number") {
+                        Ok(number) => {
+                            manager.number_error = None;
+                            if let Some(plan) = manager.plan.as_mut()
+                                && let Some(index) = manager.selected
+                                && let Some(candidate) = plan.candidates.get_mut(index)
+                            {
+                                candidate.set_disc_number(number);
+                            }
+                        }
+                        Err(error) => manager.number_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportArtistPicked(choice) => {
+                let artist_id = choice.as_ref().and_then(|choice| choice.id);
+                let canonical_name = artist_id
+                    .and_then(|id| self.controller.artist(id))
+                    .map(|artist| artist.name().to_owned());
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.set_artist_id(artist_id, canonical_name.clone());
+                    }
+                    if let Some(name) = canonical_name {
+                        manager.edit_artist = name;
+                    }
+                }
+            }
+            Message::ImportManualChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.manual_input = value;
+                }
+            }
+            Message::ImportManualAdd => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                if !matches!(manager.stage, ImportUiStage::Choose | ImportUiStage::Failed) {
+                    manager.error = Some("Finish or cancel the current review first.".to_owned());
+                    return Task::none();
+                }
+                let paths: Vec<PathBuf> = manager
+                    .manual_input
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
+                if paths.is_empty() {
+                    manager.error = Some("Enter at least one path.".to_owned());
+                } else {
+                    manager.sources.extend(paths);
+                    manager.manual_input.clear();
+                    manager.error = None;
+                    return self.start_import_scan();
+                }
+            }
+            Message::ImportDropPath(path) => return self.queue_external_drop(path),
+            Message::ImportFileHovered => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.drop_hover = true;
+                } else {
+                    self.external_drag_hover = true;
+                }
+            }
+            Message::ImportFileHoverLeft => {
+                self.external_drag_hover = false;
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.drop_hover = false;
+                }
+            }
+            Message::ImportApply => return self.start_import_copy(),
+            Message::ImportCancel => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    if matches!(
+                        manager.stage,
+                        ImportUiStage::Scanning | ImportUiStage::Importing
+                    ) {
+                        manager.cancel.store(true, Ordering::Release);
+                        manager.progress_view.message =
+                            "Cancelling at the next safe point…".to_owned();
+                    } else {
+                        self.import_manager = None;
+                    }
                 }
             }
             Message::OpenLibraryPressed => {
@@ -1660,6 +2621,9 @@ impl FluxReady {
             Message::CycleRepeat => self.controller.cycle_repeat_mode(),
             Message::VolumeChanged(volume) => self.controller.set_volume(volume),
             Message::KeyPressed(key, modifiers) => {
+                if self.import_manager.is_some() {
+                    return self.handle_import_key(&key, &modifiers);
+                }
                 if modifiers.contains(Modifiers::CTRL) {
                     match key.as_ref() {
                         Key::Named(Named::ArrowUp) => {
@@ -1731,6 +2695,29 @@ impl FluxReady {
                 {
                     self.cancel_queue_drag();
                 }
+                let mut start_dropped_scan = false;
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.progress_view = manager
+                        .progress
+                        .lock()
+                        .map(|progress| progress.clone())
+                        .unwrap_or_default();
+                    if manager
+                        .drop_deadline
+                        .is_some_and(|deadline| deadline.elapsed() >= Duration::from_millis(220))
+                    {
+                        start_dropped_scan = true;
+                    }
+                }
+                if start_dropped_scan {
+                    if let Some(manager) = self.import_manager.as_mut() {
+                        let pending = std::mem::take(&mut manager.pending_drops);
+                        manager.drop_deadline = None;
+                        manager.sources.extend(pending);
+                        manager.stage = ImportUiStage::Choose;
+                    }
+                    return self.start_import_scan();
+                }
                 if self.controller.player_state() != PlaybackState::Playing
                     || !self.controller.audio_status().is_ready()
                 {
@@ -1769,11 +2756,1090 @@ impl FluxReady {
             body = body.push(rule()).push(self.queue_panel());
         }
 
+        let base: Element<'_, Message> = body.into();
+        let body: Element<'_, Message> = if self.import_manager.is_some() {
+            stack([base, self.import_overlay()])
+                .height(Length::Fill)
+                .into()
+        } else if self.external_drag_hover {
+            stack([base, self.drop_hint()]).height(Length::Fill).into()
+        } else {
+            base
+        };
+
         container(column![body, horizontal_rule(), self.player_bar()].height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
             .style(app_style)
             .into()
+    }
+
+    fn import_overlay(&self) -> Element<'_, Message> {
+        let Some(manager) = self.import_manager.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let mut panel = column![self.import_header(manager)].spacing(10);
+        if manager.browser.is_some() {
+            panel = panel.push(self.import_browser_body(manager));
+            panel = panel.push(self.import_browser_footer(manager));
+        } else {
+            panel = panel.push(match manager.stage {
+                ImportUiStage::Choose | ImportUiStage::Scanning => self.import_choose_body(manager),
+                ImportUiStage::Review | ImportUiStage::Importing => {
+                    self.import_review_body(manager)
+                }
+                ImportUiStage::Completed | ImportUiStage::Cancelled | ImportUiStage::Failed => {
+                    self.import_result_body(manager)
+                }
+            });
+            panel = panel.push(self.import_footer(manager));
+        }
+
+        let compact_panel = matches!(
+            manager.stage,
+            ImportUiStage::Completed | ImportUiStage::Cancelled | ImportUiStage::Failed
+        ) && manager.browser.is_none();
+        let panel = container(panel)
+            .padding(16)
+            .width(Length::Fill)
+            .max_width(1_040.0)
+            .height(if compact_panel {
+                Length::Fixed(360.0)
+            } else {
+                Length::Fill
+            })
+            .max_height(680.0)
+            .style(import_panel_style);
+        let backdrop = mouse_area(
+            container(
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(modal_backdrop_style),
+        )
+        .on_press(Message::ImportNoop);
+        stack([
+            backdrop.into(),
+            container(panel)
+                .padding(18)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center(Length::Fill)
+                .into(),
+        ])
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn import_header(&self, manager: &ImportManager) -> Element<'_, Message> {
+        let (title, subtitle) = if manager.browser.is_some() {
+            (
+                "Flux Browser".to_owned(),
+                "Choose files or a folder using Flux's built-in browser.".to_owned(),
+            )
+        } else {
+            match manager.stage {
+                ImportUiStage::Choose => (
+                    "Import music".to_owned(),
+                    "Choose files or folders, drop them here, then review before anything is written."
+                        .to_owned(),
+                ),
+                ImportUiStage::Scanning => (
+                    "Reading import…".to_owned(),
+                    "Discovering files and reading metadata without changing the library."
+                        .to_owned(),
+                ),
+                ImportUiStage::Review => (
+                    "Review import".to_owned(),
+                    format!(
+                        "{} candidate(s) · edit metadata, resolve conflicts, and choose storage.",
+                        manager.plan.as_ref().map_or(0, |plan| plan.candidates.len())
+                    ),
+                ),
+                ImportUiStage::Importing => (
+                    "Importing…".to_owned(),
+                    "Copying files and publishing catalogue changes. Playback stays responsive."
+                        .to_owned(),
+                ),
+                ImportUiStage::Completed => (
+                    "Import complete".to_owned(),
+                    "Only the categories you approved were written to the catalogue.".to_owned(),
+                ),
+                ImportUiStage::Cancelled => (
+                    "Import cancelled".to_owned(),
+                    "No catalogue changes were published for the cancelled stage.".to_owned(),
+                ),
+                ImportUiStage::Failed => (
+                    "Import needs attention".to_owned(),
+                    "The issue below prevented all or part of the import.".to_owned(),
+                ),
+            }
+        };
+        let close = button(text("×").size(18).color(MUTED))
+            .style(ghost_style)
+            .padding([2, 8])
+            .on_press(Message::ImportClose);
+        let close = tooltip(
+            close,
+            container(text("Close / cancel").size(10).color(TEXT))
+                .padding([4, 7])
+                .style(tooltip_style),
+            tooltip::Position::Top,
+        )
+        .gap(6)
+        .delay(Duration::from_millis(250));
+        row![
+            column![
+                text(title).size(24).color(TEXT),
+                text(subtitle).size(11).color(MUTED),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            close,
+        ]
+        .align_y(Alignment::Start)
+        .into()
+    }
+
+    fn import_choose_body<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        if manager.stage == ImportUiStage::Scanning {
+            return self.import_progress_view(manager);
+        }
+        let portable = self.controller.storage_mode() == StorageMode::Portable;
+        let library_label = self
+            .controller
+            .portable_root()
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "No portable library is active".to_owned());
+        let mut body = column![].spacing(10);
+        if !portable {
+            body = body.push(
+                container(
+                    column![
+                        text("A portable library is required").size(13).color(TEXT),
+                        text(
+                            "Imports, Flux metadata edits, and stable artists live inside the \
+                             library's .flux folder. The legacy app index is a compatibility \
+                             backend and cannot store them."
+                        )
+                        .size(10)
+                        .color(MUTED),
+                        button(text("Open Library setup").size(11))
+                            .style(accent_button_style)
+                            .padding([7, 12])
+                            .on_press(Message::ImportOpenSetup),
+                    ]
+                    .spacing(6),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(card_style),
+            );
+        }
+
+        let native_row = row![
+            button(text("Choose files…").size(12))
+                .style(accent_button_style)
+                .padding([8, 14])
+                .on_press_maybe(portable.then_some(Message::ImportNativeFiles)),
+            button(text("Choose folder…").size(12))
+                .style(ghost_style)
+                .padding([8, 14])
+                .on_press_maybe(portable.then_some(Message::ImportNativeFolder)),
+            button(text("Flux Browser: files").size(11))
+                .style(ghost_style)
+                .padding([8, 12])
+                .on_press_maybe(portable.then_some(Message::ImportBrowserOpenFiles)),
+            button(text("Flux Browser: folder").size(11))
+                .style(ghost_style)
+                .padding([8, 12])
+                .on_press_maybe(portable.then_some(Message::ImportBrowserOpenFolder)),
+        ]
+        .spacing(8)
+        .wrap();
+        body = body.push(native_row);
+
+        let drop_zone =
+            container(
+                column![
+                text("Drop audio files or folders here").size(16).color(TEXT),
+                text(
+                    "The native picker is the default path. Flux Browser is a working fallback; \
+                     path entry is available for troubleshooting."
+                )
+                .size(10)
+                .color(MUTED),
+            ]
+                .spacing(5)
+                .align_x(Alignment::Center),
+            )
+            .padding(18)
+            .width(Length::Fill)
+            .height(Length::Fixed(108.0))
+            .center(Length::Fill)
+            .style(|_| {
+                container::Style::default()
+                    .background(if manager.drop_hover {
+                        ACCENT_SOFT
+                    } else {
+                        SURFACE
+                    })
+                    .border(Border {
+                        color: if manager.drop_hover { ACCENT } else { BORDER },
+                        width: 1.0,
+                        radius: 12.0.into(),
+                    })
+            });
+        body = body.push(drop_zone);
+
+        body = body.push(
+            row![
+                button(text(if manager.recursive {
+                    "✓ Include subfolders"
+                } else {
+                    "Include subfolders"
+                })
+                .size(11))
+                .style(nav_style(manager.recursive))
+                .padding([6, 10])
+                .on_press(Message::ImportRecursiveToggled),
+                text("Folders are walked without following symbolic links; repeated paths are deduplicated.")
+                    .size(10)
+                    .color(MUTED),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        body = body.push(
+            column![
+                text("STORAGE").size(9).color(ACCENT),
+                row![
+                    button(text(ImportStorage::Copy.label()).size(11))
+                        .style(nav_style(manager.storage == ImportStorage::Copy))
+                        .padding([7, 11])
+                        .on_press(Message::ImportStorageChanged(ImportStorage::Copy)),
+                    button(text(ImportStorage::Reference.label()).size(11))
+                        .style(nav_style(manager.storage == ImportStorage::Reference))
+                        .padding([7, 11])
+                        .on_press(Message::ImportStorageChanged(ImportStorage::Reference)),
+                ]
+                .spacing(6),
+                text(match manager.storage {
+                    ImportStorage::Copy =>
+                        "External files are copied into the library root with collision-safe names; originals are never moved or overwritten.",
+                    ImportStorage::Reference =>
+                        "Only files already inside the library folder can be referenced safely. External paths will be blocked with a clear action to switch to Copy.",
+                })
+                .size(10)
+                .color(MUTED),
+                text(format!("Library: {library_label}")).size(10).color(MUTED),
+            ]
+            .spacing(5),
+        );
+
+        body = body.push(
+            row![
+                text_input(
+                    "Troubleshooting fallback: audio file paths separated by ;",
+                    &manager.manual_input,
+                )
+                .on_input(Message::ImportManualChanged)
+                .on_submit(Message::ImportManualAdd)
+                .style(input_style)
+                .width(Length::Fill),
+                button(text("Add paths").size(11))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press_maybe(
+                        (!manager.manual_input.trim().is_empty())
+                            .then_some(Message::ImportManualAdd)
+                    ),
+            ]
+            .spacing(8),
+        );
+
+        if manager.stage == ImportUiStage::Scanning {
+            body = body.push(self.import_progress_view(manager));
+        }
+        if let Some(error) = &manager.error {
+            body = body.push(text(error).size(11).color(DANGER));
+        }
+        scrollable(body).height(Length::Fill).into()
+    }
+
+    fn import_browser_body<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let Some(browser) = manager.browser.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let mut body = column![
+            row![
+                button(text("↑ Up").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportBrowserUp),
+                text_input("Folder path…", &browser.path_input)
+                    .on_input(Message::ImportBrowserPathChanged)
+                    .on_submit(Message::ImportBrowserPathSubmit)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Go").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportBrowserPathSubmit),
+                button(text("Refresh").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportBrowserRefresh),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(browser.current.display().to_string())
+                .size(10)
+                .color(MUTED),
+            text(match browser.mode {
+                BrowserMode::Files =>
+                    "Click a folder to enter it. Click an audio file to select it; unsupported files are visibly disabled.",
+                BrowserMode::Folder =>
+                    "Navigate to the folder you want to import. The whole folder (including subfolders when enabled) becomes the source.",
+            })
+            .size(9)
+            .color(MUTED),
+        ]
+        .spacing(6);
+
+        let mut rows = column![].spacing(2);
+        for entry in &browser.entries {
+            if entry.is_dir {
+                rows = rows.push(
+                    button(
+                        row![
+                            text("▸").size(11).color(ACCENT),
+                            text(&entry.name).size(11).color(TEXT).width(Length::Fill),
+                            text("folder").size(9).color(MUTED),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([5, 8])
+                    .style(track_row_style(false))
+                    .on_press(Message::ImportBrowserEnter(entry.path.clone())),
+                );
+            } else {
+                let selected = browser.selected.contains(&entry.path);
+                let color = if entry.supported { TEXT } else { MUTED };
+                let row: Element<'_, Message> = row![
+                    text(if selected { "✓" } else { " " })
+                        .size(11)
+                        .color(ACCENT)
+                        .width(Length::Fixed(18.0)),
+                    text(&entry.name).size(11).color(color).width(Length::Fill),
+                    text(if entry.supported {
+                        human_size(entry.size)
+                    } else {
+                        "unsupported".to_owned()
+                    })
+                    .size(9)
+                    .color(MUTED),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into();
+                let button = button(row)
+                    .width(Length::Fill)
+                    .padding([5, 8])
+                    .style(track_row_style(selected));
+                let item: Element<'_, Message> = if entry.supported {
+                    button
+                        .on_press(Message::ImportBrowserToggle(entry.path.clone()))
+                        .into()
+                } else {
+                    button.into()
+                };
+                rows = rows.push(item);
+            }
+        }
+        if browser.entries.is_empty() {
+            rows = rows.push(text("This folder is empty.").size(11).color(MUTED));
+        }
+        body = body.push(
+            container(scrollable(rows).height(Length::Fill))
+                .padding(4)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(card_style),
+        );
+        if let Some(error) = &manager.error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        if let Some(error) = &browser.error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        body.height(Length::Fill).into()
+    }
+
+    fn import_browser_footer<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let Some(browser) = manager.browser.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let summary = match browser.mode {
+            BrowserMode::Files => format!("{} selected", browser.selected.len()),
+            BrowserMode::Folder => browser.current.display().to_string(),
+        };
+        row![
+            text(summary).size(10).color(MUTED).width(Length::Fill),
+            button(text("Cancel").size(10))
+                .style(ghost_style)
+                .padding([6, 10])
+                .on_press(Message::ImportBrowserCancel),
+            button(
+                text(if browser.mode == BrowserMode::Files {
+                    "Select all audio"
+                } else if manager.recursive {
+                    "✓ Subfolders"
+                } else {
+                    "Include subfolders"
+                })
+                .size(10)
+            )
+            .style(ghost_style)
+            .padding([6, 10])
+            .on_press(if browser.mode == BrowserMode::Files {
+                Message::ImportBrowserSelectAll
+            } else {
+                Message::ImportRecursiveToggled
+            }),
+            button(
+                text(if browser.mode == BrowserMode::Files {
+                    "Use selected"
+                } else {
+                    "Use this folder"
+                })
+                .size(11)
+            )
+            .style(accent_button_style)
+            .padding([7, 12])
+            .on_press_maybe(
+                (browser.mode == BrowserMode::Folder || !browser.selected.is_empty())
+                    .then_some(Message::ImportBrowserConfirm),
+            ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn import_progress_view<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let progress = &manager.progress_view;
+        let label = if progress.total > 0 {
+            format!("{}  {}/{}", progress.message, progress.done, progress.total)
+        } else {
+            progress.message.clone()
+        };
+        let mut view = column![
+            row![
+                text(label).size(11).color(TEXT).width(Length::Fill),
+                button(
+                    text(if manager.cancel.load(Ordering::Acquire) {
+                        "Cancelling…"
+                    } else {
+                        "Cancel"
+                    })
+                    .size(10)
+                )
+                .style(ghost_style)
+                .padding([5, 8])
+                .on_press_maybe(
+                    (!manager.cancel.load(Ordering::Acquire)).then_some(Message::ImportCancel)
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(6);
+        if progress.total > 0 {
+            let value = (progress.done as f32 / progress.total as f32).clamp(0.0, 1.0);
+            view = view.push(
+                progress_bar(0.0..=1.0, value)
+                    .girth(5)
+                    .style(progress_style)
+                    .length(Length::Fill),
+            );
+        }
+        container(view)
+            .padding(10)
+            .width(Length::Fill)
+            .style(card_style)
+            .into()
+    }
+
+    fn import_review_body<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let Some(plan) = manager.plan.as_ref() else {
+            return self.import_choose_body(manager);
+        };
+        let mut body = column![].spacing(8);
+        body = body.push(
+            row![
+                text(format!(
+                    "{} new · {} update · {} skip · {} issue(s)",
+                    plan.new_count(),
+                    plan.update_count(),
+                    plan.skip_count(),
+                    plan.issues.len()
+                ))
+                .size(10)
+                .color(MUTED)
+                .width(Length::Fill),
+                button(text("Skip all").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportBulkSkip),
+                button(text("Import new").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportBulkImport),
+                button(text("Update exact").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportBulkUpdate),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+        body = body.push(
+            text("Keys: ↑/↓ select · s skip · i import · u update · Ctrl+Enter import · Esc close")
+                .size(9)
+                .color(MUTED),
+        );
+        body = body.push(
+            row![
+                button(text(ImportStorage::Copy.label()).size(10))
+                    .style(nav_style(plan.storage == ImportStorage::Copy))
+                    .padding([5, 9])
+                    .on_press_maybe(
+                        (manager.stage == ImportUiStage::Review)
+                            .then_some(Message::ImportStorageChanged(ImportStorage::Copy))
+                    ),
+                button(text(ImportStorage::Reference.label()).size(10))
+                    .style(nav_style(plan.storage == ImportStorage::Reference))
+                    .padding([5, 9])
+                    .on_press_maybe(
+                        (manager.stage == ImportUiStage::Review)
+                            .then_some(Message::ImportStorageChanged(ImportStorage::Reference))
+                    ),
+                text(format!("Library: {}", plan.library_root.display()))
+                    .size(9)
+                    .color(MUTED),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        if !plan.issues.is_empty() {
+            let mut issue_text = format!("{} skipped/unreadable path(s): ", plan.issues.len());
+            for issue in plan.issues.iter().take(3) {
+                issue_text.push_str(&format!(
+                    "{} ({}); ",
+                    issue.path().display(),
+                    issue.reason()
+                ));
+            }
+            body = body.push(text(issue_text).size(9).color(MUTED));
+        }
+        let mut rows = column![].spacing(3);
+        for (index, candidate) in plan.candidates.iter().enumerate() {
+            rows = rows.push(self.import_candidate_row(manager, index, candidate));
+        }
+        let list = scrollable(rows).height(Length::Fill);
+        let details = self.import_candidate_details(manager);
+
+        body = body.push(
+            row![
+                container(list)
+                    .width(Length::FillPortion(3))
+                    .height(Length::Fill)
+                    .style(card_style)
+                    .padding(6),
+                container(details)
+                    .width(Length::FillPortion(2))
+                    .height(Length::Fill)
+                    .style(card_style)
+                    .padding(12),
+            ]
+            .spacing(10)
+            .height(Length::Fill),
+        );
+        if manager.stage == ImportUiStage::Importing {
+            body = body.push(self.import_progress_view(manager));
+        }
+        if let Some(error) = &manager.error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        body.height(Length::Fill).into()
+    }
+
+    fn import_candidate_row<'a>(
+        &self,
+        manager: &ImportManager,
+        index: usize,
+        candidate: &'a flux_app::ImportCandidate,
+    ) -> Element<'a, Message> {
+        let selected = manager.selected == Some(index);
+        let (status, color) = match candidate.status() {
+            CandidateStatus::New => ("New", SUCCESS),
+            CandidateStatus::ExistingPath(_) => {
+                ("Already in library", Color::from_rgb8(0xff, 0xc2, 0x66))
+            }
+            CandidateStatus::SameContent { .. } => {
+                ("Possible same content", Color::from_rgb8(0xff, 0xc2, 0x66))
+            }
+            CandidateStatus::SimilarMetadata(_) => ("Similar metadata", MUTED),
+        };
+        let decision = match candidate.decision() {
+            ImportDecision::ImportNew => "import",
+            ImportDecision::UpdateExisting => "update",
+            ImportDecision::Skip => "skip",
+        };
+        let progress_state = manager
+            .progress_view
+            .items
+            .get(index)
+            .copied()
+            .unwrap_or(ImportItemState::Pending);
+        let state = match progress_state {
+            ImportItemState::Scanning => "scanning",
+            ImportItemState::Importing => "importing",
+            ImportItemState::Imported => "imported",
+            ImportItemState::Failed => "failed",
+            _ => decision,
+        };
+        let mut title = row![
+            text(format!("{}", index + 1))
+                .size(9)
+                .color(MUTED)
+                .width(Length::Fixed(22.0)),
+            column![
+                text(candidate.title())
+                    .size(12)
+                    .color(if selected { ACCENT } else { TEXT }),
+                text(candidate.artist_name().unwrap_or("Unknown artist"))
+                    .size(9)
+                    .color(MUTED),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+            column![
+                text(status).size(9).color(color),
+                text(format!(
+                    "{} · {}",
+                    candidate.format(),
+                    human_size(candidate.file_size())
+                ))
+                .size(8)
+                .color(MUTED),
+            ]
+            .spacing(1),
+            text(state).size(8).color(MUTED).width(Length::Fixed(58.0)),
+        ]
+        .spacing(7)
+        .align_y(Alignment::Center);
+        if candidate.metadata_incomplete() {
+            title = title.push(text("incomplete").size(8).color(MUTED));
+        }
+        button(title)
+            .width(Length::Fill)
+            .padding([7, 8])
+            .style(track_row_style(selected))
+            .on_press(Message::ImportSelect(index))
+            .into()
+    }
+
+    fn import_candidate_details<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let Some(plan) = manager.plan.as_ref() else {
+            return text("No candidate selected.").size(11).color(MUTED).into();
+        };
+        let Some(index) = manager.selected else {
+            return text("Select a candidate to edit.")
+                .size(11)
+                .color(MUTED)
+                .into();
+        };
+        let Some(candidate) = plan.candidates.get(index) else {
+            return text("Select a candidate to edit.")
+                .size(11)
+                .color(MUTED)
+                .into();
+        };
+        let mut body = column![
+            row![
+                text(candidate.title()).size(16).color(TEXT),
+                if candidate.is_edited() {
+                    Element::from(text("edited").size(9).color(ACCENT))
+                } else {
+                    Element::from(iced::widget::Space::new().width(0))
+                },
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            text(candidate.source_path().display().to_string())
+                .size(9)
+                .color(MUTED),
+            text(format!(
+                "Source tags: {} · {} · {}",
+                candidate.source_track().title(),
+                candidate.source_track().artist().unwrap_or("—"),
+                candidate.source_track().album().unwrap_or("—")
+            ))
+            .size(9)
+            .color(MUTED),
+            text(format!(
+                "{} · {} · {}",
+                candidate
+                    .source_track()
+                    .duration()
+                    .map(format_duration)
+                    .unwrap_or_else(|| "--:--".to_owned()),
+                candidate.format(),
+                human_size(candidate.file_size())
+            ))
+            .size(9)
+            .color(MUTED),
+        ]
+        .spacing(5);
+
+        match candidate.status() {
+            CandidateStatus::ExistingPath(id) => {
+                body = body.push(
+                    text(format!(
+                        "This exact path is track {id}. Update its Flux overrides to keep the \
+                         same TrackId and queue entries."
+                    ))
+                    .size(9)
+                    .color(MUTED),
+                );
+                body = body.push(
+                    row![
+                        button(text("Skip").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
+                        button(text("Update existing").size(10))
+                            .style(nav_style(
+                                candidate.decision() == ImportDecision::UpdateExisting
+                            ))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(
+                                index,
+                                ImportDecision::UpdateExisting,
+                            )),
+                    ]
+                    .spacing(6),
+                );
+            }
+            CandidateStatus::New | CandidateStatus::SimilarMetadata(_) => {
+                body = body.push(
+                    text(status_description(candidate.status()))
+                        .size(9)
+                        .color(MUTED),
+                );
+                body = body.push(
+                    row![
+                        button(text("Import separately").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(
+                                index,
+                                ImportDecision::ImportNew,
+                            )),
+                        button(text("Skip").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
+                    ]
+                    .spacing(6),
+                );
+            }
+            CandidateStatus::SameContent { .. } => {
+                body = body.push(
+                    text(status_description(candidate.status()))
+                        .size(9)
+                        .color(MUTED),
+                );
+                body = body.push(
+                    row![
+                        button(text("Import separately").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(
+                                index,
+                                ImportDecision::ImportNew,
+                            )),
+                        button(text("Skip").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
+                    ]
+                    .spacing(6),
+                );
+            }
+        }
+
+        let editable = manager.stage == ImportUiStage::Review;
+        body = body.push(text("TITLE").size(8).color(MUTED));
+        body = body.push(
+            text_input("Title", &manager.edit_title)
+                .on_input(Message::ImportTitleChanged)
+                .style(input_style)
+                .width(Length::Fill),
+        );
+        body = body.push(text("ARTIST").size(8).color(MUTED));
+        body = body.push(
+            text_input("Artist name", &manager.edit_artist)
+                .on_input(Message::ImportArtistChanged)
+                .style(input_style)
+                .width(Length::Fill),
+        );
+        let mut choices = self.editor_artist_choices();
+        if let Some(choice) = choices.first_mut() {
+            choice.label = "No stable artist (create/link from artist name)".to_owned();
+        }
+        let selected_artist = candidate
+            .artist_id()
+            .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned())
+            .or_else(|| choices.first().cloned());
+        body = body.push(
+            pick_list(choices, selected_artist, |choice| {
+                Message::ImportArtistPicked(Some(choice))
+            })
+            .text_size(11)
+            .padding([6, 8])
+            .width(Length::Fill),
+        );
+        body = body.push(text("ALBUM").size(8).color(MUTED));
+        body = body.push(
+            text_input("Album", &manager.edit_album)
+                .on_input(Message::ImportAlbumChanged)
+                .style(input_style)
+                .width(Length::Fill),
+        );
+        body = body.push(
+            row![
+                text_input("Track #", &manager.edit_track_number)
+                    .on_input(Message::ImportTrackNumberChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+                text_input("Disc #", &manager.edit_disc_number)
+                    .on_input(Message::ImportDiscNumberChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+            ]
+            .spacing(6),
+        );
+        if let Some(error) = &manager.number_error {
+            body = body.push(text(error).size(9).color(DANGER));
+        }
+        if let Some(destination) = candidate.destination() {
+            body = body.push(
+                text(format!("Destination: {}", destination.display()))
+                    .size(9)
+                    .color(MUTED),
+            );
+        }
+        if let Some(error) = candidate.storage_error() {
+            body = body.push(text(error).size(9).color(DANGER));
+        }
+        body = body.push(
+            text(
+                "Review edits become Flux-owned overrides; embedded audio tags are never written. \
+                 Artwork extraction/preview is not part of this build.",
+            )
+            .size(9)
+            .color(MUTED),
+        );
+        if !editable {
+            body = body.push(
+                text("Editing is disabled while files/catalogue changes are in progress.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        }
+        scrollable(body).height(Length::Fill).into()
+    }
+
+    fn import_footer<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let mut footer = row![].spacing(8).align_y(Alignment::Center);
+        let summary = match manager.stage {
+            ImportUiStage::Review => manager.plan.as_ref().map_or_else(
+                || "No reviewed plan".to_owned(),
+                |plan| {
+                    format!(
+                        "{} new · {} update · {} skip · {} issue(s)",
+                        plan.new_count(),
+                        plan.update_count(),
+                        plan.skip_count(),
+                        plan.issues.len()
+                    )
+                },
+            ),
+            ImportUiStage::Importing => manager.progress_view.message.clone(),
+            ImportUiStage::Completed => manager.report.as_ref().map_or_else(
+                || "Complete".to_owned(),
+                |report| {
+                    format!(
+                        "{} imported · {} updated · {} skipped · {} failed",
+                        report.imported, report.updated, report.skipped, report.failed
+                    )
+                },
+            ),
+            ImportUiStage::Cancelled => "Cancelled before catalogue publication".to_owned(),
+            ImportUiStage::Failed => "Import could not complete".to_owned(),
+            ImportUiStage::Choose | ImportUiStage::Scanning => String::new(),
+        };
+        footer = footer.push(text(summary).size(10).color(MUTED).width(Length::Fill));
+
+        match manager.stage {
+            ImportUiStage::Review => {
+                footer = footer.push(
+                    button(text("Cancel").size(10))
+                        .style(ghost_style)
+                        .padding([6, 10])
+                        .on_press(Message::ImportCancel),
+                );
+                let can_import = manager.plan.as_ref().is_some_and(ImportPlan::can_import);
+                footer = footer.push(
+                    button(
+                        text(format!(
+                            "Import {} item(s)",
+                            manager
+                                .plan
+                                .as_ref()
+                                .map_or(0, |plan| { plan.new_count() + plan.update_count() })
+                        ))
+                        .size(11),
+                    )
+                    .style(accent_button_style)
+                    .padding([7, 12])
+                    .on_press_maybe(can_import.then_some(Message::ImportApply)),
+                );
+            }
+            ImportUiStage::Importing => {
+                footer = footer.push(
+                    button(text("Cancel").size(10))
+                        .style(ghost_style)
+                        .padding([6, 10])
+                        .on_press_maybe(
+                            (!manager.cancel.load(Ordering::Acquire))
+                                .then_some(Message::ImportCancel),
+                        ),
+                );
+            }
+            ImportUiStage::Completed | ImportUiStage::Cancelled | ImportUiStage::Failed => {
+                footer = footer.push(
+                    button(text("Choose again").size(10))
+                        .style(ghost_style)
+                        .padding([6, 10])
+                        .on_press(Message::ImportReset),
+                );
+                footer = footer.push(
+                    button(text("Done").size(11))
+                        .style(accent_button_style)
+                        .padding([7, 12])
+                        .on_press(Message::ImportClose),
+                );
+            }
+            ImportUiStage::Choose | ImportUiStage::Scanning => {
+                footer = footer.push(
+                    button(text("Close").size(10))
+                        .style(ghost_style)
+                        .padding([6, 10])
+                        .on_press(Message::ImportClose),
+                );
+            }
+        }
+        container(footer).padding([4, 2]).width(Length::Fill).into()
+    }
+
+    fn import_result_body<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let mut body = column![].spacing(10);
+        if let Some(error) = &manager.error {
+            body = body.push(
+                container(text(error).size(11).color(DANGER))
+                    .padding(12)
+                    .width(Length::Fill)
+                    .style(error_banner_style),
+            );
+        }
+        if let Some(report) = &manager.report {
+            body = body.push(
+                text(format!(
+                    "{} imported · {} updated · {} skipped · {} failed",
+                    report.imported, report.updated, report.skipped, report.failed
+                ))
+                .size(16)
+                .color(TEXT),
+            );
+            for item in &report.items {
+                let (state, color) = match item.state {
+                    ImportItemState::Imported => ("imported", SUCCESS),
+                    ImportItemState::Skipped => ("skipped", MUTED),
+                    ImportItemState::Failed => ("failed", DANGER),
+                    _ => ("pending", MUTED),
+                };
+                body = body.push(
+                    row![
+                        text(state).size(9).color(color).width(Length::Fixed(56.0)),
+                        text(item.message.clone())
+                            .size(10)
+                            .color(MUTED)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(8),
+                );
+            }
+        }
+        if let Some(plan) = &manager.plan
+            && !plan.issues.is_empty()
+        {
+            body = body.push(text("Issues").size(10).color(ACCENT));
+            for issue in plan.issues.iter().take(20) {
+                body = body.push(
+                    text(format!("{} — {}", issue.path().display(), issue.reason()))
+                        .size(9)
+                        .color(MUTED),
+                );
+            }
+        }
+        scrollable(body).height(Length::Fill).into()
+    }
+
+    fn drop_hint(&self) -> Element<'_, Message> {
+        container(
+            column![
+                text("Drop to import").size(26).color(TEXT),
+                text("Audio files and folders can be dropped anywhere in the window.")
+                    .size(12)
+                    .color(MUTED),
+            ]
+            .spacing(8)
+            .align_x(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center(Length::Fill)
+        .style(|_| {
+            container::Style::default()
+                .background(Color::from_rgba8(6, 8, 12, 0.90))
+                .border(Border {
+                    color: ACCENT_BORDER,
+                    width: 2.0,
+                    radius: 16.0.into(),
+                })
+        })
+        .into()
     }
 
     fn nav_counts(&self) -> (usize, usize, usize, usize) {
@@ -1854,6 +3920,14 @@ impl FluxReady {
         }
 
         nav = nav.push(iced::widget::Space::new().height(12));
+        nav = nav.push(
+            button(text("Import music").size(12))
+                .width(Length::Fill)
+                .padding([8, 10])
+                .style(accent_button_style)
+                .on_press(Message::ImportOpen),
+        );
+        nav = nav.push(iced::widget::Space::new().height(6));
         nav = nav.push(
             button(text("Library setup").size(12))
                 .width(Length::Fill)
@@ -2064,10 +4138,17 @@ impl FluxReady {
             .size(12)
             .color(MUTED)
             .width(Length::Fixed(420.0)),
-            button(text("Scan your music").size(12))
-                .style(accent_button_style)
-                .padding([8, 14])
-                .on_press(Message::ToggleSetup),
+            row![
+                button(text("Import music").size(12))
+                    .style(accent_button_style)
+                    .padding([8, 14])
+                    .on_press(Message::ImportOpen),
+                button(text("Scan a folder").size(12))
+                    .style(ghost_style)
+                    .padding([8, 14])
+                    .on_press(Message::ToggleSetup),
+            ]
+            .spacing(8),
         ]
         .spacing(12)
         .align_x(Alignment::Center);
@@ -2429,50 +4510,6 @@ impl FluxReady {
         ));
 
         let portable = self.controller.storage_mode() == StorageMode::Portable;
-        let import_ready =
-            portable && !scanning && !protected && !self.import_input.trim().is_empty();
-        let mut import_body = column![
-            text_input(
-                "Audio file paths, separated by ; (no native file picker in this build)",
-                &self.import_input,
-            )
-            .on_input(Message::ImportInputChanged)
-            .style(input_style)
-            .width(Length::Fill),
-            row![
-                button(text("Copy & import").size(11))
-                    .style(accent_button_style)
-                    .padding([7, 12])
-                    .on_press_maybe(import_ready.then_some(Message::ImportPressed(true))),
-                button(text("Import in place").size(11))
-                    .style(ghost_style)
-                    .padding([7, 12])
-                    .on_press_maybe(import_ready.then_some(Message::ImportPressed(false))),
-            ]
-            .spacing(8),
-            text(if !portable {
-                "Import requires a portable library. Create or open one below."
-            } else {
-                "Copy imports into this library without moving or overwriting originals. \
-                 In-place accepts files already inside the library folder. Repeated imports \
-                 are deduplicated."
-            })
-            .size(10)
-            .color(if portable { MUTED } else { DANGER }),
-        ]
-        .spacing(8);
-        if !portable {
-            import_body = import_body.push(
-                text("The current app index is a compatibility backend; metadata edits and artist relationships live only in a portable library.")
-                    .size(9)
-                    .color(MUTED),
-            );
-        }
-        setup = setup.push(setup_card(
-            "IMPORT AUDIO FILES",
-            "Add one or many individual files. Imported files are real catalogue records, not UI-only rows.",
-            import_body,
-        ));
 
         let library_label = match self.controller.storage_mode() {
             StorageMode::Legacy => match self.controller.legacy_index_path() {
@@ -3445,8 +5482,9 @@ mod tests {
             dir_input: String::new(),
             search: String::new(),
             lib_input: String::new(),
-            import_input: String::new(),
             track_editor: None,
+            import_manager: None,
+            external_drag_hover: false,
             artist_selected: None,
             artist_name_input: String::new(),
             artist_rename_input: String::new(),
@@ -3716,6 +5754,75 @@ mod tests {
     }
 
     #[test]
+    fn import_manager_reviews_and_commits_through_gui_messages() {
+        let dir = TempDir::new("gui-import-manager");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("library root");
+        flux_app::create_portable_library(&root).expect("create portable library");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("import.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let source_bytes = std::fs::read(&source).expect("source bytes");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+
+        let request = ImportRequest {
+            sources: vec![source.clone()],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: gui.controller.portable_root().expect("root").to_path_buf(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: Vec::new(),
+        };
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let plan = prepare_import_plan(request, progress, cancel);
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportPlanReady(Box::new(plan)));
+        let manager = gui.import_manager.as_ref().expect("manager open");
+        assert_eq!(manager.stage, ImportUiStage::Review);
+        assert_eq!(manager.selected, Some(0));
+
+        send(
+            &mut gui,
+            Message::ImportTitleChanged("GUI imported title".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::ImportArtistChanged("GUI import artist".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::ImportAlbumChanged("GUI import album".to_owned()),
+        );
+        let plan = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.clone())
+            .expect("plan");
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prepared = prepare_import_files(&plan, progress, cancel);
+        send(&mut gui, Message::ImportPrepared(Box::new(prepared)));
+        let manager = gui.import_manager.as_ref().expect("manager");
+        assert_eq!(manager.stage, ImportUiStage::Completed);
+        let track = gui.controller.tracks()[0].1.clone();
+        assert_eq!(track.title(), "GUI imported title");
+        assert_eq!(track.artist(), Some("GUI import artist"));
+        assert_eq!(track.album(), Some("GUI import album"));
+        assert_eq!(gui.controller.queue_len(), 1);
+        assert_eq!(std::fs::read(&source).expect("source"), source_bytes);
+        assert_ne!(track.source().path(), source);
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn import_edit_and_artist_messages_persist_through_the_gui_state() {
         let dir = TempDir::new("gui-manage-flow");
         let root = dir.path().join("library");
@@ -3733,13 +5840,10 @@ mod tests {
         );
         send(&mut gui, Message::OpenLibraryPressed);
         assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
-        send(
-            &mut gui,
-            Message::ImportInputChanged(source.display().to_string()),
-        );
-        send(&mut gui, Message::ImportPressed(true));
+        gui.controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("quick fixture import");
         assert_eq!(gui.controller.tracks().len(), 1);
-        assert!(gui.import_input.is_empty());
         let id = gui.controller.tracks()[0].0;
 
         send(&mut gui, Message::EditTrack(id));

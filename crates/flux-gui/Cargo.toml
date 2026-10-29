@@ -21,6 +21,7 @@ cpal = ["flux-app/cpal"]
 [dependencies]
 flux-core.workspace = true
 flux-app.workspace = true
+flux-platform.workspace = true
 # `advanced` exposes Iced's native custom-widget drawing API for the
 # real waveform line. `tokio` selects iced's tokio-backed runtime, which
 # provides `iced::time::every` (the default thread-pool backend has no
