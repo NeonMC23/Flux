@@ -2622,3 +2622,411 @@ mod tests {
         }
     }
 }
+
+/// One track in a [`CanonicalSeed`], including the external audio source
+/// used during a controlled migration. The source is copied, never moved.
+#[derive(Debug, Clone)]
+pub struct CanonicalSeedTrack {
+    /// Canonical metadata and stable ID.
+    pub track: CanonicalTrack,
+    /// Existing audio file copied into the canonical album directory.
+    pub source_audio: PathBuf,
+    /// Original audio extension without a leading dot.
+    pub extension: String,
+    /// Optional LRC text stored as `track_<id>.lrc`.
+    pub lyrics_text: Option<String>,
+}
+
+/// A fully validated in-memory snapshot used by migration to build a new
+/// canonical library in one transactional publication.
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalSeed {
+    /// Artists to create.
+    pub artists: Vec<CanonicalArtist>,
+    /// Albums to create.
+    pub albums: Vec<CanonicalAlbum>,
+    /// Tracks and their external source files.
+    pub tracks: Vec<CanonicalSeedTrack>,
+    /// Playlists to create.
+    pub playlists: Vec<CanonicalPlaylist>,
+    /// Ratings/favorites to persist.
+    pub ratings: BTreeMap<TrackId, TrackRating>,
+    /// Optional cover: album ID -> (source, canonical extension).
+    pub covers: BTreeMap<AlbumId, (PathBuf, String)>,
+    /// Preserved next TrackId counter, when the source had retired-ID gaps.
+    pub next_track_id: Option<u64>,
+    /// Preserved next ArtistId counter.
+    pub next_artist_id: Option<u64>,
+    /// Preserved next AlbumId counter.
+    pub next_album_id: Option<u64>,
+    /// Preserved next PlaylistId counter.
+    pub next_playlist_id: Option<u64>,
+}
+
+impl CanonicalLibrary {
+    /// Creates a new canonical library from a migration seed.
+    ///
+    /// `root` must be absent or empty. The empty root is created first; the
+    /// seed is then published in one transaction whose catalogue write is the
+    /// commit point. On failure the root may contain an empty canonical
+    /// library but never a catalogue that references partially copied audio.
+    pub fn create_from_seed(root: &Path, seed: &CanonicalSeed) -> Result<Self, CanonicalError> {
+        let mut library = Self::create(root)?;
+        library.install_seed(seed)?;
+        Ok(library)
+    }
+
+    /// Installs a migration seed into an empty canonical library.
+    pub fn install_seed(&mut self, seed: &CanonicalSeed) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        if !self.artists.is_empty()
+            || !self.albums.is_empty()
+            || !self.tracks.is_empty()
+            || !self.playlists.is_empty()
+        {
+            return Err(CanonicalError::Invalid(
+                "a migration seed can only be installed into an empty canonical library".to_owned(),
+            ));
+        }
+        let mut artists = BTreeMap::new();
+        let mut albums = BTreeMap::new();
+        let mut tracks = BTreeMap::new();
+        let mut playlists = BTreeMap::new();
+        let mut catalog = CatalogDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: CATALOG_KIND.to_owned(),
+            library_id: self.catalog.library_id.clone(),
+            generation: self.catalog.generation,
+            transaction_id: None,
+            next_track_id: 1,
+            next_artist_id: 1,
+            next_album_id: 1,
+            next_playlist_id: 1,
+            artists: Vec::new(),
+            albums: Vec::new(),
+            tracks: Vec::new(),
+            playlists: Vec::new(),
+            ratings_path: RATINGS_FILE_NAME.to_owned(),
+        };
+        let mut writes = Vec::new();
+
+        for artist in &seed.artists {
+            if artist.id.get() == 0 || artist.name.trim().is_empty() {
+                return Err(CanonicalError::Invalid(
+                    "seed artists require nonzero IDs and names".to_owned(),
+                ));
+            }
+            if artists.insert(artist.id, artist.clone()).is_some() {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed contains duplicate artist {}",
+                    artist.id
+                )));
+            }
+            catalog.next_artist_id = catalog.next_artist_id.max(artist.id.get() + 1);
+            let rel = artist_rel(artist.id);
+            catalog.artists.push(CatalogArtistDto {
+                id: artist.id.get(),
+                path: rel.display_lossy(),
+            });
+            let dto = ArtistEntityDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: ARTIST_KIND.to_owned(),
+                id: artist.id.get(),
+                name: artist.name.clone(),
+                aliases: artist.aliases.clone(),
+            };
+            push_entity_write(&mut writes, &rel, "artist.flux", &dto)?;
+        }
+        catalog.artists.sort_by_key(|entry| entry.id);
+
+        for album in &seed.albums {
+            if !artists.contains_key(&album.owner_artist_id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed album {} references missing owner {}",
+                    album.id, album.owner_artist_id
+                )));
+            }
+            if albums.insert(album.id, album.clone()).is_some() {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed contains duplicate album {}",
+                    album.id
+                )));
+            }
+            catalog.next_album_id = catalog.next_album_id.max(album.id.get() + 1);
+            let rel = album_rel(album.owner_artist_id, album.id);
+            catalog.albums.push(CatalogAlbumDto {
+                id: album.id.get(),
+                artist_id: album.owner_artist_id.get(),
+                path: rel.display_lossy(),
+            });
+            let mut order = Vec::new();
+            let mut seen = HashSet::new();
+            for track in &album.track_order {
+                if !seen.insert(*track) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "seed album {} lists track {track} more than once",
+                        album.id
+                    )));
+                }
+                order.push(track.get());
+            }
+            let dto = AlbumEntityDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: ALBUM_KIND.to_owned(),
+                id: album.id.get(),
+                owner_artist_id: album.owner_artist_id.get(),
+                title: album.title.clone(),
+                release_type: album.release_type,
+                cover: album.cover.clone(),
+                track_order: order,
+            };
+            push_entity_write(&mut writes, &rel, "album.flux", &dto)?;
+        }
+        catalog.albums.sort_by_key(|entry| entry.id);
+
+        for item in &seed.tracks {
+            let track = &item.track;
+            let Some(album) = albums.get(&track.album_id) else {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed track {} references missing album {}",
+                    track.id, track.album_id
+                )));
+            };
+            if album.owner_artist_id != track.owner_artist_id {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed track {} owner is not the album owner",
+                    track.id
+                )));
+            }
+            if track.credited_artist_ids.is_empty()
+                || track.credited_artist_ids[0] != track.owner_artist_id
+                || track
+                    .credited_artist_ids
+                    .iter()
+                    .any(|artist| !artists.contains_key(artist))
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed track {} has invalid credits",
+                    track.id
+                )));
+            }
+            if tracks.insert(track.id, track.clone()).is_some() {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed contains duplicate track {}",
+                    track.id
+                )));
+            }
+            let extension = item.extension.trim_start_matches('.').to_ascii_lowercase();
+            if extension.is_empty() || !extension.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed track {} has an unsafe audio extension",
+                    track.id
+                )));
+            }
+            if !item.source_audio.is_file() {
+                return Err(CanonicalError::MissingResource(item.source_audio.clone()));
+            }
+            let fingerprint = ContentFingerprint::of_file(&item.source_audio)?;
+            let audio_rel =
+                track_audio_rel(track.owner_artist_id, track.album_id, track.id, &extension);
+            let record_rel = track_record_rel(track.owner_artist_id, track.album_id, track.id);
+            catalog.next_track_id = catalog.next_track_id.max(track.id.get() + 1);
+            catalog.tracks.push(CatalogTrackDto {
+                id: track.id.get(),
+                owner_artist_id: track.owner_artist_id.get(),
+                album_id: track.album_id.get(),
+                audio_path: audio_rel.display_lossy(),
+                record_path: record_rel.display_lossy(),
+            });
+            let lyrics = item
+                .lyrics_text
+                .as_ref()
+                .map(|_| format!("track_{:06}.lrc", track.id.get()));
+            let dto = TrackEntityDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: TRACK_KIND.to_owned(),
+                id: track.id.get(),
+                title: track.title.clone(),
+                credited_artist_ids: track
+                    .credited_artist_ids
+                    .iter()
+                    .map(|artist| artist.get())
+                    .collect(),
+                owner_artist_id: track.owner_artist_id.get(),
+                album_id: track.album_id.get(),
+                track_number: track.track_number,
+                disc_number: track.disc_number,
+                duration_ms: track.duration_ms,
+                lyrics,
+                fingerprint: track.fingerprint.or(Some(fingerprint)),
+            };
+            push_file_write(&mut writes, &record_rel, &dto)?;
+            if let (Some(text), Some(name)) = (&item.lyrics_text, &dto.lyrics) {
+                let rel = RelPath::from_utf8(&format!(
+                    "{}/{}",
+                    record_rel
+                        .display_lossy()
+                        .rsplit_once('/')
+                        .map_or("", |(dir, _)| dir),
+                    name
+                ))?;
+                writes.push(PendingWrite {
+                    target: rel,
+                    bytes: Some(text.as_bytes().to_vec()),
+                    copy_from: None,
+                    expected: None,
+                });
+            }
+            writes.push(PendingWrite {
+                target: audio_rel,
+                bytes: None,
+                copy_from: Some(item.source_audio.clone()),
+                expected: Some(fingerprint),
+            });
+        }
+        catalog.tracks.sort_by_key(|entry| entry.id);
+        for (value, field) in [
+            (seed.next_track_id, "track"),
+            (seed.next_artist_id, "artist"),
+            (seed.next_album_id, "album"),
+            (seed.next_playlist_id, "playlist"),
+        ] {
+            if value.is_some_and(|value| value == 0) {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed {field} counter must be nonzero"
+                )));
+            }
+        }
+        catalog.next_track_id = catalog.next_track_id.max(seed.next_track_id.unwrap_or(1));
+        catalog.next_artist_id = catalog.next_artist_id.max(seed.next_artist_id.unwrap_or(1));
+        catalog.next_album_id = catalog.next_album_id.max(seed.next_album_id.unwrap_or(1));
+        catalog.next_playlist_id = catalog
+            .next_playlist_id
+            .max(seed.next_playlist_id.unwrap_or(1));
+        for album in albums.values() {
+            for id in &album.track_order {
+                if !tracks.contains_key(id) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "seed album {} references missing track {id}",
+                        album.id
+                    )));
+                }
+            }
+        }
+        if tracks.len() != catalog.tracks.len() {
+            return Err(CanonicalError::Invalid(
+                "seed tracks are not unique".to_owned(),
+            ));
+        }
+
+        for (album_id, (source, extension)) in &seed.covers {
+            let album = albums.get(album_id).ok_or_else(|| {
+                CanonicalError::Invalid(format!("cover references missing album {album_id}"))
+            })?;
+            let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+            if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+                return Err(CanonicalError::Invalid(
+                    "seed cover must be png, jpg, jpeg, or webp".to_owned(),
+                ));
+            }
+            let size = fs::metadata(source)?.len();
+            if size == 0 || size > 16 * 1024 * 1024 {
+                return Err(CanonicalError::Invalid(
+                    "seed cover must be between 1 byte and 16 MiB".to_owned(),
+                ));
+            }
+            let album_rel = album_rel(album.owner_artist_id, album.id);
+            writes.push(PendingWrite {
+                target: RelPath::from_utf8(&format!(
+                    "{}/cover.{extension}",
+                    album_rel.display_lossy()
+                ))?,
+                bytes: None,
+                copy_from: Some(source.clone()),
+                expected: Some(ContentFingerprint::of_file(source)?),
+            });
+        }
+
+        for playlist in &seed.playlists {
+            if playlist.id.get() == 0 || playlist.name.trim().is_empty() {
+                return Err(CanonicalError::Invalid(
+                    "seed playlists require nonzero IDs and names".to_owned(),
+                ));
+            }
+            if playlist
+                .track_ids
+                .iter()
+                .any(|track| !tracks.contains_key(track))
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed playlist {} references a missing track",
+                    playlist.id
+                )));
+            }
+            if playlists.insert(playlist.id, playlist.clone()).is_some() {
+                return Err(CanonicalError::Invalid(format!(
+                    "seed contains duplicate playlist {}",
+                    playlist.id
+                )));
+            }
+            catalog.next_playlist_id = catalog.next_playlist_id.max(playlist.id.get() + 1);
+            let rel = playlist_rel(playlist.id);
+            catalog.playlists.push(CatalogPlaylistDto {
+                id: playlist.id.get(),
+                path: rel.display_lossy(),
+            });
+            let dto = PlaylistEntityDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: PLAYLIST_KIND.to_owned(),
+                id: playlist.id.get(),
+                name: playlist.name.clone(),
+                track_ids: playlist.track_ids.iter().map(|track| track.get()).collect(),
+            };
+            push_file_write(&mut writes, &rel, &dto)?;
+        }
+        catalog.playlists.sort_by_key(|entry| entry.id);
+
+        if seed
+            .ratings
+            .values()
+            .any(|rating| rating.rating.is_some_and(|value| value > 5))
+        {
+            return Err(CanonicalError::Invalid(
+                "seed rating must be 0..=5".to_owned(),
+            ));
+        }
+        if seed.ratings.keys().any(|track| !tracks.contains_key(track)) {
+            return Err(CanonicalError::Invalid(
+                "seed ratings reference a missing track".to_owned(),
+            ));
+        }
+        let ratings = RatingsDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: RATINGS_KIND.to_owned(),
+            entries: seed
+                .ratings
+                .iter()
+                .map(|(track, value)| RatingEntryDto {
+                    track_id: track.get(),
+                    rating: value.rating,
+                    favorite: value.favorite,
+                })
+                .collect(),
+        };
+        let ratings_bytes =
+            serde_json::to_vec_pretty(&ratings).map_err(|err| CanonicalError::Malformed {
+                file: RATINGS_FILE_NAME.to_owned(),
+                message: err.to_string(),
+            })?;
+        writes.push(PendingWrite {
+            target: RelPath::from_utf8(RATINGS_FILE_NAME)?,
+            bytes: Some(ratings_bytes),
+            copy_from: None,
+            expected: None,
+        });
+
+        self.commit_writes(Some(catalog), writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+}

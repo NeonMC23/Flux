@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use flux_core::{Track, TrackId};
 
 pub mod canonical;
+pub mod canonical_migrate;
 mod fs_ops;
 pub mod library_lock;
 pub mod migrate;
