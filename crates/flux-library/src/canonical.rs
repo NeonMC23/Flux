@@ -1,0 +1,2624 @@
+//! Canonical self-contained Flux library storage.
+//!
+//! This module is the target persistent format for the canonical storage
+//! redesign. It is intentionally independent of audio-tag readers: music
+//! metadata comes only from Flux files. Audio files are opaque managed
+//! resources; container-level decoding may validate that a file exists and
+//! can be copied, but tags are never consulted.
+//!
+//! Layout:
+//!
+//! ```text
+//! <root>/
+//!   library.flux
+//!   catalog.flux
+//!   catalog.flux.bak
+//!   artists/artist_<id>/artist.flux
+//!   artists/artist_<id>/albums/album_<id>/
+//!       album.flux
+//!       cover.<ext>                     (optional)
+//!       tracks/track_<id>.<ext>
+//!       tracks/track_<id>.flux
+//!       tracks/track_<id>.lrc           (optional)
+//!   playlists/playlist_<id>.flux
+//!   ratings.flux
+//!   transactions/<txn>/journal.flux
+//!   backups/
+//! ```
+//!
+//! `catalog.flux` is authoritative for entity existence, stable IDs, physical
+//! ownership, album/playlist membership, canonical relative paths, counters,
+//! and the committed generation. Per-entity files are authoritative for their
+//! metadata. The reader validates the two representations against each other
+//! and never silently repairs a mismatch.
+//!
+//! New canonical libraries are written through a transaction journal. A batch
+//! writes its journal first, installs files with same-directory temporary
+//! files and atomic renames, publishes `catalog.flux` last, marks the journal
+//! committed, and only then deletes its backups. Startup recovery either
+//! completes cleanup for a committed catalogue or restores the pre-batch
+//! bytes and removes files created by an uncommitted batch.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::fs;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use flux_core::{ArtistId, TrackId};
+use serde::{Deserialize, Serialize};
+
+use crate::portable::{PathValidationError, RelPath};
+
+/// Version of the canonical library format written by this build.
+pub const CANONICAL_SCHEMA_VERSION: u32 = 1;
+/// Root manifest file.
+pub const LIBRARY_FILE_NAME: &str = "library.flux";
+/// Authoritative catalogue file.
+pub const CATALOG_FILE_NAME: &str = "catalog.flux";
+/// Previous committed catalogue generation.
+pub const CATALOG_BACKUP_FILE_NAME: &str = "catalog.flux.bak";
+/// Ratings file.
+pub const RATINGS_FILE_NAME: &str = "ratings.flux";
+/// Managed transaction directory.
+pub const TRANSACTIONS_DIR_NAME: &str = "transactions";
+/// Recovery backup directory.
+pub const BACKUPS_DIR_NAME: &str = "backups";
+/// Artists directory.
+pub const ARTISTS_DIR_NAME: &str = "artists";
+/// Playlists directory.
+pub const PLAYLISTS_DIR_NAME: &str = "playlists";
+
+const MANIFEST_KIND: &str = "flux-library";
+const CATALOG_KIND: &str = "flux-catalog";
+const ARTIST_KIND: &str = "flux-artist";
+const ALBUM_KIND: &str = "flux-album";
+const TRACK_KIND: &str = "flux-track";
+const PLAYLIST_KIND: &str = "flux-playlist";
+const RATINGS_KIND: &str = "flux-ratings";
+const JOURNAL_KIND: &str = "flux-transaction";
+
+// ----------------------------------------------------------------- IDs ---
+
+/// Stable identity of an album/release within one canonical library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AlbumId(u64);
+
+impl AlbumId {
+    /// Creates an ID from a raw value.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+    /// Raw value.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for AlbumId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Stable identity of a playlist within one canonical library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlaylistId(u64);
+
+impl PlaylistId {
+    /// Creates an ID from a raw value.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+    /// Raw value.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for PlaylistId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Explicit release type for an album directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseType {
+    /// Full-length album.
+    #[default]
+    Album,
+    /// Extended play.
+    Ep,
+    /// Single.
+    Single,
+    /// Compilation or various-artists release.
+    Compilation,
+    /// A release that does not fit the other categories.
+    Other,
+}
+
+impl ReleaseType {
+    /// Stable lowercase wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Album => "album",
+            Self::Ep => "ep",
+            Self::Single => "single",
+            Self::Compilation => "compilation",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Non-cryptographic content fingerprint used for copy verification and
+/// duplicate leads. This is deliberately a persisted FNV-1a 64-bit value plus
+/// the byte length; it is not a security primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentFingerprint {
+    /// Byte length.
+    pub size_bytes: u64,
+    /// FNV-1a 64-bit hash of the complete file.
+    pub fnv1a64: u64,
+}
+
+impl ContentFingerprint {
+    /// Computes a fingerprint by streaming `path`; never reads audio tags.
+    pub fn of_file(path: &Path) -> Result<Self, CanonicalError> {
+        let mut file = fs::File::open(path)?;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut size = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            size += read as u64;
+            for byte in &buffer[..read] {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        Ok(Self {
+            size_bytes: size,
+            fnv1a64: hash,
+        })
+    }
+}
+
+// -------------------------------------------------------------- errors ---
+
+/// Why a canonical library operation failed.
+#[derive(Debug)]
+pub enum CanonicalError {
+    /// Filesystem error.
+    Io(std::io::Error),
+    /// JSON malformed.
+    Malformed { file: String, message: String },
+    /// Wrong discriminator.
+    WrongKind {
+        file: String,
+        expected: &'static str,
+        found: String,
+    },
+    /// Unsupported format version.
+    UnsupportedVersion {
+        file: String,
+        found: u32,
+        supported: u32,
+    },
+    /// Structural invariant violation.
+    Invalid(String),
+    /// Relative path rejected.
+    InvalidPath(PathValidationError),
+    /// No canonical library at the root.
+    NotFound(PathBuf),
+    /// Root is not empty / already a canonical library.
+    AlreadyExists(PathBuf),
+    /// A required resource is missing.
+    MissingResource(PathBuf),
+    /// A transaction journal is malformed; no automatic repair is performed.
+    Transaction { file: String, message: String },
+}
+
+impl fmt::Display for CanonicalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "filesystem error: {err}"),
+            Self::Malformed { file, message } => write!(f, "{file} is malformed: {message}"),
+            Self::WrongKind {
+                file,
+                expected,
+                found,
+            } => {
+                write!(f, "{file} declares kind {found:?}, expected {expected:?}")
+            }
+            Self::UnsupportedVersion {
+                file,
+                found,
+                supported,
+            } => write!(
+                f,
+                "{file} uses unsupported canonical schema version {found} (this build supports {supported})"
+            ),
+            Self::Invalid(reason) => write!(f, "invalid canonical library: {reason}"),
+            Self::InvalidPath(err) => write!(f, "invalid canonical relative path: {err}"),
+            Self::NotFound(root) => {
+                write!(f, "no canonical Flux library exists at {}", root.display())
+            }
+            Self::AlreadyExists(root) => write!(
+                f,
+                "a non-empty or canonical library already exists at {}",
+                root.display()
+            ),
+            Self::MissingResource(path) => write!(
+                f,
+                "required library resource is missing: {}",
+                path.display()
+            ),
+            Self::Transaction { file, message } => {
+                write!(f, "transaction {file} cannot be recovered: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CanonicalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::InvalidPath(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for CanonicalError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+impl From<PathValidationError> for CanonicalError {
+    fn from(err: PathValidationError) -> Self {
+        Self::InvalidPath(err)
+    }
+}
+
+// ----------------------------------------------------------- entities ---
+
+/// One canonical artist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalArtist {
+    /// Stable identity.
+    pub id: ArtistId,
+    /// Canonical display name.
+    pub name: String,
+    /// Optional alternate names.
+    pub aliases: Vec<String>,
+}
+
+/// One canonical album/release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalAlbum {
+    /// Stable identity.
+    pub id: AlbumId,
+    /// Artist owning the album directory and its physical tracks.
+    pub owner_artist_id: ArtistId,
+    /// Canonical title.
+    pub title: String,
+    /// Release type.
+    pub release_type: ReleaseType,
+    /// Optional cover file name inside the album directory.
+    pub cover: Option<String>,
+    /// Ordered track IDs in this album.
+    pub track_order: Vec<TrackId>,
+}
+
+/// One canonical track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalTrack {
+    /// Stable identity.
+    pub id: TrackId,
+    /// Canonical title.
+    pub title: String,
+    /// Ordered credited artists; the first must be the owning artist.
+    pub credited_artist_ids: Vec<ArtistId>,
+    /// Physical owner (album owner).
+    pub owner_artist_id: ArtistId,
+    /// Owning album.
+    pub album_id: AlbumId,
+    /// Track number within its disc.
+    pub track_number: Option<u32>,
+    /// Disc number.
+    pub disc_number: Option<u32>,
+    /// Stored technical duration, when known independently of tags.
+    pub duration_ms: Option<u64>,
+    /// Optional lyrics file name inside the track directory.
+    pub lyrics: Option<String>,
+    /// Optional content fingerprint.
+    pub fingerprint: Option<ContentFingerprint>,
+}
+
+/// One canonical playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalPlaylist {
+    /// Stable identity.
+    pub id: PlaylistId,
+    /// Playlist name.
+    pub name: String,
+    /// Ordered track references.
+    pub track_ids: Vec<TrackId>,
+}
+
+/// Rating/favorite value for one track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackRating {
+    /// Optional 0..=5 rating.
+    pub rating: Option<u8>,
+    /// Favorite flag.
+    pub favorite: bool,
+}
+
+/// One canonical library snapshot plus its on-disk root.
+#[derive(Debug)]
+pub struct CanonicalLibrary {
+    root: PathBuf,
+    manifest: LibraryManifestDto,
+    catalog: CatalogDto,
+    artists: BTreeMap<ArtistId, CanonicalArtist>,
+    albums: BTreeMap<AlbumId, CanonicalAlbum>,
+    tracks: BTreeMap<TrackId, CanonicalTrack>,
+    playlists: BTreeMap<PlaylistId, CanonicalPlaylist>,
+    ratings: BTreeMap<TrackId, TrackRating>,
+    track_paths: BTreeMap<TrackId, RelPath>,
+    track_records: BTreeMap<TrackId, RelPath>,
+    artist_paths: BTreeMap<ArtistId, RelPath>,
+    album_paths: BTreeMap<AlbumId, RelPath>,
+    playlist_paths: BTreeMap<PlaylistId, RelPath>,
+}
+
+impl CanonicalLibrary {
+    /// Library root.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    /// Stable library identity.
+    #[must_use]
+    pub fn library_id(&self) -> &str {
+        &self.manifest.library_id
+    }
+    /// Committed generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.catalog.generation
+    }
+    /// Artists in ascending ID order.
+    pub fn artists(&self) -> impl Iterator<Item = &CanonicalArtist> {
+        self.artists.values()
+    }
+    /// Albums in ascending ID order.
+    pub fn albums(&self) -> impl Iterator<Item = &CanonicalAlbum> {
+        self.albums.values()
+    }
+    /// Tracks in ascending ID order.
+    pub fn tracks(&self) -> impl Iterator<Item = &CanonicalTrack> {
+        self.tracks.values()
+    }
+    /// Playlists in ascending ID order.
+    pub fn playlists(&self) -> impl Iterator<Item = &CanonicalPlaylist> {
+        self.playlists.values()
+    }
+    /// Artist by ID.
+    #[must_use]
+    pub fn artist(&self, id: ArtistId) -> Option<&CanonicalArtist> {
+        self.artists.get(&id)
+    }
+    /// Album by ID.
+    #[must_use]
+    pub fn album(&self, id: AlbumId) -> Option<&CanonicalAlbum> {
+        self.albums.get(&id)
+    }
+    /// Track by ID.
+    #[must_use]
+    pub fn track(&self, id: TrackId) -> Option<&CanonicalTrack> {
+        self.tracks.get(&id)
+    }
+    /// Playlist by ID.
+    #[must_use]
+    pub fn playlist(&self, id: PlaylistId) -> Option<&CanonicalPlaylist> {
+        self.playlists.get(&id)
+    }
+    /// Rating for a track.
+    #[must_use]
+    pub fn rating(&self, id: TrackId) -> Option<TrackRating> {
+        self.ratings.get(&id).copied()
+    }
+    /// Absolute path for a track's canonical audio file.
+    #[must_use]
+    pub fn track_audio_path(&self, id: TrackId) -> Option<PathBuf> {
+        let rel = self.track_paths.get(&id)?;
+        let os = rel.to_os_path()?;
+        Some(self.root.join(os))
+    }
+    /// Absolute path for a track's `.flux` metadata record.
+    #[must_use]
+    pub fn track_record_path(&self, id: TrackId) -> Option<PathBuf> {
+        let rel = self.track_records.get(&id)?;
+        let os = rel.to_os_path()?;
+        Some(self.root.join(os))
+    }
+    /// Whether the canonical audio file currently exists.
+    #[must_use]
+    pub fn track_available(&self, id: TrackId) -> bool {
+        self.track_audio_path(id)
+            .is_some_and(|path| fs::symlink_metadata(path).is_ok_and(|m| m.is_file()))
+    }
+    /// Absolute path for an album directory.
+    #[must_use]
+    pub fn album_dir(&self, id: AlbumId) -> Option<PathBuf> {
+        let rel = self.album_paths.get(&id)?;
+        Some(self.root.join(rel.to_os_path()?))
+    }
+    /// Absolute path for an artist directory.
+    #[must_use]
+    pub fn artist_dir(&self, id: ArtistId) -> Option<PathBuf> {
+        let rel = self.artist_paths.get(&id)?;
+        Some(self.root.join(rel.to_os_path()?))
+    }
+    /// Absolute path for a playlist file.
+    #[must_use]
+    pub fn playlist_path(&self, id: PlaylistId) -> Option<PathBuf> {
+        let rel = self.playlist_paths.get(&id)?;
+        Some(self.root.join(rel.to_os_path()?))
+    }
+}
+
+// -------------------------------------------------------------- DTOs ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LibraryManifestDto {
+    schema_version: u32,
+    kind: String,
+    library_id: String,
+    created_unix_ms: u64,
+    catalog: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogDto {
+    schema_version: u32,
+    kind: String,
+    library_id: String,
+    generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+    next_track_id: u64,
+    next_artist_id: u64,
+    next_album_id: u64,
+    next_playlist_id: u64,
+    artists: Vec<CatalogArtistDto>,
+    albums: Vec<CatalogAlbumDto>,
+    tracks: Vec<CatalogTrackDto>,
+    playlists: Vec<CatalogPlaylistDto>,
+    ratings_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogArtistDto {
+    id: u64,
+    path: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogAlbumDto {
+    id: u64,
+    artist_id: u64,
+    path: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogTrackDto {
+    id: u64,
+    owner_artist_id: u64,
+    album_id: u64,
+    audio_path: String,
+    record_path: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogPlaylistDto {
+    id: u64,
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArtistEntityDto {
+    schema_version: u32,
+    kind: String,
+    id: u64,
+    name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AlbumEntityDto {
+    schema_version: u32,
+    kind: String,
+    id: u64,
+    owner_artist_id: u64,
+    title: String,
+    release_type: ReleaseType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cover: Option<String>,
+    track_order: Vec<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrackEntityDto {
+    schema_version: u32,
+    kind: String,
+    id: u64,
+    title: String,
+    credited_artist_ids: Vec<u64>,
+    owner_artist_id: u64,
+    album_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    track_number: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disc_number: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lyrics: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<ContentFingerprint>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlaylistEntityDto {
+    schema_version: u32,
+    kind: String,
+    id: u64,
+    name: String,
+    track_ids: Vec<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RatingsDto {
+    schema_version: u32,
+    kind: String,
+    #[serde(default)]
+    entries: Vec<RatingEntryDto>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RatingEntryDto {
+    track_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rating: Option<u8>,
+    favorite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalDto {
+    schema_version: u32,
+    kind: String,
+    transaction_id: String,
+    operation: String,
+    state: JournalState,
+    intended_generation: u64,
+    actions: Vec<JournalActionDto>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JournalState {
+    Applying,
+    Committed,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalActionDto {
+    target: String,
+    existed: bool,
+    /// Backup file name inside the transaction directory for a replaced file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
+    /// Staging file name inside the transaction directory for a copied resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged_source: Option<String>,
+}
+
+// -------------------------------------------------------- path layout ---
+
+fn artist_rel(id: ArtistId) -> RelPath {
+    RelPath::from_utf8(&format!("artists/artist_{:06}", id.get()))
+        .expect("generated artist path is valid")
+}
+fn album_rel(owner: ArtistId, id: AlbumId) -> RelPath {
+    RelPath::from_utf8(&format!(
+        "artists/artist_{:06}/albums/album_{:06}",
+        owner.get(),
+        id.get()
+    ))
+    .expect("generated album path is valid")
+}
+fn track_audio_rel(owner: ArtistId, album: AlbumId, id: TrackId, extension: &str) -> RelPath {
+    RelPath::from_utf8(&format!(
+        "artists/artist_{:06}/albums/album_{:06}/tracks/track_{:06}.{extension}",
+        owner.get(),
+        album.get(),
+        id.get()
+    ))
+    .expect("generated track path is valid")
+}
+fn track_record_rel(owner: ArtistId, album: AlbumId, id: TrackId) -> RelPath {
+    RelPath::from_utf8(&format!(
+        "artists/artist_{:06}/albums/album_{:06}/tracks/track_{:06}.flux",
+        owner.get(),
+        album.get(),
+        id.get()
+    ))
+    .expect("generated record path is valid")
+}
+fn playlist_rel(id: PlaylistId) -> RelPath {
+    RelPath::from_utf8(&format!("playlists/playlist_{:06}.flux", id.get()))
+        .expect("generated playlist path is valid")
+}
+fn canonical_rel_path(text: &str, file: &str) -> Result<RelPath, CanonicalError> {
+    let rel = RelPath::from_utf8(text)?;
+    // The generated canonical layout never uses raw-byte paths; accepting
+    // them would make cross-platform validation and hashing inconsistent.
+    if rel.as_str().is_none() {
+        return Err(CanonicalError::Invalid(format!(
+            "{file} contains a non-UTF-8 canonical path"
+        )));
+    }
+    Ok(rel)
+}
+fn safe_join(root: &Path, rel: &RelPath) -> Result<PathBuf, CanonicalError> {
+    let os = rel.to_os_path().ok_or(CanonicalError::InvalidPath(
+        PathValidationError::NonUtf8Component,
+    ))?;
+    Ok(root.join(os))
+}
+
+/// Rejects symlink components in an existing canonical resource path. The
+/// final component may be absent; missing ancestors are also allowed while
+/// creating a library, but any existing symlink is an escape attempt.
+fn reject_symlink_escape(root: &Path, rel: &RelPath) -> Result<(), CanonicalError> {
+    let os = rel.to_os_path().ok_or(CanonicalError::InvalidPath(
+        PathValidationError::NonUtf8Component,
+    ))?;
+    let mut current = root.to_path_buf();
+    for component in os.components() {
+        let Component::Normal(component) = component else {
+            return Err(CanonicalError::InvalidPath(PathValidationError::Absolute));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(CanonicalError::Invalid(format!(
+                    "path {} contains a symbolic link",
+                    rel.display_lossy()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn valid_library_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn generate_library_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = nanos
+        ^ (u64::from(std::process::id()) << 32)
+        ^ COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+    let mut out = String::with_capacity(32);
+    for _ in 0..2 {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        out.push_str(&format!("{z:016x}"));
+    }
+    out
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, file: &str) -> Result<T, CanonicalError> {
+    let bytes = fs::read(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            CanonicalError::MissingResource(path.to_path_buf())
+        } else {
+            CanonicalError::Io(err)
+        }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|err| CanonicalError::Malformed {
+        file: file.to_owned(),
+        message: err.to_string(),
+    })
+}
+
+fn check_header(
+    version: u32,
+    kind: &str,
+    file: &str,
+    expected_kind: &'static str,
+) -> Result<(), CanonicalError> {
+    if version != CANONICAL_SCHEMA_VERSION {
+        return Err(CanonicalError::UnsupportedVersion {
+            file: file.to_owned(),
+            found: version,
+            supported: CANONICAL_SCHEMA_VERSION,
+        });
+    }
+    if kind != expected_kind {
+        return Err(CanonicalError::WrongKind {
+            file: file.to_owned(),
+            expected: expected_kind,
+            found: kind.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------ opening ---
+
+/// User/caller-supplied metadata for one canonical import. No audio tag is
+/// read; callers may derive these values from filenames or explicit review.
+#[derive(Debug, Clone)]
+pub struct CanonicalImportedTrack {
+    /// Source audio file to copy into the album directory.
+    pub source: PathBuf,
+    /// Canonical title.
+    pub title: String,
+    /// Canonical owner artist name (created or reused by exact name).
+    pub artist_name: String,
+    /// Album title (required for canonical storage).
+    pub album_title: Option<String>,
+    /// Release type when a new album is created.
+    pub release_type: ReleaseType,
+    /// Optional track number.
+    pub track_number: Option<u32>,
+    /// Optional disc number.
+    pub disc_number: Option<u32>,
+    /// Optional technical duration in milliseconds.
+    pub duration_ms: Option<u64>,
+}
+
+impl CanonicalLibrary {
+    /// Creates an empty canonical library at `root`.
+    ///
+    /// The root must be either absent or empty. A partial canonical layout is
+    /// never overwritten; use an explicit migration/repair workflow instead.
+    pub fn create(root: &Path) -> Result<Self, CanonicalError> {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(CanonicalError::Invalid(
+                    "the library root must not be a symbolic link".to_owned(),
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                let mut entries = fs::read_dir(root)?;
+                if entries.next().is_some() {
+                    return Err(CanonicalError::AlreadyExists(root.to_path_buf()));
+                }
+            }
+            Ok(_) => return Err(CanonicalError::AlreadyExists(root.to_path_buf())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(root)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        for dir in [
+            ARTISTS_DIR_NAME,
+            PLAYLISTS_DIR_NAME,
+            TRANSACTIONS_DIR_NAME,
+            BACKUPS_DIR_NAME,
+        ] {
+            fs::create_dir_all(root.join(dir))?;
+        }
+        let manifest = LibraryManifestDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: MANIFEST_KIND.to_owned(),
+            library_id: generate_library_id(),
+            created_unix_ms: crate::portable::now_unix_ms(),
+            catalog: CATALOG_FILE_NAME.to_owned(),
+        };
+        let catalog = CatalogDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: CATALOG_KIND.to_owned(),
+            library_id: manifest.library_id.clone(),
+            generation: 1,
+            transaction_id: None,
+            next_track_id: 1,
+            next_artist_id: 1,
+            next_album_id: 1,
+            next_playlist_id: 1,
+            artists: Vec::new(),
+            albums: Vec::new(),
+            tracks: Vec::new(),
+            playlists: Vec::new(),
+            ratings_path: RATINGS_FILE_NAME.to_owned(),
+        };
+        let ratings = RatingsDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: RATINGS_KIND.to_owned(),
+            entries: Vec::new(),
+        };
+        write_atomic(
+            &root.join(RATINGS_FILE_NAME),
+            &serde_json::to_vec_pretty(&ratings).map_err(|err| CanonicalError::Malformed {
+                file: RATINGS_FILE_NAME.to_owned(),
+                message: err.to_string(),
+            })?,
+        )?;
+        write_atomic(
+            &root.join(CATALOG_FILE_NAME),
+            &serde_json::to_vec_pretty(&catalog).map_err(|err| CanonicalError::Malformed {
+                file: CATALOG_FILE_NAME.to_owned(),
+                message: err.to_string(),
+            })?,
+        )?;
+        write_atomic(
+            &root.join(LIBRARY_FILE_NAME),
+            &serde_json::to_vec_pretty(&manifest).map_err(|err| CanonicalError::Malformed {
+                file: LIBRARY_FILE_NAME.to_owned(),
+                message: err.to_string(),
+            })?,
+        )?;
+        Self::open(root)
+    }
+
+    /// Opens and fully validates a canonical library, recovering any
+    /// interrupted transaction first.
+    ///
+    /// # Errors
+    ///
+    /// Missing/invalid manifest or catalogue, malformed entity files,
+    /// duplicate IDs/paths, invalid relationships, path traversal/symlink
+    /// escapes, missing required entity records, and unrecoverable journals.
+    pub fn open(root: &Path) -> Result<Self, CanonicalError> {
+        let root = std::fs::canonicalize(root).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                CanonicalError::NotFound(root.to_path_buf())
+            } else {
+                CanonicalError::Io(err)
+            }
+        })?;
+        let manifest_path = root.join(LIBRARY_FILE_NAME);
+        if !manifest_path.exists() {
+            return Err(CanonicalError::NotFound(root));
+        }
+        let manifest: LibraryManifestDto = read_json(&manifest_path, LIBRARY_FILE_NAME)?;
+        check_header(
+            manifest.schema_version,
+            &manifest.kind,
+            LIBRARY_FILE_NAME,
+            MANIFEST_KIND,
+        )?;
+        if !valid_library_id(&manifest.library_id) {
+            return Err(CanonicalError::Invalid(
+                "library.flux has an invalid library_id".to_owned(),
+            ));
+        }
+        if manifest.catalog != CATALOG_FILE_NAME {
+            return Err(CanonicalError::Invalid(
+                "library.flux references an unexpected catalogue file".to_owned(),
+            ));
+        }
+
+        let catalog_path = root.join(CATALOG_FILE_NAME);
+        let catalog: CatalogDto = read_json(&catalog_path, CATALOG_FILE_NAME)?;
+        check_header(
+            catalog.schema_version,
+            &catalog.kind,
+            CATALOG_FILE_NAME,
+            CATALOG_KIND,
+        )?;
+        if catalog.library_id != manifest.library_id {
+            return Err(CanonicalError::Invalid(
+                "catalogue library_id does not match library.flux".to_owned(),
+            ));
+        }
+        recover_transactions(
+            &root,
+            &manifest.library_id,
+            catalog.generation,
+            catalog.transaction_id.as_deref(),
+        )?;
+        Self::load(root, manifest, catalog)
+    }
+
+    fn load(
+        root: PathBuf,
+        manifest: LibraryManifestDto,
+        catalog: CatalogDto,
+    ) -> Result<Self, CanonicalError> {
+        validate_catalog_header(&catalog)?;
+        let mut artist_paths = BTreeMap::new();
+        let mut album_paths = BTreeMap::new();
+        let mut track_paths = BTreeMap::new();
+        let mut track_records = BTreeMap::new();
+        let mut playlist_paths = BTreeMap::new();
+        let mut seen_audio_paths = HashSet::new();
+
+        for entry in &catalog.artists {
+            let id = ArtistId::new(entry.id);
+            if id.get() == 0 {
+                return Err(CanonicalError::Invalid("artist ID 0".to_owned()));
+            }
+            let rel = canonical_rel_path(&entry.path, ARTISTS_DIR_NAME)?;
+            if rel != artist_rel(id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "artist {id} path {} is not canonical",
+                    entry.path
+                )));
+            }
+            if artist_paths.insert(id, rel).is_some() {
+                return Err(CanonicalError::Invalid(format!(
+                    "artist ID {id} appears more than once"
+                )));
+            }
+        }
+        for entry in &catalog.albums {
+            let id = AlbumId::new(entry.id);
+            let owner = ArtistId::new(entry.artist_id);
+            if id.get() == 0 || owner.get() == 0 {
+                return Err(CanonicalError::Invalid("album/owner ID 0".to_owned()));
+            }
+            if !artist_paths.contains_key(&owner) {
+                return Err(CanonicalError::Invalid(format!(
+                    "album {id} references missing artist {owner}"
+                )));
+            }
+            let rel = canonical_rel_path(&entry.path, "albums")?;
+            if rel != album_rel(owner, id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "album {id} path {} is not canonical",
+                    entry.path
+                )));
+            }
+            if album_paths.insert(id, rel).is_some() {
+                return Err(CanonicalError::Invalid(format!(
+                    "album ID {id} appears more than once"
+                )));
+            }
+        }
+        for entry in &catalog.tracks {
+            let id = TrackId::new(entry.id);
+            let owner = ArtistId::new(entry.owner_artist_id);
+            let album = AlbumId::new(entry.album_id);
+            if id.get() == 0 || owner.get() == 0 || album.get() == 0 {
+                return Err(CanonicalError::Invalid("track/owner/album ID 0".to_owned()));
+            }
+            if !artist_paths.contains_key(&owner) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} references missing artist {owner}"
+                )));
+            }
+            if !album_paths.contains_key(&album) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} references missing album {album}"
+                )));
+            }
+            let audio = canonical_rel_path(&entry.audio_path, "track audio")?;
+            let Some(extension) = Path::new(&entry.audio_path)
+                .extension()
+                .and_then(|e| e.to_str())
+            else {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} has no audio extension"
+                )));
+            };
+            if audio != track_audio_rel(owner, album, id, extension) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} audio path {} is not canonical",
+                    entry.audio_path
+                )));
+            }
+            let record = canonical_rel_path(&entry.record_path, "track record")?;
+            if record != track_record_rel(owner, album, id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} record path {} is not canonical",
+                    entry.record_path
+                )));
+            }
+            if !seen_audio_paths.insert(entry.audio_path.clone()) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track audio path {} is claimed more than once",
+                    entry.audio_path
+                )));
+            }
+            track_paths.insert(id, audio);
+            track_records.insert(id, record);
+        }
+        for entry in &catalog.playlists {
+            let id = PlaylistId::new(entry.id);
+            if id.get() == 0 {
+                return Err(CanonicalError::Invalid("playlist ID 0".to_owned()));
+            }
+            let rel = canonical_rel_path(&entry.path, "playlist")?;
+            if rel != playlist_rel(id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "playlist {id} path {} is not canonical",
+                    entry.path
+                )));
+            }
+            playlist_paths.insert(id, rel);
+        }
+        if playlist_paths.len() != catalog.playlists.len()
+            || artist_paths.len() != catalog.artists.len()
+            || album_paths.len() != catalog.albums.len()
+            || track_paths.len() != catalog.tracks.len()
+        {
+            return Err(CanonicalError::Invalid(
+                "catalogue contains duplicate entity IDs".to_owned(),
+            ));
+        }
+
+        let mut artists = BTreeMap::new();
+        for (id, rel) in &artist_paths {
+            let file = format!("{}.flux", rel.display_lossy());
+            let dto: ArtistEntityDto =
+                read_json(&safe_join(&root, rel)?.join("artist.flux"), &file)?;
+            check_header(dto.schema_version, &dto.kind, &file, ARTIST_KIND)?;
+            if dto.id != id.get() || dto.id == 0 {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} ID does not match the catalogue"
+                )));
+            }
+            if dto.name.trim().is_empty() {
+                return Err(CanonicalError::Invalid(format!("{file} has an empty name")));
+            }
+            artists.insert(
+                *id,
+                CanonicalArtist {
+                    id: *id,
+                    name: dto.name,
+                    aliases: dto.aliases,
+                },
+            );
+        }
+
+        let mut albums = BTreeMap::new();
+        let mut album_track_membership: HashMap<TrackId, AlbumId> = HashMap::new();
+        for (id, rel) in &album_paths {
+            let owner = catalog
+                .albums
+                .iter()
+                .find(|entry| entry.id == id.get())
+                .map(|entry| ArtistId::new(entry.artist_id))
+                .ok_or_else(|| CanonicalError::Invalid("missing album descriptor".to_owned()))?;
+            let file = format!("{}.flux", rel.display_lossy());
+            let dto: AlbumEntityDto = read_json(&safe_join(&root, rel)?.join("album.flux"), &file)?;
+            check_header(dto.schema_version, &dto.kind, &file, ALBUM_KIND)?;
+            if dto.id != id.get() || dto.owner_artist_id != owner.get() {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} ID/owner does not match the catalogue"
+                )));
+            }
+            if dto.title.trim().is_empty() {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} has an empty title"
+                )));
+            }
+            if let Some(cover) = &dto.cover
+                && (cover.is_empty()
+                    || cover.contains('/')
+                    || cover.contains('\\')
+                    || cover == "."
+                    || cover == "..")
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} has an invalid cover file name"
+                )));
+            }
+            let mut order = Vec::with_capacity(dto.track_order.len());
+            let mut seen = HashSet::new();
+            for raw in dto.track_order {
+                let track = TrackId::new(raw);
+                if !seen.insert(track) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "album {id} lists track {track} more than once"
+                    )));
+                }
+                if album_track_membership.insert(track, *id).is_some() {
+                    return Err(CanonicalError::Invalid(format!(
+                        "track {track} appears in more than one album"
+                    )));
+                }
+                order.push(track);
+            }
+            albums.insert(
+                *id,
+                CanonicalAlbum {
+                    id: *id,
+                    owner_artist_id: owner,
+                    title: dto.title,
+                    release_type: dto.release_type,
+                    cover: dto.cover,
+                    track_order: order,
+                },
+            );
+        }
+
+        let mut tracks = BTreeMap::new();
+        for descriptor in &catalog.tracks {
+            let id = TrackId::new(descriptor.id);
+            let rel = track_records
+                .get(&id)
+                .ok_or_else(|| CanonicalError::Invalid("missing track record path".to_owned()))?;
+            let file = format!("{}.flux", rel.display_lossy());
+            let dto: TrackEntityDto = read_json(&safe_join(&root, rel)?, &file)?;
+            check_header(dto.schema_version, &dto.kind, &file, TRACK_KIND)?;
+            if dto.id != id.get() {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} ID does not match the catalogue"
+                )));
+            }
+            if dto.title.trim().is_empty() {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} has an empty title"
+                )));
+            }
+            let owner = ArtistId::new(descriptor.owner_artist_id);
+            let album_id = AlbumId::new(descriptor.album_id);
+            if dto.owner_artist_id != owner.get() || dto.album_id != album_id.get() {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} owner/album does not match the catalogue"
+                )));
+            }
+            let Some(album) = albums.get(&album_id) else {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} references missing album {album_id}"
+                )));
+            };
+            if album.owner_artist_id != owner {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} owner is not the album owner"
+                )));
+            }
+            if album_track_membership.get(&id) != Some(&album_id)
+                || !album.track_order.contains(&id)
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} is not consistently listed in album {album_id}"
+                )));
+            }
+            if dto.credited_artist_ids.is_empty() {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} has no credited artists"
+                )));
+            }
+            let mut credits = Vec::with_capacity(dto.credited_artist_ids.len());
+            let mut credit_set = HashSet::new();
+            for raw in dto.credited_artist_ids {
+                let artist = ArtistId::new(raw);
+                if !artist_paths.contains_key(&artist) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "track {id} credits missing artist {artist}"
+                    )));
+                }
+                if !credit_set.insert(artist) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "track {id} credits artist {artist} more than once"
+                    )));
+                }
+                credits.push(artist);
+            }
+            if credits.first() != Some(&owner) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id}'s first credited artist must be its owner"
+                )));
+            }
+            if let Some(lyrics) = &dto.lyrics
+                && (lyrics.is_empty()
+                    || lyrics.contains('/')
+                    || lyrics.contains('\\')
+                    || lyrics == "."
+                    || lyrics == "..")
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} has an invalid lyrics file name"
+                )));
+            }
+            tracks.insert(
+                id,
+                CanonicalTrack {
+                    id,
+                    title: dto.title,
+                    credited_artist_ids: credits,
+                    owner_artist_id: owner,
+                    album_id,
+                    track_number: dto.track_number,
+                    disc_number: dto.disc_number,
+                    duration_ms: dto.duration_ms,
+                    lyrics: dto.lyrics,
+                    fingerprint: dto.fingerprint,
+                },
+            );
+        }
+        for album in albums.values() {
+            for track in &album.track_order {
+                if !tracks.contains_key(track) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "album {} references missing track {track}",
+                        album.id
+                    )));
+                }
+            }
+        }
+        if tracks.len() != catalog.tracks.len() {
+            return Err(CanonicalError::Invalid(
+                "catalogue contains duplicate track IDs".to_owned(),
+            ));
+        }
+
+        let mut playlists = BTreeMap::new();
+        for (id, rel) in &playlist_paths {
+            let file = format!("{}.flux", rel.display_lossy());
+            let dto: PlaylistEntityDto = read_json(&safe_join(&root, rel)?, &file)?;
+            check_header(dto.schema_version, &dto.kind, &file, PLAYLIST_KIND)?;
+            if dto.id != id.get() {
+                return Err(CanonicalError::Invalid(format!(
+                    "{file} ID does not match the catalogue"
+                )));
+            }
+            let mut order = Vec::with_capacity(dto.track_ids.len());
+            for raw in dto.track_ids {
+                let track = TrackId::new(raw);
+                if !tracks.contains_key(&track) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "playlist {id} references missing track {track}"
+                    )));
+                }
+                order.push(track);
+            }
+            playlists.insert(
+                *id,
+                CanonicalPlaylist {
+                    id: *id,
+                    name: dto.name,
+                    track_ids: order,
+                },
+            );
+        }
+
+        let ratings_path = canonical_rel_path(&catalog.ratings_path, RATINGS_FILE_NAME)?;
+        if ratings_path != RelPath::from_utf8(RATINGS_FILE_NAME)? {
+            return Err(CanonicalError::Invalid(
+                "ratings_path must be ratings.flux".to_owned(),
+            ));
+        }
+        let ratings_dto: RatingsDto = read_json(&root.join(RATINGS_FILE_NAME), RATINGS_FILE_NAME)?;
+        check_header(
+            ratings_dto.schema_version,
+            &ratings_dto.kind,
+            RATINGS_FILE_NAME,
+            RATINGS_KIND,
+        )?;
+        let mut ratings = BTreeMap::new();
+        for entry in ratings_dto.entries {
+            let track = TrackId::new(entry.track_id);
+            if !tracks.contains_key(&track) {
+                return Err(CanonicalError::Invalid(format!(
+                    "ratings file references missing track {track}"
+                )));
+            }
+            if entry.rating.is_some_and(|rating| rating > 5) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {track} has a rating above 5"
+                )));
+            }
+            if ratings
+                .insert(
+                    track,
+                    TrackRating {
+                        rating: entry.rating,
+                        favorite: entry.favorite,
+                    },
+                )
+                .is_some()
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {track} has duplicate ratings"
+                )));
+            }
+        }
+
+        // Validate every canonical path is representable and free of any
+        // symlink component before handing the library to a caller.
+        for rel in artist_paths
+            .values()
+            .chain(album_paths.values())
+            .chain(track_paths.values())
+            .chain(track_records.values())
+            .chain(playlist_paths.values())
+        {
+            reject_symlink_escape(&root, rel)?;
+        }
+        for audio in track_paths.values() {
+            reject_symlink_escape(&root, audio)?;
+        }
+
+        Ok(Self {
+            root,
+            manifest,
+            catalog,
+            artists,
+            albums,
+            tracks,
+            playlists,
+            ratings,
+            track_paths,
+            track_records,
+            artist_paths,
+            album_paths,
+            playlist_paths,
+        })
+    }
+}
+
+fn validate_catalog_header(catalog: &CatalogDto) -> Result<(), CanonicalError> {
+    check_header(
+        catalog.schema_version,
+        &catalog.kind,
+        CATALOG_FILE_NAME,
+        CATALOG_KIND,
+    )?;
+    if catalog.generation == 0 {
+        return Err(CanonicalError::Invalid("catalogue generation 0".to_owned()));
+    }
+    for (name, value) in [
+        ("next_track_id", catalog.next_track_id),
+        ("next_artist_id", catalog.next_artist_id),
+        ("next_album_id", catalog.next_album_id),
+        ("next_playlist_id", catalog.next_playlist_id),
+    ] {
+        if value == 0 {
+            return Err(CanonicalError::Invalid(format!("{name} is 0")));
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------- file writing ---
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CanonicalError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CanonicalError::Invalid("file has no parent directory".to_owned()))?;
+    fs::create_dir_all(parent)?;
+    let temp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("flux")
+    ));
+    let mut file = fs::File::create(&temp)?;
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temp, path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), CanonicalError> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------ transactions ---
+
+fn transaction_rel(txn: &str) -> RelPath {
+    RelPath::from_utf8(&format!("{TRANSACTIONS_DIR_NAME}/{txn}"))
+        .expect("generated transaction path is valid")
+}
+
+fn write_journal(root: &Path, journal: &JournalDto) -> Result<(), CanonicalError> {
+    let dir = safe_join(root, &transaction_rel(&journal.transaction_id))?;
+    fs::create_dir_all(&dir)?;
+    let bytes = serde_json::to_vec_pretty(journal).map_err(|err| CanonicalError::Malformed {
+        file: "transaction journal".to_owned(),
+        message: err.to_string(),
+    })?;
+    write_atomic(&dir.join("journal.flux"), &bytes)
+}
+
+fn recover_one_transaction(
+    root: &Path,
+    txn_dir: &Path,
+    journal: &JournalDto,
+    _catalog_transaction: Option<&str>,
+) -> Result<(), CanonicalError> {
+    for action in &journal.actions {
+        let rel = canonical_rel_path(&action.target, "transaction journal")?;
+        let target = safe_join(root, &rel)?;
+        match &action.backup {
+            Some(backup) => {
+                let backup = txn_dir.join(backup);
+                if backup.exists() {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::rename(backup, target)?;
+                }
+            }
+            None if !action.existed => {
+                let _ = fs::remove_file(target);
+            }
+            None => {}
+        }
+    }
+    let _ = fs::remove_dir_all(txn_dir);
+    Ok(())
+}
+
+fn recover_transactions(
+    root: &Path,
+    library_id: &str,
+    generation: u64,
+    catalog_transaction: Option<&str>,
+) -> Result<(), CanonicalError> {
+    let dir = root.join(TRANSACTIONS_DIR_NAME);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(&dir)?.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let journal_path = entry.path().join("journal.flux");
+        let journal: JournalDto = read_json(&journal_path, &format!("{name}/journal.flux"))
+            .map_err(|err| CanonicalError::Transaction {
+                file: name.clone(),
+                message: err.to_string(),
+            })?;
+        check_header(
+            journal.schema_version,
+            &journal.kind,
+            &format!("{name}/journal.flux"),
+            JOURNAL_KIND,
+        )
+        .map_err(|err| CanonicalError::Transaction {
+            file: name.clone(),
+            message: err.to_string(),
+        })?;
+        if journal.transaction_id != name {
+            return Err(CanonicalError::Transaction {
+                file: name,
+                message: "journal transaction_id does not match its directory".to_owned(),
+            });
+        }
+        if journal.state == JournalState::Committed
+            || catalog_transaction == Some(journal.transaction_id.as_str())
+        {
+            // The catalogue committed before the journal cleanup. Safe to
+            // discard only this transaction's backups/staging.
+            let _ = fs::remove_dir_all(entry.path());
+            continue;
+        }
+        // Uncommitted. Restore replaced files and delete only files that this
+        // transaction created and explicitly journaled.
+        for action in &journal.actions {
+            let rel = canonical_rel_path(&action.target, &format!("{name}/journal.flux")).map_err(
+                |err| CanonicalError::Transaction {
+                    file: name.clone(),
+                    message: err.to_string(),
+                },
+            )?;
+            let target = safe_join(root, &rel).map_err(|err| CanonicalError::Transaction {
+                file: name.clone(),
+                message: err.to_string(),
+            })?;
+            match &action.backup {
+                Some(backup) => {
+                    let backup = entry.path().join(backup);
+                    if backup.exists() {
+                        if let Some(parent) = target.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::rename(backup, target)?;
+                    }
+                }
+                None if !action.existed => {
+                    let _ = fs::remove_file(target);
+                }
+                None => {}
+            }
+        }
+        let _ = fs::remove_dir_all(entry.path());
+    }
+    // The caller will re-read the catalogue after recovery.
+    let _ = (library_id, generation);
+    Ok(())
+}
+
+// -------------------------------------------------------------- export ---
+
+impl CanonicalLibrary {
+    /// Iterates track audio paths and yields `(TrackId, path, available)`.
+    pub fn track_audio_paths(&self) -> impl Iterator<Item = (TrackId, PathBuf, bool)> + '_ {
+        self.track_paths.keys().filter_map(|id| {
+            self.track_audio_path(*id).map(|path| {
+                let available = fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+                (*id, path, available)
+            })
+        })
+    }
+}
+
+// ------------------------------------------------------------- writes ---
+
+struct PendingWrite {
+    target: RelPath,
+    bytes: Option<Vec<u8>>,
+    copy_from: Option<PathBuf>,
+    expected: Option<ContentFingerprint>,
+}
+
+impl CanonicalLibrary {
+    fn next_transaction_id() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        format!(
+            "txn-{nanos:016x}-{:08x}",
+            COUNTER.fetch_add(1, Ordering::Relaxed) as u32
+        )
+    }
+
+    fn commit_writes(
+        &mut self,
+        new_catalog: Option<CatalogDto>,
+        writes: Vec<PendingWrite>,
+    ) -> Result<(), CanonicalError> {
+        let transaction_id = Self::next_transaction_id();
+        let txn_rel = transaction_rel(&transaction_id);
+        let txn_dir = safe_join(&self.root, &txn_rel)?;
+        fs::create_dir_all(&txn_dir)?;
+
+        let mut actions = Vec::with_capacity(writes.len());
+        for (index, write) in writes.iter().enumerate() {
+            let target = safe_join(&self.root, &write.target)?;
+            let existed = target.exists();
+            let backup = if existed {
+                let name = format!("backup-{index}");
+                let backup_path = txn_dir.join(&name);
+                fs::copy(&target, &backup_path)?;
+                Some(name)
+            } else {
+                None
+            };
+            actions.push(JournalActionDto {
+                target: write.target.display_lossy(),
+                existed,
+                backup,
+                staged_source: None,
+            });
+        }
+        let intended_generation = new_catalog
+            .as_ref()
+            .map_or(self.catalog.generation, |catalog| catalog.generation);
+        let journal = JournalDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: JOURNAL_KIND.to_owned(),
+            transaction_id: transaction_id.clone(),
+            operation: if new_catalog.is_some() {
+                "catalogue-write".to_owned()
+            } else {
+                "metadata-write".to_owned()
+            },
+            state: JournalState::Applying,
+            intended_generation,
+            actions,
+        };
+        write_journal(&self.root, &journal)?;
+
+        let mut catalog_written = false;
+        let result = (|| -> Result<(), CanonicalError> {
+            for write in writes {
+                let target = safe_join(&self.root, &write.target)?;
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if let Some(bytes) = write.bytes {
+                    write_atomic(&target, &bytes)?;
+                } else if let Some(source) = write.copy_from {
+                    let temp = target.with_extension(format!(
+                        "{}.txn-{transaction_id}.tmp",
+                        target
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("flux")
+                    ));
+                    fs::copy(&source, &temp)?;
+                    let file = fs::File::open(&temp)?;
+                    file.sync_all()?;
+                    drop(file);
+                    if let Some(expected) = write.expected
+                        && ContentFingerprint::of_file(&temp)? != expected
+                    {
+                        let _ = fs::remove_file(&temp);
+                        return Err(CanonicalError::Invalid(format!(
+                            "copy verification failed for {}",
+                            source.display()
+                        )));
+                    }
+                    fs::rename(&temp, &target)?;
+                    if let Some(parent) = target.parent() {
+                        sync_directory(parent)?;
+                    }
+                } else {
+                    return Err(CanonicalError::Invalid(
+                        "transaction write has neither bytes nor a source".to_owned(),
+                    ));
+                }
+            }
+            if let Some(mut catalog) = new_catalog {
+                catalog.generation = self.catalog.generation.checked_add(1).ok_or_else(|| {
+                    CanonicalError::Invalid("catalogue generation overflow".to_owned())
+                })?;
+                catalog.transaction_id = Some(transaction_id.clone());
+                let catalog_path = self.root.join(CATALOG_FILE_NAME);
+                if catalog_path.exists() {
+                    let prior = fs::read(&catalog_path)?;
+                    let backup_name = format!("catalog-gen-{}.flux", self.catalog.generation);
+                    write_atomic(&self.root.join(BACKUPS_DIR_NAME).join(backup_name), &prior)?;
+                    write_atomic(&self.root.join(CATALOG_BACKUP_FILE_NAME), &prior)?;
+                }
+                let bytes = serde_json::to_vec_pretty(&catalog).map_err(|err| {
+                    CanonicalError::Malformed {
+                        file: CATALOG_FILE_NAME.to_owned(),
+                        message: err.to_string(),
+                    }
+                })?;
+                write_atomic(&catalog_path, &bytes)?;
+                catalog_written = true;
+            }
+            let mut committed = journal.clone();
+            committed.state = JournalState::Committed;
+            write_journal(&self.root, &committed)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&txn_dir);
+                Ok(())
+            }
+            Err(err) => {
+                // Restore using the journal we just wrote.
+                let _ = recover_one_transaction(&self.root, &txn_dir, &journal, None);
+                Err(err)
+            }
+        }
+    }
+
+    fn reopen_after(&mut self) -> Result<(), CanonicalError> {
+        let reopened = Self::open(&self.root)?;
+        *self = reopened;
+        Ok(())
+    }
+
+    fn ensure_no_duplicate_name(&self, name: &str) -> Result<(), CanonicalError> {
+        if name.trim().is_empty() {
+            return Err(CanonicalError::Invalid(
+                "names must not be empty".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Creates an artist with a stable new ID.
+    pub fn create_artist(
+        &mut self,
+        name: impl Into<String>,
+        aliases: Vec<String>,
+    ) -> Result<ArtistId, CanonicalError> {
+        self.ensure_writable()?;
+        let name = name.into().trim().to_owned();
+        self.ensure_no_duplicate_name(&name)?;
+        let id = ArtistId::new(self.catalog.next_artist_id);
+        let rel = artist_rel(id);
+        let file = ArtistEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ARTIST_KIND.to_owned(),
+            id: id.get(),
+            name,
+            aliases: aliases
+                .into_iter()
+                .map(|alias| alias.trim().to_owned())
+                .filter(|alias| !alias.is_empty())
+                .collect(),
+        };
+        let mut catalog = self.catalog.clone();
+        catalog.next_artist_id = catalog
+            .next_artist_id
+            .checked_add(1)
+            .ok_or_else(|| CanonicalError::Invalid("artist counter overflow".to_owned()))?;
+        catalog.artists.push(CatalogArtistDto {
+            id: id.get(),
+            path: rel.display_lossy(),
+        });
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &rel, "artist.flux", &file)?;
+        self.commit_writes(Some(catalog), writes)?;
+        self.reopen_after()?;
+        Ok(id)
+    }
+
+    /// Renames an artist without changing its ID or directory name. The
+    /// canonical directory is ID-derived, so no physical move is needed.
+    pub fn rename_artist(
+        &mut self,
+        id: ArtistId,
+        name: impl Into<String>,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let artist =
+            self.artists.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("artist {id} is not in the library"))
+            })?;
+        let name = name.into().trim().to_owned();
+        self.ensure_no_duplicate_name(&name)?;
+        let dto = ArtistEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ARTIST_KIND.to_owned(),
+            id: id.get(),
+            name,
+            aliases: artist.aliases,
+        };
+        let rel = self
+            .artist_paths
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing artist path".to_owned()))?;
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &rel, "artist.flux", &dto)?;
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Creates an empty album under an existing artist.
+    pub fn create_album(
+        &mut self,
+        owner: ArtistId,
+        title: impl Into<String>,
+        release_type: ReleaseType,
+    ) -> Result<AlbumId, CanonicalError> {
+        self.ensure_writable()?;
+        if !self.artists.contains_key(&owner) {
+            return Err(CanonicalError::Invalid(format!(
+                "owner artist {owner} is not in the library"
+            )));
+        }
+        let title = title.into().trim().to_owned();
+        self.ensure_no_duplicate_name(&title)?;
+        let id = AlbumId::new(self.catalog.next_album_id);
+        let rel = album_rel(owner, id);
+        let dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: id.get(),
+            owner_artist_id: owner.get(),
+            title,
+            release_type,
+            cover: None,
+            track_order: Vec::new(),
+        };
+        let mut catalog = self.catalog.clone();
+        catalog.next_album_id = catalog
+            .next_album_id
+            .checked_add(1)
+            .ok_or_else(|| CanonicalError::Invalid("album counter overflow".to_owned()))?;
+        catalog.albums.push(CatalogAlbumDto {
+            id: id.get(),
+            artist_id: owner.get(),
+            path: rel.display_lossy(),
+        });
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &rel, "album.flux", &dto)?;
+        self.commit_writes(Some(catalog), writes)?;
+        self.reopen_after()?;
+        Ok(id)
+    }
+
+    /// Describes one file to import. Metadata is supplied by the caller; this
+    /// API never reads audio tags.
+    pub fn import_track(
+        &mut self,
+        imported: CanonicalImportedTrack,
+    ) -> Result<TrackId, CanonicalError> {
+        self.ensure_writable()?;
+        let source = imported.source;
+        let fingerprint = ContentFingerprint::of_file(&source)?;
+        let extension = source
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .ok_or_else(|| CanonicalError::Invalid("source has no usable extension".to_owned()))?;
+        if extension.is_empty() || !extension.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(CanonicalError::Invalid(
+                "source extension is not a safe canonical suffix".to_owned(),
+            ));
+        }
+        let title = imported.title.trim().to_owned();
+        if title.is_empty() {
+            return Err(CanonicalError::Invalid(
+                "track title must not be empty".to_owned(),
+            ));
+        }
+        let artist_name = imported.artist_name.trim().to_owned();
+        self.ensure_no_duplicate_name(&artist_name)?;
+        let album_title = imported
+            .album_title
+            .map(|title| title.trim().to_owned())
+            .filter(|title| !title.is_empty())
+            .ok_or_else(|| {
+                CanonicalError::Invalid("canonical imports require an album title".to_owned())
+            })?;
+
+        let mut catalog = self.catalog.clone();
+        let mut writes = Vec::new();
+
+        let artist_id = match catalog.artists.iter().find(|entry| {
+            self.artists
+                .get(&ArtistId::new(entry.id))
+                .is_some_and(|artist| artist.name == artist_name)
+        }) {
+            Some(entry) => ArtistId::new(entry.id),
+            None => {
+                let id = ArtistId::new(catalog.next_artist_id);
+                catalog.next_artist_id = catalog
+                    .next_artist_id
+                    .checked_add(1)
+                    .ok_or_else(|| CanonicalError::Invalid("artist counter overflow".to_owned()))?;
+                let rel = artist_rel(id);
+                catalog.artists.push(CatalogArtistDto {
+                    id: id.get(),
+                    path: rel.display_lossy(),
+                });
+                let artist = ArtistEntityDto {
+                    schema_version: CANONICAL_SCHEMA_VERSION,
+                    kind: ARTIST_KIND.to_owned(),
+                    id: id.get(),
+                    name: artist_name,
+                    aliases: Vec::new(),
+                };
+                push_entity_write(&mut writes, &rel, "artist.flux", &artist)?;
+                id
+            }
+        };
+
+        let mut album = catalog.albums.iter().find_map(|entry| {
+            let id = AlbumId::new(entry.id);
+            self.albums
+                .get(&id)
+                .filter(|album| album.owner_artist_id == artist_id && album.title == album_title)
+                .cloned()
+                .map(|album| (id, album))
+        });
+        let (album_id, album_rel_path, mut album) = match album.take() {
+            Some((id, album)) => (
+                id,
+                self.album_paths
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| CanonicalError::Invalid("missing album path".to_owned()))?,
+                album,
+            ),
+            None => {
+                let id = AlbumId::new(catalog.next_album_id);
+                catalog.next_album_id = catalog
+                    .next_album_id
+                    .checked_add(1)
+                    .ok_or_else(|| CanonicalError::Invalid("album counter overflow".to_owned()))?;
+                let rel = album_rel(artist_id, id);
+                catalog.albums.push(CatalogAlbumDto {
+                    id: id.get(),
+                    artist_id: artist_id.get(),
+                    path: rel.display_lossy(),
+                });
+                (
+                    id,
+                    album_rel(artist_id, id),
+                    CanonicalAlbum {
+                        id,
+                        owner_artist_id: artist_id,
+                        title: album_title,
+                        release_type: imported.release_type,
+                        cover: None,
+                        track_order: Vec::new(),
+                    },
+                )
+            }
+        };
+
+        let track_id = TrackId::new(catalog.next_track_id);
+        catalog.next_track_id = catalog
+            .next_track_id
+            .checked_add(1)
+            .ok_or_else(|| CanonicalError::Invalid("track counter overflow".to_owned()))?;
+        let audio_rel = track_audio_rel(artist_id, album_id, track_id, &extension);
+        let record_rel = track_record_rel(artist_id, album_id, track_id);
+        catalog.tracks.push(CatalogTrackDto {
+            id: track_id.get(),
+            owner_artist_id: artist_id.get(),
+            album_id: album_id.get(),
+            audio_path: audio_rel.display_lossy(),
+            record_path: record_rel.display_lossy(),
+        });
+
+        album.track_order.push(track_id);
+        let album_dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: album_id.get(),
+            owner_artist_id: artist_id.get(),
+            title: album.title,
+            release_type: album.release_type,
+            cover: album.cover,
+            track_order: album.track_order.iter().map(|id| id.get()).collect(),
+        };
+        let track_dto = TrackEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: TRACK_KIND.to_owned(),
+            id: track_id.get(),
+            title,
+            credited_artist_ids: vec![artist_id.get()],
+            owner_artist_id: artist_id.get(),
+            album_id: album_id.get(),
+            track_number: imported.track_number,
+            disc_number: imported.disc_number,
+            duration_ms: imported.duration_ms,
+            lyrics: None,
+            fingerprint: Some(fingerprint),
+        };
+        push_entity_write(&mut writes, &album_rel_path, "album.flux", &album_dto)?;
+        push_file_write(&mut writes, &record_rel, &track_dto)?;
+        writes.push(PendingWrite {
+            target: audio_rel,
+            bytes: None,
+            copy_from: Some(source),
+            expected: Some(fingerprint),
+        });
+        self.commit_writes(Some(catalog), writes)?;
+        self.reopen_after()?;
+        Ok(track_id)
+    }
+
+    /// Updates track metadata. Owner/album are intentionally not changed by
+    /// this method; ownership moves have a separate plan/transfer workflow.
+    pub fn update_track_metadata(
+        &mut self,
+        id: TrackId,
+        title: impl Into<String>,
+        credited_artist_ids: Vec<ArtistId>,
+        track_number: Option<u32>,
+        disc_number: Option<u32>,
+        duration_ms: Option<u64>,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let track =
+            self.tracks.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("track {id} is not in the library"))
+            })?;
+        let title = title.into().trim().to_owned();
+        if title.is_empty() {
+            return Err(CanonicalError::Invalid(
+                "track title must not be empty".to_owned(),
+            ));
+        }
+        if credited_artist_ids.is_empty()
+            || credited_artist_ids[0] != track.owner_artist_id
+            || credited_artist_ids
+                .iter()
+                .any(|artist| !self.artists.contains_key(artist))
+        {
+            return Err(CanonicalError::Invalid(
+                "credits must be non-empty, start with the owner, and reference known artists"
+                    .to_owned(),
+            ));
+        }
+        let rel = self
+            .track_records
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing track record path".to_owned()))?;
+        let dto = TrackEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: TRACK_KIND.to_owned(),
+            id: id.get(),
+            title,
+            credited_artist_ids: credited_artist_ids.iter().map(|id| id.get()).collect(),
+            owner_artist_id: track.owner_artist_id.get(),
+            album_id: track.album_id.get(),
+            track_number,
+            disc_number,
+            duration_ms,
+            lyrics: track.lyrics,
+            fingerprint: track.fingerprint,
+        };
+        let mut writes = Vec::new();
+        push_file_write(&mut writes, &rel, &dto)?;
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Writes/replaces a managed cover. No image decoding is performed; the
+    /// extension and bounded size are validated, and the file is installed
+    /// atomically. Missing covers never invalidate the album.
+    pub fn set_cover(
+        &mut self,
+        album_id: AlbumId,
+        source: &Path,
+        extension: &str,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+        if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+            return Err(CanonicalError::Invalid(
+                "cover must be png, jpg, jpeg, or webp".to_owned(),
+            ));
+        }
+        let size = fs::metadata(source)?.len();
+        if size == 0 || size > 16 * 1024 * 1024 {
+            return Err(CanonicalError::Invalid(
+                "cover must be between 1 byte and 16 MiB".to_owned(),
+            ));
+        }
+        let album = self
+            .albums
+            .get(&album_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("album is not in the library".to_owned()))?;
+        let album_rel_path = self
+            .album_paths
+            .get(&album_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing album path".to_owned()))?;
+        let cover_name = format!("cover.{extension}");
+        let album_dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: album_id.get(),
+            owner_artist_id: album.owner_artist_id.get(),
+            title: album.title,
+            release_type: album.release_type,
+            cover: Some(cover_name.clone()),
+            track_order: album.track_order.iter().map(|id| id.get()).collect(),
+        };
+        let cover_rel = RelPath::from_utf8(&format!(
+            "{}/{}",
+            album_rel_path.display_lossy(),
+            cover_name
+        ))?;
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &album_rel_path, "album.flux", &album_dto)?;
+        writes.push(PendingWrite {
+            target: cover_rel,
+            bytes: None,
+            copy_from: Some(source.to_path_buf()),
+            expected: Some(ContentFingerprint::of_file(source)?),
+        });
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Writes or removes a managed lyrics file. The caller supplies text; no
+    /// tag metadata is consulted.
+    pub fn set_lyrics(&mut self, id: TrackId, lyrics: Option<&str>) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let track = self
+            .tracks
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("track is not in the library".to_owned()))?;
+        let record_rel = self
+            .track_records
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing track record".to_owned()))?;
+        let lyrics_name = lyrics.map(|_| format!("track_{:06}.lrc", id.get()));
+        let dto = TrackEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: TRACK_KIND.to_owned(),
+            id: id.get(),
+            title: track.title,
+            credited_artist_ids: track
+                .credited_artist_ids
+                .iter()
+                .map(|artist| artist.get())
+                .collect(),
+            owner_artist_id: track.owner_artist_id.get(),
+            album_id: track.album_id.get(),
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            duration_ms: track.duration_ms,
+            lyrics: lyrics_name.clone(),
+            fingerprint: track.fingerprint,
+        };
+        let mut writes = Vec::new();
+        push_file_write(&mut writes, &record_rel, &dto)?;
+        if let (Some(name), Some(text)) = (lyrics_name, lyrics) {
+            let rel = RelPath::from_utf8(&format!(
+                "{}/{}",
+                record_rel
+                    .display_lossy()
+                    .rsplit_once('/')
+                    .map_or("", |(dir, _)| dir),
+                name
+            ))?;
+            writes.push(PendingWrite {
+                target: rel,
+                bytes: Some(text.as_bytes().to_vec()),
+                copy_from: None,
+                expected: None,
+            });
+        }
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Writes a playlist file and registers it in the catalogue.
+    pub fn set_playlist(
+        &mut self,
+        id: Option<PlaylistId>,
+        name: impl Into<String>,
+        track_ids: Vec<TrackId>,
+    ) -> Result<PlaylistId, CanonicalError> {
+        self.ensure_writable()?;
+        let name = name.into().trim().to_owned();
+        if name.is_empty() {
+            return Err(CanonicalError::Invalid(
+                "playlist name must not be empty".to_owned(),
+            ));
+        }
+        for track in &track_ids {
+            if !self.tracks.contains_key(track) {
+                return Err(CanonicalError::Invalid(format!(
+                    "playlist references missing track {track}"
+                )));
+            }
+        }
+        let id = id.unwrap_or_else(|| PlaylistId::new(self.catalog.next_playlist_id));
+        let rel = playlist_rel(id);
+        let dto = PlaylistEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: PLAYLIST_KIND.to_owned(),
+            id: id.get(),
+            name,
+            track_ids: track_ids.iter().map(|track| track.get()).collect(),
+        };
+        let mut catalog = self.catalog.clone();
+        if !catalog.playlists.iter().any(|entry| entry.id == id.get()) {
+            if id.get() != catalog.next_playlist_id {
+                return Err(CanonicalError::Invalid(
+                    "new playlist ID does not match the counter".to_owned(),
+                ));
+            }
+            catalog.next_playlist_id = catalog
+                .next_playlist_id
+                .checked_add(1)
+                .ok_or_else(|| CanonicalError::Invalid("playlist counter overflow".to_owned()))?;
+            catalog.playlists.push(CatalogPlaylistDto {
+                id: id.get(),
+                path: rel.display_lossy(),
+            });
+        }
+        let mut writes = Vec::new();
+        push_file_write(&mut writes, &rel, &dto)?;
+        self.commit_writes(Some(catalog), writes)?;
+        self.reopen_after()?;
+        Ok(id)
+    }
+
+    /// Stores/removes a rating and favorite flag.
+    pub fn set_rating(
+        &mut self,
+        id: TrackId,
+        rating: Option<u8>,
+        favorite: bool,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        if !self.tracks.contains_key(&id) {
+            return Err(CanonicalError::Invalid(
+                "track is not in the library".to_owned(),
+            ));
+        }
+        if rating.is_some_and(|rating| rating > 5) {
+            return Err(CanonicalError::Invalid("rating must be 0..=5".to_owned()));
+        }
+        let mut entries = self
+            .ratings
+            .iter()
+            .map(|(track, value)| RatingEntryDto {
+                track_id: track.get(),
+                rating: value.rating,
+                favorite: value.favorite,
+            })
+            .collect::<Vec<_>>();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.track_id == id.get()) {
+            entry.rating = rating;
+            entry.favorite = favorite;
+        } else {
+            entries.push(RatingEntryDto {
+                track_id: id.get(),
+                rating,
+                favorite,
+            });
+        }
+        entries.sort_by_key(|entry| entry.track_id);
+        let dto = RatingsDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: RATINGS_KIND.to_owned(),
+            entries,
+        };
+        let bytes = serde_json::to_vec_pretty(&dto).map_err(|err| CanonicalError::Malformed {
+            file: RATINGS_FILE_NAME.to_owned(),
+            message: err.to_string(),
+        })?;
+        let writes = vec![PendingWrite {
+            target: RelPath::from_utf8(RATINGS_FILE_NAME)?,
+            bytes: Some(bytes),
+            copy_from: None,
+            expected: None,
+        }];
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    fn ensure_writable(&self) -> Result<(), CanonicalError> {
+        Ok(())
+    }
+}
+
+fn push_entity_write<T: Serialize>(
+    writes: &mut Vec<PendingWrite>,
+    dir: &RelPath,
+    file: &str,
+    value: &T,
+) -> Result<(), CanonicalError> {
+    let rel = RelPath::from_utf8(&format!("{}/{}", dir.display_lossy(), file))?;
+    push_file_write(writes, &rel, value)
+}
+
+fn push_file_write<T: Serialize>(
+    writes: &mut Vec<PendingWrite>,
+    rel: &RelPath,
+    value: &T,
+) -> Result<(), CanonicalError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|err| CanonicalError::Malformed {
+        file: rel.display_lossy(),
+        message: err.to_string(),
+    })?;
+    writes.push(PendingWrite {
+        target: rel.clone(),
+        bytes: Some(bytes),
+        copy_from: None,
+        expected: None,
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use flux_core::{ArtistId, TrackId};
+
+    use super::{
+        CanonicalError, CanonicalImportedTrack, CanonicalLibrary, ContentFingerprint, ReleaseType,
+    };
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "flux-canonical-test-{}-{name}-{unique}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("temp");
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            fs::create_dir_all(path.parent().expect("parent")).expect("parents");
+            fs::write(&path, bytes).expect("write");
+            path
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn import(dir: &TempDir, library: &mut CanonicalLibrary, name: &str) -> TrackId {
+        let source = dir.write(
+            &format!("source/{name}"),
+            b"not real audio, but a managed opaque resource",
+        );
+        library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: format!("Title {name}"),
+                artist_name: "Artist One".to_owned(),
+                album_title: Some("Album One".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: Some(1),
+                duration_ms: Some(123_000),
+            })
+            .expect("import")
+    }
+
+    #[test]
+    fn create_import_reopen_and_relative_layout() {
+        let dir = TempDir::new("create");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        assert_eq!(library.artists().count(), 0);
+        let track_id = import(&dir, &mut library, "one.wav");
+        drop(library);
+
+        let opened = CanonicalLibrary::open(&root).expect("open");
+        assert_eq!(opened.library_id().len(), 32);
+        assert_eq!(opened.generation(), 2);
+        assert_eq!(opened.artists().count(), 1);
+        assert_eq!(opened.albums().count(), 1);
+        assert_eq!(opened.tracks().count(), 1);
+        let track = opened.track(track_id).expect("track");
+        assert_eq!(track.title, "Title one.wav");
+        assert_eq!(track.credited_artist_ids, vec![ArtistId::new(1)]);
+        let audio = opened.track_audio_path(track_id).expect("audio path");
+        assert!(audio.starts_with(&root));
+        assert!(
+            audio.ends_with("artists/artist_000001/albums/album_000001/tracks/track_000001.wav")
+        );
+        assert_eq!(
+            fs::read(&audio).expect("audio"),
+            b"not real audio, but a managed opaque resource"
+        );
+        assert!(opened.track_record_path(track_id).is_some());
+        assert!(opened.track_available(track_id));
+        let fingerprint = ContentFingerprint::of_file(&audio).expect("fingerprint");
+        assert_eq!(track.fingerprint, Some(fingerprint));
+        assert_eq!(opened.rating(track_id), None);
+    }
+
+    #[test]
+    fn renames_preserve_ids_and_relationships() {
+        let dir = TempDir::new("rename");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let track_id = import(&dir, &mut library, "one.wav");
+        let artist_id = library.track(track_id).expect("track").owner_artist_id;
+        let album_id = library.track(track_id).expect("track").album_id;
+        library
+            .rename_artist(artist_id, "Renamed Artist")
+            .expect("rename");
+        assert_eq!(
+            library.artist(artist_id).map(|artist| artist.name.as_str()),
+            Some("Renamed Artist")
+        );
+        assert_eq!(library.track(track_id).map(|t| t.id), Some(track_id));
+        assert_eq!(library.album(album_id).map(|a| a.id), Some(album_id));
+        assert_eq!(
+            library
+                .track(track_id)
+                .map(|t| t.credited_artist_ids.clone()),
+            Some(vec![artist_id])
+        );
+        drop(library);
+        let reopened = CanonicalLibrary::open(&root).expect("reopen");
+        assert_eq!(
+            reopened.artist(artist_id).map(|a| a.name.as_str()),
+            Some("Renamed Artist")
+        );
+    }
+
+    #[test]
+    fn lyrics_playlist_ratings_and_cover_are_managed_resources() {
+        let dir = TempDir::new("resources");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let track_id = import(&dir, &mut library, "one.wav");
+        let album_id = library.track(track_id).expect("track").album_id;
+        library
+            .set_lyrics(track_id, Some("[00:00.00]hello\n"))
+            .expect("lyrics");
+        let playlist = library
+            .set_playlist(None, "Favorites", vec![track_id])
+            .expect("playlist");
+        library.set_rating(track_id, Some(5), true).expect("rating");
+        let cover = dir.write("art/cover.png", b"fake png bytes");
+        library.set_cover(album_id, &cover, "png").expect("cover");
+        drop(library);
+
+        let opened = CanonicalLibrary::open(&root).expect("open resources");
+        assert!(opened.playlist(playlist).is_some());
+        assert_eq!(
+            opened.playlist(playlist).map(|p| p.track_ids.clone()),
+            Some(vec![track_id])
+        );
+        assert_eq!(
+            opened.rating(track_id),
+            Some(super::TrackRating {
+                rating: Some(5),
+                favorite: true
+            })
+        );
+        let track = opened.track(track_id).expect("track");
+        let lyrics = track.lyrics.as_ref().expect("lyrics");
+        let album_dir = opened.album_dir(album_id).expect("album dir");
+        assert!(album_dir.join("tracks").join(lyrics).exists());
+        assert!(album_dir.join("cover.png").exists());
+    }
+
+    #[test]
+    fn malformed_or_conflicting_catalogue_is_rejected() {
+        let dir = TempDir::new("malformed");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let track = import(&dir, &mut library, "one.wav");
+        drop(library);
+        let catalog_path = root.join("catalog.flux");
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("catalog")).expect("json");
+        catalog["tracks"][0]["audio_path"] = serde_json::json!("../escape.wav");
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("bytes"),
+        )
+        .expect("write");
+        assert!(matches!(
+            CanonicalLibrary::open(&root),
+            Err(CanonicalError::InvalidPath(_)) | Err(CanonicalError::Invalid(_))
+        ));
+        let _ = track;
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_rejected_without_rewrite() {
+        let dir = TempDir::new("version");
+        let root = dir.path().join("FluxLibrary");
+        CanonicalLibrary::create(&root).expect("create");
+        let manifest_path = root.join(super::LIBRARY_FILE_NAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest")).expect("json");
+        manifest["schema_version"] = serde_json::json!(99);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("bytes"),
+        )
+        .expect("write");
+        let before = fs::read(&manifest_path).expect("before");
+        assert!(matches!(
+            CanonicalLibrary::open(&root),
+            Err(CanonicalError::UnsupportedVersion { found: 99, .. })
+        ));
+        assert_eq!(fs::read(&manifest_path).expect("after"), before);
+    }
+
+    #[test]
+    fn uncommitted_transaction_rolls_back_and_committed_cleanup_is_idempotent() {
+        let dir = TempDir::new("recover");
+        let root = dir.path().join("FluxLibrary");
+        let library = CanonicalLibrary::create(&root).expect("create");
+        let original = root.join("ratings.flux");
+        let before = fs::read(&original).expect("ratings");
+        let txn = "txn-recover";
+        let txn_dir = root.join(super::TRANSACTIONS_DIR_NAME).join(txn);
+        fs::create_dir_all(&txn_dir).expect("txn");
+        fs::write(txn_dir.join("backup-0"), &before).expect("backup");
+        fs::write(
+            txn_dir.join("journal.flux"),
+            br#"{
+            "schema_version": 1,
+            "kind": "flux-transaction",
+            "transaction_id": "txn-recover",
+            "operation": "test",
+            "state": "applying",
+            "intended_generation": 1,
+            "actions": [
+                {"target": "ratings.flux", "existed": true, "backup": "backup-0"},
+                {"target": "orphan.txt", "existed": false}
+            ]
+        }"#,
+        )
+        .expect("journal");
+        fs::write(&original, b"corrupt pending bytes").expect("pending");
+        fs::write(root.join("orphan.txt"), b"orphan").expect("orphan");
+        drop(library);
+        let reopened = CanonicalLibrary::open(&root).expect("recover");
+        assert_eq!(
+            fs::read(root.join("ratings.flux")).expect("restored"),
+            before
+        );
+        assert!(!root.join("orphan.txt").exists());
+        assert!(!txn_dir.exists());
+        assert_eq!(reopened.track(TrackId::new(99)), None);
+    }
+
+    #[test]
+    fn playlist_and_rating_validation_rejects_dangling_refs() {
+        let dir = TempDir::new("dangling");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let track = import(&dir, &mut library, "one.wav");
+        let playlist = library
+            .set_playlist(None, "P", vec![track])
+            .expect("playlist");
+        let path = library.playlist_path(playlist).expect("path");
+        drop(library);
+        let mut dto: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("playlist")).expect("json");
+        dto["track_ids"] = serde_json::json!([999]);
+        fs::write(&path, serde_json::to_vec_pretty(&dto).expect("bytes")).expect("write");
+        assert!(matches!(
+            CanonicalLibrary::open(&root),
+            Err(CanonicalError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_paths_cannot_escape_via_symlink() {
+        #[cfg(unix)]
+        {
+            let dir = TempDir::new("symlink");
+            let root = dir.path().join("FluxLibrary");
+            let mut library = CanonicalLibrary::create(&root).expect("create");
+            let track = import(&dir, &mut library, "one.wav");
+            let audio = library.track_audio_path(track).expect("audio");
+            let outside = dir.write("outside.wav", b"outside");
+            fs::remove_file(&audio).expect("remove");
+            std::os::unix::fs::symlink(&outside, &audio).expect("symlink");
+            drop(library);
+            assert!(matches!(
+                CanonicalLibrary::open(&root),
+                Err(CanonicalError::Invalid(_))
+            ));
+        }
+    }
+}
