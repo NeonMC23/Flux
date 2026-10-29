@@ -110,7 +110,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use flux_core::TrackId;
+use flux_core::{ArtistId, TrackId};
 
 use crate::library_lock::{LibraryLock, LibraryLockError};
 use crate::portable::{
@@ -1272,6 +1272,35 @@ pub fn execute_migration(plan: &MigrationPlan) -> Result<MigrationReport, Migrat
         .collect();
     imports.sort_by_key(|record| record.id.get());
 
+    // Legacy metadata has only artist names, not identities. Mint one
+    // stable artist per distinct trimmed name so migrated tracks participate
+    // in rename/relationship semantics immediately; no name-based merge of
+    // multiple existing identities can occur because the destination was
+    // required to be empty.
+    let mut artist_ids: HashMap<String, ArtistId> = HashMap::new();
+    for record in &mut imports {
+        let Some(name) = record
+            .tags
+            .artist
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let artist_id = match artist_ids.get(name) {
+            Some(id) => *id,
+            None => {
+                let id = store
+                    .create_artist(name)
+                    .map_err(|err| portable_failure(MigrationStage::ImportRecords, root, err))?;
+                artist_ids.insert(name.to_owned(), id);
+                id
+            }
+        };
+        record.artist_id = Some(artist_id);
+    }
+
     store
         .import_tracks(imports, plan.source_next_id)
         .map_err(|err| portable_failure(MigrationStage::ImportRecords, root, err))?;
@@ -1515,6 +1544,12 @@ mod tests {
             "inside-root path mapped to a clean relative path"
         );
         assert_eq!(song_record.availability(), Availability::Present);
+        let artist_id = song_record.artist_id().expect("artist relationship");
+        assert_eq!(
+            store.artist(artist_id).map(|artist| artist.name()),
+            Some("The Artist"),
+            "legacy names become stable artist identities on migration"
+        );
         assert_eq!(
             song_record.file().map(|f| f.size_bytes),
             Some(4),
