@@ -117,23 +117,95 @@ need an explicit replacement credit list, and multi-item resumable recovery must
 exist before destructive deletion can be enabled. No GUI/TUI control deletes an
 artist.
 
-## Transactions and recovery
+## Transaction state machine and recovery
 
-- A batch writes `transactions/<txn>/journal.flux` before changing files,
-  backs up replaced files inside the transaction directory, installs data with
-  same-directory temporary files plus renames, publishes `catalog.flux` last,
-  marks the journal committed, then removes backups.
-- Open scans journals before normal use. A journal whose transaction ID matches
-  the committed catalogue is cleaned up; an uncommitted journal restores
-  backups and removes only journaled created files. Malformed journals stop
-  open rather than deleting data.
-- Paths with absolute components, traversal, non-UTF-8 canonical text or any
-  symlink component are rejected. Audio may be missing at runtime, but migration
-  blocks on missing source files.
-- Catalog backups are retained as recovery artifacts. Automatic rollback from a
-  catalog-only backup is deliberately **not** implemented: metadata files can
-  advance independently, so a stale catalogue would be inconsistent. This is a
-  known limitation requiring a future generation-consistent snapshot.
+Ownership transfer uses the canonical batch journal. The persisted states are:
+
+| State | Meaning | Recovery decision |
+|---|---|---|
+| `prepared` | Journal is durable; resources are not yet staged. | Uncommitted: roll back. |
+| `copying` | Destination resources are being staged inside the transaction directory. | Uncommitted: roll back; staging is discarded. |
+| `verified` | All staged copies passed size/content verification. | Uncommitted: roll back. |
+| `publishing` | Staged resources may be replacing entity files; catalogue is not yet authoritative. | Uncommitted unless the catalogue records this transaction ID: roll back. |
+| `committed` | The catalogue was atomically published and records this transaction ID. | Finish cleanup only if the catalogue records the ID; otherwise recovery-required. |
+| `cleaning` | Obsolete source resources are being removed. | Same catalogue-ID check, then finish cleanup idempotently. |
+| `completed` | Cleanup finished; only journal removal remains. | Same catalogue-ID check, then finish cleanup/remove journal. |
+| `rolled_back` | Reserved for an explicitly recorded rollback. | Treated as uncommitted; rollback is idempotent and the journal is only then removed. |
+| `applying` | Legacy journals from the earlier implementation. | Treat as uncommitted unless the catalogue records its ID. |
+
+`Planned` is the in-memory ownership plan and creates no persistent mutation.
+The **single authoritative commit point is `catalog.flux` containing the
+transaction ID**. Destination files existing alone never imply commitment.
+A malformed, truncated, unknown-version, missing or ambiguous journal stops open
+with a recovery-required error and preserves the transaction directory and
+valuable files.
+
+### Persistence sequence
+
+1. Create `transactions/<txn>/`, synchronize the transactions directory, back up
+   every replaced target, and synchronize the transaction directory.
+2. Write `journal.flux` with `prepared`, using a synced temporary file, rename,
+   and parent-directory sync.
+3. Stage every byte payload and audio/lyrics copy inside the transaction
+   directory, syncing each staged file. Verify expected content fingerprints.
+4. Write `verified`, then `publishing`.
+5. Publish staged entity files with same-filesystem renames and parent-directory
+   syncs.
+6. Publish `catalog.flux` last. Its transaction ID is the commit record.
+7. Write `committed`, `cleaning`, remove only journal-owned obsolete resources
+   (checking the active catalogue never references them), write `completed`, then
+   remove the transaction directory.
+8. On any error before catalogue publication, rollback restores backups and
+   deletes only transaction-created targets. On interruption, no rollback runs;
+   reopen follows the journal/catalogue decision above.
+
+Staging inside `transactions/<txn>/` prevents partially copied resources from
+appearing as destination files. Cross-filesystem source copies are performed as
+verified copy-then-publish; target publication uses same-root renames. Files are
+never removed merely because they are unreferenced by a partial catalogue.
+
+### Failure-injection matrix
+
+Test-only, deterministic boundaries are injected through a scoped
+`TransactionFailure` value; production has no user-facing control. The transfer
+matrix exercises all 18 points below with an abrupt interruption, then drops the
+library, reopens/recoveries twice, and checks the old-or-new authority, exact
+audio/lyrics bytes, owner, album, credits, ratings, playlists, TrackId and one
+physical audio copy:
+
+1. before journal creation;
+2. after durable journal preparation;
+3. before staging;
+4. during generic staging;
+5. during audio staging;
+6. after audio staging before verification;
+7. during lyrics staging;
+8. after copy before verification;
+9. after verification;
+10. before metadata publication;
+11. after a metadata/resource publication step;
+12. before catalogue publication;
+13. immediately after catalogue publication;
+14. before cleanup;
+15. during source-audio/record cleanup;
+16. during source-lyrics cleanup;
+17. after cleanup;
+18. before journal finalization.
+
+Additional tests cover rollback retry, referenced-path cleanup refusal, and
+malformed/truncated/unknown-version/orphan journals. Recovery is idempotent and
+preserves ambiguous resources.
+
+### Durability limits
+
+The implementation flushes journals and staged files and synchronizes parent
+directories after critical renames on Unix. It cannot promise stronger
+power-loss guarantees than the filesystem/device cache honors, nor atomic
+multi-file visibility across independent renames. The catalogue is the sole
+commit record, so those renames are reconciled by journal rollback/cleanup.
+Unsupported or read-only storage fails visibly; no automatic repair is attempted
+for a malformed journal. Catalog-only backup restoration remains disabled because
+it is not generation-consistent with per-entity files.
 
 ## Migration
 
@@ -174,7 +246,9 @@ cleanup.
 6. Playlists, ratings/favorites and lyrics have canonical Controller APIs and
    persistence tests, but no GUI/TUI screens.
 7. Automatic catalogue-backup rollback is not generation-consistent and is
-   disabled; transaction-journal recovery is implemented and tested.
+   disabled; transaction-journal recovery is implemented and test-injected at
+   every listed boundary. A recovery-required malformed journal requires manual
+   inspection; it is preserved rather than destructively repaired.
 8. Migration is application-level and bidirectional in the normal UI, but the
    execute phase is synchronous; very large migrations need background progress
    and cooperative cancellation.
