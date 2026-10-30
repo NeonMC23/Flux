@@ -1512,4 +1512,18 @@ mod tests {
             "a lon 3:45"
         );
     }
+
+    #[test]
+    fn deletion_and_transfer_keys_refuse_to_bypass_gui_workflow() {
+        let dir = TempDir::new("tui-delete-refusal");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('T'));
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("GUI"))
+        );
+        assert_eq!(tui.mode, Mode::Normal);
+        tui.controller.shutdown();
+    }
 }

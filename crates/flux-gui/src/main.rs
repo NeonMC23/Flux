@@ -18,11 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flux_app::{
-    Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan, Controller,
-    ImportApplyReport, ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest,
-    ImportStage, ImportStorage, PreparedImport, ReconcileReport, RelPath, StorageMode,
-    TrackMetadataEdit, WAVEFORM_WINDOW, format_duration, is_track_playable, prepare_import_files,
-    prepare_import_plan,
+    AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
+    Controller, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan, ImportProgress,
+    ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport, RelPath,
+    StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, format_duration, is_track_playable,
+    prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
     APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
@@ -881,6 +881,22 @@ fn parse_optional_number(value: &str, field: &str) -> Result<Option<u32>, String
     }
 }
 
+fn deletion_decision_label(decision: &flux_app::ArtistDeletionDecision) -> String {
+    match decision {
+        flux_app::ArtistDeletionDecision::Unresolved => "Unresolved".to_owned(),
+        flux_app::ArtistDeletionDecision::Transfer { new_owner, .. } => {
+            format!("Transfer to {new_owner}")
+        }
+        flux_app::ArtistDeletionDecision::RemoveCredit { .. } => "Remove credit only".to_owned(),
+        flux_app::ArtistDeletionDecision::Delete { confirmed: true } => {
+            "PERMANENT DELETE".to_owned()
+        }
+        flux_app::ArtistDeletionDecision::Delete { confirmed: false } => {
+            "Delete needs confirmation".to_owned()
+        }
+    }
+}
+
 fn display_artist(track: &Track) -> String {
     nonempty(track.artist()).unwrap_or_else(|| "Unknown artist".to_owned())
 }
@@ -1077,6 +1093,38 @@ impl std::fmt::Display for ArtistChoice {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlbumChoice {
+    id: AlbumId,
+    label: String,
+}
+
+impl std::fmt::Display for AlbumChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionUiStage {
+    Review,
+    Executing,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug)]
+struct DeletionManager {
+    plan: flux_app::ArtistDeletionPlan,
+    selected: Option<TrackId>,
+    destination_artist: Option<ArtistChoice>,
+    destination_album: Option<AlbumChoice>,
+    new_album_title: String,
+    stage: DeletionUiStage,
+    report: Option<flux_app::ArtistDeletionReport>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct TrackEditor {
     id: TrackId,
@@ -1228,6 +1276,7 @@ struct FluxReady {
     lib_input: String,
     track_editor: Option<TrackEditor>,
     import_manager: Option<ImportManager>,
+    deletion_manager: Option<DeletionManager>,
     external_drag_hover: bool,
     artist_selected: Option<ArtistId>,
     artist_name_input: String,
@@ -1269,6 +1318,18 @@ enum Message {
     ArtistCreatePressed,
     ArtistRenameNameChanged(String),
     ArtistRenamePressed,
+    ArtistDeleteOpen,
+    ArtistDeletionSelect(TrackId),
+    ArtistDeletionDestinationArtist(Option<ArtistChoice>),
+    ArtistDeletionDestinationAlbum(Option<AlbumChoice>),
+    ArtistDeletionNewAlbum(String),
+    ArtistDeletionSetTransfer,
+    ArtistDeletionSetDelete,
+    ArtistDeletionSetRemoveCredit,
+    ArtistDeletionResetDecision,
+    ArtistDeletionExecute,
+    ArtistDeletionCommit,
+    ArtistDeletionCancel,
     RelinkTrack(TrackId, RelPath),
     ImportOpen,
     ImportOpenSetup,
@@ -1375,6 +1436,7 @@ impl FluxReady {
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
+            deletion_manager: None,
             external_drag_hover: false,
             artist_selected: None,
             artist_name_input: String::new(),
@@ -1547,6 +1609,83 @@ impl FluxReady {
         }];
         choices.extend(self.artist_choices());
         choices
+    }
+
+    fn sync_deletion_defaults(&mut self) {
+        let Some(manager) = self.deletion_manager.as_mut() else {
+            return;
+        };
+        let Some(id) = manager.selected else {
+            return;
+        };
+        let Some(track) = manager
+            .plan
+            .owned_tracks
+            .iter()
+            .chain(manager.plan.credited_tracks.iter())
+            .find(|track| track.track_id == id)
+            .cloned()
+        else {
+            return;
+        };
+        if track.owner_artist_id != manager.plan.artist_id {
+            manager.destination_artist = None;
+            manager.destination_album = None;
+            manager.new_album_title.clear();
+            return;
+        }
+        let (wanted_owner, wanted_destination) = match &track.decision {
+            flux_app::ArtistDeletionDecision::Transfer {
+                new_owner,
+                destination,
+            } => (Some(*new_owner), Some(destination.clone())),
+            _ => (track.eligible_owners.first().copied(), None),
+        };
+        manager.destination_artist = wanted_owner.map(|owner| ArtistChoice {
+            id: Some(owner),
+            label: self
+                .controller
+                .artist(owner)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {owner}")),
+        });
+        manager.destination_album = None;
+        manager.new_album_title.clear();
+        if let Some(destination) = wanted_destination {
+            match destination {
+                flux_app::ArtistDeletionDestination::Existing(id) => {
+                    manager.destination_album = manager
+                        .plan
+                        .destination_albums
+                        .iter()
+                        .find(|album| album.id == id)
+                        .map(|album| AlbumChoice {
+                            id: album.id,
+                            label: format!("{} · {}", album.title, album.id),
+                        });
+                }
+                flux_app::ArtistDeletionDestination::New { title, .. } => {
+                    manager.new_album_title = title;
+                }
+            }
+        }
+        if manager.destination_album.is_none()
+            && manager.new_album_title.is_empty()
+            && let Some(owner) = manager
+                .destination_artist
+                .as_ref()
+                .and_then(|choice| choice.id)
+            && let Some(album) = manager
+                .plan
+                .destination_albums
+                .iter()
+                .find(|album| album.owner_artist_id == owner)
+        {
+            manager.destination_album = Some(AlbumChoice {
+                id: album.id,
+                label: format!("{} · {}", album.title, album.id),
+            });
+        }
     }
 
     fn start_track_editor(&mut self, id: TrackId) {
@@ -2112,6 +2251,170 @@ impl FluxReady {
                         }
                     }
                 }
+            }
+            Message::ArtistDeleteOpen => {
+                let Some(id) = self.artist_selected else {
+                    self.lifecycle_msg = Some("Select an artist first.".to_owned());
+                    return Task::none();
+                };
+                match self.controller.plan_artist_deletion(id) {
+                    Ok(plan) => {
+                        self.import_manager = None;
+                        let selected = plan
+                            .owned_tracks
+                            .first()
+                            .or_else(|| plan.credited_tracks.first())
+                            .map(|track| track.track_id);
+                        self.deletion_manager = Some(DeletionManager {
+                            plan,
+                            selected,
+                            destination_artist: None,
+                            destination_album: None,
+                            new_album_title: String::new(),
+                            stage: DeletionUiStage::Review,
+                            report: None,
+                            error: None,
+                        });
+                        self.show_setup = false;
+                        self.sync_deletion_defaults();
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::ArtistDeletionSelect(id) => {
+                if let Some(manager) = self.deletion_manager.as_mut() {
+                    manager.selected = Some(id);
+                    manager.destination_artist = None;
+                    manager.destination_album = None;
+                    manager.new_album_title.clear();
+                    manager.error = None;
+                    manager.stage = DeletionUiStage::Review;
+                }
+                self.sync_deletion_defaults();
+            }
+            Message::ArtistDeletionDestinationArtist(choice) => {
+                if let Some(manager) = self.deletion_manager.as_mut() {
+                    manager.destination_artist = choice;
+                    manager.destination_album = None;
+                }
+            }
+            Message::ArtistDeletionDestinationAlbum(choice) => {
+                if let Some(manager) = self.deletion_manager.as_mut() {
+                    manager.destination_album = choice;
+                    if manager.destination_album.is_some() {
+                        manager.new_album_title.clear();
+                    }
+                }
+            }
+            Message::ArtistDeletionNewAlbum(value) => {
+                if let Some(manager) = self.deletion_manager.as_mut() {
+                    manager.new_album_title = value;
+                    if !manager.new_album_title.trim().is_empty() {
+                        manager.destination_album = None;
+                    }
+                }
+            }
+            Message::ArtistDeletionSetTransfer => {
+                let Some(manager) = self.deletion_manager.as_mut() else {
+                    return Task::none();
+                };
+                let Some(id) = manager.selected else {
+                    return Task::none();
+                };
+                let Some(new_owner) = manager
+                    .destination_artist
+                    .as_ref()
+                    .and_then(|choice| choice.id)
+                else {
+                    manager.error = Some("Choose a surviving destination artist.".to_owned());
+                    return Task::none();
+                };
+                let new_title = manager.new_album_title.trim().to_owned();
+                let destination = if new_title.is_empty() {
+                    let Some(album) = manager.destination_album.as_ref() else {
+                        manager.error =
+                            Some("Choose a destination album or enter a new title.".to_owned());
+                        return Task::none();
+                    };
+                    flux_app::ArtistDeletionDestination::Existing(album.id)
+                } else {
+                    flux_app::ArtistDeletionDestination::New {
+                        title: new_title,
+                        release_type: flux_app::ReleaseType::Album,
+                    }
+                };
+                match manager.plan.set_transfer(id, new_owner, destination) {
+                    Ok(()) => manager.error = None,
+                    Err(error) => manager.error = Some(error),
+                }
+            }
+            Message::ArtistDeletionSetDelete => {
+                if let Some(manager) = self.deletion_manager.as_mut()
+                    && let Some(id) = manager.selected
+                {
+                    match manager.plan.set_delete(id, true) {
+                        Ok(()) => manager.error = None,
+                        Err(error) => manager.error = Some(error),
+                    }
+                }
+            }
+            Message::ArtistDeletionSetRemoveCredit => {
+                if let Some(manager) = self.deletion_manager.as_mut()
+                    && let Some(id) = manager.selected
+                {
+                    match manager.plan.set_remove_credit(id, None) {
+                        Ok(()) => manager.error = None,
+                        Err(error) => manager.error = Some(error),
+                    }
+                }
+            }
+            Message::ArtistDeletionResetDecision => {
+                if let Some(manager) = self.deletion_manager.as_mut()
+                    && let Some(id) = manager.selected
+                {
+                    manager.plan.set_unresolved(id);
+                    manager.error = None;
+                }
+            }
+            Message::ArtistDeletionExecute => {
+                let Some(manager) = self.deletion_manager.as_mut() else {
+                    return Task::none();
+                };
+                if !manager.plan.is_ready() {
+                    manager.error = manager
+                        .plan
+                        .blocking_reason()
+                        .map(str::to_owned)
+                        .or_else(|| Some("Resolve every affected track first.".to_owned()));
+                    return Task::none();
+                }
+                manager.stage = DeletionUiStage::Executing;
+                manager.error = None;
+                return Task::done(Message::ArtistDeletionCommit);
+            }
+            Message::ArtistDeletionCommit => {
+                let Some(manager) = self.deletion_manager.as_mut() else {
+                    return Task::none();
+                };
+                let plan = manager.plan.clone();
+                match self.controller.execute_artist_deletion(&plan) {
+                    Ok(report) => {
+                        if let Some(manager) = self.deletion_manager.as_mut() {
+                            manager.report = Some(report);
+                            manager.stage = DeletionUiStage::Completed;
+                        }
+                        self.lifecycle_msg = Some("Artist deletion committed.".to_owned());
+                    }
+                    Err(error) => {
+                        if let Some(manager) = self.deletion_manager.as_mut() {
+                            manager.error = Some(error);
+                            manager.stage = DeletionUiStage::Failed;
+                        }
+                    }
+                }
+            }
+            Message::ArtistDeletionCancel => {
+                self.deletion_manager = None;
             }
             Message::RelinkTrack(id, candidate) => {
                 match self.controller.relink_portable_track(id, &candidate) {
@@ -2780,6 +3083,12 @@ impl FluxReady {
             Message::CycleRepeat => self.controller.cycle_repeat_mode(),
             Message::VolumeChanged(volume) => self.controller.set_volume(volume),
             Message::KeyPressed(key, modifiers) => {
+                if self.deletion_manager.is_some() {
+                    if matches!(key, Key::Named(Named::Escape)) {
+                        self.deletion_manager = None;
+                    }
+                    return Task::none();
+                }
                 if self.import_manager.is_some() {
                     return self.handle_import_key(&key, &modifiers);
                 }
@@ -2916,7 +3225,11 @@ impl FluxReady {
         }
 
         let base: Element<'_, Message> = body.into();
-        let body: Element<'_, Message> = if self.import_manager.is_some() {
+        let body: Element<'_, Message> = if self.deletion_manager.is_some() {
+            stack([base, self.deletion_overlay()])
+                .height(Length::Fill)
+                .into()
+        } else if self.import_manager.is_some() {
             stack([base, self.import_overlay()])
                 .height(Length::Fill)
                 .into()
@@ -2931,6 +3244,427 @@ impl FluxReady {
             .height(Length::Fill)
             .style(app_style)
             .into()
+    }
+
+    fn deletion_overlay(&self) -> Element<'_, Message> {
+        let Some(manager) = self.deletion_manager.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let selected = manager.selected.and_then(|id| {
+            manager
+                .plan
+                .owned_tracks
+                .iter()
+                .chain(manager.plan.credited_tracks.iter())
+                .find(|track| track.track_id == id)
+                .cloned()
+        });
+        let transfer_count = manager
+            .plan
+            .owned_tracks
+            .iter()
+            .filter(|track| {
+                matches!(
+                    track.decision,
+                    flux_app::ArtistDeletionDecision::Transfer { .. }
+                )
+            })
+            .count();
+        let delete_count = manager.plan.deleted_track_ids().len();
+        let lyrics_moved = manager
+            .plan
+            .owned_tracks
+            .iter()
+            .filter(|track| {
+                matches!(
+                    track.decision,
+                    flux_app::ArtistDeletionDecision::Transfer { .. }
+                ) && track.lyrics_path.is_some()
+            })
+            .count();
+        let lyrics_deleted = manager
+            .plan
+            .owned_tracks
+            .iter()
+            .filter(|track| {
+                matches!(
+                    track.decision,
+                    flux_app::ArtistDeletionDecision::Delete { confirmed: true }
+                ) && track.lyrics_path.is_some()
+            })
+            .count();
+        let mut panel = column![].spacing(10);
+        panel = panel.push(
+            row![
+                column![
+                    text(format!("Delete artist · {}", manager.plan.artist_name))
+                        .size(20)
+                        .color(TEXT),
+                    text("One logical transaction. The artist is removed only after every affected track is resolved, staged, verified and committed.")
+                        .size(10)
+                        .color(MUTED),
+                ]
+                .spacing(3)
+                .width(Length::Fill),
+                button(text("Cancel").size(11))
+                    .style(ghost_style)
+                    .padding([7, 11])
+                    .on_press(Message::ArtistDeletionCancel),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        panel = panel.push(
+            container(
+                column![
+                    text(format!(
+                        "{} owned track(s) · {} credited-only track(s) · {} owned album(s) · {} affected playlist(s)",
+                        manager.plan.owned_tracks.len(),
+                        manager.plan.credited_tracks.len(),
+                        manager.plan.albums.len(),
+                        manager.plan.affected_playlists.len(),
+                    ))
+                    .size(10)
+                    .color(MUTED),
+                    text(format!(
+                        "Resources: {transfer_count} audio file(s) copied, {delete_count} audio file(s) permanently deleted, {lyrics_moved} lyrics file(s) moved, {lyrics_deleted} lyrics file(s) deleted."
+                    ))
+                    .size(9)
+                    .color(DANGER),
+                    text("Transfers preserve TrackId, credits, playlist/rating references and album order. Explicit deletion permanently removes audio, lyrics, ratings and playlist entries.")
+                        .size(9)
+                        .color(MUTED),
+                ]
+                .spacing(3),
+            )
+            .padding(10)
+            .style(card_style),
+        );
+        let mut rows = column![].spacing(4);
+        for track in manager
+            .plan
+            .owned_tracks
+            .iter()
+            .chain(manager.plan.credited_tracks.iter())
+        {
+            let is_selected = manager.selected == Some(track.track_id);
+            let owner = self
+                .controller
+                .artist(track.owner_artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {}", track.owner_artist_id));
+            let decision = deletion_decision_label(&track.decision);
+            let kind = if track.owner_artist_id == manager.plan.artist_id {
+                "owned"
+            } else {
+                "credited-only"
+            };
+            rows = rows.push(
+                button(
+                    row![
+                        column![
+                            text(track.title.clone()).size(12).color(if is_selected {
+                                ACCENT
+                            } else {
+                                TEXT
+                            }),
+                            text(format!(
+                                "{kind} · owner {owner} · album {}",
+                                track.album_title
+                            ))
+                            .size(9)
+                            .color(MUTED),
+                        ]
+                        .spacing(1)
+                        .width(Length::Fill),
+                        column![
+                            text(decision).size(9).color(if track.issues.is_empty() {
+                                MUTED
+                            } else {
+                                DANGER
+                            }),
+                            text(format!(
+                                "{} playlist(s) · rating {} · lyrics {}",
+                                track.playlist_ids.len(),
+                                track
+                                    .rating
+                                    .map(|rating| rating.rating.unwrap_or(0).to_string())
+                                    .unwrap_or_else(|| "—".to_owned()),
+                                if track.lyrics_path.is_some() {
+                                    "yes"
+                                } else {
+                                    "no"
+                                }
+                            ))
+                            .size(8)
+                            .color(MUTED),
+                        ]
+                        .spacing(1),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([7, 9])
+                .style(track_row_style(is_selected))
+                .on_press(Message::ArtistDeletionSelect(track.track_id)),
+            );
+        }
+        panel = panel.push(
+            container(scrollable(rows).height(Length::Fixed(180.0)))
+                .padding(6)
+                .style(card_style),
+        );
+        if let Some(track) = selected {
+            let owned = track.owner_artist_id == manager.plan.artist_id;
+            panel = panel.push(
+                container(
+                    column![
+                        text(format!("Selected: {}", track.title))
+                            .size(13)
+                            .color(TEXT),
+                        text(format!("Credits: {}", self.credit_display(track.track_id)))
+                            .size(9)
+                            .color(MUTED),
+                        text(format!(
+                            "Audio: {} · lyrics: {} · rating: {} · playlists: {}",
+                            track.audio_path.display_lossy(),
+                            track
+                                .lyrics_path
+                                .as_ref()
+                                .map(|path| path.display_lossy())
+                                .unwrap_or_else(|| "none".to_owned()),
+                            track
+                                .rating
+                                .map(|rating| format!("{:?}", rating.rating))
+                                .unwrap_or_else(|| "none".to_owned()),
+                            {
+                                let names = track
+                                    .playlist_ids
+                                    .iter()
+                                    .map(|id| {
+                                        self.controller
+                                            .playlists()
+                                            .into_iter()
+                                            .find(|playlist| playlist.id == *id)
+                                            .map(|playlist| playlist.name)
+                                            .unwrap_or_else(|| id.to_string())
+                                    })
+                                    .collect::<Vec<_>>();
+                                if names.is_empty() {
+                                    "none".to_owned()
+                                } else {
+                                    names.join(", ")
+                                }
+                            }
+                        ))
+                        .size(9)
+                        .color(MUTED),
+                    ]
+                    .spacing(3),
+                )
+                .padding(9)
+                .style(card_style),
+            );
+            if owned {
+                let artist_choices = track
+                    .eligible_owners
+                    .iter()
+                    .map(|artist| ArtistChoice {
+                        id: Some(*artist),
+                        label: self
+                            .controller
+                            .artist(*artist)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| format!("Artist {artist}")),
+                    })
+                    .collect::<Vec<_>>();
+                let selected_artist = manager.destination_artist.clone().filter(|choice| {
+                    artist_choices
+                        .iter()
+                        .any(|candidate| candidate.id == choice.id)
+                });
+                let album_choices = manager
+                    .destination_artist
+                    .as_ref()
+                    .and_then(|choice| choice.id)
+                    .map(|owner| {
+                        manager
+                            .plan
+                            .destination_albums
+                            .iter()
+                            .filter(|album| album.owner_artist_id == owner)
+                            .map(|album| AlbumChoice {
+                                id: album.id,
+                                label: format!("{} · {}", album.title, album.id),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let selected_album = manager.destination_album.clone().filter(|choice| {
+                    album_choices
+                        .iter()
+                        .any(|candidate| candidate.id == choice.id)
+                });
+                panel = panel.push(
+                    column![
+                        text("TRANSFER TO A SURVIVING CREDITED ARTIST").size(8).color(ACCENT),
+                        pick_list(artist_choices, selected_artist, |choice| {
+                            Message::ArtistDeletionDestinationArtist(Some(choice))
+                        })
+                        .placeholder("Destination artist…")
+                        .text_size(10)
+                        .padding([5, 7])
+                        .width(Length::Fill),
+                        pick_list(album_choices, selected_album, |choice| {
+                            Message::ArtistDeletionDestinationAlbum(Some(choice))
+                        })
+                        .placeholder("Existing destination album…")
+                        .text_size(10)
+                        .padding([5, 7])
+                        .width(Length::Fill),
+                        text_input("…or new destination album title", &manager.new_album_title)
+                            .on_input(Message::ArtistDeletionNewAlbum)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        row![
+                            button(text("Set transfer").size(10))
+                                .style(accent_button_style)
+                                .padding([5, 9])
+                                .on_press(Message::ArtistDeletionSetTransfer),
+                            button(text("Delete this track permanently").size(10))
+                                .style(danger_button_style)
+                                .padding([5, 9])
+                                .on_press(Message::ArtistDeletionSetDelete),
+                            button(text("Reset decision").size(9))
+                                .style(ghost_style)
+                                .padding([5, 8])
+                                .on_press(Message::ArtistDeletionResetDecision),
+                        ]
+                        .spacing(6),
+                        text("Deleting a track is irreversible and removes its audio, lyrics, rating and playlist entries.")
+                            .size(9)
+                            .color(DANGER),
+                    ]
+                    .spacing(6),
+                );
+            } else {
+                panel = panel.push(
+                    column![
+                        text("KEEP THE EXISTING OWNER; REMOVE ONLY THIS ARTIST'S CREDIT").size(8).color(ACCENT),
+                        text("Audio, TrackId, album, owner, lyrics, ratings and playlist entries are preserved.")
+                            .size(9)
+                            .color(MUTED),
+                        button(text("Remove this artist's credit only").size(10))
+                            .style(accent_button_style)
+                            .padding([5, 9])
+                            .on_press(Message::ArtistDeletionSetRemoveCredit),
+                    ]
+                    .spacing(5),
+                );
+            }
+            for issue in &track.issues {
+                panel = panel.push(text(issue.clone()).size(9).color(DANGER));
+            }
+        }
+        if !manager.plan.issues.is_empty() {
+            panel = panel.push(
+                text(format!(
+                    "Blocked: {}",
+                    manager
+                        .plan
+                        .issues
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ))
+                .size(9)
+                .color(DANGER),
+            );
+        }
+        if let Some(error) = &manager.error {
+            panel = panel.push(text(error).size(10).color(DANGER));
+        }
+        if manager.stage == DeletionUiStage::Executing {
+            panel = panel.push(
+                text("Executing one canonical transaction (staging, verification, publication and cleanup)…")
+                    .size(10)
+                    .color(ACCENT),
+            );
+        }
+        if manager.stage == DeletionUiStage::Failed {
+            panel = panel.push(
+                text("Deletion did not commit cleanly. Reopen/refresh the library to run recovery before retrying.")
+                    .size(10)
+                    .color(DANGER),
+            );
+        }
+        if let Some(report) = &manager.report {
+            panel = panel.push(
+                text(format!(
+                    "Committed: {} transferred, {} credit(s) removed, {} track(s) deleted, {} album(s) removed.",
+                    report.transferred,
+                    report.credits_removed,
+                    report.deleted_tracks.len(),
+                    report.deleted_albums.len()
+                ))
+                .size(10)
+                .color(SUCCESS),
+            );
+        }
+        panel = panel.push(
+            row![
+                text(format!(
+                    "{} explicit deletion(s) · {} album(s) will be removed",
+                    manager.plan.deleted_track_ids().len(),
+                    manager.plan.albums.len()
+                ))
+                .size(9)
+                .color(MUTED)
+                .width(Length::Fill),
+                button(text("Cancel / close").size(10))
+                    .style(ghost_style)
+                    .padding([6, 10])
+                    .on_press(Message::ArtistDeletionCancel),
+                button(text("Commit artist deletion").size(11))
+                    .style(danger_button_style)
+                    .padding([7, 11])
+                    .on_press_maybe(
+                        (manager.stage == DeletionUiStage::Review && manager.plan.is_ready())
+                            .then_some(Message::ArtistDeletionExecute)
+                    ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        let panel = container(scrollable(panel).height(Length::Fill))
+            .padding(16)
+            .width(Length::Fill)
+            .max_width(1_040.0)
+            .height(Length::Fill)
+            .max_height(720.0)
+            .style(import_panel_style);
+        stack([
+            container(
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(modal_backdrop_style)
+            .into(),
+            container(panel)
+                .padding(18)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center(Length::Fill)
+                .into(),
+        ])
+        .height(Length::Fill)
+        .into()
     }
 
     fn import_overlay(&self) -> Element<'_, Message> {
@@ -4960,6 +5694,13 @@ impl FluxReady {
                     ),
             ]
             .spacing(8),
+            button(text("Delete artist…").size(11))
+                .style(danger_button_style)
+                .padding([7, 10])
+                .on_press_maybe(
+                    (artist_editable && self.artist_selected.is_some())
+                        .then_some(Message::ArtistDeleteOpen)
+                ),
         ]
         .spacing(8);
         if !portable {
@@ -5855,6 +6596,7 @@ mod tests {
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
+            deletion_manager: None,
             external_drag_hover: false,
             artist_selected: None,
             artist_name_input: String::new(),
@@ -6519,6 +7261,128 @@ mod tests {
             Some("Destination")
         );
         assert_eq!(gui.controller.track_credits(id), vec![a, b]);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn gui_artist_deletion_edits_decisions_blocks_unresolved_and_commits() {
+        let dir = TempDir::new("gui-artist-delete");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let a = gui.controller.create_artist("A").expect("A");
+        let b = gui.controller.create_artist("B").expect("B");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let collab_source = source_dir.join("collab.wav");
+        let solo_source = source_dir.join("solo.wav");
+        let guest_source = source_dir.join("guest.wav");
+        for path in [&collab_source, &solo_source, &guest_source] {
+            std::fs::write(path, minimal_wav()).expect("wav");
+        }
+        let collab = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source: collab_source,
+                title: "Collab".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("A Album".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("collab");
+        let solo = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source: solo_source,
+                title: "Solo".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a],
+                album_title: Some("A Album".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("solo");
+        let guest = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source: guest_source,
+                title: "Guest".to_owned(),
+                artist_id: Some(b),
+                artist_name: "B".to_owned(),
+                credited_artist_ids: vec![b, a],
+                album_title: Some("B Album".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("guest");
+        let destination = gui.controller.track_album_id(guest).expect("album");
+        send(
+            &mut gui,
+            Message::ArtistSelected(Some(ArtistChoice {
+                id: Some(a),
+                label: "A".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::ArtistDeleteOpen);
+        assert!(gui.deletion_manager.is_some());
+        send(&mut gui, Message::ArtistDeletionCancel);
+        assert!(gui.deletion_manager.is_none(), "cancel changes nothing");
+        assert!(gui.controller.artist(a).is_some());
+        send(&mut gui, Message::ArtistDeleteOpen);
+        send(&mut gui, Message::ArtistDeletionExecute);
+        assert_eq!(
+            gui.deletion_manager.as_ref().expect("manager").stage,
+            DeletionUiStage::Review,
+            "unresolved plan cannot execute"
+        );
+        assert!(gui.controller.artist(a).is_some());
+        send(&mut gui, Message::ArtistDeletionSelect(collab));
+        send(
+            &mut gui,
+            Message::ArtistDeletionDestinationArtist(Some(ArtistChoice {
+                id: Some(b),
+                label: "B".to_owned(),
+            })),
+        );
+        send(
+            &mut gui,
+            Message::ArtistDeletionDestinationAlbum(Some(AlbumChoice {
+                id: destination,
+                label: "B Album".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::ArtistDeletionSetTransfer);
+        send(&mut gui, Message::ArtistDeletionSelect(solo));
+        send(&mut gui, Message::ArtistDeletionSetDelete);
+        send(&mut gui, Message::ArtistDeletionSelect(guest));
+        send(&mut gui, Message::ArtistDeletionSetRemoveCredit);
+        let plan = gui.deletion_manager.as_ref().expect("manager").plan.clone();
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        send(&mut gui, Message::ArtistDeletionExecute);
+        send(&mut gui, Message::ArtistDeletionCommit);
+        assert_eq!(
+            gui.deletion_manager.as_ref().expect("manager").stage,
+            DeletionUiStage::Completed
+        );
+        assert!(gui.controller.artist(a).is_none());
+        assert!(gui.controller.track(solo).is_none());
+        assert_eq!(gui.controller.track_artist_id(collab), Some(b));
+        assert_eq!(gui.controller.track_credits(collab), vec![b]);
         gui.controller.shutdown();
     }
 }
