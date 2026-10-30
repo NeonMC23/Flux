@@ -2,8 +2,9 @@
 //!
 //! The import manager is deliberately split into three phases:
 //!
-//! 1. [`prepare_import_plan`] discovers files and reads their source tags
-//!    without touching the active library. It produces editable
+//! 1. [`prepare_import_plan`] discovers files and infers candidate metadata
+//!    only from filenames/directories without touching the active library
+//!    or reading audio tags. It produces editable
 //!    [`ImportCandidate`]s, duplicate/conflict hints, and issues.
 //! 2. [`prepare_import_files`] performs the potentially slow copy phase in
 //!    the background, with cooperative cancellation. It creates no
@@ -730,7 +731,6 @@ fn probe_candidates(
     progress: &Mutex<ImportProgress>,
     issues: &mut Vec<ImportIssue>,
 ) -> Vec<(PathBuf, Track)> {
-    let mut library = flux_library::Library::new();
     let total = paths.len();
     resize_progress_items(progress, total);
     update_progress(
@@ -738,7 +738,7 @@ fn probe_candidates(
         ImportStage::ReadingMetadata,
         0,
         total,
-        "Reading audio metadata…",
+        "Inferring metadata from filenames and folders…",
     );
     let mut candidates = Vec::with_capacity(total);
 
@@ -747,19 +747,25 @@ fn probe_candidates(
             break;
         }
         set_progress_item(progress, index, ImportItemState::Scanning);
-        let report = library.scan(&[path.as_path()]);
-        for issue in report.skipped().iter().chain(report.failed()) {
-            issues.push(ImportIssue {
-                path: issue.path().to_path_buf(),
-                reason: issue.reason().to_owned(),
-            });
-        }
-        if let Some(id) = library.id_for_path(&path)
-            && let Some(track) = library.get(id)
-        {
-            candidates.push((path, track.clone()));
+        if let Some(inferred) = crate::infer_canonical_import(&path) {
+            let mut track = Track::new(inferred.title, TrackSource::local(path.clone()));
+            track = track.with_artist(inferred.artist_name);
+            if let Some(album) = inferred.album_title {
+                track = track.with_album(album);
+            }
+            if let Some(number) = inferred.track_number {
+                track = track.with_track_number(number);
+            }
+            if let Some(disc) = inferred.disc_number {
+                track = track.with_disc_number(disc);
+            }
+            candidates.push((path, track));
             set_progress_item(progress, index, ImportItemState::Ready);
         } else {
+            issues.push(ImportIssue {
+                path,
+                reason: "the filename cannot be used for metadata inference".to_owned(),
+            });
             set_progress_item(progress, index, ImportItemState::Failed);
         }
         update_progress(
@@ -767,7 +773,7 @@ fn probe_candidates(
             ImportStage::ReadingMetadata,
             index + 1,
             total,
-            format!("Reading metadata… {}/{}", index + 1, total),
+            format!("Inferring metadata… {}/{}", index + 1, total),
         );
     }
     candidates
@@ -1167,7 +1173,19 @@ where
         }
         let candidate = &plan.candidates[index];
         set_progress_item(&progress, index, ImportItemState::Importing);
-        let result = if candidate.source_path.starts_with(&plan.library_root) {
+        let canonical = plan.library_root.join("catalog.flux").is_file();
+        let result = if canonical {
+            std::fs::metadata(&candidate.source_path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|_| candidate.source_path.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "source is missing or not a regular file: {}",
+                        candidate.source_path.display()
+                    )
+                })
+        } else if candidate.source_path.starts_with(&plan.library_root) {
             Ok(candidate.source_path.clone())
         } else if plan.storage == ImportStorage::Reference {
             Err("external source cannot be referenced; choose Copy into the library".to_owned())
@@ -1358,6 +1376,153 @@ fn apply_candidate_metadata(
     Ok(())
 }
 
+fn apply_import_plan_canonical(
+    controller: &mut Controller,
+    plan: &ImportPlan,
+) -> Result<ImportApplyReport, String> {
+    use crate::TrackMetadataEdit;
+    use flux_library::canonical::CanonicalImportedTrack;
+
+    if plan.storage == ImportStorage::Reference {
+        return Err(
+            "Canonical libraries copy every import; reference-only storage is disabled.".to_owned(),
+        );
+    }
+    if controller.is_scanning() {
+        return Err("A library scan is running; import after it finishes.".to_owned());
+    }
+    let mut report = ImportApplyReport::default();
+    for (index, candidate) in plan.candidates.iter().enumerate() {
+        match candidate.decision {
+            ImportDecision::Skip => {
+                report.skipped += 1;
+                report.items.push(AppliedImportItem {
+                    index,
+                    track_id: candidate.status.matched_track(),
+                    state: ImportItemState::Skipped,
+                    message: "Skipped".to_owned(),
+                });
+            }
+            ImportDecision::UpdateExisting => {
+                let Some(id) = candidate.status.matched_track() else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "No existing track to update.".to_owned(),
+                    });
+                    continue;
+                };
+                let artist_id = candidate
+                    .artist_id
+                    .or_else(|| controller.track_artist_id(id));
+                let result = controller.edit_track_metadata(
+                    id,
+                    TrackMetadataEdit {
+                        title: Some(candidate.title.clone()),
+                        artist_id,
+                        album: candidate.album.clone(),
+                        track_number: candidate.track_number,
+                        disc_number: candidate.disc_number,
+                    },
+                );
+                match result {
+                    Ok(()) => {
+                        report.updated += 1;
+                        report.items.push(AppliedImportItem {
+                            index,
+                            track_id: Some(id),
+                            state: ImportItemState::Imported,
+                            message: "Updated existing track".to_owned(),
+                        });
+                    }
+                    Err(message) => report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(id),
+                        state: ImportItemState::Failed,
+                        message,
+                    }),
+                }
+            }
+            ImportDecision::ImportNew => {
+                let Some(artist_name) = candidate
+                    .artist_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "Artist is required before importing.".to_owned(),
+                    });
+                    continue;
+                };
+                let Some(album_title) = candidate
+                    .album
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|album| !album.is_empty())
+                else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "Album is required before importing.".to_owned(),
+                    });
+                    continue;
+                };
+                let Some(store) = controller.canonical_store.as_mut() else {
+                    return Err("The canonical library is unavailable.".to_owned());
+                };
+                let imported = CanonicalImportedTrack {
+                    source: candidate.source_path.clone(),
+                    title: candidate.title.clone(),
+                    artist_id: candidate.artist_id,
+                    artist_name: artist_name.to_owned(),
+                    album_title: Some(album_title.to_owned()),
+                    release_type: flux_library::canonical::ReleaseType::Album,
+                    track_number: candidate.track_number,
+                    disc_number: candidate.disc_number,
+                    duration_ms: None,
+                };
+                match store.import_track(imported) {
+                    Ok(id) => {
+                        report.imported += 1;
+                        report.items.push(AppliedImportItem {
+                            index,
+                            track_id: Some(id),
+                            state: ImportItemState::Imported,
+                            message: "Imported".to_owned(),
+                        });
+                    }
+                    Err(err) => report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: err.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+    controller.refresh_from_canonical();
+    controller.sync_default_queue();
+    controller.outbox.push(ControllerEvent::LibraryChanged);
+    report.failed = report
+        .items
+        .iter()
+        .filter(|item| item.state == ImportItemState::Failed)
+        .count();
+    report.items.sort_by_key(|item| item.index);
+    controller.report_status(format!(
+        "Canonical import complete: {} new track(s), {} updated, {} skipped, {} failed.",
+        report.imported, report.updated, report.skipped, report.failed
+    ));
+    Ok(report)
+}
+
 /// Applies reviewed decisions and prepared files. This is the only point
 /// where import changes enter the catalogue. New tracks are inserted into
 /// the runtime library, synced to the portable store, given overrides/artist
@@ -1405,6 +1570,9 @@ pub fn apply_import_plan(
 ) -> Result<ImportApplyReport, String> {
     if plan.cancelled || prepared.cancelled {
         return Err("The import was cancelled; no catalogue changes were made.".to_owned());
+    }
+    if controller.storage_mode() == StorageMode::Canonical {
+        return apply_import_plan_canonical(controller, plan);
     }
     if controller.storage_mode() != StorageMode::Portable {
         return Err(
@@ -1817,7 +1985,7 @@ mod tests {
         let canonical_root = root.canonicalize().expect("canonical");
         let existing = wav(&canonical_root, "song.wav", 4_410, -0.2);
         let existing_bytes = fs::read(&existing).expect("bytes");
-        let source_dir = dir.path().join("source");
+        let source_dir = dir.path().join("Reviewed Artist/Base album");
         let source = wav(&source_dir, "song.wav", 4_410, 0.3);
         let source_bytes = fs::read(&source).expect("source bytes");
 
@@ -1837,6 +2005,7 @@ mod tests {
         plan.candidates[0].set_title("Reviewed title");
         plan.candidates[0].set_album(Some("Reviewed album".to_owned()));
         plan.candidates[0].set_artist_name(Some("Reviewed Artist".to_owned()));
+        assert_eq!(plan.candidates[0].artist_name(), Some("Reviewed Artist"));
         plan.candidates[0].set_track_number(Some(2));
         let prepared = prepare(&plan, progress, cancel);
         assert_eq!(prepared.created_files.len(), 1);
@@ -2000,7 +2169,12 @@ mod tests {
         let root = dir.path().join("library");
         let (mut controller, _control) = portable_controller(&root);
         let canonical_root = root.canonicalize().expect("canonical");
-        let first = wav(&canonical_root, "same-name.wav", 441, 0.1);
+        let first = wav(
+            &canonical_root.join("Artist/Album"),
+            "same-name.wav",
+            441,
+            0.1,
+        );
         let (first_plan, progress, cancel) =
             plan(&controller, vec![first], false, ImportStorage::Reference);
         let prepared = prepare(&first_plan, progress, cancel);
@@ -2009,7 +2183,7 @@ mod tests {
             .expect("first");
         let id = controller.tracks()[0].0;
 
-        let second_dir = dir.path().join("other");
+        let second_dir = dir.path().join("other/Artist/Album");
         let second = wav(&second_dir, "same-name.wav", 441, -0.4);
         let (second_plan, _progress, _cancel) =
             plan(&controller, vec![second], false, ImportStorage::Copy);

@@ -18,11 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flux_app::{
-    Artist, AudioStatus, Availability, CandidateStatus, Controller, ImportApplyReport,
-    ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage,
-    ImportStorage, MigrationPlan, PreparedImport, ReconcileReport, RelPath, StorageMode,
-    TrackMetadataEdit, WAVEFORM_WINDOW, default_index_path, format_duration, is_track_playable,
-    prepare_import_files, prepare_import_plan,
+    Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan, Controller,
+    ImportApplyReport, ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest,
+    ImportStage, ImportStorage, PreparedImport, ReconcileReport, RelPath, StorageMode,
+    TrackMetadataEdit, WAVEFORM_WINDOW, format_duration, is_track_playable, prepare_import_files,
+    prepare_import_plan,
 };
 use flux_core::{
     APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
@@ -977,6 +977,7 @@ fn pagination_footer(
 }
 
 const ARTIST_KEY_SEPARATOR: char = '\u{1f}';
+const ALBUM_KEY_SEPARATOR: char = '\u{1e}';
 
 fn artist_group_key(artist_id: Option<ArtistId>, track: &Track) -> String {
     format!(
@@ -993,11 +994,25 @@ fn artist_key_parts(key: &str) -> (&str, &str) {
         .unwrap_or((key, "none"))
 }
 
+fn album_group_key(album_id: Option<flux_app::AlbumId>, track: &Track) -> String {
+    format!(
+        "{}{ALBUM_KEY_SEPARATOR}{}",
+        display_album(track),
+        album_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_owned())
+    )
+}
+
+fn album_key_parts(key: &str) -> (&str, &str) {
+    key.split_once(ALBUM_KEY_SEPARATOR).unwrap_or((key, "none"))
+}
+
 fn group_key(view: LibraryView, track: &Track) -> Option<String> {
     match view {
         LibraryView::Tracks => None,
         LibraryView::Artists => Some(artist_group_key(None, track)),
-        LibraryView::Albums => Some(display_album(track)),
+        LibraryView::Albums => Some(album_group_key(None, track)),
         LibraryView::Folders => Some(display_folder(track)),
     }
 }
@@ -1009,7 +1024,8 @@ fn group_title(view: LibraryView, key: &str) -> String {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| key.to_owned()),
-        LibraryView::Tracks | LibraryView::Albums => key.to_owned(),
+        LibraryView::Albums => album_key_parts(key).0.to_owned(),
+        LibraryView::Tracks => key.to_owned(),
     }
 }
 
@@ -1205,7 +1221,6 @@ impl ImportManager {
 
 struct FluxReady {
     controller: Controller,
-    dir_input: String,
     search: String,
     lib_input: String,
     track_editor: Option<TrackEditor>,
@@ -1216,7 +1231,7 @@ struct FluxReady {
     artist_rename_input: String,
     last_reconcile: Option<ReconcileReport>,
     migrate_source: String,
-    pending_plan: Option<MigrationPlan>,
+    pending_plan: Option<CanonicalMigrationPlan>,
     migrated_dest: Option<PathBuf>,
     lifecycle_msg: Option<String>,
     view: LibraryView,
@@ -1234,7 +1249,6 @@ struct FluxReady {
 
 #[derive(Debug, Clone)]
 enum Message {
-    DirInputChanged(String),
     LibInputChanged(String),
     EditTrack(TrackId),
     EditorTitleChanged(String),
@@ -1273,7 +1287,6 @@ enum Message {
     ImportBrowserPathChanged(String),
     ImportBrowserPathSubmit,
     ImportRecursiveToggled,
-    ImportStorageChanged(ImportStorage),
     ImportPlanReady(Box<ImportPlan>),
     ImportPrepared(Box<PreparedImport>),
     ImportSelect(usize),
@@ -1305,7 +1318,6 @@ enum Message {
     CancelMigrationPressed,
     OpenMigratedPressed,
     ReconcilePressed,
-    ScanPressed,
     RefreshPressed,
     SearchChanged(String),
     SelectView(LibraryView),
@@ -1349,7 +1361,6 @@ impl FluxReady {
             .map_or(0, |index| index / QUEUE_PAGE_SIZE);
         Self {
             controller,
-            dir_input: String::new(),
             search: String::new(),
             lib_input: String::new(),
             track_editor: None,
@@ -1522,7 +1533,7 @@ impl FluxReady {
     fn editor_artist_choices(&self) -> Vec<ArtistChoice> {
         let mut choices = vec![ArtistChoice {
             id: None,
-            label: "No stable artist (use tags/fallback)".to_owned(),
+            label: "No stable artist".to_owned(),
         }];
         choices.extend(self.artist_choices());
         choices
@@ -1638,7 +1649,10 @@ impl FluxReady {
             manager.stage = ImportUiStage::Choose;
             return Task::none();
         }
-        if self.controller.storage_mode() != StorageMode::Portable {
+        if !matches!(
+            self.controller.storage_mode(),
+            StorageMode::Portable | StorageMode::Canonical
+        ) {
             manager.error = Some(
                 "Importing requires a portable library. Close this dialog and create or open \
                  one in Library setup."
@@ -1647,7 +1661,12 @@ impl FluxReady {
             manager.stage = ImportUiStage::Failed;
             return Task::none();
         }
-        let Some(root) = self.controller.portable_root().map(Path::to_path_buf) else {
+        let Some(root) = self
+            .controller
+            .canonical_root()
+            .or_else(|| self.controller.portable_root())
+            .map(Path::to_path_buf)
+        else {
             manager.error = Some("The portable library is unavailable.".to_owned());
             manager.stage = ImportUiStage::Failed;
             return Task::none();
@@ -1820,7 +1839,8 @@ impl FluxReady {
     fn native_files_task(&mut self) -> Task<Message> {
         let start = self
             .controller
-            .portable_root()
+            .canonical_root()
+            .or_else(|| self.controller.portable_root())
             .map(Path::to_path_buf)
             .or_else(home_directory);
         self.open_import_manager();
@@ -1833,7 +1853,8 @@ impl FluxReady {
     fn native_folder_task(&mut self) -> Task<Message> {
         let start = self
             .controller
-            .portable_root()
+            .canonical_root()
+            .or_else(|| self.controller.portable_root())
             .map(Path::to_path_buf)
             .or_else(home_directory);
         self.open_import_manager();
@@ -1850,7 +1871,8 @@ impl FluxReady {
         };
         let start = self
             .controller
-            .portable_root()
+            .canonical_root()
+            .or_else(|| self.controller.portable_root())
             .map(Path::to_path_buf)
             .or_else(home_directory)
             .unwrap_or_else(|| PathBuf::from("."));
@@ -1880,12 +1902,15 @@ impl FluxReady {
     }
 
     fn queue_external_drop(&mut self, path: PathBuf) -> Task<Message> {
-        if self.controller.storage_mode() != StorageMode::Portable {
+        if !matches!(
+            self.controller.storage_mode(),
+            StorageMode::Portable | StorageMode::Canonical
+        ) {
             self.open_import_manager();
             if let Some(manager) = self.import_manager.as_mut() {
                 manager.stage = ImportUiStage::Failed;
                 manager.error = Some(
-                    "Importing requires a portable library. Create or open one in Library \
+                    "Importing requires a canonical library. Create or open one in Library \
                      setup, then drop the files again."
                         .to_owned(),
                 );
@@ -1942,7 +1967,6 @@ impl FluxReady {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::DirInputChanged(value) => self.dir_input = value,
             Message::LibInputChanged(value) => self.lib_input = value,
             Message::EditTrack(id) => self.start_track_editor(id),
             Message::EditorTitleChanged(value) => {
@@ -2043,7 +2067,8 @@ impl FluxReady {
                     let storage = manager.storage;
                     *manager = ImportManager::new();
                     manager.recursive = recursive;
-                    manager.storage = storage;
+                    let _ = storage;
+                    manager.storage = ImportStorage::Copy;
                 }
             }
             Message::ImportNoop => {}
@@ -2175,16 +2200,6 @@ impl FluxReady {
             Message::ImportRecursiveToggled => {
                 if let Some(manager) = self.import_manager.as_mut() {
                     manager.recursive = !manager.recursive;
-                }
-            }
-            Message::ImportStorageChanged(storage) => {
-                if let Some(manager) = self.import_manager.as_mut()
-                    && manager.stage == ImportUiStage::Review
-                {
-                    manager.storage = storage;
-                    if let Some(plan) = manager.plan.as_mut() {
-                        plan.set_storage(storage);
-                    }
                 }
             }
             Message::ImportPlanReady(plan) => {
@@ -2417,7 +2432,7 @@ impl FluxReady {
             }
             Message::OpenLibraryPressed => {
                 let path = PathBuf::from(self.lib_input.trim());
-                if self.controller.switch_to_portable(&path).is_ok() {
+                if self.controller.switch_to_canonical(&path).is_ok() {
                     self.after_switch();
                 }
             }
@@ -2425,20 +2440,18 @@ impl FluxReady {
                 let path = PathBuf::from(self.lib_input.trim());
                 if self
                     .controller
-                    .switch_to_new_portable_library(&path)
+                    .switch_to_new_canonical_library(&path)
                     .is_ok()
                 {
                     self.after_switch();
                 }
             }
             Message::UseLegacyIndexPressed => {
-                if self
-                    .controller
-                    .switch_to_legacy_index(default_index_path())
-                    .is_ok()
-                {
-                    self.after_switch();
-                }
+                self.lifecycle_msg = Some(
+                    "Legacy runtime switching is disabled. Use the migration workflow to \
+                     carry an existing index into a canonical library."
+                        .to_owned(),
+                );
             }
             Message::AcknowledgeRecoveryPressed => {
                 if let Err(err) = self.controller.acknowledge_portable_recovery() {
@@ -2454,7 +2467,7 @@ impl FluxReady {
             Message::PlanMigrationPressed => {
                 let source = PathBuf::from(self.migrate_source.trim());
                 let destination = PathBuf::from(self.lib_input.trim());
-                match flux_app::plan_legacy_migration(&source, &destination) {
+                match flux_app::plan_canonical_migration(&source, &destination) {
                     Ok(plan) => {
                         self.lifecycle_msg = Some(migration_plan_summary(&plan));
                         self.pending_plan = Some(plan);
@@ -2468,21 +2481,17 @@ impl FluxReady {
             }
             Message::ExecuteMigrationPressed => {
                 if let Some(plan) = self.pending_plan.take() {
-                    let destination = plan.destination_root().to_path_buf();
-                    match flux_app::execute_legacy_migration(&plan) {
+                    let destination = plan.destination().to_path_buf();
+                    match flux_app::execute_canonical_migration(&plan) {
                         Ok(report) => {
-                            let done = report.plan();
-                            let excluded = done.records().len() - done.migrated_count();
                             self.migrated_dest = Some(destination);
                             self.lifecycle_msg = Some(format!(
-                                "Migration complete: {} track(s) migrated \
-                                 ({} present, {} missing), {} excluded. The active \
-                                 library is unchanged — choose “Open migrated \
-                                 library” to switch to the result.",
-                                done.migrated_count(),
-                                done.present_count(),
-                                done.missing_count(),
-                                excluded,
+                                "Canonical migration complete: {} track(s), {} artist(s), \
+                                 {} album(s) validated. The source is untouched; choose \
+                                 “Open migrated library” to activate the result.",
+                                report.tracks(),
+                                report.artists(),
+                                report.albums(),
                             ));
                         }
                         Err(err) => {
@@ -2497,21 +2506,22 @@ impl FluxReady {
             }
             Message::OpenMigratedPressed => {
                 if let Some(destination) = self.migrated_dest.clone()
-                    && self.controller.switch_to_portable(&destination).is_ok()
+                    && self.controller.switch_to_canonical(&destination).is_ok()
                 {
                     self.after_switch();
                 }
             }
             Message::ReconcilePressed => {
-                if let Ok(report) = self.controller.reconcile_portable_library() {
+                if self.controller.storage_mode() == StorageMode::Canonical {
+                    self.controller.refresh();
+                    self.last_reconcile = None;
+                    self.lifecycle_msg = Some(
+                        "Canonical library refreshed; manifest, catalogue and resource paths validated."
+                            .to_owned(),
+                    );
+                } else if let Ok(report) = self.controller.reconcile_portable_library() {
                     self.lifecycle_msg = Some(reconcile_summary(&report));
                     self.last_reconcile = Some(report);
-                }
-            }
-            Message::ScanPressed => {
-                let path = self.dir_input.trim();
-                if !path.is_empty() {
-                    self.controller.begin_scan(PathBuf::from(path));
                 }
             }
             Message::RefreshPressed => self.controller.refresh(),
@@ -2914,7 +2924,10 @@ impl FluxReady {
         if manager.stage == ImportUiStage::Scanning {
             return self.import_progress_view(manager);
         }
-        let portable = self.controller.storage_mode() == StorageMode::Portable;
+        let portable = matches!(
+            self.controller.storage_mode(),
+            StorageMode::Portable | StorageMode::Canonical
+        );
         let library_label = self
             .controller
             .portable_root()
@@ -2925,11 +2938,11 @@ impl FluxReady {
             body = body.push(
                 container(
                     column![
-                        text("A portable library is required").size(13).color(TEXT),
+                        text("A canonical library is required").size(13).color(TEXT),
                         text(
-                            "Imports, Flux metadata edits, and stable artists live inside the \
-                             library's .flux folder. The legacy app index is a compatibility \
-                             backend and cannot store them."
+                            "Imports, Flux metadata edits, stable artists, albums and resources \
+                             live inside the canonical library. The legacy app index is a \
+                             migration source only."
                         )
                         .size(10)
                         .color(MUTED),
@@ -3023,25 +3036,9 @@ impl FluxReady {
         body = body.push(
             column![
                 text("STORAGE").size(9).color(ACCENT),
-                row![
-                    button(text(ImportStorage::Copy.label()).size(11))
-                        .style(nav_style(manager.storage == ImportStorage::Copy))
-                        .padding([7, 11])
-                        .on_press(Message::ImportStorageChanged(ImportStorage::Copy)),
-                    button(text(ImportStorage::Reference.label()).size(11))
-                        .style(nav_style(manager.storage == ImportStorage::Reference))
-                        .padding([7, 11])
-                        .on_press(Message::ImportStorageChanged(ImportStorage::Reference)),
-                ]
-                .spacing(6),
-                text(match manager.storage {
-                    ImportStorage::Copy =>
-                        "External files are copied into the library root with collision-safe names; originals are never moved or overwritten.",
-                    ImportStorage::Reference =>
-                        "Only files already inside the library folder can be referenced safely. External paths will be blocked with a clear action to switch to Copy.",
-                })
-                .size(10)
-                .color(MUTED),
+                text("Every import is copied into the canonical library. External references are not supported; original sources are never moved or deleted.")
+                    .size(10)
+                    .color(MUTED),
                 text(format!("Library: {library_label}")).size(10).color(MUTED),
             ]
             .spacing(5),
@@ -3079,7 +3076,7 @@ impl FluxReady {
                         .size(10)
                         .color(MUTED),
                     text("NON-DESTRUCTIVE").size(9).color(ACCENT),
-                    text("Audio files and embedded tags are never rewritten; originals are never moved.")
+                    text("Audio files are copied into the library; originals and embedded tags are never modified.")
                         .size(10)
                         .color(MUTED),
                     text("DUPLICATE-AWARE").size(9).color(ACCENT),
@@ -3345,20 +3342,9 @@ impl FluxReady {
         );
         body = body.push(
             row![
-                button(text(ImportStorage::Copy.label()).size(10))
-                    .style(nav_style(plan.storage == ImportStorage::Copy))
-                    .padding([5, 9])
-                    .on_press_maybe(
-                        (manager.stage == ImportUiStage::Review)
-                            .then_some(Message::ImportStorageChanged(ImportStorage::Copy))
-                    ),
-                button(text(ImportStorage::Reference.label()).size(10))
-                    .style(nav_style(plan.storage == ImportStorage::Reference))
-                    .padding([5, 9])
-                    .on_press_maybe(
-                        (manager.stage == ImportUiStage::Review)
-                            .then_some(Message::ImportStorageChanged(ImportStorage::Reference))
-                    ),
+                text("COPY-ONLY · managed canonical library")
+                    .size(9)
+                    .color(ACCENT),
                 text(format!("Library: {}", plan.library_root.display()))
                     .size(9)
                     .color(MUTED),
@@ -3525,7 +3511,7 @@ impl FluxReady {
                 .size(9)
                 .color(MUTED),
             text(format!(
-                "Source tags: {} · {} · {}",
+                "Inferred from names: {} · {} · {}",
                 candidate.source_track().title(),
                 candidate.source_track().artist().unwrap_or("—"),
                 candidate.source_track().album().unwrap_or("—")
@@ -3685,7 +3671,13 @@ impl FluxReady {
         if let Some(error) = &manager.number_error {
             body = body.push(text(error).size(9).color(DANGER));
         }
-        if let Some(destination) = candidate.destination() {
+        if matches!(self.controller.storage_mode(), StorageMode::Canonical) {
+            body = body.push(
+                text("Destination: assigned inside the canonical album directory at commit.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        } else if let Some(destination) = candidate.destination() {
             body = body.push(
                 text(format!("Destination: {}", destination.display()))
                     .size(9)
@@ -3697,8 +3689,9 @@ impl FluxReady {
         }
         body = body.push(
             text(
-                "Review edits become Flux-owned overrides; embedded audio tags are never written. \
-                 Artwork extraction/preview is not part of this build.",
+                "Metadata was inferred only from filenames and folders. Review edits become \
+                 canonical Flux metadata; audio tags are never read or written. Artwork \
+                 extraction/preview is not part of this build.",
             )
             .size(9)
             .color(MUTED),
@@ -3989,7 +3982,8 @@ impl FluxReady {
 
         let library_state = match self.controller.storage_mode() {
             StorageMode::Legacy => "App index",
-            StorageMode::Portable => "Portable library",
+            StorageMode::Portable => "Portable library (migration source)",
+            StorageMode::Canonical => "Canonical library",
         };
         nav = nav.push(text("LIBRARY SOURCE").size(8).color(MUTED));
         nav = nav.push(text(library_state).size(10).color(TEXT));
@@ -4038,7 +4032,7 @@ impl FluxReady {
             (
                 "Edit track metadata".to_owned(),
                 format!(
-                    "Track {} · Flux stores overrides; the audio file and its tags stay untouched.",
+                    "Track {} · Flux stores canonical metadata; the audio file and its tags stay untouched.",
                     editor.id
                 ),
             )
@@ -4178,8 +4172,8 @@ impl FluxReady {
             text("♪").size(46).color(ACCENT),
             text("Your library is empty").size(22).color(TEXT),
             text(
-                "Scan a folder of local music to begin. Flux reads embedded tags \
-                 and never writes to your audio files."
+                "Import music to begin. Flux infers metadata from filenames and folders, \
+                 lets you review it, and copies every file into the canonical library."
             )
             .size(12)
             .color(MUTED)
@@ -4189,7 +4183,7 @@ impl FluxReady {
                     .style(accent_button_style)
                     .padding([8, 14])
                     .on_press(Message::ImportOpen),
-                button(text("Scan a folder").size(12))
+                button(text("Library setup").size(12))
                     .style(ghost_style)
                     .padding([8, 14])
                     .on_press(Message::ToggleSetup),
@@ -4252,7 +4246,7 @@ impl FluxReady {
 
         let mut body = column![
             text("Flux-owned overrides").size(9).color(ACCENT),
-            text("These values are stored in the portable library. The audio file and its embedded tags are never rewritten.")
+            text("These values are stored in the canonical library. The audio file and its embedded tags are never rewritten.")
                 .size(10)
                 .color(MUTED),
             text(source_path).size(10).color(MUTED),
@@ -4323,10 +4317,12 @@ impl FluxReady {
     }
 
     fn group_key_for(&self, view: LibraryView, id: TrackId, track: &Track) -> Option<String> {
-        if view == LibraryView::Artists {
-            Some(artist_group_key(self.controller.track_artist_id(id), track))
-        } else {
-            group_key(view, track)
+        match view {
+            LibraryView::Artists => {
+                Some(artist_group_key(self.controller.track_artist_id(id), track))
+            }
+            LibraryView::Albums => Some(album_group_key(self.controller.track_album_id(id), track)),
+            _ => group_key(view, track),
         }
     }
 
@@ -4367,6 +4363,13 @@ impl FluxReady {
                     format!("{count} track(s) · no stable artist")
                 } else {
                     format!("{count} track(s) · artist {artist_id}")
+                }
+            } else if self.view == LibraryView::Albums {
+                let (_, album_id) = album_key_parts(key);
+                if album_id == "none" {
+                    format!("{count} track(s) · no stable album")
+                } else {
+                    format!("{count} track(s) · album {album_id}")
                 }
             } else {
                 format!("{count} track(s)")
@@ -4451,7 +4454,10 @@ impl FluxReady {
         let start = page * TRACK_PAGE_SIZE;
         let end = (start + TRACK_PAGE_SIZE).min(total);
         let current = self.controller.current_id();
-        let editable = self.controller.storage_mode() == StorageMode::Portable;
+        let editable = matches!(
+            self.controller.storage_mode(),
+            StorageMode::Portable | StorageMode::Canonical
+        );
 
         let header = row![
             text("#").size(9).color(MUTED).width(Length::Fixed(28.0)),
@@ -4501,7 +4507,6 @@ impl FluxReady {
     fn setup_view(&self) -> Element<'_, Message> {
         let scanning = self.controller.is_scanning();
         let protected = self.controller.legacy_index_write_protected();
-        let scan_ready = !scanning && !protected && !self.dir_input.trim().is_empty();
         let lib_ready = !scanning && !self.lib_input.trim().is_empty();
 
         let mut setup = column![].spacing(12);
@@ -4520,20 +4525,20 @@ impl FluxReady {
         ));
 
         setup = setup.push(setup_card(
-            "SCAN LOCAL MUSIC",
-            "Add a folder of local audio to the active library. Embedded tags are read; \
-             audio files are never modified.",
+            "IMPORT LOCAL MUSIC",
+            "Import through the review-first manager. Every audio file is copied into the \
+             canonical library; filenames and folders provide provisional metadata and \
+             audio tags are never read.",
             column![
                 row![
-                    text_input("Music folder path…", &self.dir_input)
-                        .on_input(Message::DirInputChanged)
-                        .on_submit(Message::ScanPressed)
-                        .style(input_style)
-                        .width(Length::Fill),
-                    button(text("Scan folder").size(11))
+                    button(text("Choose folder…").size(11))
                         .style(accent_button_style)
                         .padding([7, 12])
-                        .on_press_maybe(scan_ready.then_some(Message::ScanPressed)),
+                        .on_press(Message::ImportNativeFolder),
+                    button(text("Choose files…").size(11))
+                        .style(ghost_style)
+                        .padding([7, 12])
+                        .on_press(Message::ImportNativeFiles),
                     button(text("Refresh").size(11))
                         .style(ghost_style)
                         .padding([7, 12])
@@ -4542,20 +4547,21 @@ impl FluxReady {
                         ),
                 ]
                 .spacing(8),
-                text(if protected {
-                    "Scanning is disabled until the unreadable app index is preserved and replaced."
-                } else if scanning {
+                text(if scanning {
                     "Scanning… the library updates when the worker finishes."
                 } else {
-                    "Tags and durations come from the files; filenames are the fallback."
+                    "Metadata is reviewed before commit; external references are not supported."
                 })
                 .size(10)
-                .color(if protected { DANGER } else { MUTED }),
+                .color(MUTED),
             ]
             .spacing(8),
         ));
 
-        let portable = self.controller.storage_mode() == StorageMode::Portable;
+        let portable = matches!(
+            self.controller.storage_mode(),
+            StorageMode::Portable | StorageMode::Canonical
+        );
 
         let library_label = match self.controller.storage_mode() {
             StorageMode::Legacy => match self.controller.legacy_index_path() {
@@ -4566,12 +4572,16 @@ impl FluxReady {
                 Some(root) => format!("Active: portable library — {}", root.display()),
                 None => "Active: portable library".to_owned(),
             },
+            StorageMode::Canonical => match self.controller.canonical_root() {
+                Some(root) => format!("Active: canonical library — {}", root.display()),
+                None => "Active: canonical library".to_owned(),
+            },
         };
 
         let mut portable_body = column![text(library_label).size(10).color(MUTED)].spacing(8);
         portable_body = portable_body.push(
             row![
-                text_input("Portable library folder…", &self.lib_input)
+                text_input("Canonical library folder…", &self.lib_input)
                     .on_input(Message::LibInputChanged)
                     .on_submit(Message::OpenLibraryPressed)
                     .style(input_style)
@@ -4606,9 +4616,9 @@ impl FluxReady {
         }
 
         setup = setup.push(setup_card(
-            "PORTABLE LIBRARY",
-            "A portable library keeps its catalogue in a .flux folder beside your music, \
-             so the whole library can move with the folder.",
+            "CANONICAL LIBRARY",
+            "A canonical library keeps managed audio, catalogue and metadata together in \
+             one portable root. Every persisted resource path is relative to that root.",
             portable_body,
         ));
 
@@ -4667,27 +4677,38 @@ impl FluxReady {
         .spacing(8);
         if !portable {
             artist_body = artist_body.push(
-                text("Artist management requires a portable library.")
+                text("Artist management requires a canonical library.")
                     .size(10)
                     .color(DANGER),
             );
         }
         setup = setup.push(setup_card(
             "ARTISTS",
-            "Create, select, and rename stable artist identities.",
+            "Create, select, and rename stable canonical artist identities.",
             artist_body,
         ));
 
         let mut health_body = column![
             row![
-                button(text("Reconcile library").size(11))
+                button(
+                    text(if self.controller.storage_mode() == StorageMode::Canonical {
+                        "Refresh & validate"
+                    } else {
+                        "Reconcile library"
+                    })
+                    .size(11)
+                )
                     .style(ghost_style)
                     .padding([7, 10])
                     .on_press_maybe(
                         (portable && !scanning && self.controller.portable_recovery().is_none())
                             .then_some(Message::ReconcilePressed)
                     ),
-                text("Checks every recorded file for changes, missing files, and safe move candidates. Nothing is moved automatically.")
+                text(if self.controller.storage_mode() == StorageMode::Canonical {
+                    "Reopens the canonical library and validates its manifest, catalogue and managed resource paths."
+                } else {
+                    "Checks every recorded file for changes, missing files, and safe move candidates. Nothing is moved automatically."
+                })
                     .size(10)
                     .color(MUTED),
             ]
@@ -4740,10 +4761,13 @@ impl FluxReady {
 
         let mut migration_body = column![
             row![
-                text_input("Legacy index file to migrate…", &self.migrate_source)
-                    .on_input(Message::MigrateSourceChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
+                text_input(
+                    "Legacy index file or portable library folder…",
+                    &self.migrate_source
+                )
+                .on_input(Message::MigrateSourceChanged)
+                .style(input_style)
+                .width(Length::Fill),
                 button(text("Plan migration").size(11))
                     .style(ghost_style)
                     .padding([7, 12])
@@ -4786,9 +4810,9 @@ impl FluxReady {
             );
         }
         setup = setup.push(setup_card(
-            "MIGRATE A LEGACY INDEX",
-            "Carry an existing app-data index into a portable library, preserving IDs and \
-             metadata while reporting excluded paths.",
+            "MIGRATE TO CANONICAL",
+            "Inventory a legacy index or portable schema-v3 library and build a separate \
+             canonical library. The source is never modified or activated automatically.",
             migration_body,
         ));
 
@@ -5432,21 +5456,35 @@ fn repeat_label(mode: RepeatMode) -> &'static str {
     }
 }
 
-fn migration_plan_summary(plan: &MigrationPlan) -> String {
+fn migration_plan_summary(plan: &CanonicalMigrationPlan) -> String {
+    let issues = if plan.is_ready() {
+        "no blocking issues".to_owned()
+    } else {
+        format!(
+            "{} blocking issue(s): {}",
+            plan.issues().len(),
+            plan.issues()
+                .iter()
+                .take(3)
+                .map(|issue| issue.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
     format!(
-        "Migration plan: {} track(s) will migrate ({} present, {} missing — \
-         kept and marked unavailable). Excluded: {} outside the destination \
-         folder, {} reached through symlinks, {} with unrepresentable paths, \
-         {} ambiguous after path normalization. Track IDs and the ID counter \
-         are preserved; the legacy index and all audio files stay untouched. \
-         Choose “Execute migration” to proceed, or Cancel to write nothing.",
-        plan.migrated_count(),
-        plan.present_count(),
-        plan.missing_count(),
-        plan.external_count(),
-        plan.symlinked_count(),
-        plan.unrepresentable_count(),
-        plan.ambiguous_count(),
+        "Canonical migration plan ({}): {} track(s), {} artist(s), {} album(s), \
+         about {} MiB to copy; {}. The source is read-only. Track IDs and counters \
+         are preserved where the source has them. Choose Execute only when there \
+         are no blocking issues.",
+        match plan.format() {
+            flux_app::CanonicalSourceFormat::PortableSchemaV3 => "schema-v3",
+            flux_app::CanonicalSourceFormat::LegacyIndex => "legacy index",
+        },
+        plan.track_count(),
+        plan.artist_count(),
+        plan.album_count(),
+        plan.estimated_bytes() / (1024 * 1024),
+        issues,
     )
 }
 
@@ -5525,7 +5563,6 @@ mod tests {
         let last_queue_current = controller.current_queue_entry_id();
         FluxReady {
             controller,
-            dir_input: String::new(),
             search: String::new(),
             lib_input: String::new(),
             track_editor: None,
@@ -5571,15 +5608,20 @@ mod tests {
         );
         send(&mut gui, Message::CreateLibraryPressed);
 
-        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
         assert_eq!(
-            gui.controller.portable_root(),
+            gui.controller.canonical_root(),
             Some(std::fs::canonicalize(&root).expect("canonical").as_path())
         );
         assert!(
-            root.join(".flux").exists(),
-            "store was created via flux-app"
+            root.join("catalog.flux").exists(),
+            "canonical catalogue exists"
         );
+        assert!(
+            root.join("library.flux").exists(),
+            "canonical manifest exists"
+        );
+        assert!(!root.join(".flux").exists(), "no legacy portable store");
         gui.controller.shutdown();
     }
 
@@ -5620,9 +5662,10 @@ mod tests {
         .expect("index");
 
         let mut gui = gui(&dir);
+        let destination = dir.path().join("canonical-result");
         send(
             &mut gui,
-            Message::LibInputChanged(root.display().to_string()),
+            Message::LibInputChanged(destination.display().to_string()),
         );
         send(
             &mut gui,
@@ -5634,18 +5677,19 @@ mod tests {
         assert!(gui.lifecycle_msg.is_some(), "plan summary is shown");
         send(&mut gui, Message::CancelMigrationPressed);
         assert!(gui.pending_plan.is_none());
-        assert!(!root.join(".flux").exists(), "cancel wrote nothing");
+        assert!(!destination.exists(), "cancel wrote nothing");
         assert_eq!(gui.controller.storage_mode(), StorageMode::Legacy);
 
         send(&mut gui, Message::PlanMigrationPressed);
         send(&mut gui, Message::ExecuteMigrationPressed);
         assert!(gui.pending_plan.is_none());
-        assert_eq!(gui.migrated_dest.as_deref(), Some(root.as_path()));
-        assert!(root.join(".flux").exists());
+        assert_eq!(gui.migrated_dest.as_deref(), Some(destination.as_path()));
+        assert!(destination.join("catalog.flux").exists());
+        assert!(destination.join("library.flux").exists());
         assert_eq!(gui.controller.storage_mode(), StorageMode::Legacy);
 
         send(&mut gui, Message::OpenMigratedPressed);
-        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
         let ids: Vec<u64> = gui
             .controller
             .tracks()
@@ -5673,17 +5717,12 @@ mod tests {
             Message::LibInputChanged(root.display().to_string()),
         );
         send(&mut gui, Message::CreateLibraryPressed);
-        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
         send(&mut gui, Message::ReconcilePressed);
-        let message = gui.lifecycle_msg.clone().expect("summary shown");
-        assert!(
-            message.starts_with("Reconciliation: 0 track(s) checked"),
-            "{message}"
-        );
         assert_eq!(
             gui.controller.storage_mode(),
-            StorageMode::Portable,
-            "reconciling never switches libraries"
+            StorageMode::Canonical,
+            "refreshing never switches libraries"
         );
         gui.controller.shutdown();
     }
@@ -5804,7 +5843,7 @@ mod tests {
         let dir = TempDir::new("gui-import-entry");
         let root = dir.path().join("library");
         std::fs::create_dir_all(&root).expect("library root");
-        flux_app::create_portable_library(&root).expect("create portable library");
+        flux_app::create_canonical_library(&root).expect("create canonical library");
         let source = root.join("drop.wav");
         std::fs::write(&source, minimal_wav()).expect("source");
         let mut gui = gui(&dir);
@@ -5869,8 +5908,8 @@ mod tests {
         let dir = TempDir::new("gui-import-manager");
         let root = dir.path().join("library");
         std::fs::create_dir_all(&root).expect("library root");
-        flux_app::create_portable_library(&root).expect("create portable library");
-        let source_dir = dir.path().join("source");
+        flux_app::create_canonical_library(&root).expect("create canonical library");
+        let source_dir = dir.path().join("Artist/Album");
         std::fs::create_dir_all(&source_dir).expect("source");
         let source = source_dir.join("import.wav");
         std::fs::write(&source, minimal_wav()).expect("source");
@@ -5881,13 +5920,13 @@ mod tests {
             Message::LibInputChanged(root.display().to_string()),
         );
         send(&mut gui, Message::OpenLibraryPressed);
-        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
 
         let request = ImportRequest {
             sources: vec![source.clone()],
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: gui.controller.portable_root().expect("root").to_path_buf(),
+            library_root: gui.controller.canonical_root().expect("root").to_path_buf(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
         };
@@ -5938,8 +5977,8 @@ mod tests {
         let dir = TempDir::new("gui-manage-flow");
         let root = dir.path().join("library");
         std::fs::create_dir_all(&root).expect("library root");
-        flux_app::create_portable_library(&root).expect("create portable library");
-        let source_dir = dir.path().join("source");
+        flux_app::create_canonical_library(&root).expect("create canonical library");
+        let source_dir = dir.path().join("Artist/Album");
         std::fs::create_dir_all(&source_dir).expect("source dir");
         let source = source_dir.join("song.wav");
         std::fs::write(&source, minimal_wav()).expect("source");
@@ -5950,7 +5989,7 @@ mod tests {
             Message::LibInputChanged(root.display().to_string()),
         );
         send(&mut gui, Message::OpenLibraryPressed);
-        assert_eq!(gui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
         gui.controller
             .import_files(std::slice::from_ref(&source), true)
             .expect("quick fixture import");
@@ -5967,22 +6006,13 @@ mod tests {
             &mut gui,
             Message::EditorAlbumChanged("Edited album".to_owned()),
         );
-        send(
-            &mut gui,
-            Message::EditorNewArtistChanged("GUI Artist".to_owned()),
-        );
-        send(&mut gui, Message::EditorCreateArtist);
-        let artist_id = gui
-            .track_editor
-            .as_ref()
-            .and_then(|editor| editor.artist_id)
-            .expect("artist selected");
         send(&mut gui, Message::EditorSave);
         assert!(gui.track_editor.is_none());
         let track = gui.controller.track(id).expect("edited track");
         assert_eq!(track.title(), "Edited title");
-        assert_eq!(track.artist(), Some("GUI Artist"));
+        assert_eq!(track.artist(), Some("Artist"));
         assert_eq!(track.album(), Some("Edited album"));
+        let artist_id = gui.controller.track_artist_id(id).expect("artist");
 
         send(
             &mut gui,

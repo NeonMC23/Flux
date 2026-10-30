@@ -255,6 +255,8 @@ pub enum CanonicalMigrationError {
     DestinationExists(PathBuf),
     /// Destination has no usable parent.
     InvalidDestination(PathBuf),
+    /// The selected source is not a supported legacy/portable library.
+    UnsupportedSource(String),
     /// Building staging failed.
     Build {
         /// Isolated staging directory retained for inspection/cleanup.
@@ -291,6 +293,9 @@ impl fmt::Display for CanonicalMigrationError {
             }
             Self::InvalidDestination(path) => {
                 write!(f, "destination has no usable parent: {}", path.display())
+            }
+            Self::UnsupportedSource(message) => {
+                write!(f, "unsupported migration source: {message}")
             }
             Self::Build { staging, source } => write!(
                 f,

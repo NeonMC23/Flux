@@ -197,6 +197,17 @@ pub struct Artist {
 }
 
 impl Artist {
+    /// Constructs an artist descriptor for presentation adapters. Catalogue
+    /// implementations remain responsible for identity allocation.
+    #[must_use]
+    pub fn new(id: ArtistId, name: impl Into<String>, aliases: Vec<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            aliases,
+        }
+    }
+
     /// The stable identity.
     #[must_use]
     pub fn id(&self) -> ArtistId {

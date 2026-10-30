@@ -21,7 +21,7 @@
 //!   `Delete` remove the current queue entry, `Ctrl+↑`/`Ctrl+↓`
 //!   reorder the current queue entry
 //! - `o` scan a folder (type a path), `r` refresh scanned folders
-//! - `i` quick copy-import paths, `I` quick-import paths already inside
+//! - `i`/`I` quick copy-import paths into the canonical library
 //!   the portable library (the GUI has the full review-first Import
 //!   Manager), `e` edit the selected track, `P` create an artist,
 //!   `Y` rename an artist (`artist-id|new-name`), `V` list artist IDs,
@@ -46,7 +46,7 @@
 //! active library untouched.
 
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -56,7 +56,7 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use flux_app::{
-    Controller, MigrationPlan, ReconcileReport, StorageMode, TrackMetadataEdit, default_index_path,
+    CanonicalMigrationPlan, Controller, ReconcileReport, StorageMode, TrackMetadataEdit,
     format_duration, is_track_playable,
 };
 use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
@@ -114,7 +114,7 @@ enum Mode {
     OpenInput,
     /// Typing a folder for a new portable library (`C`).
     CreateInput,
-    /// Typing semicolon-separated audio file paths (`i` copy / `I` in place).
+    /// Typing semicolon-separated audio file paths (`i`/`I` copy into the library).
     ImportInput,
     /// Editing the selected track as `title|album|track|disc|artist-id`.
     TrackEditInput,
@@ -148,12 +148,12 @@ struct Tui {
     /// Legacy index file chosen at migration step 1.
     migrate_source: PathBuf,
     /// Planned-but-unconfirmed migration (nothing written yet).
-    pending_plan: Option<MigrationPlan>,
+    pending_plan: Option<CanonicalMigrationPlan>,
     /// Destination of a completed migration, offered for activation.
     migrated_dest: Option<PathBuf>,
     /// Latest library-lifecycle outcome (plan summary, errors, …).
     lifecycle_msg: Option<String>,
-    /// Whether the current import input will copy external files.
+    /// Kept true: canonical imports always copy; no external references exist.
     import_copy: bool,
     /// Last reconciliation, used by the explicit `L` unique-relink action.
     last_reconcile: Option<ReconcileReport>,
@@ -270,7 +270,7 @@ impl Tui {
             }
             KeyCode::Char('I') => {
                 self.mode = Mode::ImportInput;
-                self.import_copy = false;
+                self.import_copy = true;
                 self.input.clear();
             }
             KeyCode::Char('e') => {
@@ -322,13 +322,11 @@ impl Tui {
                 self.input.clear();
             }
             KeyCode::Char('B') => {
-                if self
-                    .controller
-                    .switch_to_legacy_index(default_index_path())
-                    .is_ok()
-                {
-                    self.after_switch();
-                }
+                self.lifecycle_msg = Some(
+                    "Legacy runtime switching is disabled. Migrate an old index with M; \
+                     the source is left untouched."
+                        .to_owned(),
+                );
             }
             KeyCode::Char('U') => {
                 if !self.controller.legacy_index_write_protected() {
@@ -354,9 +352,12 @@ impl Tui {
                 }
             }
             KeyCode::Char('X') => {
-                // Failures land in the controller's error line; the
-                // detailed summary replaces the lifecycle message.
-                if let Ok(report) = self.controller.reconcile_portable_library() {
+                if self.controller.storage_mode() == StorageMode::Canonical {
+                    self.controller.refresh();
+                    self.lifecycle_msg = Some(
+                        "Refreshed the canonical library and validated its resources.".to_owned(),
+                    );
+                } else if let Ok(report) = self.controller.reconcile_portable_library() {
                     self.lifecycle_msg = Some(reconcile_summary(&report));
                     self.last_reconcile = Some(report);
                 }
@@ -391,7 +392,7 @@ impl Tui {
             Mode::MigratedDone => {
                 if key.code == KeyCode::Char('a')
                     && let Some(destination) = self.migrated_dest.clone()
-                    && self.controller.switch_to_portable(&destination).is_ok()
+                    && self.controller.switch_to_canonical(&destination).is_ok()
                 {
                     self.after_switch();
                 }
@@ -416,7 +417,17 @@ impl Tui {
                     Mode::ScanInput => {
                         let path = text.trim();
                         if !path.is_empty() {
-                            self.controller.begin_scan(PathBuf::from(path));
+                            match self.controller.import_folder(Path::new(path), true) {
+                                Ok(report) => {
+                                    self.lifecycle_msg = Some(format!(
+                                        "Import: {} added, {} duplicate(s), {} issue(s).",
+                                        report.added,
+                                        report.deduplicated,
+                                        report.issues.len()
+                                    ));
+                                }
+                                Err(err) => self.lifecycle_msg = Some(err),
+                            }
                         }
                     }
                     Mode::SearchInput => {
@@ -507,7 +518,7 @@ impl Tui {
                     }
                     Mode::OpenInput => {
                         let path = PathBuf::from(text.trim());
-                        if self.controller.switch_to_portable(&path).is_ok() {
+                        if self.controller.switch_to_canonical(&path).is_ok() {
                             self.after_switch();
                         }
                     }
@@ -515,7 +526,7 @@ impl Tui {
                         let path = PathBuf::from(text.trim());
                         if self
                             .controller
-                            .switch_to_new_portable_library(&path)
+                            .switch_to_new_canonical_library(&path)
                             .is_ok()
                         {
                             self.after_switch();
@@ -530,7 +541,8 @@ impl Tui {
                     }
                     Mode::MigrateDestInput => {
                         let destination = PathBuf::from(text.trim());
-                        match flux_app::plan_legacy_migration(&self.migrate_source, &destination) {
+                        match flux_app::plan_canonical_migration(&self.migrate_source, &destination)
+                        {
                             Ok(plan) => {
                                 self.lifecycle_msg = Some(migration_plan_summary(&plan));
                                 self.pending_plan = Some(plan);
@@ -567,18 +579,16 @@ impl Tui {
             self.mode = Mode::Normal;
             return;
         };
-        let destination = plan.destination_root().to_path_buf();
-        match flux_app::execute_legacy_migration(&plan) {
+        let destination = plan.destination().to_path_buf();
+        match flux_app::execute_canonical_migration(&plan) {
             Ok(report) => {
-                let done = report.plan();
                 self.lifecycle_msg = Some(format!(
-                    "Migration complete: {} track(s) migrated ({} present, {} missing), \
-                     {} excluded. Active library unchanged — press a to open the \
+                    "Canonical migration complete: {} track(s), {} artist(s), {} album(s), \
+                     validated. The source is untouched. Press a to activate the \
                      migrated library, Esc to keep the current one.",
-                    done.migrated_count(),
-                    done.present_count(),
-                    done.missing_count(),
-                    done.records().len() - done.migrated_count(),
+                    report.tracks(),
+                    report.artists(),
+                    report.albums(),
                 ));
                 self.migrated_dest = Some(destination);
                 self.mode = Mode::MigratedDone;
@@ -682,6 +692,10 @@ impl Tui {
                 Some(root) => format!("library: portable {}", root.display()),
                 None => "library: portable".to_owned(),
             },
+            StorageMode::Canonical => match self.controller.canonical_root() {
+                Some(root) => format!("library: canonical {}", root.display()),
+                None => "library: canonical".to_owned(),
+            },
         };
         let mut header = format!(
             "Flux {MILESTONE} — terminal player   [{library_label}]   [queue {}]",
@@ -773,7 +787,7 @@ impl Tui {
         let help = match self.mode {
             Mode::Normal => "Enter play · Space pause · s stop · n/p skip · a add · x next \
                              · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
-                             · i quick copy-import · I quick in-place · e edit track · V artists \
+                             · i/I quick copy-import · e edit track · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
                              · B index · U fix · q quit"
@@ -785,8 +799,7 @@ impl Tui {
             Mode::SearchInput => format!("Search (Enter to apply, Esc to cancel): {}_", self.input),
             Mode::ImportInput => format!(
                 "{} import paths separated by ; (Enter to import, Esc to cancel): {}_",
-                if self.import_copy { "Copy" } else { "In-place" },
-                self.input
+                "Copy", self.input
             ),
             Mode::TrackEditInput => format!(
                 "Edit selected track as title|album|track|disc|artist-id (Enter save, Esc cancel): {}_",
@@ -906,19 +919,28 @@ fn reconcile_summary(report: &flux_app::ReconcileReport) -> String {
     summary
 }
 
-fn migration_plan_summary(plan: &MigrationPlan) -> String {
-    format!(
-        "Migrate {} track(s) ({} present, {} missing→unavailable); excluded: \
-         {} external, {} symlinked, {} unrepresentable, {} ambiguous. \
-         y = execute, Esc = cancel (writes nothing).",
-        plan.migrated_count(),
-        plan.present_count(),
-        plan.missing_count(),
-        plan.external_count(),
-        plan.symlinked_count(),
-        plan.unrepresentable_count(),
-        plan.ambiguous_count(),
-    )
+fn migration_plan_summary(plan: &CanonicalMigrationPlan) -> String {
+    if plan.is_ready() {
+        format!(
+            "Canonical migration: {} track(s), {} artist(s), {} album(s), about {} MiB. \
+             y = execute, Esc = cancel (source untouched).",
+            plan.track_count(),
+            plan.artist_count(),
+            plan.album_count(),
+            plan.estimated_bytes() / (1024 * 1024),
+        )
+    } else {
+        format!(
+            "Canonical migration blocked by {} issue(s): {}. Resolve them before executing.",
+            plan.issues().len(),
+            plan.issues()
+                .iter()
+                .take(3)
+                .map(|issue| issue.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
 }
 
 fn track_edit_form(controller: &Controller, id: TrackId, track: &Track) -> String {
@@ -999,7 +1021,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
     let mut controller =
         Controller::open_default().map_err(|err| std::io::Error::other(err.to_string()))?;
     if let Some(dir) = initial_dir {
-        controller.begin_scan(dir);
+        let _ = controller.import_folder(&dir, true);
     }
 
     let guard = TerminalGuard::enter()?;
@@ -1133,8 +1155,12 @@ mod tests {
         key(&mut tui, KeyCode::Char('C'));
         type_path(&mut tui, &root);
         assert_eq!(tui.mode, Mode::Normal);
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
-        assert!(root.join(".flux").exists(), "store created via flux-app");
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
+        assert!(
+            root.join("catalog.flux").exists(),
+            "canonical catalogue created"
+        );
+        assert!(!root.join(".flux").exists(), "no portable runtime store");
         tui.controller.shutdown();
     }
 
@@ -1143,7 +1169,7 @@ mod tests {
         let dir = TempDir::new("tui-manage");
         let root = dir.path().join("library");
         std::fs::create_dir_all(&root).expect("root");
-        let source_dir = dir.path().join("source");
+        let source_dir = dir.path().join("Tui Artist/Album");
         std::fs::create_dir_all(&source_dir).expect("source");
         let source = source_dir.join("song.wav");
         std::fs::write(&source, minimal_wav()).expect("source");
@@ -1151,7 +1177,7 @@ mod tests {
 
         key(&mut tui, KeyCode::Char('C'));
         type_path(&mut tui, &root);
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
 
         key(&mut tui, KeyCode::Char('i'));
         assert_eq!(tui.mode, Mode::ImportInput);
@@ -1159,17 +1185,17 @@ mod tests {
         type_path(&mut tui, &source);
         assert_eq!(tui.controller.tracks().len(), 1);
         let id = tui.controller.tracks()[0].0;
+        let artist = tui.controller.track_artist_id(id).expect("inferred artist");
         let source_message = tui.lifecycle_msg.clone().expect("import summary");
         assert!(source_message.contains("1 added"), "{source_message}");
 
         key(&mut tui, KeyCode::Char('P'));
-        type_text(&mut tui, "Tui Artist");
-        assert_eq!(tui.controller.artists().len(), 1);
-        let artist = tui.controller.artists()[0].id();
+        type_text(&mut tui, "Extra Artist");
+        assert_eq!(tui.controller.artists().len(), 2);
         assert!(
             tui.lifecycle_msg
                 .as_deref()
-                .is_some_and(|m| m.contains("Tui Artist"))
+                .is_some_and(|m| m.contains("Extra Artist"))
         );
 
         key(&mut tui, KeyCode::Char('e'));
@@ -1198,52 +1224,51 @@ mod tests {
             Some("Renamed Tui Artist")
         );
 
-        let outside_refused = source_dir.join("refused.wav");
-        std::fs::write(&outside_refused, minimal_wav()).expect("outside");
+        let outside = dir.path().join("Other Artist/Album/outside.wav");
+        std::fs::create_dir_all(outside.parent().expect("parent")).expect("outside dir");
+        let mut different = minimal_wav();
+        different.push(0);
+        std::fs::write(&outside, different).expect("outside");
         key(&mut tui, KeyCode::Char('I'));
-        type_path(&mut tui, &outside_refused);
-        assert_eq!(tui.controller.tracks().len(), 1);
-        assert!(
-            tui.lifecycle_msg
-                .as_deref()
-                .is_some_and(|m| m.contains("issue"))
-        );
+        type_path(&mut tui, &outside);
+        assert_eq!(tui.controller.tracks().len(), 2);
+        assert!(outside.is_file(), "source is never moved or deleted");
         tui.controller.shutdown();
     }
 
     #[test]
-    fn reconcile_then_relink_unique_candidate_keeps_the_track_id() {
-        let dir = TempDir::new("tui-relink");
+    fn canonical_refresh_keeps_missing_track_identity() {
+        use flux_app::StorageMode;
+
+        let dir = TempDir::new("tui-missing");
         let root = dir.path().join("library");
-        std::fs::create_dir_all(&root).expect("root");
-        let file = root.join("missing.wav");
-        std::fs::write(&file, minimal_wav()).expect("audio");
+        let source_dir = dir.path().join("Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join("missing.wav");
+        std::fs::write(&source, minimal_wav()).expect("audio");
         let mut tui = tui(&dir);
         key(&mut tui, KeyCode::Char('C'));
         type_path(&mut tui, &root);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
         key(&mut tui, KeyCode::Char('I'));
-        type_path(&mut tui, &file);
+        type_path(&mut tui, &source);
         assert_eq!(tui.controller.tracks().len(), 1);
         let id = tui.controller.tracks()[0].0;
-
-        let moved = root.join("moved.wav");
-        std::fs::rename(&file, &moved).expect("move audio");
+        let audio = tui
+            .controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        std::fs::remove_file(audio).expect("remove managed audio");
         key(&mut tui, KeyCode::Char('X'));
-        assert!(tui.last_reconcile.is_some());
-        assert!(
-            tui.lifecycle_msg
-                .as_deref()
-                .is_some_and(|message| message.contains("possible new locations"))
-        );
-        key(&mut tui, KeyCode::Char('L'));
+        assert!(tui.controller.track(id).is_some(), "identity is retained");
         assert_eq!(
-            tui.controller
-                .track(id)
-                .map(|track| track.source().path().to_path_buf()),
-            Some(moved),
-            "the explicit unique-candidate action relinks the same TrackId"
+            tui.controller.track_availability(id),
+            Some(flux_app::Availability::Missing)
         );
-        assert!(tui.last_reconcile.is_none());
+        assert!(source.is_file(), "the original source remains untouched");
         tui.controller.shutdown();
     }
 
@@ -1266,30 +1291,31 @@ mod tests {
         )
         .expect("index");
 
+        let destination = dir.path().join("CanonicalResult");
         let mut tui = tui(&dir);
         key(&mut tui, KeyCode::Char('M'));
         assert_eq!(tui.mode, Mode::MigrateSourceInput);
         type_path(&mut tui, &index);
         assert_eq!(tui.mode, Mode::MigrateDestInput);
-        type_path(&mut tui, &root);
+        type_path(&mut tui, &destination);
         assert_eq!(tui.mode, Mode::MigrateConfirm);
         assert!(tui.pending_plan.is_some());
-        assert!(!root.join(".flux").exists(), "planning wrote nothing");
+        assert!(!destination.exists(), "planning wrote nothing");
         assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
 
         // Cancel at the confirmation step.
         key(&mut tui, KeyCode::Esc);
         assert_eq!(tui.mode, Mode::Normal);
         assert!(tui.pending_plan.is_none());
-        assert!(!root.join(".flux").exists(), "cancel wrote nothing");
+        assert!(!destination.exists(), "cancel wrote nothing");
 
         // Again, this time confirm and activate.
         key(&mut tui, KeyCode::Char('M'));
         type_path(&mut tui, &index);
-        type_path(&mut tui, &root);
+        type_path(&mut tui, &destination);
         key(&mut tui, KeyCode::Char('y'));
         assert_eq!(tui.mode, Mode::MigratedDone);
-        assert!(root.join(".flux").exists());
+        assert!(destination.join("catalog.flux").exists());
         assert_eq!(
             tui.controller.storage_mode(),
             StorageMode::Legacy,
@@ -1298,7 +1324,7 @@ mod tests {
 
         key(&mut tui, KeyCode::Char('a'));
         assert_eq!(tui.mode, Mode::Normal);
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
         let ids: Vec<u64> = tui
             .controller
             .tracks()
@@ -1327,12 +1353,15 @@ mod tests {
         // Create + switch, then X reconciles and reports.
         key(&mut tui, KeyCode::Char('C'));
         type_path(&mut tui, &root);
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
         key(&mut tui, KeyCode::Char('X'));
         assert_eq!(tui.mode, Mode::Normal);
         let message = tui.lifecycle_msg.clone().expect("summary shown");
-        assert!(message.starts_with("Reconciled 0:"), "{message}");
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Portable);
+        assert!(
+            message.contains("Refreshed the canonical library"),
+            "{message}"
+        );
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
         tui.controller.shutdown();
     }
 

@@ -783,6 +783,8 @@ pub struct CanonicalImportedTrack {
     pub source: PathBuf,
     /// Canonical title.
     pub title: String,
+    /// Existing stable owner artist, when the review selected one.
+    pub artist_id: Option<ArtistId>,
     /// Canonical owner artist name (created or reused by exact name).
     pub artist_name: String,
     /// Album title (required for canonical storage).
@@ -1582,6 +1584,151 @@ fn recover_transactions(
     Ok(())
 }
 
+impl CanonicalLibrary {
+    /// The next TrackId counter, preserving retired-ID gaps.
+    #[must_use]
+    pub fn next_track_id(&self) -> u64 {
+        self.catalog.next_track_id
+    }
+    /// The next ArtistId counter.
+    #[must_use]
+    pub fn next_artist_id(&self) -> u64 {
+        self.catalog.next_artist_id
+    }
+    /// The next AlbumId counter.
+    #[must_use]
+    pub fn next_album_id(&self) -> u64 {
+        self.catalog.next_album_id
+    }
+    /// The next PlaylistId counter.
+    #[must_use]
+    pub fn next_playlist_id(&self) -> u64 {
+        self.catalog.next_playlist_id
+    }
+    /// Ordered credited artists for a track.
+    #[must_use]
+    pub fn track_credits(&self, id: TrackId) -> Option<&[ArtistId]> {
+        self.tracks
+            .get(&id)
+            .map(|track| track.credited_artist_ids.as_slice())
+    }
+    /// Finds an album by exact owner and title.
+    #[must_use]
+    pub fn album_by_title(&self, owner: ArtistId, title: &str) -> Option<AlbumId> {
+        self.albums
+            .values()
+            .find(|album| album.owner_artist_id == owner && album.title == title)
+            .map(|album| album.id)
+    }
+    /// All track IDs physically owned by an artist.
+    pub fn owned_track_ids(&self, artist: ArtistId) -> impl Iterator<Item = TrackId> + '_ {
+        self.tracks
+            .values()
+            .filter(move |track| track.owner_artist_id == artist)
+            .map(|track| track.id)
+    }
+    /// All track IDs an artist is credited on, including featuring credits.
+    pub fn credited_track_ids(&self, artist: ArtistId) -> impl Iterator<Item = TrackId> + '_ {
+        self.tracks
+            .values()
+            .filter(move |track| track.credited_artist_ids.contains(&artist))
+            .map(|track| track.id)
+    }
+    /// Absolute path to a track's managed lyrics file, when recorded.
+    #[must_use]
+    pub fn track_lyrics_path(&self, id: TrackId) -> Option<PathBuf> {
+        let track = self.tracks.get(&id)?;
+        let lyrics = track.lyrics.as_ref()?;
+        let record = self.track_records.get(&id)?;
+        let os = record.to_os_path()?;
+        let dir = os.parent()?;
+        Some(self.root.join(dir).join(lyrics))
+    }
+    /// Finds a track with exactly the given content fingerprint.
+    #[must_use]
+    pub fn track_by_fingerprint(&self, fingerprint: ContentFingerprint) -> Option<TrackId> {
+        self.tracks
+            .values()
+            .find(|track| track.fingerprint == Some(fingerprint))
+            .map(|track| track.id)
+    }
+    /// Renames an album without changing its ID or directory. The generated
+    /// directory name is ID-derived, so no physical move is required.
+    pub fn rename_album(
+        &mut self,
+        id: AlbumId,
+        title: impl Into<String>,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let album = self
+            .albums
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("album is not in the library".to_owned()))?;
+        let title = title.into().trim().to_owned();
+        if title.is_empty() {
+            return Err(CanonicalError::Invalid(
+                "album title must not be empty".to_owned(),
+            ));
+        }
+        let rel = self
+            .album_paths
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing album path".to_owned()))?;
+        let dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: id.get(),
+            owner_artist_id: album.owner_artist_id.get(),
+            title,
+            release_type: album.release_type,
+            cover: album.cover,
+            track_order: album.track_order.iter().map(|track| track.get()).collect(),
+        };
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &rel, "album.flux", &dto)?;
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+    /// Rebuilds the legacy in-memory [`Library`] view from canonical data.
+    /// This is a presentation adapter only; canonical files remain the
+    /// authority.
+    #[must_use]
+    pub fn runtime_library(&self) -> crate::Library {
+        let mut tracks = Vec::with_capacity(self.tracks.len());
+        for track in self.tracks.values() {
+            let Some(path) = self.track_audio_path(track.id) else {
+                continue;
+            };
+            let mut runtime =
+                flux_core::Track::new(track.title.clone(), flux_core::TrackSource::local(path));
+            if let Some(artist) = self
+                .artists
+                .get(&track.owner_artist_id)
+                .map(|artist| artist.name.clone())
+            {
+                runtime = runtime.with_artist(artist);
+            }
+            if let Some(album) = self.albums.get(&track.album_id) {
+                runtime = runtime.with_album(album.title.clone());
+            }
+            if let Some(number) = track.track_number {
+                runtime = runtime.with_track_number(number);
+            }
+            if let Some(disc) = track.disc_number {
+                runtime = runtime.with_disc_number(disc);
+            }
+            if let Some(ms) = track.duration_ms {
+                runtime = runtime.with_duration(std::time::Duration::from_millis(ms));
+            }
+            tracks.push((track.id, runtime));
+        }
+        crate::Library::from_parts(tracks, self.catalog.next_track_id)
+    }
+}
+
 // -------------------------------------------------------------- export ---
 
 impl CanonicalLibrary {
@@ -1913,13 +2060,21 @@ impl CanonicalLibrary {
         let mut catalog = self.catalog.clone();
         let mut writes = Vec::new();
 
-        let artist_id = match catalog.artists.iter().find(|entry| {
+        let artist_id = if let Some(id) = imported.artist_id {
+            if !self.artists.contains_key(&id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "selected owner artist {id} is not in the library"
+                )));
+            }
+            id
+        } else if let Some(entry) = catalog.artists.iter().find(|entry| {
             self.artists
                 .get(&ArtistId::new(entry.id))
                 .is_some_and(|artist| artist.name == artist_name)
         }) {
-            Some(entry) => ArtistId::new(entry.id),
-            None => {
+            ArtistId::new(entry.id)
+        } else {
+            {
                 let id = ArtistId::new(catalog.next_artist_id);
                 catalog.next_artist_id = catalog
                     .next_artist_id
@@ -2407,6 +2562,7 @@ mod tests {
             .import_track(CanonicalImportedTrack {
                 source,
                 title: format!("Title {name}"),
+                artist_id: None,
                 artist_name: "Artist One".to_owned(),
                 album_title: Some("Album One".to_owned()),
                 release_type: ReleaseType::Album,

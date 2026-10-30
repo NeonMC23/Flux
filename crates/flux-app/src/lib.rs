@@ -27,92 +27,33 @@
 //!
 //! # Storage backends and library lifecycle
 //!
-//! Persistence goes through one explicit backend at a time
-//! ([`StorageMode`]). The backend is chosen at construction and can
-//! afterwards be replaced only through the explicit switch methods,
-//! which build and validate the candidate library first and swap
-//! atomically — a failed switch changes nothing, and queue/selection
-//! state never carries track IDs across libraries. Playback stops and
-//! the destination library's own persisted queue is loaded (or its
-//! whole-library default is derived when no queue file exists):
+//! The canonical self-contained library is the normal runtime backend
+//! ([`StorageMode::Canonical`]). The Controller owns the validated
+//! [`CanonicalLibrary`] and exposes a display snapshot plus stable IDs;
+//! canonical files remain the authority. Create/open/switch build and validate
+//! the candidate first, stop playback, load that library's queue, and never
+//! carry track IDs or queue selections across libraries.
 //!
-//! - **Legacy** ([`Controller::new`] / [`Controller::open_default`],
-//!   later [`Controller::switch_to_legacy_index`]): the version-1
-//!   JSON index at the given path (today's default; its startup
-//!   behavior is unchanged — a missing index starts empty, an
-//!   unreadable one starts empty with a reported error).
-//! - **Portable** ([`Controller::new_portable`], later
-//!   [`Controller::switch_to_portable`] /
-//!   [`Controller::switch_to_new_portable_library`]): the `.flux`
-//!   store at a caller-supplied library root. Opening is fallible and
-//!   strict: a missing or invalid store is a [`PortableOpenError`],
-//!   never a silent fallback to an empty library or the legacy index,
-//!   and nothing is created. The in-memory [`Library`] is
-//!   reconstructed from the store (IDs, counter, and missing records
-//!   included); saves sync it back and commit through the store's own
-//!   protocol. A store recovered from its backup catalogue stays
-//!   read-only — scans and saves refuse — until
-//!   [`acknowledge_portable_recovery`](Controller::acknowledge_portable_recovery)
-//!   is called explicitly. Because a portable library can only store
-//!   paths inside its own root, portable-mode scans accept only
-//!   folders within that root.
+//! Canonical mode:
 //!
-//! Creating a brand-new portable library ([`create_portable_library`])
-//! and migrating a legacy index ([`plan_legacy_migration`] →
-//! [`execute_legacy_migration`], or the one-call
-//! [`migrate_legacy_library`]) are likewise explicit, caller-requested
-//! operations: never side effects of startup, scanning, or saving,
-//! and neither switches a running controller by itself — activating
-//! the result is the separate switch step above.
+//! - resolves playback paths from the library root only;
+//! - copies every import into the library (no external references);
+//! - infers import metadata from filenames/folders and never reads tags;
+//! - commits through the canonical transaction journal and validates paths;
+//! - keeps artist/album renames identity-preserving;
+//! - refuses physical-owner changes until ownership transfer is implemented.
 //!
-//! Reconciliation ([`Controller::reconcile_portable_library`]) is the
-//! portable catalogue's explicit maintenance pass: it compares every
-//! persistent record (not just the ones loaded in memory) with the
-//! filesystem, refreshes availability and size/mtime fingerprints,
-//! retains missing records with their IDs and metadata, and reports
-//! possible new locations for moved files as candidates. Applying a
-//! candidate is the separate, revalidated
-//! [`Controller::relink_portable_track`] step — reconciliation never
-//! moves, deletes, or retags anything by itself, and never runs
-//! implicitly at startup or after a scan.
+//! Legacy (`Controller::new`, `switch_to_legacy_index`) and portable schema-v3
+//! (`new_portable`, `switch_to_portable`) constructors remain for explicit
+//! migration compatibility and existing tests. The GUI/TUI defaults and all
+//! normal front-end setup/migration flows use canonical mode; the old backends
+//! are not officially reachable as normal runtime destinations.
 //!
-//! Portable-library management is also deliberately explicit:
-//! the [`import`] module provides a review-first, cancellable import plan
-//! (discovery, metadata, duplicate decisions, copy/reference storage, and
-//! per-item results); [`Controller::import_files`] remains the direct
-//! single-step API used by the TUI, [`Controller::edit_track_metadata`]
-//! writes Flux-owned overrides,
-//! and [`Controller::create_artist`] / [`Controller::rename_artist`]
-//! maintain stable artist identities. These operations never rewrite
-//! embedded audio tags, never move/delete originals, preserve track IDs
-//! and queue entries, and require the portable backend. The legacy index
-//! remains a compatibility backend for playback/browsing; management is
-//! intentionally not faked there.
-//!
-//! # Threading
-//!
-//! All `Controller` methods are synchronous and, except where noted,
-//! non-blocking — safe to call from a UI thread. Directory scans run on
-//! a controller-owned worker thread: [`begin_scan`](Controller::begin_scan)
-//! starts one and [`poll`](Controller::poll) reports completion. The
-//! engine has its own threads (see `flux-audio`); its events are
-//! drained in `poll` without waiting. The only blocking operations are
-//! index load in [`Controller::new`] (call it before starting the UI),
-//! [`save_index`](Controller::save_index), and
-//! [`shutdown`](Controller::shutdown) — lifecycle points, not gestures.
-//!
-//! # Playable vs. indexed
-//!
-//! The library scanner indexes 16 file extensions, but the engine
-//! decodes a subset of them (see `flux_audio::decode` for the exact
-//! container/codec matrix: WAV, FLAC, MP3, AAC/ADTS, Ogg Vorbis,
-//! Opus, and AAC in M4A/MP4). The controller checks
-//! `flux_audio::decode::is_playable` before asking the engine to load
-//! anything and surfaces a clear error for the rest; indexed tracks are
-//! never presented as playable by implication (see
-//! [`is_track_playable`], which front-ends use for display). Even for
-//! a playable extension the engine still validates the contents, and
-//! corrupt files fail with a typed error — never a silent skip.
+//! Migration ([`plan_canonical_migration`] →
+//! [`execute_canonical_migration`]) is explicit and read-only on the source.
+//! It inventories a legacy index or portable schema-v3 root, builds and
+//! validates a separate canonical destination, and activates only after the
+//! caller confirms. Startup never migrates or overwrites old data.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -129,6 +70,10 @@ pub use flux_audio::engine::WAVEFORM_WINDOW;
 use flux_audio::engine::{EngineEvent, EngineHandle};
 use flux_core::{
     ArtistId, PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
+};
+use flux_library::canonical::{
+    CanonicalAlbum, CanonicalError, CanonicalImportedTrack, CanonicalLibrary, CanonicalPlaylist,
+    ReleaseType, TrackRating,
 };
 use flux_library::portable::{
     CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, OpenedStore, PortableRefreshReport,
@@ -148,6 +93,11 @@ pub use import::{
     prepare_import_plan,
 };
 
+pub use flux_library::canonical::{AlbumId, PlaylistId};
+pub use flux_library::canonical_migrate::{
+    CanonicalMigrationError, CanonicalMigrationIssue, CanonicalMigrationPlan,
+    CanonicalMigrationReport, CanonicalSourceFormat,
+};
 pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
 pub use flux_library::{
     Artist, Availability, MetadataOverrides, PortableStoreError, ReconcileOutcome, ReconcileReport,
@@ -203,8 +153,10 @@ impl AudioStatus {
 pub enum StorageMode {
     /// The legacy version-1 JSON index (the long-standing default).
     Legacy,
-    /// The portable `.flux` store at an explicit library root.
+    /// The legacy portable schema-v3 store (migration compatibility only in new sessions).
     Portable,
+    /// The canonical self-contained Flux library.
+    Canonical,
 }
 
 /// A complete track metadata edit from a user-facing form.
@@ -282,12 +234,15 @@ impl ImportReport {
 pub enum ControllerOpenError {
     /// Exclusive ownership of the legacy library could not be acquired.
     Lock(LibraryLockError),
+    /// Canonical library opening/creation failed.
+    Canonical(String),
 }
 
 impl fmt::Display for ControllerOpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lock(err) => write!(f, "{err}"),
+            Self::Canonical(message) => write!(f, "{message}"),
         }
     }
 }
@@ -296,11 +251,63 @@ impl std::error::Error for ControllerOpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Lock(err) => Some(err),
+            Self::Canonical(_) => None,
         }
     }
 }
 
 impl From<LibraryLockError> for ControllerOpenError {
+    fn from(err: LibraryLockError) -> Self {
+        Self::Lock(err)
+    }
+}
+
+/// Why a canonical library could not be opened or created.
+#[derive(Debug)]
+pub enum CanonicalOpenError {
+    /// Supplied root is missing or not a directory.
+    RootInvalid {
+        /// Supplied root.
+        root: PathBuf,
+        /// Detail.
+        reason: String,
+    },
+    /// Canonical validation failed.
+    Store(CanonicalError),
+    /// Exclusive ownership could not be acquired.
+    Lock(LibraryLockError),
+}
+
+impl fmt::Display for CanonicalOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootInvalid { root, reason } => {
+                write!(
+                    f,
+                    "canonical library root {} is not usable: {reason}",
+                    root.display()
+                )
+            }
+            Self::Store(err) => write!(f, "could not open the canonical library: {err}"),
+            Self::Lock(err) => write!(f, "could not reserve the canonical library: {err}"),
+        }
+    }
+}
+impl std::error::Error for CanonicalOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(err) => Some(err),
+            Self::Lock(err) => Some(err),
+            Self::RootInvalid { .. } => None,
+        }
+    }
+}
+impl From<CanonicalError> for CanonicalOpenError {
+    fn from(err: CanonicalError) -> Self {
+        Self::Store(err)
+    }
+}
+impl From<LibraryLockError> for CanonicalOpenError {
     fn from(err: LibraryLockError) -> Self {
         Self::Lock(err)
     }
@@ -425,6 +432,8 @@ pub enum CreateLibraryError {
     },
     /// Another Flux process owns the destination.
     Lock(LibraryLockError),
+    /// Canonical creation/reopen failed.
+    Canonical(CanonicalError),
     /// A scan is in progress on the controller that was asked to
     /// create-and-switch; nothing was created. (Only returned by
     /// [`Controller::switch_to_new_portable_library`].)
@@ -456,6 +465,7 @@ impl fmt::Display for CreateLibraryError {
                 root.display()
             ),
             Self::Lock(err) => write!(f, "{err}"),
+            Self::Canonical(err) => write!(f, "could not create the canonical library: {err}"),
             Self::ScanInProgress => {
                 write!(
                     f,
@@ -471,8 +481,15 @@ impl std::error::Error for CreateLibraryError {
         match self {
             Self::Store(err) => Some(err),
             Self::Lock(err) => Some(err),
+            Self::Canonical(err) => Some(err),
             _ => None,
         }
+    }
+}
+
+impl From<CanonicalError> for CreateLibraryError {
+    fn from(err: CanonicalError) -> Self {
+        Self::Canonical(err)
     }
 }
 
@@ -506,6 +523,8 @@ pub enum SwitchError {
     Legacy(StoreError),
     /// Exclusive ownership of the legacy candidate could not be acquired.
     Lock(LibraryLockError),
+    /// The canonical candidate could not be opened.
+    Canonical(CanonicalOpenError),
 }
 
 impl fmt::Display for SwitchError {
@@ -520,6 +539,7 @@ impl fmt::Display for SwitchError {
             Self::Portable(err) => write!(f, "could not switch libraries: {err}"),
             Self::Legacy(err) => write!(f, "could not switch libraries: {err}"),
             Self::Lock(err) => write!(f, "could not switch libraries: {err}"),
+            Self::Canonical(err) => write!(f, "could not switch libraries: {err}"),
         }
     }
 }
@@ -531,7 +551,14 @@ impl std::error::Error for SwitchError {
             Self::Portable(err) => Some(err),
             Self::Legacy(err) => Some(err),
             Self::Lock(err) => Some(err),
+            Self::Canonical(err) => Some(err),
         }
+    }
+}
+
+impl From<CanonicalOpenError> for SwitchError {
+    fn from(err: CanonicalOpenError) -> Self {
+        Self::Canonical(err)
     }
 }
 
@@ -550,6 +577,11 @@ enum StorageBackend {
     /// `root` is canonical: library paths and scan paths are built
     /// from it so path identity is spelling-consistent.
     Portable {
+        root: PathBuf,
+    },
+    /// Canonical self-contained library. All normal reads/writes go through
+    /// the canonical store held beside the display snapshot.
+    Canonical {
         root: PathBuf,
     },
 }
@@ -685,6 +717,12 @@ pub fn default_index_path() -> Option<PathBuf> {
     flux_platform::app_dirs("flux").map(|dirs| dirs.data_dir().join("library-index.json"))
 }
 
+/// Default canonical library root inside the per-user data directory.
+#[must_use]
+pub fn default_canonical_root() -> Option<PathBuf> {
+    flux_platform::app_dirs("flux").map(|dirs| dirs.data_dir().join("FluxLibrary"))
+}
+
 /// Builds a migration plan from the legacy index at `legacy_index`
 /// to a new portable library at `destination_root`, without writing
 /// anything. This is an explicit, caller-requested operation: no
@@ -700,6 +738,44 @@ pub fn default_index_path() -> Option<PathBuf> {
 /// unreadable/invalid legacy index, unusable destination root, or a
 /// destination that already contains an initialized or partial
 /// portable store.
+/// Plans a canonical migration from either a legacy index file or a portable
+/// schema-v3 library directory. The source is read-only and the caller must
+/// choose a separate, still-absent destination root.
+pub fn plan_canonical_migration(
+    source: &Path,
+    destination: &Path,
+) -> Result<CanonicalMigrationPlan, CanonicalMigrationError> {
+    if source.is_file() {
+        return flux_library::canonical_migrate::plan_legacy_index(source, destination);
+    }
+    if source.is_dir() {
+        if source.join("catalog.flux").is_file() {
+            return Err(CanonicalMigrationError::UnsupportedSource(
+                "the source is already a canonical library".to_owned(),
+            ));
+        }
+        if source.join(".flux").join("catalog.flux").is_file() {
+            return flux_library::canonical_migrate::plan_portable_v3(source, destination);
+        }
+        return Err(CanonicalMigrationError::UnsupportedSource(
+            "the directory contains neither a portable schema-v3 catalogue nor a canonical library"
+                .to_owned(),
+        ));
+    }
+    Err(CanonicalMigrationError::UnsupportedSource(format!(
+        "{} does not exist or is neither a legacy index file nor a library directory",
+        source.display()
+    )))
+}
+
+/// Executes a previously planned canonical migration after validation and
+/// staging. The source remains untouched.
+pub fn execute_canonical_migration(
+    plan: &CanonicalMigrationPlan,
+) -> Result<CanonicalMigrationReport, CanonicalMigrationError> {
+    plan.execute()
+}
+
 pub fn plan_legacy_migration(
     legacy_index: &Path,
     destination_root: &Path,
@@ -744,6 +820,31 @@ pub fn execute_legacy_migration(plan: &MigrationPlan) -> Result<MigrationReport,
 /// preserved. No controller is involved and nothing is switched —
 /// pair with [`Controller::switch_to_portable`] (or the one-call
 /// [`Controller::switch_to_new_portable_library`]) to start using it.
+/// Creates and verifies an empty canonical library at `root`.
+///
+/// `root` may be absent or empty directories. Existing non-empty data is
+/// refused; the source is never repaired or overwritten automatically.
+pub fn create_canonical_library(root: &Path) -> Result<CreatedLibrary, CreateLibraryError> {
+    let created = CanonicalLibrary::create(root)?;
+    let library_id = created.library_id().to_owned();
+    let root = created.root().to_path_buf();
+    drop(created);
+    let reopened = CanonicalLibrary::open(&root)?;
+    if !reopened.artists().next().is_none()
+        || !reopened.albums().next().is_none()
+        || !reopened.tracks().next().is_none()
+        || reopened.library_id() != library_id
+    {
+        return Err(CreateLibraryError::Verification {
+            root,
+            detail: "the created canonical library did not reopen as the same empty library"
+                .to_owned(),
+        });
+    }
+    Ok(CreatedLibrary { root, library_id })
+}
+
+/// Creates and verifies an empty portable library at `root`.
 pub fn create_portable_library(root: &Path) -> Result<CreatedLibrary, CreateLibraryError> {
     let root_invalid = |reason: String| CreateLibraryError::RootInvalid {
         root: root.to_owned(),
@@ -928,10 +1029,13 @@ pub struct Controller {
     /// to that path (scan saves and explicit saves) are refused until
     /// `replace_unreadable_legacy_index` preserves it and clears this.
     legacy_index_write_protected: bool,
-    /// The portable store in portable mode — `None` in legacy mode,
+    /// The portable store in portable mode — `None` in legacy/canonical mode,
     /// while a scan thread owns it, or if it was lost with a scan
     /// thread and could not be reopened (saves then fail visibly).
     portable_store: Option<PortableStore>,
+    /// Canonical store in canonical mode. This is the runtime authority for
+    /// entities and paths; `library`/`tracks` are presentation snapshots.
+    canonical_store: Option<CanonicalLibrary>,
     /// Pending backup-recovery details in portable mode, until
     /// explicitly acknowledged.
     portable_recovery: Option<RecoveryInfo>,
@@ -951,6 +1055,7 @@ struct LibrarySeed {
     storage: StorageBackend,
     library_lock: Option<Arc<LibraryLock>>,
     portable_store: Option<PortableStore>,
+    canonical_store: Option<CanonicalLibrary>,
     portable_recovery: Option<RecoveryInfo>,
     roots: Vec<PathBuf>,
     queue: Queue,
@@ -1020,6 +1125,7 @@ impl Controller {
                 storage: StorageBackend::Legacy { index_path },
                 library_lock,
                 portable_store: None,
+                canonical_store: None,
                 portable_recovery: None,
                 roots: Vec::new(),
                 queue,
@@ -1078,6 +1184,7 @@ impl Controller {
                 storage: StorageBackend::Portable { root: root.clone() },
                 library_lock: Some(Arc::new(lock)),
                 portable_store: Some(opened.store),
+                canonical_store: None,
                 portable_recovery: recovery,
                 roots: vec![root],
                 queue,
@@ -1098,6 +1205,71 @@ impl Controller {
         Ok(controller)
     }
 
+    /// Opens an existing canonical library as the runtime authority.
+    pub fn new_canonical(
+        engine: EngineHandle,
+        audio: AudioStatus,
+        library_root: &Path,
+    ) -> Result<Self, CanonicalOpenError> {
+        let root = canonical_library_root(library_root)?;
+        let lock = LibraryLock::acquire_portable_root(&root)?;
+        let store = CanonicalLibrary::open(&root)?;
+        let library = store.runtime_library();
+        let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
+        let (queue, queue_auto_library, queue_write_protected, queue_error) =
+            load_queue(queue_store.as_ref(), &library);
+        let mut controller = Self::assemble(
+            engine,
+            audio,
+            LibrarySeed {
+                library,
+                storage: StorageBackend::Canonical { root: root.clone() },
+                library_lock: Some(Arc::new(lock)),
+                portable_store: None,
+                canonical_store: Some(store),
+                portable_recovery: None,
+                roots: Vec::new(),
+                queue,
+                queue_store,
+                queue_write_protected,
+                queue_auto_library,
+            },
+        );
+        if let Some(error) = queue_error {
+            controller.report_error(error);
+        }
+        controller.report_status(format!("Opened canonical library at {}.", root.display()));
+        Ok(controller)
+    }
+
+    /// Opens the default canonical library, creating an empty one on first
+    /// run. Existing legacy/portable data is never migrated automatically.
+    pub fn open_default() -> Result<Self, ControllerOpenError> {
+        let root = default_canonical_root().ok_or_else(|| {
+            ControllerOpenError::Canonical(
+                "no per-user data directory is available for a canonical library".to_owned(),
+            )
+        })?;
+        if !root.exists() {
+            if let Some(parent) = root.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    ControllerOpenError::Canonical(format!(
+                        "could not create {}: {err}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            create_canonical_library(&root).map_err(|err| {
+                ControllerOpenError::Canonical(format!(
+                    "could not create the default canonical library: {err}"
+                ))
+            })?;
+        }
+        let (engine, audio) = default_engine();
+        Self::new_canonical(engine, audio, &root)
+            .map_err(|err| ControllerOpenError::Canonical(err.to_string()))
+    }
+
     /// Shared construction once the initial library and backend are
     /// known: snapshot, playback model, queue, and engine volume are
     /// set up identically for both backends.
@@ -1107,6 +1279,7 @@ impl Controller {
             storage,
             library_lock,
             portable_store,
+            canonical_store,
             portable_recovery,
             roots,
             queue,
@@ -1133,6 +1306,7 @@ impl Controller {
             library_lock,
             legacy_index_write_protected: false,
             portable_store,
+            canonical_store,
             portable_recovery,
             roots,
             scan_rx: None,
@@ -1142,18 +1316,6 @@ impl Controller {
         };
         controller.engine.set_volume(controller.volume);
         controller
-    }
-
-    /// The standard application setup: [`default_engine`] +
-    /// [`default_index_path`] (legacy backend, as before — portable
-    /// mode is always an explicit choice via
-    /// [`new_portable`](Self::new_portable)).
-    ///
-    /// Returns the same ownership error as [`Controller::new`] rather
-    /// than starting with a writable empty library.
-    pub fn open_default() -> Result<Self, ControllerOpenError> {
-        let (engine, audio) = default_engine();
-        Self::new(engine, audio, default_index_path())
     }
 
     // ------------------------------------------------------ accessors ---
@@ -1200,6 +1362,12 @@ impl Controller {
     /// available. Duplicate display names are intentionally preserved.
     #[must_use]
     pub fn artists(&self) -> Vec<Artist> {
+        if let Some(store) = self.canonical_store.as_ref() {
+            return store
+                .artists()
+                .map(|artist| Artist::new(artist.id, artist.name.clone(), artist.aliases.clone()))
+                .collect();
+        }
         self.portable_store
             .as_ref()
             .map(|store| store.artists().cloned().collect())
@@ -1209,6 +1377,11 @@ impl Controller {
     /// Looks up one stable artist identity.
     #[must_use]
     pub fn artist(&self, id: ArtistId) -> Option<Artist> {
+        if let Some(store) = self.canonical_store.as_ref() {
+            return store
+                .artist(id)
+                .map(|artist| Artist::new(artist.id, artist.name.clone(), artist.aliases.clone()));
+        }
         self.portable_store
             .as_ref()
             .and_then(|store| store.artist(id).cloned())
@@ -1217,16 +1390,131 @@ impl Controller {
     /// The stable artist relationship for a track, when one is assigned.
     #[must_use]
     pub fn track_artist_id(&self, id: TrackId) -> Option<ArtistId> {
+        if let Some(store) = self.canonical_store.as_ref() {
+            return store.track(id).map(|track| track.owner_artist_id);
+        }
         self.portable_store
             .as_ref()
             .and_then(|store| store.get(id))
             .and_then(|track| track.artist_id())
     }
 
-    /// Last-known availability of a portable track. `None` in legacy mode,
-    /// for unknown IDs, or when no store is available.
+    /// Every credited artist for a canonical track, owner first.
+    #[must_use]
+    pub fn track_credits(&self, id: TrackId) -> Vec<ArtistId> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.track_credits(id))
+            .map(ToOwned::to_owned)
+            .unwrap_or_default()
+    }
+
+    /// Canonical albums in stable ID order.
+    #[must_use]
+    pub fn albums(&self) -> Vec<CanonicalAlbum> {
+        self.canonical_store
+            .as_ref()
+            .map(|store| store.albums().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The canonical album owning a track.
+    #[must_use]
+    pub fn track_album_id(&self, id: TrackId) -> Option<AlbumId> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.track(id))
+            .map(|track| track.album_id)
+    }
+
+    /// Track IDs in canonical album order.
+    #[must_use]
+    pub fn album_tracks(&self, id: AlbumId) -> Vec<TrackId> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.album(id))
+            .map(|album| album.track_order.clone())
+            .unwrap_or_default()
+    }
+
+    /// Canonical playlists in stable ID order.
+    #[must_use]
+    pub fn playlists(&self) -> Vec<CanonicalPlaylist> {
+        self.canonical_store
+            .as_ref()
+            .map(|store| store.playlists().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The canonical rating/favorite value for a track.
+    #[must_use]
+    pub fn rating(&self, id: TrackId) -> Option<TrackRating> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.rating(id))
+    }
+
+    /// Stores a rating/favorite value through the canonical engine.
+    pub fn set_rating(
+        &mut self,
+        id: TrackId,
+        rating: Option<u8>,
+        favorite: bool,
+    ) -> Result<(), String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Ratings require a canonical library.".to_owned());
+        };
+        store
+            .set_rating(id, rating, favorite)
+            .map_err(|err| format!("Could not save rating: {err}"))?;
+        Ok(())
+    }
+
+    /// Creates or updates a canonical playlist.
+    pub fn set_playlist(
+        &mut self,
+        id: Option<PlaylistId>,
+        name: &str,
+        track_ids: Vec<TrackId>,
+    ) -> Result<PlaylistId, String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        store
+            .set_playlist(id, name, track_ids)
+            .map_err(|err| format!("Could not save playlist: {err}"))
+    }
+
+    /// Stores optional managed LRC text for a track.
+    pub fn set_lyrics(&mut self, id: TrackId, lyrics: Option<&str>) -> Result<(), String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Lyrics require a canonical library.".to_owned());
+        };
+        store
+            .set_lyrics(id, lyrics)
+            .map_err(|err| format!("Could not save lyrics: {err}"))
+    }
+
+    /// Reads a canonical track's managed lyrics text, when present.
+    #[must_use]
+    pub fn track_lyrics(&self, id: TrackId) -> Option<String> {
+        let path = self.canonical_store.as_ref()?.track_lyrics_path(id)?;
+        std::fs::read_to_string(path).ok()
+    }
+
+    /// Last-known availability of a catalogue track. `None` in legacy mode
+    /// or for unknown IDs.
     #[must_use]
     pub fn track_availability(&self, id: TrackId) -> Option<Availability> {
+        if let Some(store) = self.canonical_store.as_ref() {
+            return store.track(id).map(|_| {
+                if store.track_available(id) {
+                    Availability::Present
+                } else {
+                    Availability::Missing
+                }
+            });
+        }
         self.portable_store
             .as_ref()
             .and_then(|store| store.get(id))
@@ -1377,6 +1665,7 @@ impl Controller {
         match &self.storage {
             StorageBackend::Legacy { .. } => StorageMode::Legacy,
             StorageBackend::Portable { .. } => StorageMode::Portable,
+            StorageBackend::Canonical { .. } => StorageMode::Canonical,
         }
     }
 
@@ -1386,7 +1675,7 @@ impl Controller {
     pub fn legacy_index_path(&self) -> Option<&Path> {
         match &self.storage {
             StorageBackend::Legacy { index_path } => index_path.as_deref(),
-            StorageBackend::Portable { .. } => None,
+            StorageBackend::Portable { .. } | StorageBackend::Canonical { .. } => None,
         }
     }
 
@@ -1399,7 +1688,8 @@ impl Controller {
             StorageBackend::Legacy {
                 index_path: Some(_),
             }
-            | StorageBackend::Portable { .. } => self.library_lock.is_some(),
+            | StorageBackend::Portable { .. }
+            | StorageBackend::Canonical { .. } => self.library_lock.is_some(),
         }
     }
 
@@ -1425,8 +1715,17 @@ impl Controller {
     #[must_use]
     pub fn portable_root(&self) -> Option<&Path> {
         match &self.storage {
-            StorageBackend::Portable { root } => Some(root),
+            StorageBackend::Portable { root } | StorageBackend::Canonical { root } => Some(root),
             StorageBackend::Legacy { .. } => None,
+        }
+    }
+
+    /// The active canonical library root, when canonical mode is active.
+    #[must_use]
+    pub fn canonical_root(&self) -> Option<&Path> {
+        match &self.storage {
+            StorageBackend::Canonical { root } => Some(root),
+            _ => None,
         }
     }
 
@@ -1484,6 +1783,84 @@ impl Controller {
 
     // --------------------------------------------------- switching ---
 
+    /// Switches the active library to an existing canonical library.
+    pub fn switch_to_canonical(&mut self, library_root: &Path) -> Result<(), SwitchError> {
+        if self.is_scanning() {
+            self.report_error(SwitchError::ScanInProgress.to_string());
+            return Err(SwitchError::ScanInProgress);
+        }
+        let root = canonical_library_root(library_root).map_err(|err| {
+            let err = SwitchError::from(err);
+            self.report_error(err.to_string());
+            err
+        })?;
+        if self.canonical_root() == Some(root.as_path()) {
+            self.report_status(format!(
+                "Already using the canonical library at {}.",
+                root.display()
+            ));
+            return Ok(());
+        }
+        let lock = LibraryLock::acquire_portable_root(&root).map_err(|err| {
+            let err = SwitchError::Canonical(CanonicalOpenError::Lock(err));
+            self.report_error(err.to_string());
+            err
+        })?;
+        let store = CanonicalLibrary::open(&root).map_err(|err| {
+            let err = SwitchError::Canonical(CanonicalOpenError::Store(err));
+            self.report_error(err.to_string());
+            err
+        })?;
+        let library = store.runtime_library();
+        let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
+        let (queue, queue_auto_library, queue_write_protected, queue_error) =
+            load_queue(queue_store.as_ref(), &library);
+        self.install_library(LibrarySeed {
+            library,
+            storage: StorageBackend::Canonical { root: root.clone() },
+            library_lock: Some(Arc::new(lock)),
+            portable_store: None,
+            canonical_store: Some(store),
+            portable_recovery: None,
+            roots: Vec::new(),
+            queue,
+            queue_store,
+            queue_write_protected,
+            queue_auto_library,
+        });
+        self.report_status(format!(
+            "Switched to the canonical library at {}.",
+            root.display()
+        ));
+        if let Some(error) = queue_error {
+            self.report_error(error);
+        }
+        Ok(())
+    }
+
+    /// Creates a new canonical library and switches to it only after creation
+    /// and reopening verify.
+    pub fn switch_to_new_canonical_library(
+        &mut self,
+        library_root: &Path,
+    ) -> Result<CreatedLibrary, CreateLibraryError> {
+        if self.is_scanning() {
+            return Err(CreateLibraryError::ScanInProgress);
+        }
+        let created = create_canonical_library(library_root)?;
+        self.switch_to_canonical(created.root()).map_err(|err| {
+            CreateLibraryError::Verification {
+                root: library_root.to_owned(),
+                detail: format!("created library could not be activated: {err}"),
+            }
+        })?;
+        self.report_status(format!(
+            "Created and switched to the canonical library at {}.",
+            created.root().display()
+        ));
+        Ok(created)
+    }
+
     /// Switches the active library to the existing portable library
     /// at `library_root`. The candidate is fully opened and
     /// validated first; only then is it installed — so on any
@@ -1539,6 +1916,7 @@ impl Controller {
             storage: StorageBackend::Portable { root: root.clone() },
             library_lock: Some(Arc::new(lock)),
             portable_store: Some(opened.store),
+            canonical_store: None,
             portable_recovery: recovery,
             roots: vec![root.clone()],
             queue,
@@ -1676,6 +2054,7 @@ impl Controller {
             storage: StorageBackend::Legacy { index_path },
             library_lock: candidate_lock,
             portable_store: None,
+            canonical_store: None,
             portable_recovery: None,
             roots: Vec::new(),
             queue,
@@ -1702,6 +2081,7 @@ impl Controller {
             storage,
             library_lock,
             portable_store,
+            canonical_store,
             portable_recovery,
             roots,
             queue,
@@ -1721,6 +2101,7 @@ impl Controller {
         self.library_lock = library_lock;
         self.legacy_index_write_protected = false;
         self.portable_store = portable_store;
+        self.canonical_store = canonical_store;
         self.portable_recovery = portable_recovery;
         self.roots = roots;
         self.queue_store = queue_store;
@@ -1842,6 +2223,20 @@ impl Controller {
             self.report_error(message.clone());
             return Err(message);
         }
+        if let Some(store) = self.canonical_store.as_mut() {
+            let id = match store.create_artist(name, Vec::new()) {
+                Ok(id) => id,
+                Err(err) => {
+                    let message = format!("Could not create artist: {err}");
+                    self.report_error(message.clone());
+                    return Err(message);
+                }
+            };
+            self.refresh_from_canonical();
+            self.outbox.push(ControllerEvent::LibraryChanged);
+            self.report_status(format!("Created artist {} (ID {}).", name.trim(), id));
+            return Ok(id);
+        }
         let Some(store) = self.portable_store.as_mut() else {
             let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
             self.report_error(message.clone());
@@ -1869,6 +2264,17 @@ impl Controller {
             self.report_error(message.clone());
             return Err(message);
         }
+        if let Some(store) = self.canonical_store.as_mut() {
+            if let Err(err) = store.rename_artist(id, name) {
+                let message = format!("Could not rename artist: {err}");
+                self.report_error(message.clone());
+                return Err(message);
+            }
+            self.refresh_from_canonical();
+            self.outbox.push(ControllerEvent::LibraryChanged);
+            self.report_status(format!("Renamed artist {} to {}.", id, name.trim()));
+            return Ok(());
+        }
         let Some(store) = self.portable_store.as_mut() else {
             let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
             self.report_error(message.clone());
@@ -1883,6 +2289,29 @@ impl Controller {
         self.refresh_from_store();
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(format!("Renamed artist {} to {}.", id, name.trim()));
+        Ok(())
+    }
+
+    /// Renames an album, preserving its stable ID, directory and every track
+    /// reference.
+    pub fn rename_album(&mut self, id: AlbumId, title: &str) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            let message = "Album operations require a canonical library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if let Err(err) = store.rename_album(id, title) {
+            let message = format!("Could not rename album: {err}");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Renamed album {} to {}.", id, title.trim()));
         Ok(())
     }
 
@@ -1903,6 +2332,73 @@ impl Controller {
         if let Err(message) = self.portable_maintenance_guard() {
             self.report_error(message.clone());
             return Err(message);
+        }
+        if self.canonical_store.is_some() {
+            let Some(store) = self.canonical_store.as_ref() else {
+                unreachable!()
+            };
+            let Some(track) = store.track(id).cloned() else {
+                let message = format!("Track {id} is not in the canonical library.");
+                self.report_error(message.clone());
+                return Err(message);
+            };
+            if let Some(artist_id) = edit.artist_id
+                && artist_id != track.owner_artist_id
+            {
+                let message = "Changing the physical owner is not available yet; use an                                ownership-transfer operation instead."
+                    .to_owned();
+                self.report_error(message.clone());
+                return Err(message);
+            }
+            let title = edit
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or(&track.title)
+                .to_owned();
+            let track_number = edit.track_number;
+            let disc_number = edit.disc_number;
+            let credits = track.credited_artist_ids.clone();
+            let album_change = edit
+                .album
+                .as_deref()
+                .map(str::trim)
+                .filter(|album| !album.is_empty())
+                .is_some_and(|album| {
+                    store
+                        .album(track.album_id)
+                        .is_none_or(|current| current.title != album)
+                });
+            let store = self.canonical_store.as_mut().expect("canonical store");
+            if album_change
+                && let Some(album) = edit
+                    .album
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                && let Err(err) = store.rename_album(track.album_id, album)
+            {
+                let message = format!("Could not rename album: {err}");
+                self.report_error(message.clone());
+                return Err(message);
+            }
+            if let Err(err) = store.update_track_metadata(
+                id,
+                title,
+                credits,
+                track_number,
+                disc_number,
+                track.duration_ms,
+            ) {
+                let message = format!("Could not update track metadata: {err}");
+                self.report_error(message.clone());
+                return Err(message);
+            }
+            self.refresh_from_canonical();
+            self.outbox.push(ControllerEvent::LibraryChanged);
+            self.report_status(format!("Updated metadata for track {id}."));
+            return Ok(());
         }
         let Some(store) = self.portable_store.as_mut() else {
             let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
@@ -1958,23 +2454,23 @@ impl Controller {
         Ok(())
     }
 
-    /// Imports individual audio files into the active portable library.
+    /// Imports individual audio files into the active library.
     ///
-    /// With `copy = true`, files outside the library root are copied into
-    /// the library root under a collision-free name; originals are never
-    /// moved, deleted, or overwritten. Files already inside the root are
-    /// referenced in place. With `copy = false`, only files already inside
-    /// the library root are accepted. Repeated imports of the same source
-    /// reuse an identical existing copy instead of creating a duplicate
-    /// catalogue entry.
-    ///
-    /// Tag reading, duplicate/path checks, stable IDs, artist creation, and
-    /// persistence all go through the existing library/portable pipeline.
-    /// Individual bad paths are reported and do not abort the batch.
+    /// Canonical mode always copies every source into the managed canonical
+    /// album directory and never reads audio tags: title, artist, album and
+    /// track number are inferred conservatively from the filename and parent
+    /// folders. `copy` is retained only for the migration-compatible portable
+    /// backend; canonical mode ignores it and never creates a reference.
+    /// Sources are never moved, deleted, or overwritten. Identical content is
+    /// deduplicated by canonical fingerprint. Individual bad paths are
+    /// reported and do not abort the batch.
     pub fn import_files(&mut self, paths: &[PathBuf], copy: bool) -> Result<ImportReport, String> {
         if let Err(message) = self.portable_maintenance_guard() {
             self.report_error(message.clone());
             return Err(message);
+        }
+        if self.canonical_store.is_some() {
+            return self.import_files_canonical(paths, copy);
         }
         let Some(root) = self.portable_root().map(Path::to_path_buf) else {
             let message = PORTABLE_STORE_UNAVAILABLE.to_owned();
@@ -2151,6 +2647,94 @@ impl Controller {
     /// after catalogue maintenance, preserving the queue selection and
     /// reporting any tracks that could not be represented or carried
     /// over.
+    /// Recursively imports supported audio files from a folder. Canonical
+    /// mode uses filename/folder inference and copies every file; sources are
+    /// never moved. Symlinks are not followed.
+    pub fn import_folder(&mut self, root: &Path, recursive: bool) -> Result<ImportReport, String> {
+        let mut files = Vec::new();
+        let mut issues = Vec::new();
+        collect_audio_files(root, recursive, &mut files, &mut issues)?;
+        let mut report = self.import_files(&files, true)?;
+        report.issues.extend(issues);
+        Ok(report)
+    }
+
+    fn import_files_canonical(
+        &mut self,
+        paths: &[PathBuf],
+        _copy: bool,
+    ) -> Result<ImportReport, String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            let message = "The canonical library is unavailable.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let mut report = ImportReport::default();
+        for source in paths {
+            if !is_supported_audio_path(source) {
+                report.issues.push(ImportIssue {
+                    path: source.clone(),
+                    reason: "unsupported or missing audio extension".to_owned(),
+                });
+                continue;
+            }
+            let Some(inferred) = infer_canonical_import(source) else {
+                report.issues.push(ImportIssue {
+                    path: source.clone(),
+                    reason: "the source file cannot be read".to_owned(),
+                });
+                continue;
+            };
+            let fingerprint = match flux_library::canonical::ContentFingerprint::of_file(source) {
+                Ok(fingerprint) => fingerprint,
+                Err(err) => {
+                    report.issues.push(ImportIssue {
+                        path: source.clone(),
+                        reason: format!("could not fingerprint source: {err}"),
+                    });
+                    continue;
+                }
+            };
+            if store.track_by_fingerprint(fingerprint).is_some() {
+                report.deduplicated += 1;
+                continue;
+            }
+            match store.import_track(inferred) {
+                Ok(id) => {
+                    report.added += 1;
+                    if let Some(path) = store.track_audio_path(id) {
+                        report.copied.push(path);
+                    }
+                }
+                Err(err) => report.issues.push(ImportIssue {
+                    path: source.clone(),
+                    reason: err.to_string(),
+                }),
+            }
+        }
+        self.refresh_from_canonical();
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        if report.added > 0 || report.deduplicated > 0 {
+            self.report_status(format!(
+                "Canonical import: {} added, {} duplicate(s), {} issue(s).",
+                report.added,
+                report.deduplicated,
+                report.issues.len()
+            ));
+        }
+        Ok(report)
+    }
+
+    fn refresh_from_canonical(&mut self) {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return;
+        };
+        let library = store.runtime_library();
+        self.tracks = snapshot(&library);
+        self.library = Some(library);
+    }
+
     fn refresh_from_store(&mut self) {
         let Some(report) = self.rebuilt_from_store() else {
             return;
@@ -2458,6 +3042,21 @@ impl Controller {
     /// mode the library root itself is the session's initial scan
     /// root, so refresh always has somewhere to look.)
     pub fn refresh(&mut self) {
+        if let StorageBackend::Canonical { root } = &self.storage {
+            let root = root.clone();
+            match CanonicalLibrary::open(&root) {
+                Ok(store) => {
+                    self.canonical_store = Some(store);
+                    self.refresh_from_canonical();
+                    self.outbox.push(ControllerEvent::LibraryChanged);
+                    self.report_status("Refreshed the canonical library from disk.".to_owned());
+                }
+                Err(err) => {
+                    self.report_error(format!("Could not refresh canonical library: {err}"))
+                }
+            }
+            return;
+        }
         if self.roots.is_empty() {
             self.report_status("Nothing to refresh yet — scan a folder first.".to_owned());
             return;
@@ -2490,6 +3089,9 @@ impl Controller {
                 StorageBackend::Portable { .. } => {
                     "A scan is in progress; the portable library will be saved when it finishes."
                 }
+                StorageBackend::Canonical { .. } => {
+                    "A canonical library operation is in progress; try again when it finishes."
+                }
             }
             .into());
         };
@@ -2516,6 +3118,7 @@ impl Controller {
                     None => Err(PORTABLE_STORE_UNAVAILABLE.to_owned()),
                 }
             }
+            StorageBackend::Canonical { .. } => Ok(()),
         }
     }
 
@@ -2642,6 +3245,10 @@ impl Controller {
                                 "The library scan ended unexpectedly; the library \
                                  was restored from the portable library files."
                             }
+                            StorageBackend::Canonical { .. } => {
+                                "The library scan ended unexpectedly; the canonical \
+                                 library was reopened."
+                            }
                         }
                     } else {
                         match self.storage {
@@ -2653,6 +3260,10 @@ impl Controller {
                                 "The library scan ended unexpectedly, and the \
                                  portable library could not be reopened to \
                                  restore the library from."
+                            }
+                            StorageBackend::Canonical { .. } => {
+                                "The library scan ended unexpectedly, and the \
+                                 canonical library could not be reopened."
                             }
                         }
                     }
@@ -2888,9 +3499,18 @@ impl Controller {
             self.report_error("A library scan is already in progress.".to_owned());
             return;
         }
+        if matches!(self.storage, StorageBackend::Canonical { .. }) {
+            self.report_error(
+                "Folder scanning is disabled for canonical libraries; use the Import Manager \
+                 so every audio file is copied into the library."
+                    .to_owned(),
+            );
+            return;
+        }
         let scan_writes = match &self.storage {
             StorageBackend::Legacy { index_path } => index_path.is_some(),
             StorageBackend::Portable { .. } => self.portable_store.is_some(),
+            StorageBackend::Canonical { .. } => false,
         };
         if scan_writes && !self.active_library_is_owned() {
             self.report_error(LIBRARY_NOT_OWNED.to_owned());
@@ -2962,6 +3582,7 @@ impl Controller {
                 Some(store) => ScanPersistence::Portable(Box::new(store)),
                 None => ScanPersistence::PortableUnavailable,
             },
+            StorageBackend::Canonical { .. } => ScanPersistence::None,
         };
         let lease = self.library_lock.clone();
         let work = ScanWork {
@@ -3171,6 +3792,17 @@ impl Controller {
                     None
                 }
             },
+            StorageBackend::Canonical { root } => match CanonicalLibrary::open(root) {
+                Ok(store) => {
+                    let library = store.runtime_library();
+                    self.canonical_store = Some(store);
+                    Some(library)
+                }
+                Err(_) => {
+                    self.canonical_store = None;
+                    None
+                }
+            },
         };
         match restored {
             Some(library) => {
@@ -3350,6 +3982,152 @@ fn validate_scan_root(root: &Path) -> Result<(), String> {
 /// candidate is judged by exactly the same rules in both.
 /// The queue file for a canonical legacy index: a sibling
 /// `<index>.queue.json`, kept separate from the catalogue.
+fn collect_audio_files(
+    root: &Path,
+    recursive: bool,
+    files: &mut Vec<PathBuf>,
+    issues: &mut Vec<ImportIssue>,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|err| format!("Cannot import {}: {err}", root.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Cannot import {}: it is a symbolic link; links are never followed.",
+            root.display()
+        ));
+    }
+    if metadata.is_file() {
+        if is_supported_audio_path(root) {
+            files.push(root.to_path_buf());
+        } else {
+            issues.push(ImportIssue {
+                path: root.to_path_buf(),
+                reason: "unsupported or missing audio extension".to_owned(),
+            });
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Cannot import {}: it is not a file or folder.",
+            root.display()
+        ));
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|err| format!("Cannot list {}: {err}", dir.display()))?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    issues.push(ImportIssue {
+                        path: dir.clone(),
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    issues.push(ImportIssue {
+                        path,
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                issues.push(ImportIssue {
+                    path,
+                    reason: "symbolic links are not followed".to_owned(),
+                });
+            } else if file_type.is_dir() && recursive {
+                stack.push(path);
+            } else if file_type.is_file() {
+                if is_supported_audio_path(&path) {
+                    files.push(path);
+                } else {
+                    issues.push(ImportIssue {
+                        path,
+                        reason: "unsupported or missing audio extension".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok(())
+}
+
+/// Conservative filename/folder inference for quick imports. It never opens
+/// the audio file or reads tags.
+fn infer_canonical_import(path: &Path) -> Option<CanonicalImportedTrack> {
+    let stem = path.file_stem()?.to_str()?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    let mut title = stem.to_owned();
+    let mut track_number = None;
+    let mut artist_name = None;
+    // Numeric track prefix: "01 - Title", "01. Title", "01 Title".
+    if let Some((prefix, rest)) = stem.split_once(['-', '.', ' '])
+        && let Ok(number) = prefix.trim().parse::<u32>()
+    {
+        let rest = rest.trim().trim_start_matches(['-', '.', ' ']).trim();
+        if !rest.is_empty() {
+            track_number = Some(number);
+            title = rest.to_owned();
+        }
+    }
+    // "Artist - Title" remains after removing a numeric prefix.
+    if let Some((left, right)) = title.split_once(" - ") {
+        let left = left.trim();
+        let right = right.trim();
+        if !left.is_empty() && !right.is_empty() {
+            artist_name = Some(left.to_owned());
+            title = right.to_owned();
+        }
+    }
+    let parent = path.parent();
+    let album = parent
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .filter(|name| {
+            !matches!(
+                name.as_str(),
+                "music" | "Music" | "audio" | "Audio" | "Downloads"
+            )
+        });
+    if artist_name.is_none() {
+        artist_name = parent
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
+    }
+    let artist_name = artist_name.unwrap_or_else(|| "Unknown Artist".to_owned());
+    let album_title = album.unwrap_or_else(|| "Unknown Album".to_owned());
+    Some(CanonicalImportedTrack {
+        source: path.to_path_buf(),
+        title,
+        artist_id: None,
+        artist_name,
+        album_title: Some(album_title),
+        release_type: ReleaseType::Album,
+        track_number,
+        disc_number: None,
+        duration_ms: None,
+    })
+}
+
 fn legacy_queue_path(canonical_index: &Path) -> PathBuf {
     let mut name = canonical_index.as_os_str().to_os_string();
     name.push(".queue.json");
@@ -3361,6 +4139,12 @@ fn legacy_queue_path(canonical_index: &Path) -> PathBuf {
 /// patterns.
 fn portable_queue_path(root: &Path) -> PathBuf {
     root.join(FLUX_DIR_NAME).join("queue").join("queue.json")
+}
+
+/// Queue persistence for a canonical library. This is application state, not
+/// catalogue data, and never contains audio paths or metadata.
+fn canonical_queue_path(root: &Path) -> PathBuf {
+    root.join("queue.flux")
 }
 
 fn default_queue(library: &Library) -> Queue {
@@ -3396,6 +4180,24 @@ fn load_queue(
             )),
         ),
     }
+}
+
+fn canonical_library_root(library_root: &Path) -> Result<PathBuf, CanonicalOpenError> {
+    let invalid = |reason: String| CanonicalOpenError::RootInvalid {
+        root: library_root.to_owned(),
+        reason,
+    };
+    match std::fs::metadata(library_root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(invalid("it exists but is not a directory".to_owned())),
+        Err(err) => {
+            return Err(invalid(format!(
+                "it does not exist or cannot be inspected: {err}"
+            )));
+        }
+    }
+    std::fs::canonicalize(library_root)
+        .map_err(|err| invalid(format!("it cannot be canonicalized: {err}")))
 }
 
 fn canonical_portable_root(library_root: &Path) -> Result<PathBuf, PortableOpenError> {
@@ -3551,9 +4353,9 @@ mod tests {
 
     use super::{
         AudioStatus, Controller, ControllerEvent, CreateLibraryError, PortableOpenError,
-        ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit, create_portable_library,
-        default_engine, execute_legacy_migration, is_track_playable, migrate_legacy_library,
-        plan_legacy_migration,
+        ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit, create_canonical_library,
+        create_portable_library, default_engine, execute_legacy_migration, is_track_playable,
+        migrate_legacy_library, plan_legacy_migration,
     };
 
     struct TempDir(PathBuf);
@@ -7336,6 +8138,265 @@ mod tests {
             loaded.queue.current_entry_id(),
             controller.current_queue_entry_id()
         );
+        controller.shutdown();
+    }
+
+    fn boot_canonical_at(root: &Path) -> (Controller, NullControl) {
+        let (engine, control) = EngineHandle::spawn_null(48_000, 1);
+        let controller = Controller::new_canonical(engine, AudioStatus::Ready, root)
+            .expect("open canonical controller");
+        (controller, control)
+    }
+
+    fn canonical_track_fixture(dir: &TempDir) -> (PathBuf, PathBuf) {
+        let root = dir.path().join("FluxLibrary");
+        create_canonical_library(&root).expect("create canonical library");
+        let source = dir.path().join("Artist/Album/01 - Song.wav");
+        fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        write_dc_wav(
+            source.parent().expect("parent"),
+            "01 - Song.wav",
+            4_410,
+            0.2,
+        );
+        (root, source)
+    }
+
+    #[test]
+    fn canonical_controller_imports_copies_and_reopens_with_stable_ids() {
+        let dir = TempDir::new("canonical-open");
+        let (root, source) = canonical_track_fixture(&dir);
+        let source_before = fs::read(&source).expect("source");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        assert_eq!(controller.storage_mode(), StorageMode::Canonical);
+        assert_eq!(controller.canonical_root(), Some(root.as_path()));
+        assert!(controller.tracks().is_empty());
+
+        let report = controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("canonical import");
+        assert_eq!(report.added, 1);
+        assert_eq!(report.issues.len(), 0);
+        assert_eq!(fs::read(&source).expect("source after"), source_before);
+        let (id, track) = controller.tracks()[0].clone();
+        assert_eq!(track.title(), "Song");
+        assert_eq!(track.artist(), Some("Artist"));
+        assert_eq!(track.album(), Some("Album"));
+        assert!(track.source().path().starts_with(&root));
+        assert_ne!(track.source().path(), source);
+        assert!(fs::read(track.source().path()).is_ok());
+        let artist_id = controller.track_artist_id(id).expect("artist");
+        controller
+            .rename_artist(artist_id, "Renamed Artist")
+            .expect("rename");
+        assert_eq!(
+            controller.track(id).and_then(Track::artist),
+            Some("Renamed Artist")
+        );
+        assert_eq!(controller.track_artist_id(id), Some(artist_id));
+
+        let entry = controller.enqueue_track(id).expect("enqueue");
+        let current = controller.current_queue_entry_id();
+        assert!(current.is_some());
+        assert!(controller.queue_entry_index(entry).is_some());
+        controller.shutdown();
+
+        let (controller, _control) = boot_canonical_at(&root);
+        assert_eq!(controller.storage_mode(), StorageMode::Canonical);
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].0, id);
+        assert_eq!(
+            controller.track(id).and_then(Track::artist),
+            Some("Renamed Artist")
+        );
+        assert_eq!(controller.track_artist_id(id), Some(artist_id));
+        assert_eq!(controller.current_queue_entry_id(), current);
+        assert!(root.join("queue.flux").is_file());
+        assert!(
+            !root.join(".flux").exists(),
+            "no legacy portable backend is created"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_import_is_copy_only_and_never_reads_tags() {
+        use crate::import::{
+            ImportDecision, ImportProgress, ImportRequest, ImportStorage, prepare_import_files,
+            prepare_import_plan,
+        };
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let dir = TempDir::new("canonical-import");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let request = ImportRequest {
+            sources: vec![source.clone()],
+            recursive: false,
+            storage: ImportStorage::Reference,
+            library_root: root.clone(),
+            existing_tracks: controller.tracks().to_vec(),
+            existing_artists: Vec::new(),
+        };
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut plan = prepare_import_plan(request, Arc::clone(&progress), cancel);
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].title(), "Song");
+        assert_eq!(plan.candidates[0].artist_name(), Some("Artist"));
+        assert_eq!(plan.candidates[0].album(), Some("Album"));
+        plan.set_storage(ImportStorage::Copy);
+        plan.candidates[0].set_decision(ImportDecision::ImportNew);
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::clone(&progress),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            prepared.created_files.is_empty(),
+            "canonical engine owns staging"
+        );
+        let report = controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("canonical apply");
+        assert_eq!(report.imported, 1);
+        assert_eq!(
+            fs::read(&source).expect("source"),
+            fs::read(&source).expect("source")
+        );
+        let track = controller.tracks()[0].1.clone();
+        assert!(track.source().path().starts_with(&root));
+        assert!(fs::read(track.source().path()).is_ok());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_switching_resets_queue_and_preserves_each_library() {
+        let dir = TempDir::new("canonical-switch");
+        let (root_a, source) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let (mut controller, _control) = boot_canonical_at(&root_a);
+        controller.import_files(&[source], true).expect("import");
+        let id = controller.tracks()[0].0;
+        assert!(controller.queue_len() >= 1);
+        controller.switch_to_canonical(&root_b).expect("switch b");
+        assert!(controller.tracks().is_empty());
+        assert_eq!(controller.queue_len(), 0);
+        controller.switch_to_canonical(&root_a).expect("switch a");
+        assert_eq!(controller.tracks()[0].0, id);
+        assert!(controller.queue_len() >= 1);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_missing_audio_is_reported_without_losing_identity() {
+        let dir = TempDir::new("canonical-missing");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], true).expect("import");
+        let id = controller.tracks()[0].0;
+        let audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        controller.shutdown();
+        fs::remove_file(audio).expect("remove managed audio");
+        let (controller, _control) = boot_canonical_at(&root);
+        assert!(controller.track(id).is_some());
+        assert_eq!(
+            controller.track_availability(id),
+            Some(flux_library::Availability::Missing)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_playlists_ratings_and_lyrics_survive_restart() {
+        let dir = TempDir::new("canonical-data");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], true).expect("import");
+        let id = controller.tracks()[0].0;
+        controller.set_rating(id, Some(5), true).expect("rating");
+        controller
+            .set_lyrics(id, Some("[00:00.00]hello"))
+            .expect("lyrics");
+        let playlist = controller
+            .set_playlist(None, "Favorites", vec![id])
+            .expect("playlist");
+        assert_eq!(
+            controller.track_lyrics(id).as_deref(),
+            Some("[00:00.00]hello")
+        );
+        controller.shutdown();
+
+        let (controller, _control) = boot_canonical_at(&root);
+        assert_eq!(
+            controller.rating(id),
+            Some(flux_library::canonical::TrackRating {
+                rating: Some(5),
+                favorite: true
+            })
+        );
+        assert_eq!(
+            controller
+                .playlists()
+                .into_iter()
+                .find(|entry| entry.id == playlist)
+                .map(|entry| entry.track_ids),
+            Some(vec![id])
+        );
+        assert_eq!(
+            controller.track_lyrics(id).as_deref(),
+            Some("[00:00.00]hello")
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn app_canonical_migration_workflow_preserves_source() {
+        let dir = TempDir::new("canonical-migrate-app");
+        let source = dir.path().join("old-portable");
+        fs::create_dir_all(&source).expect("source dir");
+        create_portable_library(&source).expect("portable source");
+        let source_audio = source.join("Artist/Album/01 - Song.wav");
+        fs::create_dir_all(source_audio.parent().expect("parent")).expect("dirs");
+        write_dc_wav(
+            source_audio.parent().expect("parent"),
+            "01 - Song.wav",
+            4_410,
+            0.2,
+        );
+        let mut store = flux_library::PortableStore::open(&source)
+            .expect("open portable")
+            .store;
+        let artist = store.create_artist("Artist").expect("artist");
+        let mut record = imported_record(
+            1,
+            "Artist/Album/01 - Song.wav",
+            flux_library::Availability::Present,
+            "Song",
+        );
+        record.artist_id = Some(artist);
+        store.import_tracks(vec![record], 2).expect("import");
+        store.commit().expect("commit");
+        let catalog_before = fs::read(source.join(".flux/catalog.flux")).expect("catalog");
+        let destination = dir.path().join("Canonical");
+        let plan = super::plan_canonical_migration(&source, &destination).expect("plan");
+        assert!(plan.is_ready(), "issues: {:?}", plan.issues());
+        let report = super::execute_canonical_migration(&plan).expect("execute");
+        assert_eq!(report.tracks(), 1);
+        assert_eq!(
+            fs::read(source.join(".flux/catalog.flux")).expect("catalog"),
+            catalog_before
+        );
+        assert!(source_audio.is_file());
+        let (controller, _control) = boot_canonical_at(&destination);
+        assert_eq!(controller.tracks().len(), 1);
         controller.shutdown();
     }
 }
