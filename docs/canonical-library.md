@@ -164,6 +164,44 @@ appearing as destination files. Cross-filesystem source copies are performed as
 verified copy-then-publish; target publication uses same-root renames. Files are
 never removed merely because they are unreferenced by a partial catalogue.
 
+### Transaction concurrency and pending work
+
+Normal writes are single-transaction: before creating a journal the engine
+checks `transactions/` and refuses to start if any transaction directory is
+present. This prevents a retry from writing a second transaction while a failed
+rollback still owns earlier backups. Recovery can process multiple pre-existing
+journal directories independently (for example after external corruption or
+copied crash artifacts); committed cleanup and uncommitted rollback are decided
+per transaction and one transaction never uses another's resources. The
+catalogue transaction ID remains the only commit authority.
+
+### Partial journal writes
+
+`write_atomic` creates `journal.flux.tmp`, writes and syncs content, renames it
+to `journal.flux`, then syncs the parent. Tests cover the observable artifacts:
+missing journal after directory creation, incomplete temporary journal, truncated
+final journal, complete temporary journal before rename, and a complete journal
+after rename before parent sync. Missing/truncated artifacts stop open and
+preserve the directory; a complete uncommitted journal is rolled back. Low-level
+write failures inside `write_atomic` itself are not injected because the
+standard library does not expose a portable hook; the closest deterministic
+filesystem states are tested instead.
+
+### Real process termination
+
+Dedicated child test processes abort without unwinding at:
+- after journal preparation,
+- during audio staging,
+- after metadata/resource publication before catalogue publication,
+- immediately after catalogue publication,
+- during post-commit cleanup,
+- during recovery cleanup.
+
+The parent reopens the same disposable library, verifies old/new authority,
+audio and lyrics bytes, TrackId/credits/ratings/playlists, then reopens again to
+prove idempotence. The recovery child is aborted inside cleanup and the parent
+resumes it; journal and file remain until the successful retry.
+
 ### Failure-injection matrix
 
 Test-only, deterministic boundaries are injected through a scoped
@@ -206,6 +244,14 @@ commit record, so those renames are reconciled by journal rollback/cleanup.
 Unsupported or read-only storage fails visibly; no automatic repair is attempted
 for a malformed journal. Catalog-only backup restoration remains disabled because
 it is not generation-consistent with per-entity files.
+
+Filesystem tests on Unix cover read-only destination directories, pending-write
+rejection after a permission-blocked rollback, destination symlink replacement,
+and missing source audio. Cross-device library roots and ENOSPC were not
+available to test here; staging uses copies inside the transaction directory and
+publishes with same-root renames, so a true cross-device source is copy-based,
+but no second mounted filesystem test is claimed. Non-Unix directory-sync
+semantics are not independently verified.
 
 ## Migration
 
@@ -254,3 +300,7 @@ cleanup.
    and cooperative cancellation.
 9. Cross-platform native behavior and real GUI migration were not runtime
    verified in this stage.
+10. ENOSPC and a true second mounted filesystem were not available for testing.
+    Low-level `write_atomic` interruption is represented by deterministic journal
+    artifacts rather than an in-process portable filesystem hook. A real process
+    abort is tested, but not a kernel/power failure.

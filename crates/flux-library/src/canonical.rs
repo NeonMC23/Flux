@@ -418,6 +418,8 @@ pub struct TransactionFailure {
     pub point: TransactionFailPoint,
     /// When true, simulate an abrupt interruption by skipping rollback.
     pub interrupt: bool,
+    /// When true, terminate the process at the boundary (test children only).
+    pub abort: bool,
 }
 
 /// One canonical library snapshot plus its on-disk root.
@@ -1586,6 +1588,10 @@ fn cleanup_one_path(
     journal: &JournalDto,
     target: &RelPath,
 ) -> Result<(), CanonicalError> {
+    #[cfg(test)]
+    if std::env::var_os("FLUX_TEST_ABORT_RECOVERY").is_some() {
+        std::process::abort();
+    }
     // Never remove a path that the active catalogue still references.
     let catalog_path = root.join(CATALOG_FILE_NAME);
     if catalog_path.exists() {
@@ -1938,10 +1944,12 @@ impl CanonicalLibrary {
     }
 
     fn maybe_fail(&self, point: TransactionFailPoint) -> Result<(), CanonicalError> {
-        if self
-            .fail_scenario
-            .is_some_and(|failure| failure.point == point)
+        if let Some(failure) = self.fail_scenario
+            && failure.point == point
         {
+            if failure.abort {
+                std::process::abort();
+            }
             return Err(CanonicalError::Invalid(format!(
                 "injected transaction failure at {}",
                 fail_point_name(point)
@@ -1963,6 +1971,22 @@ impl CanonicalLibrary {
         self.commit_writes_with_cleanup(new_catalog, writes, Vec::new())
     }
 
+    fn ensure_no_pending_transactions(&self) -> Result<(), CanonicalError> {
+        let dir = self.root.join(TRANSACTIONS_DIR_NAME);
+        if !dir.exists() {
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(&dir)?.flatten();
+        if entries.any(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())) {
+            return Err(CanonicalError::Transaction {
+                file: TRANSACTIONS_DIR_NAME.to_owned(),
+                message: "a previous transaction is unresolved; reopen the library and complete recovery before starting another write"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn commit_writes_with_cleanup(
         &mut self,
         new_catalog: Option<CatalogDto>,
@@ -1970,6 +1994,7 @@ impl CanonicalLibrary {
         cleanup: Vec<RelPath>,
     ) -> Result<(), CanonicalError> {
         self.maybe_fail(TransactionFailPoint::BeforeJournal)?;
+        self.ensure_no_pending_transactions()?;
         let transaction_id = Self::next_transaction_id();
         let txn_rel = transaction_rel(&transaction_id);
         let txn_dir = safe_join(&self.root, &txn_rel)?;
@@ -4647,6 +4672,7 @@ mod failure_matrix_tests {
             fx.library.set_transaction_failure(Some(TransactionFailure {
                 point: *point,
                 interrupt: true,
+                abort: false,
             }));
             let error = fx
                 .library
@@ -4746,6 +4772,7 @@ mod failure_matrix_tests {
         fx.library.set_transaction_failure(Some(TransactionFailure {
             point: TransactionFailPoint::AfterVerify,
             interrupt: false,
+            abort: false,
         }));
         assert!(fx.library.execute_ownership_transfer(&fx.plan).is_err());
         fx.library.set_transaction_failure(None);
@@ -4930,5 +4957,650 @@ mod failure_matrix_tests {
         assert!(audio.is_file(), "referenced audio is never cleaned up");
         assert!(txn_dir.is_dir(), "unsafe journal is preserved");
         let _ = rel;
+    }
+}
+
+#[cfg(test)]
+mod partial_journal_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn valid_journal(txn: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"kind":"flux-transaction","transaction_id":"{txn}","operation":"catalogue-write","state":"prepared","intended_generation":1,"actions":[],"cleanup":[]}}"#
+        )
+    }
+
+    fn root_with_transaction(name: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = TempDir::new(name);
+        let root = dir.path().join("FluxLibrary");
+        CanonicalLibrary::create(&root).expect("create");
+        let txn_dir = root.join(TRANSACTIONS_DIR_NAME).join("txn-partial");
+        fs::create_dir_all(&txn_dir).expect("txn dir");
+        (dir, root, txn_dir)
+    }
+
+    #[test]
+    fn partial_journal_artifacts_never_trigger_destructive_cleanup() {
+        // Before temporary journal creation: transaction directory exists, no journal.
+        let (_dir, root, txn_dir) = root_with_transaction("journal-before-temp");
+        fs::write(txn_dir.join("valuable.bin"), b"not staging").expect("valuable");
+        assert!(CanonicalLibrary::open(&root).is_err());
+        assert!(txn_dir.join("valuable.bin").is_file());
+        assert!(txn_dir.is_dir());
+
+        // Temporary file exists but is incomplete.
+        let (_dir, root, txn_dir) = root_with_transaction("journal-partial-temp");
+        fs::write(txn_dir.join("journal.flux.tmp"), b"{").expect("temp");
+        assert!(CanonicalLibrary::open(&root).is_err());
+        assert!(txn_dir.join("journal.flux.tmp").is_file());
+        assert!(txn_dir.is_dir());
+
+        // Final journal exists but content is truncated.
+        let (_dir, root, txn_dir) = root_with_transaction("journal-truncated");
+        fs::write(txn_dir.join("journal.flux"), b"{\"schema_version\":1").expect("journal");
+        assert!(CanonicalLibrary::open(&root).is_err());
+        assert!(txn_dir.join("journal.flux").is_file());
+        assert!(txn_dir.is_dir());
+
+        // Complete content synced into the temporary file, before final rename.
+        let (_dir, root, txn_dir) = root_with_transaction("journal-before-rename");
+        fs::write(
+            txn_dir.join("journal.flux.tmp"),
+            valid_journal("txn-partial"),
+        )
+        .expect("temp complete");
+        assert!(CanonicalLibrary::open(&root).is_err());
+        assert!(txn_dir.join("journal.flux.tmp").is_file());
+        assert!(txn_dir.is_dir());
+
+        // Complete journal after rename, before directory sync: recovery sees a
+        // valid uncommitted journal and removes only that transaction directory.
+        let (_dir, root, txn_dir) = root_with_transaction("journal-after-rename");
+        fs::write(txn_dir.join("journal.flux"), valid_journal("txn-partial")).expect("journal");
+        assert!(CanonicalLibrary::open(&root).is_ok());
+        assert!(!txn_dir.exists());
+    }
+
+    #[test]
+    fn valid_transaction_can_proceed_after_ambiguous_journal_is_removed() {
+        let dir = TempDir::new("journal-recover-valid");
+        let root = dir.path().join("FluxLibrary");
+        CanonicalLibrary::create(&root).expect("create");
+        let txn_dir = root.join(TRANSACTIONS_DIR_NAME).join("txn-broken");
+        fs::create_dir_all(&txn_dir).expect("txn");
+        fs::write(txn_dir.join("journal.flux"), b"{").expect("broken");
+        assert!(CanonicalLibrary::open(&root).is_err());
+        // Explicit cleanup of the ambiguous test artifact, never automatic
+        // transaction recovery.
+        fs::remove_dir_all(&txn_dir).expect("remove ambiguous journal");
+        let mut library = CanonicalLibrary::open(&root).expect("reopen");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let source = dir.write("source/song.wav", b"valid after journal failure");
+        assert!(
+            library
+                .import_track(CanonicalImportedTrack {
+                    source,
+                    title: "Song".to_owned(),
+                    artist_id: Some(a),
+                    artist_name: "A".to_owned(),
+                    credited_artist_ids: Vec::new(),
+                    album_title: Some("Album".to_owned()),
+                    release_type: ReleaseType::Album,
+                    track_number: None,
+                    disc_number: None,
+                    duration_ms: None,
+                })
+                .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod multiple_transaction_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn journal(txn: &str, state: &str, actions: &str, cleanup: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"kind":"flux-transaction","transaction_id":"{txn}","operation":"test","state":"{state}","intended_generation":1,"actions":[{actions}],"cleanup":[{cleanup}]}}"#
+        )
+    }
+
+    #[test]
+    fn multiple_uncommitted_transactions_roll_back_independently() {
+        let dir = TempDir::new("multi-uncommitted");
+        let root = dir.path().join("FluxLibrary");
+        CanonicalLibrary::create(&root).expect("create");
+        let transactions = root.join(TRANSACTIONS_DIR_NAME);
+        for name in ["txn-a", "txn-b"] {
+            let txn = transactions.join(name);
+            fs::create_dir_all(&txn).expect("txn");
+            fs::write(
+                txn.join("journal.flux"),
+                journal(
+                    name,
+                    "prepared",
+                    &format!(r#"{{"target":"{name}.wav","existed":false}}"#),
+                    "",
+                ),
+            )
+            .expect("journal");
+            fs::write(root.join(format!("{name}.wav")), b"partial").expect("partial");
+        }
+        fs::write(root.join("unrelated.wav"), b"keep").expect("keep");
+        let reopened = CanonicalLibrary::open(&root).expect("rollback both");
+        assert!(!root.join("txn-a.wav").exists());
+        assert!(!root.join("txn-b.wav").exists());
+        assert!(root.join("unrelated.wav").is_file());
+        assert_eq!(fs::read_dir(&transactions).expect("txn dir").count(), 0);
+        drop(reopened);
+        assert!(CanonicalLibrary::open(&root).is_ok());
+    }
+
+    #[test]
+    fn committed_cleanup_and_uncommitted_rollback_are_independent() {
+        let dir = TempDir::new("multi-mixed");
+        let root = dir.path().join("FluxLibrary");
+        CanonicalLibrary::create(&root).expect("create");
+        let catalog_path = root.join(CATALOG_FILE_NAME);
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("catalog")).expect("json");
+        catalog["transaction_id"] = serde_json::json!("txn-committed");
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("catalog bytes"),
+        )
+        .expect("catalog");
+        let transactions = root.join(TRANSACTIONS_DIR_NAME);
+        let committed = transactions.join("txn-committed");
+        fs::create_dir_all(&committed).expect("committed");
+        fs::write(
+            committed.join("journal.flux"),
+            journal("txn-committed", "cleaning", "", r#""obsolete.wav""#),
+        )
+        .expect("committed journal");
+        fs::write(root.join("obsolete.wav"), b"old").expect("old");
+        let uncommitted = transactions.join("txn-uncommitted");
+        fs::create_dir_all(&uncommitted).expect("uncommitted");
+        fs::write(
+            uncommitted.join("journal.flux"),
+            journal(
+                "txn-uncommitted",
+                "copying",
+                r#"{"target":"created.wav","existed":false}"#,
+                "",
+            ),
+        )
+        .expect("uncommitted journal");
+        fs::write(root.join("created.wav"), b"partial").expect("partial");
+        let reopened = CanonicalLibrary::open(&root).expect("mixed recovery");
+        assert!(!root.join("obsolete.wav").exists());
+        assert!(!root.join("created.wav").exists());
+        assert_eq!(fs::read_dir(&transactions).expect("txn dir").count(), 0);
+        drop(reopened);
+        assert!(CanonicalLibrary::open(&root).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod process_crash_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    const CHILD_ROOT: &str = "FLUX_TEST_CRASH_ROOT";
+    const CHILD_POINT: &str = "FLUX_TEST_CRASH_POINT";
+    const CHILD_RECOVERY: &str = "FLUX_TEST_CRASH_RECOVERY_ROOT";
+
+    fn point_from_name(name: &str) -> TransactionFailPoint {
+        match name {
+            "after-journal" => TransactionFailPoint::AfterJournal,
+            "during-audio-copy" => TransactionFailPoint::DuringAudioCopy,
+            "during-metadata-publish" => TransactionFailPoint::DuringMetadataPublish,
+            "after-catalog-publish" => TransactionFailPoint::AfterCatalogPublish,
+            "during-cleanup" => TransactionFailPoint::DuringCleanup,
+            other => panic!("unknown child boundary {other}"),
+        }
+    }
+
+    #[test]
+    fn child_crash_helper() {
+        let Ok(root) = std::env::var(CHILD_ROOT) else {
+            return;
+        };
+        let point = point_from_name(&std::env::var(CHILD_POINT).expect("child crash boundary"));
+        let root = PathBuf::from(root);
+        let mut library = CanonicalLibrary::create(&root).expect("create child library");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let b = library.create_artist("B", Vec::new()).expect("B");
+        let source_dir = root.parent().expect("parent").join("child-source");
+        fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join("song.wav");
+        fs::write(&source, b"child crash payload").expect("source");
+        let track = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Source".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("track");
+        library
+            .set_lyrics(track, Some("[00:00.00]child lyrics"))
+            .expect("lyrics");
+        library.set_rating(track, Some(4), true).expect("rating");
+        library
+            .set_playlist(None, "Keep", vec![track])
+            .expect("playlist");
+        let destination = library
+            .create_album(b, "Destination", ReleaseType::Ep)
+            .expect("destination");
+        let plan = library
+            .plan_ownership_transfer(track, b, OwnershipDestination::Existing(destination))
+            .expect("plan");
+        library.set_transaction_failure(Some(TransactionFailure {
+            point,
+            interrupt: true,
+            abort: true,
+        }));
+        let _ = library.execute_ownership_transfer(&plan);
+        panic!("child did not terminate at {point:?}");
+    }
+
+    #[test]
+    fn child_recovery_crash_helper() {
+        let Ok(root) = std::env::var(CHILD_RECOVERY) else {
+            return;
+        };
+        // The parent prepared a committed journal and sets the abort marker.
+        let _ = CanonicalLibrary::open(Path::new(&root));
+        panic!("child recovery did not terminate in cleanup");
+    }
+
+    fn spawn(boundary: &str, root: &Path) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "canonical::process_crash_tests::child_crash_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root)
+            .env(CHILD_POINT, boundary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn child")
+    }
+
+    fn spawn_recovery(root: &Path) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "canonical::process_crash_tests::child_recovery_crash_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_RECOVERY, root)
+            .env("FLUX_TEST_ABORT_RECOVERY", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn recovery child")
+    }
+
+    fn assert_transfer_state(root: &Path, committed: bool) {
+        let reopened = CanonicalLibrary::open(root).expect("reopen after child crash");
+        let id = TrackId::new(1);
+        let track = reopened.track(id).expect("track retained");
+        assert_eq!(
+            track.owner_artist_id,
+            if committed {
+                ArtistId::new(2)
+            } else {
+                ArtistId::new(1)
+            }
+        );
+        assert_eq!(
+            track.credited_artist_ids,
+            vec![ArtistId::new(1), ArtistId::new(2)]
+        );
+        assert_eq!(
+            track.album_id,
+            if committed {
+                AlbumId::new(2)
+            } else {
+                AlbumId::new(1)
+            }
+        );
+        assert_eq!(
+            reopened.rating(id),
+            Some(TrackRating {
+                rating: Some(4),
+                favorite: true
+            })
+        );
+        assert_eq!(reopened.playlists().count(), 1);
+        assert_eq!(reopened.tracks().count(), 1);
+        assert_eq!(
+            fs::read(reopened.track_audio_path(id).expect("audio")).expect("audio"),
+            b"child crash payload"
+        );
+        let lyrics = reopened.track_lyrics_path(id).expect("lyrics path");
+        assert_eq!(
+            fs::read_to_string(lyrics).expect("lyrics"),
+            "[00:00.00]child lyrics"
+        );
+        let old_audio =
+            root.join("artists/artist_000001/albums/album_000001/tracks/track_000001.wav");
+        let new_audio =
+            root.join("artists/artist_000002/albums/album_000002/tracks/track_000001.wav");
+        if committed {
+            assert!(!old_audio.exists());
+            assert!(new_audio.is_file());
+        } else {
+            assert!(old_audio.is_file());
+            assert!(!new_audio.exists());
+        }
+        drop(reopened);
+        assert!(
+            CanonicalLibrary::open(root).is_ok(),
+            "second recovery idempotent"
+        );
+    }
+
+    #[test]
+    fn actual_child_termination_at_transfer_boundaries_recovers() {
+        for (boundary, committed) in [
+            ("after-journal", false),
+            ("during-audio-copy", false),
+            ("during-metadata-publish", false),
+            ("after-catalog-publish", true),
+            ("during-cleanup", true),
+        ] {
+            let dir = TempDir::new(&format!("child-{boundary}"));
+            let root = dir.path().join("FluxLibrary");
+            let status = spawn(boundary, &root);
+            assert!(
+                !status.success(),
+                "child must terminate abruptly at {boundary}, got {status:?}"
+            );
+            assert_transfer_state(&root, committed);
+        }
+    }
+
+    #[test]
+    fn actual_child_termination_during_recovery_can_resume() {
+        let dir = TempDir::new("child-recovery");
+        let root = dir.path().join("FluxLibrary");
+        CanonicalLibrary::create(&root).expect("create");
+        let obsolete = root.join("obsolete.wav");
+        fs::write(&obsolete, b"old").expect("obsolete");
+        let txn = "txn-child-recovery";
+        let txn_dir = root.join(TRANSACTIONS_DIR_NAME).join(txn);
+        fs::create_dir_all(&txn_dir).expect("txn");
+        let catalog_path = root.join(CATALOG_FILE_NAME);
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("catalog")).expect("json");
+        catalog["transaction_id"] = serde_json::json!(txn);
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("catalog bytes"),
+        )
+        .expect("catalog");
+        fs::write(
+            txn_dir.join("journal.flux"),
+            br#"{
+                "schema_version": 1,
+                "kind": "flux-transaction",
+                "transaction_id": "txn-child-recovery",
+                "operation": "ownership-transfer",
+                "state": "cleaning",
+                "intended_generation": 2,
+                "actions": [],
+                "cleanup": ["obsolete.wav"]
+            }"#,
+        )
+        .expect("journal");
+        let status = spawn_recovery(&root);
+        assert!(!status.success(), "recovery child must terminate abruptly");
+        assert!(
+            obsolete.is_file(),
+            "interrupted recovery leaves journal-owned file"
+        );
+        assert!(txn_dir.is_dir());
+        let reopened = CanonicalLibrary::open(&root).expect("resume recovery");
+        assert!(!obsolete.exists());
+        assert!(!txn_dir.exists());
+        drop(reopened);
+        assert!(CanonicalLibrary::open(&root).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod filesystem_edge_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    struct EdgeFixture {
+        _dir: TempDir,
+        root: std::path::PathBuf,
+        library: CanonicalLibrary,
+        track: TrackId,
+        b: ArtistId,
+        destination: AlbumId,
+        plan: OwnershipTransferPlan,
+    }
+
+    fn fixture(name: &str) -> EdgeFixture {
+        let dir = TempDir::new(name);
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let b = library.create_artist("B", Vec::new()).expect("B");
+        let source = dir.write("source/song.wav", b"edge payload");
+        let track = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Source".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: None,
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("track");
+        let destination = library
+            .create_album(b, "Destination", ReleaseType::Album)
+            .expect("album");
+        let plan = library
+            .plan_ownership_transfer(track, b, OwnershipDestination::Existing(destination))
+            .expect("plan");
+        EdgeFixture {
+            _dir: dir,
+            root,
+            library,
+            track,
+            b,
+            destination,
+            plan,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_destination_fails_without_committing_and_can_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fx = fixture("readonly-destination");
+        let album_dir = fx.library.album_dir(fx.destination).expect("album dir");
+        let original = fs::metadata(&album_dir).expect("metadata").permissions();
+        let mut readonly = original.clone();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&album_dir, readonly).expect("chmod");
+        // Root-style environments ignore permission bits; do not claim a test
+        // that cannot fail.
+        let writable_even_when_readonly = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(album_dir.join(".permission-probe"))
+            .is_ok();
+        if writable_even_when_readonly {
+            let _ = fs::remove_file(album_dir.join(".permission-probe"));
+            fs::set_permissions(&album_dir, original).expect("restore");
+            return;
+        }
+        assert!(fx.library.execute_ownership_transfer(&fx.plan).is_err());
+        assert_eq!(
+            fx.library
+                .track(fx.track)
+                .map(|track| track.owner_artist_id),
+            Some(ArtistId::new(1))
+        );
+        // The failed rollback is still pending; a second write must not start
+        // until recovery completes.
+        assert!(fx.library.execute_ownership_transfer(&fx.plan).is_err());
+        fs::set_permissions(&album_dir, original).expect("restore");
+        drop(fx.library);
+        let mut recovered = CanonicalLibrary::open(&fx.root).expect("recover blocked rollback");
+        assert_eq!(
+            recovered.track(fx.track).map(|track| track.owner_artist_id),
+            Some(ArtistId::new(1))
+        );
+        recovered
+            .execute_ownership_transfer(&fx.plan)
+            .expect("retry after permission repair");
+        fx.library = recovered;
+        assert_eq!(
+            fx.library
+                .track(fx.track)
+                .map(|track| track.owner_artist_id),
+            Some(fx.b)
+        );
+        drop(fx.library);
+        assert!(CanonicalLibrary::open(&fx.root).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_symlink_replacement_is_rejected_before_publication() {
+        use std::os::unix::fs::symlink;
+
+        let mut fx = fixture("symlink-target");
+        let target = fx
+            .root
+            .join(fx.plan.new_audio_path().to_os_path().expect("path"));
+        fs::create_dir_all(target.parent().expect("parent")).expect("dirs");
+        let outside = fx.root.parent().expect("parent").join("outside.wav");
+        fs::write(&outside, b"outside").expect("outside");
+        symlink(&outside, &target).expect("symlink");
+        assert!(fx.library.execute_ownership_transfer(&fx.plan).is_err());
+        assert_eq!(
+            fx.library
+                .track(fx.track)
+                .map(|track| track.owner_artist_id),
+            Some(ArtistId::new(1))
+        );
+        assert!(outside.is_file());
+        assert_eq!(fs::read(&outside).expect("outside"), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_permission_failure_preserves_journal_and_retries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("cleanup-permission");
+        let root = dir.path().join("FluxLibrary");
+        CanonicalLibrary::create(&root).expect("create");
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).expect("locked");
+        let obsolete = locked.join("obsolete.wav");
+        fs::write(&obsolete, b"old").expect("obsolete");
+        let txn = "txn-permission-cleanup";
+        let txn_dir = root.join(TRANSACTIONS_DIR_NAME).join(txn);
+        fs::create_dir_all(&txn_dir).expect("txn");
+        let catalog_path = root.join(CATALOG_FILE_NAME);
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("catalog")).expect("json");
+        catalog["transaction_id"] = serde_json::json!(txn);
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("catalog bytes"),
+        )
+        .expect("catalog");
+        fs::write(
+            txn_dir.join("journal.flux"),
+            br#"{
+                "schema_version": 1,
+                "kind": "flux-transaction",
+                "transaction_id": "txn-permission-cleanup",
+                "operation": "ownership-transfer",
+                "state": "cleaning",
+                "intended_generation": 2,
+                "actions": [],
+                "cleanup": ["locked/obsolete.wav"]
+            }"#,
+        )
+        .expect("journal");
+        let original = fs::metadata(&locked).expect("metadata").permissions();
+        let mut readonly = original.clone();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&locked, readonly).expect("chmod");
+        let writable = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(locked.join(".probe"))
+            .is_ok();
+        if writable {
+            let _ = fs::remove_file(locked.join(".probe"));
+            fs::set_permissions(&locked, original).expect("restore");
+            return;
+        }
+        assert!(CanonicalLibrary::open(&root).is_err());
+        assert!(obsolete.is_file());
+        assert!(txn_dir.is_dir());
+        fs::set_permissions(&locked, original).expect("restore");
+        let reopened = CanonicalLibrary::open(&root).expect("retry cleanup");
+        assert!(!obsolete.exists());
+        assert!(!txn_dir.exists());
+        drop(reopened);
+    }
+
+    #[test]
+    fn missing_source_after_plan_fails_safely_without_metadata_loss() {
+        let mut fx = fixture("missing-source");
+        let old_audio = fx.library.track_audio_path(fx.track).expect("old audio");
+        fs::remove_file(&old_audio).expect("remove source");
+        assert!(fx.library.execute_ownership_transfer(&fx.plan).is_err());
+        assert!(fx.library.track(fx.track).is_some());
+        assert_eq!(
+            fx.library.track_credits(fx.track),
+            Some([ArtistId::new(1), ArtistId::new(2)].as_slice())
+        );
+        assert!(!fx.library.track_available(fx.track));
+        drop(fx.library);
+        let reopened = CanonicalLibrary::open(&fx.root).expect("reopen missing source");
+        assert!(reopened.track(fx.track).is_some());
+        assert!(!reopened.track_available(fx.track));
     }
 }
