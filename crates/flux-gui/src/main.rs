@@ -6460,6 +6460,7 @@ mod tests {
         assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
         let a = gui.controller.create_artist("A").expect("A");
         let b = gui.controller.create_artist("B").expect("B");
+        let c = gui.controller.create_artist("C").expect("C");
         let source_dir = dir.path().join("source");
         std::fs::create_dir_all(&source_dir).expect("source");
         let source = source_dir.join("song.wav");
@@ -6483,13 +6484,32 @@ mod tests {
         send(
             &mut gui,
             Message::EditorArtistChanged(Some(ArtistChoice {
-                id: Some(b),
-                label: "B".to_owned(),
+                id: Some(c),
+                label: "C".to_owned(),
             })),
         );
         send(
             &mut gui,
             Message::EditorAlbumChanged("Destination".to_owned()),
+        );
+        send(&mut gui, Message::EditorTransferOwner);
+        assert!(
+            gui.track_editor.is_some(),
+            "failed transfer keeps editor open"
+        );
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .and_then(|e| e.error.as_ref())
+                .is_some()
+        );
+        assert_eq!(gui.controller.track_artist_id(id), Some(a));
+        send(
+            &mut gui,
+            Message::EditorArtistChanged(Some(ArtistChoice {
+                id: Some(b),
+                label: "B".to_owned(),
+            })),
         );
         send(&mut gui, Message::EditorTransferOwner);
         assert!(gui.track_editor.is_none(), "transfer closes editor");
