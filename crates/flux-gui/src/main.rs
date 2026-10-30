@@ -1146,6 +1146,7 @@ struct ImportManager {
     manual_input: String,
     edit_title: String,
     edit_artist: String,
+    edit_credit: String,
     edit_album: String,
     edit_track_number: String,
     edit_disc_number: String,
@@ -1174,6 +1175,7 @@ impl ImportManager {
             manual_input: String::new(),
             edit_title: String::new(),
             edit_artist: String::new(),
+            edit_credit: String::new(),
             edit_album: String::new(),
             edit_track_number: String::new(),
             edit_disc_number: String::new(),
@@ -1206,6 +1208,7 @@ impl ImportManager {
         self.selected = Some(index);
         self.edit_title = candidate.title().to_owned();
         self.edit_artist = candidate.artist_name().unwrap_or_default().to_owned();
+        self.edit_credit.clear();
         self.edit_album = candidate.album().unwrap_or_default().to_owned();
         self.edit_track_number = candidate
             .track_number()
@@ -1259,6 +1262,7 @@ enum Message {
     EditorNewArtistChanged(String),
     EditorCreateArtist,
     EditorSave,
+    EditorTransferOwner,
     EditorCancel,
     ArtistSelected(Option<ArtistChoice>),
     ArtistNameChanged(String),
@@ -1300,6 +1304,12 @@ enum Message {
     ImportTrackNumberChanged(String),
     ImportDiscNumberChanged(String),
     ImportArtistPicked(Option<ArtistChoice>),
+    ImportCreditNameChanged(String),
+    ImportCreditAddNamed,
+    ImportCreditAddExisting(ArtistChoice),
+    ImportCreditMove(usize, isize),
+    ImportCreditRemove(usize),
+    ImportCreditSetOwner(usize),
     ImportManualChanged(String),
     ImportManualAdd,
     ImportDropPath(PathBuf),
@@ -1598,6 +1608,69 @@ impl FluxReady {
         }
     }
 
+    fn transfer_track_editor_owner(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let id = editor.id;
+        let Some(new_owner) = editor.artist_id else {
+            if let Some(editor) = self.track_editor.as_mut() {
+                editor.error = Some("Select a credited artist as the new owner.".to_owned());
+            }
+            return;
+        };
+        let album_title = editor.album.trim().to_owned();
+        if album_title.is_empty() {
+            if let Some(editor) = self.track_editor.as_mut() {
+                editor.error = Some("Enter the destination release title.".to_owned());
+            }
+            return;
+        }
+        let current_owner = self.controller.track_artist_id(id);
+        if current_owner == Some(new_owner) {
+            if let Some(editor) = self.track_editor.as_mut() {
+                editor.error = Some("The selected artist already owns this track.".to_owned());
+            }
+            return;
+        }
+        let destination = self
+            .controller
+            .albums()
+            .into_iter()
+            .find(|album| album.owner_artist_id == new_owner && album.title == album_title)
+            .map(|album| flux_app::OwnershipDestination::Existing(album.id))
+            .unwrap_or_else(|| flux_app::OwnershipDestination::New {
+                title: album_title,
+                release_type: flux_app::ReleaseType::Album,
+            });
+        let plan = match self
+            .controller
+            .plan_track_ownership_transfer(id, new_owner, destination)
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+                return;
+            }
+        };
+        match self.controller.transfer_track_ownership(&plan) {
+            Ok(report) => {
+                self.track_editor = None;
+                self.lifecycle_msg = Some(format!(
+                    "Track {} transferred from {} to {}.",
+                    report.track_id, report.from_owner, report.to_owner
+                ));
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
     fn create_artist_from_editor(&mut self) {
         let Some(editor) = self.track_editor.as_ref() else {
             return;
@@ -1771,8 +1844,7 @@ impl FluxReady {
         if !plan.can_import() {
             manager.error = Some(
                 plan.blocking_reason()
-                    .unwrap_or("There is nothing selected to import.")
-                    .to_owned(),
+                    .unwrap_or_else(|| "There is nothing selected to import.".to_owned()),
             );
             return Task::none();
         }
@@ -2001,6 +2073,7 @@ impl FluxReady {
             }
             Message::EditorCreateArtist => self.create_artist_from_editor(),
             Message::EditorSave => self.save_track_editor(),
+            Message::EditorTransferOwner => self.transfer_track_editor_owner(),
             Message::EditorCancel => self.track_editor = None,
             Message::ArtistSelected(choice) => {
                 self.artist_selected = choice.as_ref().and_then(|choice| choice.id);
@@ -2370,6 +2443,76 @@ impl FluxReady {
                     if let Some(name) = canonical_name {
                         manager.edit_artist = name;
                     }
+                }
+            }
+            Message::ImportCreditNameChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.edit_credit = value;
+                }
+            }
+            Message::ImportCreditAddNamed => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let name = manager.edit_credit.trim().to_owned();
+                if name.is_empty() {
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut()
+                    && let Some(index) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    candidate.add_credit(flux_app::ImportCredit::new(None, name, false));
+                    manager.edit_credit.clear();
+                }
+            }
+            Message::ImportCreditAddExisting(choice) => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let Some(id) = choice.id else {
+                    return Task::none();
+                };
+                if let Some(plan) = manager.plan.as_mut()
+                    && let Some(index) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    candidate.add_credit(flux_app::ImportCredit::new(
+                        Some(id),
+                        choice.label,
+                        false,
+                    ));
+                }
+            }
+            Message::ImportCreditMove(index, delta) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                    && let Some(selected) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(selected)
+                {
+                    candidate.move_credit(index, delta);
+                }
+            }
+            Message::ImportCreditRemove(index) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                    && let Some(selected) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(selected)
+                {
+                    candidate.remove_credit(index);
+                }
+            }
+            Message::ImportCreditSetOwner(index) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                    && let Some(selected) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(selected)
+                {
+                    candidate.set_owner_index(index);
+                    manager.edit_artist = candidate.artist_name().unwrap_or_default().to_owned();
                 }
             }
             Message::ImportManualChanged(value) => {
@@ -3648,6 +3791,77 @@ impl FluxReady {
             .padding([6, 8])
             .width(Length::Fill),
         );
+        body = body.push(text("ORDERED CREDITS").size(8).color(MUTED));
+        for (credit_index, credit) in candidate.credits().iter().enumerate() {
+            let owner = credit_index == candidate.owner_index();
+            body = body.push(
+                row![
+                    text(format!("{}. {}", credit_index + 1, credit.name))
+                        .size(10)
+                        .color(if owner { ACCENT } else { TEXT })
+                        .width(Length::Fill),
+                    if owner {
+                        Element::from(text("OWNER").size(8).color(ACCENT))
+                    } else {
+                        Element::from(
+                            button(text("Set owner").size(9))
+                                .style(ghost_style)
+                                .padding([4, 7])
+                                .on_press(Message::ImportCreditSetOwner(credit_index)),
+                        )
+                    },
+                    button(text("↑").size(10))
+                        .style(ghost_style)
+                        .padding([4, 6])
+                        .on_press(Message::ImportCreditMove(credit_index, -1)),
+                    button(text("↓").size(10))
+                        .style(ghost_style)
+                        .padding([4, 6])
+                        .on_press(Message::ImportCreditMove(credit_index, 1)),
+                    button(text("×").size(10))
+                        .style(ghost_style)
+                        .padding([4, 6])
+                        .on_press_maybe(
+                            (!owner && candidate.credits().len() > 1)
+                                .then_some(Message::ImportCreditRemove(credit_index)),
+                        ),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            );
+        }
+        body = body.push(
+            row![
+                text_input("Additional credited artist…", &manager.edit_credit)
+                    .on_input(Message::ImportCreditNameChanged)
+                    .on_submit(Message::ImportCreditAddNamed)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Add credit").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportCreditAddNamed),
+            ]
+            .spacing(6),
+        );
+        let mut add_choices = self.editor_artist_choices();
+        add_choices.retain(|choice| choice.id.is_some());
+        body = body.push(
+            pick_list(
+                add_choices,
+                None::<ArtistChoice>,
+                Message::ImportCreditAddExisting,
+            )
+            .placeholder("Add existing artist…")
+            .text_size(10)
+            .padding([5, 7])
+            .width(Length::Fill),
+        );
+        body = body.push(
+            text("The owner must be one of the ordered credits. Ejecting the owner or adding an invalid credit blocks import.")
+                .size(9)
+                .color(MUTED),
+        );
         body = body.push(text("ALBUM").size(8).color(MUTED));
         body = body.push(
             text_input("Album", &manager.edit_album)
@@ -4284,7 +4498,24 @@ impl FluxReady {
             ]
             .spacing(8),
         );
-        body = body.push(text("Artist identity").size(9).color(MUTED));
+        body = body.push(
+            text("Artist identity and ordered credits")
+                .size(9)
+                .color(MUTED),
+        );
+        body = body.push(
+            text(format!(
+                "{} · physical owner: {}",
+                self.credit_display(editor.id),
+                self.controller
+                    .track_artist_id(editor.id)
+                    .and_then(|artist| self.controller.artist(artist))
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            ))
+            .size(10)
+            .color(MUTED),
+        );
         body = body.push(artist_row);
         body = body.push(new_artist_row);
         body = body.push(
@@ -4301,6 +4532,13 @@ impl FluxReady {
                     .style(accent_button_style)
                     .padding([8, 14])
                     .on_press(Message::EditorSave),
+                button(text("Transfer owner").size(11))
+                    .style(ghost_style)
+                    .padding([8, 12])
+                    .on_press_maybe(
+                        matches!(self.controller.storage_mode(), StorageMode::Canonical)
+                            .then_some(Message::EditorTransferOwner)
+                    ),
                 button(text("Cancel").size(11))
                     .style(ghost_style)
                     .padding([8, 12])
@@ -4316,20 +4554,66 @@ impl FluxReady {
             .into()
     }
 
-    fn group_key_for(&self, view: LibraryView, id: TrackId, track: &Track) -> Option<String> {
+    fn credit_display(&self, id: TrackId) -> String {
+        let credits = self.controller.track_credits(id);
+        if credits.is_empty() {
+            return self
+                .controller
+                .track(id)
+                .map(display_artist)
+                .unwrap_or_else(|| "Unknown artist".to_owned());
+        }
+        let names = credits
+            .iter()
+            .map(|artist| {
+                self.controller
+                    .artist(*artist)
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| format!("Artist {artist}"))
+            })
+            .collect::<Vec<_>>();
+        let owner = self.controller.track_artist_id(id);
+        let owner_name = owner
+            .and_then(|artist| self.controller.artist(artist))
+            .map(|artist| artist.name().to_owned());
+        if owner_name.as_deref() != names.first().map(String::as_str) {
+            format!(
+                "{} · owner {}",
+                names.join(" · "),
+                owner_name.unwrap_or_default()
+            )
+        } else {
+            names.join(" · ")
+        }
+    }
+
+    fn group_keys_for(&self, view: LibraryView, id: TrackId, track: &Track) -> Vec<String> {
         match view {
             LibraryView::Artists => {
-                Some(artist_group_key(self.controller.track_artist_id(id), track))
+                let credits = self.controller.track_credits(id);
+                if credits.is_empty() {
+                    return vec![artist_group_key(self.controller.track_artist_id(id), track)];
+                }
+                let mut keys = Vec::with_capacity(credits.len());
+                for artist in credits {
+                    let name = self
+                        .controller
+                        .artist(artist)
+                        .map(|value| value.name().to_owned())
+                        .unwrap_or_else(|| format!("Artist {artist}"));
+                    keys.push(format!("{name}{ARTIST_KEY_SEPARATOR}{artist}"));
+                }
+                keys
             }
-            LibraryView::Albums => Some(album_group_key(self.controller.track_album_id(id), track)),
-            _ => group_key(view, track),
+            LibraryView::Albums => vec![album_group_key(self.controller.track_album_id(id), track)],
+            _ => group_key(view, track).into_iter().collect(),
         }
     }
 
     fn groups_for(&self, view: LibraryView) -> Vec<(String, usize)> {
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
         for (id, track) in self.controller.tracks() {
-            if let Some(key) = self.group_key_for(view, *id, track) {
+            for key in self.group_keys_for(view, *id, track) {
                 *groups.entry(key).or_default() += 1;
             }
         }
@@ -4419,7 +4703,9 @@ impl FluxReady {
         let mut rows = self.controller.search(&self.search);
         if let Some(group) = &self.selected_group {
             rows.retain(|(id, track)| {
-                self.group_key_for(self.view, *id, track).as_deref() == Some(group.as_str())
+                self.group_keys_for(self.view, *id, track)
+                    .iter()
+                    .any(|key| key == group)
             });
         }
         rows
@@ -4487,6 +4773,7 @@ impl FluxReady {
                 start + offset + 1,
                 *id,
                 track,
+                &self.credit_display(*id),
                 current,
                 missing,
                 editable,
@@ -5218,6 +5505,7 @@ fn track_row<'a>(
     index: usize,
     id: TrackId,
     track: &'a Track,
+    credits: &str,
     current: Option<TrackId>,
     missing: bool,
     editable: bool,
@@ -5247,7 +5535,7 @@ fn track_row<'a>(
             .size(10)
             .color(if selected { ACCENT } else { MUTED })
             .width(Length::Fixed(28.0)),
-        column![title, text(display_artist(track)).size(10).color(MUTED),]
+        column![title, text(credits.to_owned()).size(10).color(MUTED),]
             .spacing(2)
             .width(Length::FillPortion(5)),
         text(display_album(track))
@@ -5285,7 +5573,7 @@ fn track_row<'a>(
             text(if editable {
                 "Edit metadata"
             } else {
-                "Use a portable library to edit"
+                "Use a canonical library to edit"
             })
             .size(10)
             .color(TEXT),
@@ -5951,6 +6239,11 @@ mod tests {
             &mut gui,
             Message::ImportAlbumChanged("GUI import album".to_owned()),
         );
+        send(
+            &mut gui,
+            Message::ImportCreditNameChanged("Featured Artist".to_owned()),
+        );
+        send(&mut gui, Message::ImportCreditAddNamed);
         let plan = gui
             .import_manager
             .as_ref()
@@ -5966,6 +6259,16 @@ mod tests {
         assert_eq!(track.title(), "GUI imported title");
         assert_eq!(track.artist(), Some("GUI import artist"));
         assert_eq!(track.album(), Some("GUI import album"));
+        let id = gui.controller.tracks()[0].0;
+        assert_eq!(gui.controller.track_credits(id).len(), 2);
+        assert_eq!(
+            gui.controller
+                .track_credits(id)
+                .first()
+                .and_then(|artist| gui.controller.artist(*artist))
+                .map(|artist| artist.name().to_owned()),
+            Some("GUI import artist".to_owned())
+        );
         assert_eq!(gui.controller.queue_len(), 1);
         assert_eq!(std::fs::read(&source).expect("source"), source_bytes);
         assert_ne!(track.source().path(), source);
@@ -6141,5 +6444,61 @@ mod tests {
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&0u32.to_le_bytes());
         wav
+    }
+
+    #[test]
+    fn gui_track_editor_transfers_owner_using_explicit_release_title() {
+        let dir = TempDir::new("gui-transfer");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
+        let a = gui.controller.create_artist("A").expect("A");
+        let b = gui.controller.create_artist("B").expect("B");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("song");
+        let id = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Album".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import");
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorArtistChanged(Some(ArtistChoice {
+                id: Some(b),
+                label: "B".to_owned(),
+            })),
+        );
+        send(
+            &mut gui,
+            Message::EditorAlbumChanged("Destination".to_owned()),
+        );
+        send(&mut gui, Message::EditorTransferOwner);
+        assert!(gui.track_editor.is_none(), "transfer closes editor");
+        assert_eq!(gui.controller.track_artist_id(id), Some(b));
+        assert_eq!(
+            gui.controller.track(id).and_then(Track::album),
+            Some("Destination")
+        );
+        assert_eq!(gui.controller.track_credits(id), vec![a, b]);
+        gui.controller.shutdown();
     }
 }

@@ -157,6 +157,29 @@ pub enum ImportDecision {
     Skip,
 }
 
+/// One ordered credit in the import review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCredit {
+    /// Existing stable artist, or `None` for a name that still needs resolution.
+    pub artist_id: Option<ArtistId>,
+    /// Display/name input used when no stable ID is selected.
+    pub name: String,
+    /// Presentation hint only; the canonical model stores ordered credits.
+    pub featuring: bool,
+}
+
+impl ImportCredit {
+    /// Constructs a credit.
+    #[must_use]
+    pub fn new(artist_id: Option<ArtistId>, name: impl Into<String>, featuring: bool) -> Self {
+        Self {
+            artist_id,
+            name: name.into(),
+            featuring,
+        }
+    }
+}
+
 /// One scanned file in the import review.
 #[derive(Debug, Clone)]
 pub struct ImportCandidate {
@@ -180,6 +203,9 @@ pub struct ImportCandidate {
     track_number: Option<u32>,
     disc_number: Option<u32>,
     artist_id: Option<ArtistId>,
+    credits: Vec<ImportCredit>,
+    owner_index: usize,
+    base_credits: Vec<ImportCredit>,
     metadata_incomplete: bool,
 }
 
@@ -270,6 +296,126 @@ impl ImportCandidate {
         self.artist_id
     }
 
+    /// Ordered credits currently under review.
+    #[must_use]
+    pub fn credits(&self) -> &[ImportCredit] {
+        &self.credits
+    }
+
+    /// Index of the physical owner inside [`credits`](Self::credits).
+    #[must_use]
+    pub fn owner_index(&self) -> usize {
+        self.owner_index
+    }
+
+    /// Adds an ordered credit. The first credit becomes the default owner when
+    /// there was no valid owner index.
+    pub fn add_credit(&mut self, credit: ImportCredit) {
+        if self.credits.is_empty() {
+            self.owner_index = 0;
+        }
+        self.credits.push(credit);
+    }
+
+    /// Removes one credit. Refuses to remove the physical owner.
+    pub fn remove_credit(&mut self, index: usize) -> bool {
+        if index >= self.credits.len() || index == self.owner_index || self.credits.len() == 1 {
+            return false;
+        }
+        self.credits.remove(index);
+        if index < self.owner_index {
+            self.owner_index -= 1;
+        }
+        self.sync_owner_fields();
+        true
+    }
+
+    /// Moves a credit up or down while preserving the owner by identity.
+    pub fn move_credit(&mut self, index: usize, delta: isize) -> bool {
+        if index >= self.credits.len() {
+            return false;
+        }
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= self.credits.len() {
+            return false;
+        }
+        let target = target as usize;
+        self.credits.swap(index, target);
+        if self.owner_index == index {
+            self.owner_index = target;
+        } else if self.owner_index == target {
+            self.owner_index = index;
+        }
+        self.sync_owner_fields();
+        true
+    }
+
+    fn sync_owner_fields(&mut self) {
+        if let Some(credit) = self.credits.get(self.owner_index) {
+            self.artist_name = Some(credit.name.clone());
+            self.artist_id = credit.artist_id;
+        }
+    }
+
+    /// Selects a credit as the physical owner. The list must remain non-empty;
+    /// invalid indexes are ignored.
+    pub fn set_owner_index(&mut self, index: usize) -> bool {
+        if index >= self.credits.len() {
+            return false;
+        }
+        self.owner_index = index;
+        self.artist_name = Some(self.credits[index].name.clone());
+        self.artist_id = self.credits[index].artist_id;
+        true
+    }
+
+    /// Updates the credit at `index` to an existing stable artist.
+    pub fn set_credit_artist(&mut self, index: usize, artist_id: ArtistId, name: String) {
+        if let Some(credit) = self.credits.get_mut(index) {
+            credit.artist_id = Some(artist_id);
+            credit.name = name;
+            if index == self.owner_index {
+                self.artist_id = Some(artist_id);
+                self.artist_name = Some(self.credits[index].name.clone());
+            }
+        }
+    }
+
+    /// First validation problem that must block canonical confirmation.
+    #[must_use]
+    pub fn validation_error(&self) -> Option<String> {
+        if self.title.trim().is_empty() {
+            return Some("Track title is required.".to_owned());
+        }
+        if self.credits.is_empty() {
+            return Some("At least one credited artist is required.".to_owned());
+        }
+        if self.owner_index >= self.credits.len() {
+            return Some("Select a physical owner from the credited artists.".to_owned());
+        }
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        for credit in &self.credits {
+            if let Some(id) = credit.artist_id {
+                if !ids.insert(id) {
+                    return Some("The same artist cannot appear twice in the credits.".to_owned());
+                }
+            } else {
+                let name = credit.name.trim();
+                if name.is_empty() {
+                    return Some("Every credit needs a name or an existing artist.".to_owned());
+                }
+                if !names.insert(name.to_lowercase()) {
+                    return Some(
+                        "The same artist name cannot appear twice; select identities explicitly."
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        None
+    }
+
     /// Whether source metadata was incomplete.
     #[must_use]
     pub fn metadata_incomplete(&self) -> bool {
@@ -285,6 +431,8 @@ impl ImportCandidate {
             || self.track_number != self.base_track_number
             || self.disc_number != self.base_disc_number
             || self.artist_id != self.base_artist_id
+            || self.owner_index != 0
+            || self.credits != self.base_credits
     }
 
     /// Sets the reviewed title. An empty title means the display fallback.
@@ -298,6 +446,13 @@ impl ImportCandidate {
         self.artist_name = artist
             .map(|artist| artist.trim().to_owned())
             .filter(|artist| !artist.is_empty());
+        if let Some(credit) = self.credits.get_mut(self.owner_index) {
+            credit.name = self
+                .artist_name
+                .clone()
+                .unwrap_or_else(|| "Unknown Artist".to_owned());
+            credit.artist_id = self.artist_id;
+        }
     }
 
     /// Sets the reviewed album.
@@ -323,6 +478,9 @@ impl ImportCandidate {
         self.artist_id = artist_id;
         if let Some(name) = display_name {
             self.set_artist_name(Some(name));
+        } else if let Some(credit) = self.credits.get_mut(self.owner_index) {
+            credit.artist_id = artist_id;
+            self.artist_name = Some(credit.name.clone());
         }
     }
 
@@ -445,19 +603,22 @@ impl ImportPlan {
         !self.cancelled
             && (self.new_count() > 0 || self.update_count() > 0)
             && self.candidates.iter().all(|candidate| {
-                candidate.decision != ImportDecision::ImportNew || candidate.storage_error.is_none()
+                candidate.decision != ImportDecision::ImportNew
+                    || (candidate.storage_error.is_none() && candidate.validation_error().is_none())
             })
     }
 
     /// First blocking reason for the reviewed plan, if any.
     #[must_use]
-    pub fn blocking_reason(&self) -> Option<&str> {
+    pub fn blocking_reason(&self) -> Option<String> {
         self.candidates
             .iter()
-            .find(|candidate| {
-                candidate.decision == ImportDecision::ImportNew && candidate.storage_error.is_some()
+            .find(|candidate| candidate.decision == ImportDecision::ImportNew)
+            .and_then(|candidate| {
+                candidate
+                    .validation_error()
+                    .or_else(|| candidate.storage_error.clone())
             })
-            .and_then(|candidate| candidate.storage_error.as_deref())
     }
 
     fn recompute_destinations(&mut self) {
@@ -876,6 +1037,13 @@ fn make_candidate(
     let metadata_incomplete = source_track.artist().is_none()
         || source_track.album().is_none()
         || source_track.title() == filename_stem(&source_path);
+    let base_credits = vec![ImportCredit::new(
+        base_artist_id,
+        base_artist_name
+            .clone()
+            .unwrap_or_else(|| "Unknown Artist".to_owned()),
+        false,
+    )];
     ImportCandidate {
         source_path: source_path.clone(),
         source_track,
@@ -891,6 +1059,9 @@ fn make_candidate(
         track_number: base_track_number,
         disc_number: base_disc_number,
         artist_id: base_artist_id,
+        credits: base_credits.clone(),
+        owner_index: 0,
+        base_credits,
         base_title,
         base_artist_name,
         base_album,
@@ -1376,6 +1547,53 @@ fn apply_candidate_metadata(
     Ok(())
 }
 
+fn resolve_canonical_credits(
+    controller: &mut Controller,
+    candidate: &ImportCandidate,
+) -> Result<(Vec<ArtistId>, ArtistId), String> {
+    let credits = candidate.credits();
+    if credits.is_empty() {
+        return Err("At least one credited artist is required.".to_owned());
+    }
+    let mut ids = Vec::with_capacity(credits.len());
+    for credit in credits {
+        let id = if let Some(id) = credit.artist_id {
+            if controller.artist(id).is_none() {
+                return Err(format!("Artist {id} is not in this library."));
+            }
+            id
+        } else {
+            let name = credit.name.trim();
+            if name.is_empty() {
+                return Err("Every credit needs a name or an existing artist.".to_owned());
+            }
+            let matches = controller
+                .artists()
+                .into_iter()
+                .filter(|artist| artist.name() == name)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [artist] => artist.id(),
+                [] => controller.create_artist(name)?,
+                _ => {
+                    return Err(format!(
+                        "Several artists are named {name:?}; select the intended identity explicitly."
+                    ));
+                }
+            }
+        };
+        if ids.contains(&id) {
+            return Err("The same artist cannot appear twice in the credit list.".to_owned());
+        }
+        ids.push(id);
+    }
+    if candidate.owner_index() >= ids.len() {
+        return Err("Select a physical owner from the credited artists.".to_owned());
+    }
+    let owner = ids[candidate.owner_index()];
+    Ok((ids, owner))
+}
+
 fn apply_import_plan_canonical(
     controller: &mut Controller,
     plan: &ImportPlan,
@@ -1428,13 +1646,41 @@ fn apply_import_plan_canonical(
                 );
                 match result {
                     Ok(()) => {
-                        report.updated += 1;
-                        report.items.push(AppliedImportItem {
-                            index,
-                            track_id: Some(id),
-                            state: ImportItemState::Imported,
-                            message: "Updated existing track".to_owned(),
-                        });
+                        let current_owner = controller.track_artist_id(id);
+                        match resolve_canonical_credits(controller, candidate) {
+                            Ok((credits, owner)) if current_owner == Some(owner) => {
+                                if let Err(message) =
+                                    controller.update_track_credits(id, credits)
+                                {
+                                    report.items.push(AppliedImportItem {
+                                        index,
+                                        track_id: Some(id),
+                                        state: ImportItemState::Failed,
+                                        message,
+                                    });
+                                    continue;
+                                }
+                                report.updated += 1;
+                                report.items.push(AppliedImportItem {
+                                    index,
+                                    track_id: Some(id),
+                                    state: ImportItemState::Imported,
+                                    message: "Updated existing track".to_owned(),
+                                });
+                            }
+                            Ok(_) => report.items.push(AppliedImportItem {
+                                index,
+                                track_id: Some(id),
+                                state: ImportItemState::Failed,
+                                message: "Changing physical ownership requires an ownership transfer, not an import update.".to_owned(),
+                            }),
+                            Err(message) => report.items.push(AppliedImportItem {
+                                index,
+                                track_id: Some(id),
+                                state: ImportItemState::Failed,
+                                message,
+                            }),
+                        }
                     }
                     Err(message) => report.items.push(AppliedImportItem {
                         index,
@@ -1445,17 +1691,28 @@ fn apply_import_plan_canonical(
                 }
             }
             ImportDecision::ImportNew => {
-                let Some(artist_name) = candidate
-                    .artist_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
+                let resolved_credits = resolve_canonical_credits(controller, candidate);
+                let (credited_artist_ids, owner_id) = match resolved_credits {
+                    Ok(value) => value,
+                    Err(message) => {
+                        report.items.push(AppliedImportItem {
+                            index,
+                            track_id: None,
+                            state: ImportItemState::Failed,
+                            message,
+                        });
+                        continue;
+                    }
+                };
+                let Some(owner_name) = controller
+                    .artist(owner_id)
+                    .map(|artist| artist.name().to_owned())
                 else {
                     report.items.push(AppliedImportItem {
                         index,
                         track_id: None,
                         state: ImportItemState::Failed,
-                        message: "Artist is required before importing.".to_owned(),
+                        message: "The selected physical owner is unavailable.".to_owned(),
                     });
                     continue;
                 };
@@ -1479,8 +1736,9 @@ fn apply_import_plan_canonical(
                 let imported = CanonicalImportedTrack {
                     source: candidate.source_path.clone(),
                     title: candidate.title.clone(),
-                    artist_id: candidate.artist_id,
-                    artist_name: artist_name.to_owned(),
+                    artist_id: Some(owner_id),
+                    artist_name: owner_name,
+                    credited_artist_ids,
                     album_title: Some(album_title.to_owned()),
                     release_type: flux_library::canonical::ReleaseType::Album,
                     track_number: candidate.track_number,
@@ -1741,8 +1999,9 @@ mod tests {
     use crate::{AudioStatus, Controller, create_portable_library};
 
     use super::{
-        CandidateStatus, ImportDecision, ImportItemState, ImportPlan, ImportProgress,
-        ImportRequest, ImportStage, ImportStorage, prepare_import_files, prepare_import_plan,
+        ArtistId, CandidateStatus, ImportCredit, ImportDecision, ImportItemState, ImportPlan,
+        ImportProgress, ImportRequest, ImportStage, ImportStorage, prepare_import_files,
+        prepare_import_plan,
     };
 
     struct TempDir(PathBuf);
@@ -2292,6 +2551,33 @@ mod tests {
         assert!(plan.cancelled);
         assert!(plan.candidates.is_empty());
         assert_eq!(controller.tracks().len(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn credit_review_preserves_order_owner_and_validation() {
+        let dir = TempDir::new("credit-review");
+        let root = dir.path().join("library");
+        let source = wav(&dir.path().join("Artist/Album"), "Song.wav", 441, 0.1);
+        let (controller, _control) = portable_controller(&root);
+        let (plan, _progress, _cancel) =
+            plan(&controller, vec![source], false, ImportStorage::Copy);
+        let candidate = &plan.candidates[0];
+        assert_eq!(candidate.credits().len(), 1);
+        assert_eq!(candidate.owner_index(), 0);
+        assert_eq!(candidate.validation_error(), None);
+        let mut candidate = candidate.clone();
+        candidate.add_credit(ImportCredit::new(None, "Featured Artist", false));
+        assert_eq!(candidate.credits().len(), 2);
+        assert!(!candidate.remove_credit(0), "owner cannot be removed");
+        assert!(candidate.set_owner_index(1));
+        assert_eq!(candidate.owner_index(), 1);
+        assert_eq!(candidate.artist_name(), Some("Featured Artist"));
+        assert!(candidate.move_credit(1, -1));
+        assert_eq!(candidate.owner_index(), 0);
+        assert_eq!(candidate.credits()[0].name, "Featured Artist");
+        candidate.set_credit_artist(0, ArtistId::new(99), "Named".to_owned());
+        assert_eq!(candidate.credits()[0].artist_id, Some(ArtistId::new(99)));
         controller.shutdown();
     }
 }

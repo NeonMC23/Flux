@@ -321,6 +321,13 @@ impl Tui {
                 self.mode = Mode::MigrateSourceInput;
                 self.input.clear();
             }
+            KeyCode::Char('T') => {
+                self.lifecycle_msg = Some(
+                    "Ownership transfer and artist deletion require the GUI review/confirm \
+                     workflow; the TUI never bypasses canonical transaction validation."
+                        .to_owned(),
+                );
+            }
             KeyCode::Char('B') => {
                 self.lifecycle_msg = Some(
                     "Legacy runtime switching is disabled. Migrate an old index with M; \
@@ -745,10 +752,11 @@ impl Tui {
                 continue;
             };
             let mut text = format!(
-                "{} {} {}",
+                "{} {} {}  · {}",
                 if index == self.cursor { ">" } else { " " },
                 if Some(*id) == current { "▶" } else { " " },
                 display_title(track),
+                credit_display(&self.controller, *id),
             );
             if !is_track_playable(track) {
                 text.push_str("  [indexed — not playable yet]");
@@ -790,7 +798,7 @@ impl Tui {
                              · i/I quick copy-import · e edit track · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
-                             · B index · U fix · q quit"
+                             · T transfer (GUI) · B index · U fix · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
@@ -995,6 +1003,27 @@ fn parse_track_edit_form(input: &str) -> Result<TrackMetadataEdit, String> {
         disc_number: number(fields[3], "disc number")?,
         artist_id,
     })
+}
+
+fn credit_display(controller: &Controller, id: TrackId) -> String {
+    let credits = controller.track_credits(id);
+    if credits.is_empty() {
+        return controller
+            .track(id)
+            .and_then(Track::artist)
+            .unwrap_or("Unknown artist")
+            .to_owned();
+    }
+    credits
+        .iter()
+        .map(|artist| {
+            controller
+                .artist(*artist)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {artist}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn display_title(track: &Track) -> String {

@@ -41,7 +41,8 @@
 //! - infers import metadata from filenames/folders and never reads tags;
 //! - commits through the canonical transaction journal and validates paths;
 //! - keeps artist/album renames identity-preserving;
-//! - refuses physical-owner changes until ownership transfer is implemented.
+//! - plans and executes copy-first single-track ownership transfers with
+//!   explicit destination releases and journal-owned cleanup.
 //!
 //! Legacy (`Controller::new`, `switch_to_legacy_index`) and portable schema-v3
 //! (`new_portable`, `switch_to_portable`) constructors remain for explicit
@@ -72,8 +73,7 @@ use flux_core::{
     ArtistId, PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
 };
 use flux_library::canonical::{
-    CanonicalAlbum, CanonicalError, CanonicalImportedTrack, CanonicalLibrary, CanonicalPlaylist,
-    ReleaseType, TrackRating,
+    CanonicalAlbum, CanonicalError, CanonicalLibrary, CanonicalPlaylist, TrackRating,
 };
 use flux_library::portable::{
     CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, OpenedStore, PortableRefreshReport,
@@ -87,13 +87,16 @@ use flux_library::{
 pub mod import;
 
 pub use import::{
-    AppliedImportItem, CandidateStatus, ImportApplyReport, ImportCandidate, ImportDecision,
-    ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
-    PreparedImport, PreparedImportItem, apply_import_plan, prepare_import_files,
+    AppliedImportItem, CandidateStatus, ImportApplyReport, ImportCandidate, ImportCredit,
+    ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage,
+    ImportStorage, PreparedImport, PreparedImportItem, apply_import_plan, prepare_import_files,
     prepare_import_plan,
 };
 
-pub use flux_library::canonical::{AlbumId, PlaylistId};
+pub use flux_library::canonical::{
+    AlbumId, ArtistDeletionPlan, ArtistDeletionTrack, CanonicalImportedTrack, OwnershipDestination,
+    OwnershipTransferPlan, OwnershipTransferReport, PlaylistId, ReleaseType,
+};
 pub use flux_library::canonical_migrate::{
     CanonicalMigrationError, CanonicalMigrationIssue, CanonicalMigrationPlan,
     CanonicalMigrationReport, CanonicalSourceFormat,
@@ -2315,6 +2318,100 @@ impl Controller {
         Ok(())
     }
 
+    /// Replaces a canonical track's ordered credits. The physical owner must
+    /// remain in the list; this never moves audio and never changes ownership.
+    pub fn update_track_credits(
+        &mut self,
+        id: TrackId,
+        credited_artist_ids: Vec<ArtistId>,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_ref() else {
+            let message = "Credits require a canonical library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let Some(track) = store.track(id).cloned() else {
+            let message = format!("Track {id} is not in the canonical library.");
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let store = self.canonical_store.as_mut().expect("canonical store");
+        if let Err(err) = store.update_track_metadata(
+            id,
+            track.title,
+            credited_artist_ids,
+            track.track_number,
+            track.disc_number,
+            track.duration_ms,
+        ) {
+            let message = format!("Could not update credits: {err}");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Updated credits for track {id}."));
+        Ok(())
+    }
+
+    /// Builds a read-only ownership-transfer plan for UI review.
+    pub fn plan_track_ownership_transfer(
+        &self,
+        id: TrackId,
+        new_owner: ArtistId,
+        destination: OwnershipDestination,
+    ) -> Result<OwnershipTransferPlan, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Ownership transfer requires a canonical library.".to_owned());
+        };
+        store
+            .plan_ownership_transfer(id, new_owner, destination)
+            .map_err(|err| format!("Could not plan ownership transfer: {err}"))
+    }
+
+    /// Executes a validated ownership-transfer plan. TrackId, credits,
+    /// playlist/rating/queue references and album order are preserved.
+    pub fn transfer_track_ownership(
+        &mut self,
+        plan: &OwnershipTransferPlan,
+    ) -> Result<OwnershipTransferReport, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            let message = "Ownership transfer requires a canonical library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let report = store
+            .execute_ownership_transfer(plan)
+            .map_err(|err| format!("Could not transfer ownership: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "Track {} transferred from {} to {}.",
+            report.track_id, report.from_owner, report.to_owner
+        ));
+        Ok(report)
+    }
+
+    /// Builds a read-only artist-deletion inventory. Execution is intentionally
+    /// unavailable until every owned/credited track has an explicit transfer or
+    /// deletion decision and a resumable multi-item transaction.
+    pub fn plan_artist_deletion(&self, id: ArtistId) -> Result<ArtistDeletionPlan, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Artist deletion planning requires a canonical library.".to_owned());
+        };
+        store
+            .plan_artist_deletion(id)
+            .map_err(|err| format!("Could not plan artist deletion: {err}"))
+    }
+
     /// Applies a full user metadata edit to one portable track without
     /// touching its audio file or embedded tags.
     ///
@@ -2647,6 +2744,28 @@ impl Controller {
     /// after catalogue maintenance, preserving the queue selection and
     /// reporting any tracks that could not be represented or carried
     /// over.
+    /// Imports one canonical track with explicit reviewed credits. This is the
+    /// application-level entry point used by tests and future non-GUI clients;
+    /// metadata must never come from audio tags.
+    pub fn import_canonical_track(
+        &mut self,
+        imported: CanonicalImportedTrack,
+    ) -> Result<TrackId, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Canonical import requires a canonical library.".to_owned());
+        };
+        let id = store
+            .import_track(imported)
+            .map_err(|err| format!("Could not import track: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(id)
+    }
+
     /// Recursively imports supported audio files from a folder. Canonical
     /// mode uses filename/folder inference and copies every file; sources are
     /// never moved. Symlinks are not followed.
@@ -4120,6 +4239,7 @@ fn infer_canonical_import(path: &Path) -> Option<CanonicalImportedTrack> {
         title,
         artist_id: None,
         artist_name,
+        credited_artist_ids: Vec::new(),
         album_title: Some(album_title),
         release_type: ReleaseType::Album,
         track_number,
@@ -8175,7 +8295,7 @@ mod tests {
         let report = controller
             .import_files(std::slice::from_ref(&source), false)
             .expect("canonical import");
-        assert_eq!(report.added, 1);
+        assert_eq!(report.added, 1, "issues: {:?}", report.issues);
         assert_eq!(report.issues.len(), 0);
         assert_eq!(fs::read(&source).expect("source after"), source_before);
         let (id, track) = controller.tracks()[0].clone();
@@ -8397,6 +8517,85 @@ mod tests {
         assert!(source_audio.is_file());
         let (controller, _control) = boot_canonical_at(&destination);
         assert_eq!(controller.tracks().len(), 1);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_ownership_transfer_preserves_queue_playlist_rating_and_credits() {
+        let dir = TempDir::new("canonical-transfer");
+        let root = dir.path().join("FluxLibrary");
+        create_canonical_library(&root).expect("create");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let a = controller.create_artist("A").expect("A");
+        let b = controller.create_artist("B").expect("B");
+        let source = dir.path().join("source/song.wav");
+        fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        write_dc_wav(source.parent().expect("parent"), "song.wav", 4_410, 0.2);
+        let id = {
+            let store = controller.canonical_store.as_mut().expect("store");
+            store
+                .import_track(flux_library::canonical::CanonicalImportedTrack {
+                    source,
+                    title: "Shared".to_owned(),
+                    artist_id: Some(a),
+                    artist_name: "A".to_owned(),
+                    credited_artist_ids: vec![a, b],
+                    album_title: Some("Album".to_owned()),
+                    release_type: flux_library::canonical::ReleaseType::Album,
+                    track_number: Some(1),
+                    disc_number: None,
+                    duration_ms: None,
+                })
+                .expect("import")
+        };
+        controller.refresh_from_canonical();
+        controller.set_rating(id, Some(3), true).expect("rating");
+        let playlist = controller
+            .set_playlist(None, "Keep", vec![id])
+            .expect("playlist");
+        controller.play_track(id);
+        let entry = controller.current_queue_entry_id().expect("queue entry");
+        let destination = {
+            let store = controller.canonical_store.as_mut().expect("store");
+            store
+                .create_album(b, "Destination", flux_library::canonical::ReleaseType::Ep)
+                .expect("album")
+        };
+        let plan = controller
+            .plan_track_ownership_transfer(
+                id,
+                b,
+                super::OwnershipDestination::Existing(destination),
+            )
+            .expect("plan");
+        let report = controller
+            .transfer_track_ownership(&plan)
+            .expect("transfer");
+        assert_eq!(report.track_id, id);
+        assert_eq!(controller.track_artist_id(id), Some(b));
+        assert_eq!(controller.track_credits(id), vec![a, b]);
+        assert_eq!(controller.track_album_id(id), Some(destination));
+        assert_eq!(controller.album_tracks(destination), vec![id]);
+        assert_eq!(controller.current_queue_entry_id(), Some(entry));
+        assert!(controller.queue_entry_index(entry).is_some());
+        assert_eq!(
+            controller.rating(id),
+            Some(flux_library::canonical::TrackRating {
+                rating: Some(3),
+                favorite: true
+            })
+        );
+        assert_eq!(
+            controller
+                .playlists()
+                .into_iter()
+                .find(|item| item.id == playlist)
+                .map(|item| item.track_ids),
+            Some(vec![id])
+        );
+        let audio = controller.track(id).expect("track").source().path();
+        assert!(audio.starts_with(controller.canonical_root().expect("root")));
+        assert!(audio.is_file());
         controller.shutdown();
     }
 }
