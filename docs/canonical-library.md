@@ -70,12 +70,52 @@ counters and are never reused.
   validated against the catalogue; the catalogue wins for relationships and
   paths. A mismatch is rejected rather than silently repaired.
 - Album track order lives in `album.flux`; every referenced track must exist and
-  belong to that album. Track owner must equal album owner; the first credited
-  artist must be the owner, with featuring artists as additional references.
+  belong to that album. Track owner must equal album owner and must be one of the
+  ordered credited artists. The first credit is the default owner at import time;
+  an explicit review decision may select a later credit as physical owner.
+  Featuring/collaboration is represented by additional ordered credits, never by
+  duplicate audio.
 - Audio tags are never read or written. Stored duration comes from Flux
   metadata (or is absent); content fingerprints are streamed bytes.
 - Cover and lyrics are optional managed files with relative, validated names.
   A missing cover does not invalidate an album.
+
+## Credits and physical ownership
+
+A track stores an ordered `credited_artist_ids` list plus exactly one
+`owner_artist_id`. The owner must appear in the credits and must match the album
+owner because the album directory is the physical container. The owner need not
+be first after an explicit ownership choice. Artist discographies resolve both
+owned and credited tracks from the same TrackId without copying audio.
+
+Canonical import inference creates one provisional credit from the folder/file
+name. The GUI review can add existing artists, add named credits, remove/reorder
+credits, and choose the physical owner. Names are matched to existing identities
+only when exactly one exact-name identity exists; ambiguous names require an
+explicit selection. Tag data is never consulted.
+
+## Ownership transfer
+
+`plan_ownership_transfer` is read-only. It requires the destination artist to be
+credited, requires an existing destination album owned by that artist or an
+explicit new album title, and rejects collisions before any write. Execution
+copies the audio and managed lyrics to new canonical paths, updates both album
+files and the track record, and publishes the catalogue last. Old audio/track
+records are listed as journal-owned cleanup and are removed only after the
+catalogue commits. If cleanup is interrupted, the committed journal removes the
+old files on the next open. TrackId, ordered credits, album order, lyrics,
+ratings, playlists and queue references are preserved. A retry against the
+committed state is an explicit no-op.
+
+## Artist deletion
+
+`plan_artist_deletion` is a read-only inventory of owned albums/tracks,
+collaborative vs non-collaborative tracks, credited-only tracks and affected
+playlists. Execution is intentionally **not implemented or exposed**: every
+owned track needs an explicit transfer/delete decision, credited-only tracks
+need an explicit replacement credit list, and multi-item resumable recovery must
+exist before destructive deletion can be enabled. No GUI/TUI control deletes an
+artist.
 
 ## Transactions and recovery
 
@@ -118,14 +158,17 @@ cleanup.
 1. The public Controller still exposes the old legacy/portable constructors and
    switches for migration compatibility and existing tests. No GUI/TUI normal
    workflow uses them, but the API-level retirement is incomplete.
-2. Import review supports one credited owner artist; ordered featuring credits,
-   release-type review and physical-owner selection are not exposed yet.
+2. Import review supports ordered credits, owner selection, add/remove/reorder,
+   and existing-artist selection. A separate featuring boolean and release-type
+   picker are not exposed; the canonical model stores order only.
 3. Import copy/publication runs synchronously at the canonical commit boundary;
    cancellation is safe before commit, but there is no background byte-copy
    progress for very large files.
-4. Artist ownership transfer/deletion with collaborative tracks and album moves
-   is not implemented. Changing physical ownership is refused; destructive
-   deletion is not exposed.
+4. Single-track ownership transfer is implemented with copy-first publication,
+   journal cleanup and no-op retry. Whole-album moves and artist-deletion
+   execution are not implemented. Deletion is inventory-only and not exposed;
+   the GUI transfer editor uses an explicit release title to select/create the
+   destination album. TUI refuses transfer and points to the GUI.
 5. Artwork is copied/validated by extension and bounded size only; there is no
    image decode/dimension validation or display and no native image picker.
 6. Playlists, ratings/favorites and lyrics have canonical Controller APIs and

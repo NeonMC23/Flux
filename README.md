@@ -82,8 +82,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   by title, artist, or album. Artist and album views group canonical stable
   identities. The queue panel supports drag reordering, keyboard moves,
   removal and direct entry playback; the seek bar moves the decoder. The
-  pencil edits canonical metadata; changing the physical owner is intentionally
-  refused until ownership transfer is implemented. Missing managed audio stays
+  pencil edits canonical metadata and exposes **Transfer owner** with an
+  explicit destination release title; the transfer copies and verifies audio,
+  then removes old files through journal cleanup. Missing managed audio stays
   listed with a `missing` marker. *Refresh & validate* reopens the canonical
   catalogue and validates its resource paths.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
@@ -108,6 +109,9 @@ player remains visible:
   is not supported by the toolkit);
 - infer provisional artist, album, title, track number and disc number only
   from filenames and directory names — no embedded tag is read;
+- edit ordered credits, add existing or named artists, remove/reorder credits,
+  and choose the physical owner from the credits; the first credit is the
+  default owner;
 - review and edit every candidate, with incomplete metadata visibly marked;
 - classify exact/repeated selection paths, identical content at different
   paths, and similar metadata with different content; similar tracks are never
@@ -144,10 +148,15 @@ background staging for very large migrations is still future work.
 - **Legacy/portable sources.** `library-index.json` and the schema-v3 `.flux`
   catalogue are read only by the explicit migration workflow. The front-ends no
   longer switch to or write them as normal runtime backends.
-- **Stable identities:** track, artist, album and playlist IDs and counters
-  persist. Artist and album renames change metadata while every related track
-  keeps its ID. Physical owner changes require the still-pending ownership
-  transfer workflow and are refused rather than simulated.
+- **Stable identities and credits:** track, artist, album and playlist IDs and
+  counters persist. A track stores ordered credits plus one physical owner;
+  featuring artists appear in their own discographies without duplicate audio.
+  Artist/album renames are metadata-only because canonical directories derive
+  from IDs, so case-only renames cannot break paths. Single-track ownership
+  transfer uses an explicit destination release, copy-first verification and
+  journal-owned cleanup; the GUI track editor exposes it, while the TUI refuses
+  and points to the GUI. Artist deletion remains inventory-only and is not
+  exposed until the full decision/transfer/recovery workflow exists.
 - **Import:** every canonical import copies into the library and preserves the
   original extension; sources are never moved, overwritten or deleted.
   Identical content is deduplicated by fingerprint. Existing IDs are preserved
@@ -213,7 +222,7 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Ownership transfer and artist deletion, playlist/rating/lyrics UI,
+Whole-album moves and artist-deletion execution, playlist/rating/lyrics UI,
 artwork/cover decoding and display, gapless playback, crossfade, EQ,
 frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
