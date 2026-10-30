@@ -39,7 +39,7 @@
 //! completes cleanup for a committed catalogue or restores the pre-batch
 //! bytes and removes files created by an uncommitted batch.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -4263,104 +4263,484 @@ mod ownership_tests {
 
 // --------------------------------------------------- artist deletion ---
 
-/// One owned track in an artist-deletion plan.
+/// Destination for an owned track transferred during artist deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtistDeletionTrack {
-    /// Track that needs a decision.
-    pub track_id: TrackId,
-    /// Album currently containing it.
-    pub album_id: AlbumId,
-    /// Other surviving credited artists eligible to become owner.
-    pub eligible_owners: Vec<ArtistId>,
+pub enum ArtistDeletionDestination {
+    /// Move into an existing album owned by the destination artist.
+    Existing(AlbumId),
+    /// Create an explicit new release under the destination artist.
+    New {
+        /// Release title.
+        title: String,
+        /// Release type.
+        release_type: ReleaseType,
+    },
 }
 
-/// Read-only artist deletion inventory. Execution is intentionally refused
-/// unless every owned/credited track has a resolved transfer and credit
-/// decision in a future workflow; this prevents exposing a destructive
-/// half-operation.
+/// One explicit per-track decision in an artist-deletion plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtistDeletionPlan {
-    /// Artist being considered.
-    pub artist_id: ArtistId,
-    /// Albums owned by the artist.
-    pub owned_albums: Vec<AlbumId>,
-    /// Tracks physically owned by the artist.
-    pub owned_tracks: Vec<ArtistDeletionTrack>,
-    /// Collaborative owned tracks (at least one eligible survivor).
-    pub collaborative_tracks: Vec<TrackId>,
-    /// Owned tracks with no surviving credited artist.
-    pub non_collaborative_tracks: Vec<TrackId>,
-    /// Tracks credited to the artist but owned by someone else.
-    pub credited_only_tracks: Vec<TrackId>,
-    /// Playlists that reference affected tracks.
-    pub affected_playlists: Vec<PlaylistId>,
-    /// Blocking reasons; a non-empty list means deletion cannot execute.
+pub enum ArtistDeletionDecision {
+    /// No decision yet; blocks execution.
+    Unresolved,
+    /// Move physical ownership and remove the deleted artist from credits.
+    Transfer {
+        /// Surviving credited artist who becomes owner.
+        new_owner: ArtistId,
+        /// Explicit destination release.
+        destination: ArtistDeletionDestination,
+    },
+    /// For a track owned by someone else, remove only the deleted artist's
+    /// credit. `replacement` is required only if the resulting list would be
+    /// empty.
+    RemoveCredit {
+        /// Explicit replacement credit when needed.
+        replacement: Option<ArtistId>,
+    },
+    /// Delete this owned track and its managed resources after confirmation.
+    Delete {
+        /// Must be true; there is no default destructive decision.
+        confirmed: bool,
+    },
+}
+
+/// Album-level inventory for the deletion preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistDeletionAlbum {
+    /// Stable album ID.
+    pub id: AlbumId,
+    /// Display title.
+    pub title: String,
+    /// Current owner.
+    pub owner_artist_id: ArtistId,
+    /// Number of tracks currently in the album.
+    pub track_count: usize,
+    /// Managed cover path, if any.
+    pub cover: Option<RelPath>,
+}
+
+/// One affected track in an artist-deletion plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistDeletionTrack {
+    /// Track identity.
+    pub track_id: TrackId,
+    /// Current album.
+    pub album_id: AlbumId,
+    /// Current album title.
+    pub album_title: String,
+    /// Track title.
+    pub title: String,
+    /// Current physical owner.
+    pub owner_artist_id: ArtistId,
+    /// Ordered credits at plan time.
+    pub credited_artist_ids: Vec<ArtistId>,
+    /// Canonical audio path at plan time.
+    pub audio_path: RelPath,
+    /// Canonical managed lyrics path, if any.
+    pub lyrics_path: Option<RelPath>,
+    /// Lyrics content fingerprint at plan time.
+    pub lyrics_fingerprint: Option<ContentFingerprint>,
+    /// Playlists that reference this track.
+    pub playlist_ids: Vec<PlaylistId>,
+    /// Current rating/favorite, if any.
+    pub rating: Option<TrackRating>,
+    /// Surviving credited artists eligible to become physical owner.
+    pub eligible_owners: Vec<ArtistId>,
+    /// Explicit decision; defaults to unresolved.
+    pub decision: ArtistDeletionDecision,
+    /// Decision/resource issues for this track.
     pub issues: Vec<String>,
 }
 
+/// Complete artist-deletion preview and decision set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistDeletionPlan {
+    /// Artist being deleted.
+    pub artist_id: ArtistId,
+    /// Display name at plan time.
+    pub artist_name: String,
+    /// Catalogue generation captured by the plan.
+    pub generation: u64,
+    /// Owned album IDs.
+    pub owned_albums: Vec<AlbumId>,
+    /// Owned album details, including empty albums.
+    pub albums: Vec<ArtistDeletionAlbum>,
+    /// All albums available as transfer destinations.
+    pub destination_albums: Vec<ArtistDeletionAlbum>,
+    /// Owned track decisions.
+    pub owned_tracks: Vec<ArtistDeletionTrack>,
+    /// Credited-only track decisions.
+    pub credited_tracks: Vec<ArtistDeletionTrack>,
+    /// IDs of collaborative owned tracks.
+    pub collaborative_tracks: Vec<TrackId>,
+    /// IDs of owned tracks with no surviving credited owner.
+    pub non_collaborative_tracks: Vec<TrackId>,
+    /// IDs of credited-only tracks.
+    pub credited_only_tracks: Vec<TrackId>,
+    /// Playlists referencing any affected track.
+    pub affected_playlists: Vec<PlaylistId>,
+    /// Blocking reasons.
+    pub issues: Vec<String>,
+    /// Resource issues independent of decisions.
+    snapshot_issues: Vec<String>,
+}
+
 impl ArtistDeletionPlan {
-    /// Whether this plan can be executed by the current build.
+    /// Whether every affected track is resolved and no blocking issue remains.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.issues.is_empty()
     }
+
+    /// First blocking issue.
+    #[must_use]
+    pub fn blocking_reason(&self) -> Option<&str> {
+        self.issues.first().map(String::as_str)
+    }
+
+    fn owned_track_mut(&mut self, id: TrackId) -> Option<&mut ArtistDeletionTrack> {
+        self.owned_tracks
+            .iter_mut()
+            .find(|track| track.track_id == id)
+    }
+
+    fn credited_track_mut(&mut self, id: TrackId) -> Option<&mut ArtistDeletionTrack> {
+        self.credited_tracks
+            .iter_mut()
+            .find(|track| track.track_id == id)
+    }
+
+    /// Sets an explicit transfer decision for an owned track.
+    pub fn set_transfer(
+        &mut self,
+        id: TrackId,
+        new_owner: ArtistId,
+        destination: ArtistDeletionDestination,
+    ) -> Result<(), String> {
+        let artist_id = self.artist_id;
+        let destination_albums = self.destination_albums.clone();
+        let track = self
+            .owned_track_mut(id)
+            .ok_or_else(|| format!("track {id} is not owned by this artist"))?;
+        if new_owner == artist_id || !track.eligible_owners.contains(&new_owner) {
+            return Err("destination artist must be another credited artist".to_owned());
+        }
+        if let ArtistDeletionDestination::Existing(album_id) = &destination {
+            let album = destination_albums
+                .iter()
+                .find(|album| album.id == *album_id)
+                .ok_or_else(|| format!("destination album {album_id} does not exist"))?;
+            if album.owner_artist_id != new_owner {
+                return Err("destination album belongs to a different artist".to_owned());
+            }
+        }
+        if let ArtistDeletionDestination::New { title, .. } = &destination
+            && title.trim().is_empty()
+        {
+            return Err("new destination album needs a title".to_owned());
+        }
+        track.decision = ArtistDeletionDecision::Transfer {
+            new_owner,
+            destination,
+        };
+        self.refresh_issues();
+        Ok(())
+    }
+
+    /// Sets a credited-only decision to remove the deleted artist's credit.
+    pub fn set_remove_credit(
+        &mut self,
+        id: TrackId,
+        replacement: Option<ArtistId>,
+    ) -> Result<(), String> {
+        let track = self
+            .credited_track_mut(id)
+            .ok_or_else(|| format!("track {id} is not a credited-only track"))?;
+        track.decision = ArtistDeletionDecision::RemoveCredit { replacement };
+        self.refresh_issues();
+        Ok(())
+    }
+
+    /// Sets an explicit confirmed deletion for an owned track.
+    pub fn set_delete(&mut self, id: TrackId, confirmed: bool) -> Result<(), String> {
+        let track = self
+            .owned_track_mut(id)
+            .ok_or_else(|| format!("track {id} is not owned by this artist"))?;
+        track.decision = ArtistDeletionDecision::Delete { confirmed };
+        self.refresh_issues();
+        Ok(())
+    }
+
+    /// Resets an owned or credited-only track to unresolved.
+    pub fn set_unresolved(&mut self, id: TrackId) {
+        if let Some(track) = self.owned_track_mut(id) {
+            track.decision = ArtistDeletionDecision::Unresolved;
+        } else if let Some(track) = self.credited_track_mut(id) {
+            track.decision = ArtistDeletionDecision::Unresolved;
+        }
+        self.refresh_issues();
+    }
+
+    /// Recomputed blocking issues after decisions change.
+    pub fn refresh_issues(&mut self) {
+        let artist_id = self.artist_id;
+        let destination_albums = self.destination_albums.clone();
+        let snapshot_issues = self.snapshot_issues.clone();
+        self.issues.clear();
+        self.issues.extend(snapshot_issues);
+        for track in &mut self.owned_tracks {
+            track.issues.clear();
+            match &track.decision {
+                ArtistDeletionDecision::Unresolved => {
+                    track
+                        .issues
+                        .push("choose transfer or explicit deletion".to_owned());
+                }
+                ArtistDeletionDecision::Transfer {
+                    new_owner,
+                    destination,
+                } => {
+                    if *new_owner == artist_id || !track.eligible_owners.contains(new_owner) {
+                        track.issues.push("invalid destination artist".to_owned());
+                    }
+                    match destination {
+                        ArtistDeletionDestination::Existing(album_id) => {
+                            if !destination_albums.iter().any(|album| {
+                                album.id == *album_id && album.owner_artist_id == *new_owner
+                            }) {
+                                track.issues.push("invalid destination album".to_owned());
+                            }
+                        }
+                        ArtistDeletionDestination::New { title, .. } if title.trim().is_empty() => {
+                            track
+                                .issues
+                                .push("destination album title is empty".to_owned());
+                        }
+                        ArtistDeletionDestination::New { .. } => {}
+                    }
+                }
+                ArtistDeletionDecision::RemoveCredit { .. } => {
+                    track
+                        .issues
+                        .push("owned tracks cannot use remove-credit".to_owned());
+                }
+                ArtistDeletionDecision::Delete { confirmed } => {
+                    if !*confirmed {
+                        track
+                            .issues
+                            .push("explicit deletion confirmation required".to_owned());
+                    }
+                }
+            }
+            if !track.issues.is_empty() {
+                self.issues.push(format!(
+                    "track {}: {}",
+                    track.track_id,
+                    track.issues.join("; ")
+                ));
+            }
+        }
+        for track in &mut self.credited_tracks {
+            track.issues.clear();
+            match &track.decision {
+                ArtistDeletionDecision::Unresolved => {
+                    track.issues.push("choose remove-credit".to_owned());
+                }
+                ArtistDeletionDecision::RemoveCredit { replacement } => {
+                    let remaining = track
+                        .credited_artist_ids
+                        .iter()
+                        .filter(|artist| **artist != self.artist_id)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if remaining.is_empty() {
+                        match replacement {
+                            Some(replacement) if *replacement != self.artist_id => {}
+                            _ => track
+                                .issues
+                                .push("a replacement credit is required".to_owned()),
+                        }
+                    }
+                    if !remaining.is_empty() && !remaining.contains(&track.owner_artist_id) {
+                        track
+                            .issues
+                            .push("resulting credits omit the physical owner".to_owned());
+                    }
+                }
+                ArtistDeletionDecision::Transfer { .. } | ArtistDeletionDecision::Delete { .. } => {
+                    track
+                        .issues
+                        .push("credited-only tracks cannot be moved or deleted".to_owned());
+                }
+            }
+            if !track.issues.is_empty() {
+                self.issues.push(format!(
+                    "track {}: {}",
+                    track.track_id,
+                    track.issues.join("; ")
+                ));
+            }
+        }
+    }
+
+    /// Track IDs explicitly selected for deletion.
+    #[must_use]
+    pub fn deleted_track_ids(&self) -> Vec<TrackId> {
+        self.owned_tracks
+            .iter()
+            .filter(|track| {
+                matches!(
+                    track.decision,
+                    ArtistDeletionDecision::Delete { confirmed: true }
+                )
+            })
+            .map(|track| track.track_id)
+            .collect()
+    }
+}
+
+/// Result of a committed artist deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistDeletionReport {
+    /// Deleted artist ID.
+    pub artist_id: ArtistId,
+    /// Tracks transferred to another owner.
+    pub transferred: usize,
+    /// Tracks retained under their existing owner with a credit removed.
+    pub credits_removed: usize,
+    /// Tracks explicitly deleted.
+    pub deleted_tracks: Vec<TrackId>,
+    /// Albums removed with the artist.
+    pub deleted_albums: Vec<AlbumId>,
 }
 
 impl CanonicalLibrary {
-    /// Builds a read-only deletion inventory. It does not modify anything.
+    /// Builds a read-only, generation-tagged deletion preview. Every affected
+    /// track starts unresolved.
     pub fn plan_artist_deletion(
         &self,
         artist_id: ArtistId,
     ) -> Result<ArtistDeletionPlan, CanonicalError> {
-        if !self.artists.contains_key(&artist_id) {
-            return Err(CanonicalError::Invalid(format!(
-                "artist {artist_id} is not in the library"
-            )));
-        }
+        let artist = self.artists.get(&artist_id).ok_or_else(|| {
+            CanonicalError::Invalid(format!("artist {artist_id} is not in the library"))
+        })?;
         let owned_albums = self
             .albums
             .values()
             .filter(|album| album.owner_artist_id == artist_id)
             .map(|album| album.id)
             .collect::<Vec<_>>();
+        let albums = self
+            .albums
+            .values()
+            .filter(|album| album.owner_artist_id == artist_id)
+            .map(|album| ArtistDeletionAlbum {
+                id: album.id,
+                title: album.title.clone(),
+                owner_artist_id: album.owner_artist_id,
+                track_count: album.track_order.len(),
+                cover: album.cover.as_ref().map(|cover| {
+                    RelPath::from_utf8(&format!(
+                        "{}/{}",
+                        album_rel(album.owner_artist_id, album.id).display_lossy(),
+                        cover
+                    ))
+                    .expect("cover path is valid")
+                }),
+            })
+            .collect::<Vec<_>>();
+        let destination_albums = self
+            .albums
+            .values()
+            .map(|album| ArtistDeletionAlbum {
+                id: album.id,
+                title: album.title.clone(),
+                owner_artist_id: album.owner_artist_id,
+                track_count: album.track_order.len(),
+                cover: None,
+            })
+            .collect::<Vec<_>>();
         let mut owned_tracks = Vec::new();
+        let mut credited_tracks = Vec::new();
         let mut collaborative = Vec::new();
         let mut non_collaborative = Vec::new();
-        for track in self
-            .tracks
-            .values()
-            .filter(|track| track.owner_artist_id == artist_id)
-        {
+        let mut credited_only = Vec::new();
+        let mut affected = HashSet::new();
+        for track in self.tracks.values() {
+            let is_owner = track.owner_artist_id == artist_id;
+            let is_credited = track.credited_artist_ids.contains(&artist_id);
+            if !is_owner && !is_credited {
+                continue;
+            }
+            let album_title = self
+                .albums
+                .get(&track.album_id)
+                .map(|album| album.title.clone())
+                .unwrap_or_default();
+            let audio_path = self.track_paths[&track.id].clone();
+            let lyrics_path = self.track_lyrics_path(track.id).and_then(|path| {
+                path.strip_prefix(&self.root).ok().and_then(|relative| {
+                    relative
+                        .to_str()
+                        .and_then(|text| RelPath::from_utf8(text).ok())
+                })
+            });
+            let playlist_ids = self
+                .playlists
+                .values()
+                .filter(|playlist| playlist.track_ids.contains(&track.id))
+                .map(|playlist| playlist.id)
+                .collect::<Vec<_>>();
+            let lyrics_fingerprint = lyrics_path.as_ref().and_then(|path| {
+                safe_join(&self.root, path)
+                    .ok()
+                    .and_then(|path| ContentFingerprint::of_file(&path).ok())
+            });
+            let mut issues = Vec::new();
+            if !self.track_available(track.id) {
+                issues.push("audio resource is missing".to_owned());
+            }
+            if track.lyrics.is_some()
+                && lyrics_path
+                    .as_ref()
+                    .is_none_or(|path| !safe_join(&self.root, path).is_ok_and(|p| p.is_file()))
+            {
+                issues.push("lyrics resource is missing".to_owned());
+            }
             let eligible_owners = track
                 .credited_artist_ids
                 .iter()
                 .copied()
                 .filter(|artist| *artist != artist_id && self.artists.contains_key(artist))
                 .collect::<Vec<_>>();
-            if eligible_owners.is_empty() {
-                non_collaborative.push(track.id);
-            } else {
-                collaborative.push(track.id);
-            }
-            owned_tracks.push(ArtistDeletionTrack {
+            let planned = ArtistDeletionTrack {
                 track_id: track.id,
                 album_id: track.album_id,
-                eligible_owners,
-            });
+                album_title,
+                title: track.title.clone(),
+                owner_artist_id: track.owner_artist_id,
+                credited_artist_ids: track.credited_artist_ids.clone(),
+                audio_path,
+                lyrics_path,
+                lyrics_fingerprint,
+                playlist_ids,
+                rating: self.rating(track.id),
+                eligible_owners: eligible_owners.clone(),
+                decision: ArtistDeletionDecision::Unresolved,
+                issues,
+            };
+            affected.insert(track.id);
+            if is_owner {
+                if eligible_owners.is_empty() {
+                    non_collaborative.push(track.id);
+                } else {
+                    collaborative.push(track.id);
+                }
+                owned_tracks.push(planned);
+            } else {
+                credited_only.push(track.id);
+                credited_tracks.push(planned);
+            }
         }
-        let credited_only = self
-            .tracks
-            .values()
-            .filter(|track| {
-                track.owner_artist_id != artist_id && track.credited_artist_ids.contains(&artist_id)
-            })
-            .map(|track| track.id)
-            .collect::<Vec<_>>();
-        let affected = owned_tracks
-            .iter()
-            .map(|track| track.track_id)
-            .chain(credited_only.iter().copied())
-            .collect::<HashSet<_>>();
         let affected_playlists = self
             .playlists
             .values()
@@ -4372,42 +4752,567 @@ impl CanonicalLibrary {
             })
             .map(|playlist| playlist.id)
             .collect::<Vec<_>>();
-        let mut issues = Vec::new();
-        if !owned_tracks.is_empty() {
-            issues.push(format!(
-                "{} owned track(s) require explicit ownership/deletion decisions",
-                owned_tracks.len()
-            ));
-        }
-        if !credited_only.is_empty() {
-            issues.push(format!(
-                "{} track(s) still credit this artist and require an explicit credit list",
-                credited_only.len()
-            ));
-        }
-        if !owned_albums.is_empty() {
-            issues.push(format!(
-                "{} owned album(s) require a destination/cleanup decision",
-                owned_albums.len()
-            ));
-        }
-        if !affected_playlists.is_empty() {
-            issues.push(format!(
-                "{} playlist(s) reference affected tracks",
-                affected_playlists.len()
-            ));
-        }
-        Ok(ArtistDeletionPlan {
+        let snapshot_issues = owned_tracks
+            .iter()
+            .chain(credited_tracks.iter())
+            .flat_map(|track| {
+                track
+                    .issues
+                    .iter()
+                    .map(|issue| format!("track {}: {issue}", track.track_id))
+            })
+            .collect::<Vec<_>>();
+        let mut plan = ArtistDeletionPlan {
             artist_id,
+            artist_name: artist.name.clone(),
+            generation: self.catalog.generation,
             owned_albums,
+            albums,
+            destination_albums,
             owned_tracks,
+            credited_tracks,
             collaborative_tracks: collaborative,
             non_collaborative_tracks: non_collaborative,
             credited_only_tracks: credited_only,
             affected_playlists,
-            issues,
+            issues: Vec::new(),
+            snapshot_issues,
+        };
+        plan.refresh_issues();
+        Ok(plan)
+    }
+
+    /// Executes an artist-deletion plan as one catalogue transaction. This
+    /// stages all transfers, credit edits, deletions, playlist/rating updates
+    /// and artist/album removal, then publishes the catalogue last.
+    pub fn execute_artist_deletion(
+        &mut self,
+        plan: &ArtistDeletionPlan,
+    ) -> Result<ArtistDeletionReport, CanonicalError> {
+        self.ensure_writable()?;
+        self.ensure_no_pending_transactions()?;
+        let album_for = self
+            .artists
+            .get(&plan.artist_id)
+            .map(|artist| artist.name.clone())
+            .ok_or_else(|| CanonicalError::Invalid("deleted artist is gone".to_owned()))?;
+        if plan.generation != self.catalog.generation {
+            return Err(CanonicalError::Invalid(
+                "deletion plan is stale: catalogue generation changed; re-preview".to_owned(),
+            ));
+        }
+        if plan.artist_name != album_for {
+            return Err(CanonicalError::Invalid(
+                "deletion plan is stale: artist name changed; re-preview".to_owned(),
+            ));
+        }
+        if !plan.is_ready() {
+            return Err(CanonicalError::Invalid(format!(
+                "deletion plan has unresolved decisions: {}",
+                plan.blocking_reason().unwrap_or("unknown issue")
+            )));
+        }
+        for planned in &plan.albums {
+            let current = self.albums.get(&planned.id).ok_or_else(|| {
+                CanonicalError::Invalid(format!("album {} disappeared; re-preview", planned.id))
+            })?;
+            if current.owner_artist_id != plan.artist_id
+                || current.title != planned.title
+                || current.track_order.len() != planned.track_count
+                || album_cover_rel(current)? != planned.cover
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "album {} changed since preview; re-preview",
+                    planned.id
+                )));
+            }
+        }
+        // Snapshot validation against the current catalogue.
+        for planned in plan.owned_tracks.iter().chain(plan.credited_tracks.iter()) {
+            let current = self.tracks.get(&planned.track_id).ok_or_else(|| {
+                CanonicalError::Invalid(format!(
+                    "track {} disappeared; re-preview",
+                    planned.track_id
+                ))
+            })?;
+            if current.owner_artist_id != planned.owner_artist_id
+                || current.album_id != planned.album_id
+                || current.credited_artist_ids != planned.credited_artist_ids
+                || current.title != planned.title
+                || self.track_paths.get(&current.id) != Some(&planned.audio_path)
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} changed since preview; re-preview",
+                    planned.track_id
+                )));
+            }
+            if self.rating(current.id) != planned.rating {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} rating changed since preview; re-preview",
+                    planned.track_id
+                )));
+            }
+            if self
+                .albums
+                .get(&current.album_id)
+                .map(|album| album.title.as_str())
+                != Some(planned.album_title.as_str())
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} album changed since preview; re-preview",
+                    planned.track_id
+                )));
+            }
+            let current_lyrics = current.lyrics.as_deref().and_then(|lyrics| {
+                plan_track_lyrics_rel(&self.track_records[&current.id], Some(lyrics))
+            });
+            if current_lyrics != planned.lyrics_path {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} lyrics changed since preview; re-preview",
+                    planned.track_id
+                )));
+            }
+            let current_lyrics_fingerprint = current_lyrics.as_ref().and_then(|path| {
+                safe_join(&self.root, path)
+                    .ok()
+                    .and_then(|path| ContentFingerprint::of_file(&path).ok())
+            });
+            if current_lyrics_fingerprint != planned.lyrics_fingerprint {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} lyrics content changed since preview; re-preview",
+                    planned.track_id
+                )));
+            }
+        }
+
+        let mut catalog = self.catalog.clone();
+        let mut albums = self.albums.clone();
+        let mut tracks = self.tracks.clone();
+        let mut ratings = self.ratings.clone();
+        let mut playlists = self.playlists.clone();
+        let mut writes = Vec::new();
+        let mut cleanup = Vec::new();
+        let mut deleted_tracks = BTreeSet::new();
+        let mut new_albums = BTreeMap::new();
+        let mut new_album_keys: BTreeMap<(ArtistId, String), AlbumId> = BTreeMap::new();
+        let mut next_album = catalog.next_album_id;
+        let mut transferred = 0u64;
+        let mut credits_removed = 0u64;
+
+        for planned in &plan.owned_tracks {
+            let current = tracks.get(&planned.track_id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid("track disappeared during deletion".to_owned())
+            })?;
+            match &planned.decision {
+                ArtistDeletionDecision::Transfer {
+                    new_owner,
+                    destination,
+                } => {
+                    if !current.credited_artist_ids.contains(new_owner)
+                        || *new_owner == plan.artist_id
+                        || !self.artists.contains_key(new_owner)
+                    {
+                        return Err(CanonicalError::Invalid(
+                            "invalid destination owner in deletion plan".to_owned(),
+                        ));
+                    }
+                    let destination_album = match destination {
+                        ArtistDeletionDestination::Existing(id) => {
+                            let album = albums.get(id).ok_or_else(|| {
+                                CanonicalError::Invalid(format!("destination album {id} is gone"))
+                            })?;
+                            if album.owner_artist_id != *new_owner {
+                                return Err(CanonicalError::Invalid(
+                                    "destination album owner is invalid".to_owned(),
+                                ));
+                            }
+                            *id
+                        }
+                        ArtistDeletionDestination::New {
+                            title,
+                            release_type,
+                        } => {
+                            let title = title.trim().to_owned();
+                            if albums.values().any(|album| {
+                                album.owner_artist_id == *new_owner && album.title == title
+                            }) {
+                                return Err(CanonicalError::Invalid(
+                                    "a destination album with that title already exists; select it explicitly"
+                                        .to_owned(),
+                                ));
+                            }
+                            let key = (*new_owner, title.clone());
+                            let id = *new_album_keys.entry(key).or_insert_with(|| {
+                                let id = AlbumId::new(next_album);
+                                next_album += 1;
+                                id
+                            });
+                            new_albums.entry(id).or_insert_with(|| CanonicalAlbum {
+                                id,
+                                owner_artist_id: *new_owner,
+                                title,
+                                release_type: *release_type,
+                                cover: None,
+                                track_order: Vec::new(),
+                            });
+                            id
+                        }
+                    };
+                    let destination_album = albums
+                        .entry(destination_album)
+                        .or_insert_with(|| new_albums[&destination_album].clone());
+                    if destination_album.track_order.contains(&current.id) {
+                        return Err(CanonicalError::Invalid(
+                            "destination album already contains the track".to_owned(),
+                        ));
+                    }
+                    let mut credits = current.credited_artist_ids.clone();
+                    credits.retain(|artist| *artist != plan.artist_id);
+                    if credits.is_empty() || !credits.contains(new_owner) {
+                        return Err(CanonicalError::Invalid(
+                            "transfer would leave invalid credits".to_owned(),
+                        ));
+                    }
+                    let old_audio = self.track_paths[&current.id].clone();
+                    let old_record = self.track_records[&current.id].clone();
+                    let old_lyrics = self.track_lyrics_path(current.id);
+                    let extension = old_audio
+                        .display_lossy()
+                        .rsplit_once('.')
+                        .map(|(_, extension)| extension.to_owned())
+                        .ok_or_else(|| {
+                            CanonicalError::Invalid("audio has no extension".to_owned())
+                        })?;
+                    let new_audio =
+                        track_audio_rel(*new_owner, destination_album.id, current.id, &extension);
+                    let new_record = track_record_rel(*new_owner, destination_album.id, current.id);
+                    if safe_join(&self.root, &new_audio)?.exists()
+                        || safe_join(&self.root, &new_record)?.exists()
+                    {
+                        return Err(CanonicalError::Invalid(
+                            "destination path collision during deletion".to_owned(),
+                        ));
+                    }
+                    destination_album.track_order.push(current.id);
+                    let lyrics = current.lyrics.clone();
+                    let new_lyrics = lyrics.as_ref().map(|name| {
+                        RelPath::from_utf8(&format!(
+                            "{}/{}",
+                            new_record
+                                .display_lossy()
+                                .rsplit_once('/')
+                                .map_or("", |(dir, _)| dir),
+                            name
+                        ))
+                        .expect("lyrics path is valid")
+                    });
+                    let track_dto = TrackEntityDto {
+                        schema_version: CANONICAL_SCHEMA_VERSION,
+                        kind: TRACK_KIND.to_owned(),
+                        id: current.id.get(),
+                        title: current.title.clone(),
+                        credited_artist_ids: credits.iter().map(|artist| artist.get()).collect(),
+                        owner_artist_id: new_owner.get(),
+                        album_id: destination_album.id.get(),
+                        track_number: current.track_number,
+                        disc_number: current.disc_number,
+                        duration_ms: current.duration_ms,
+                        lyrics,
+                        fingerprint: current.fingerprint,
+                    };
+                    let mut updated = current.clone();
+                    updated.owner_artist_id = *new_owner;
+                    updated.album_id = destination_album.id;
+                    updated.credited_artist_ids = credits;
+                    tracks.insert(updated.id, updated);
+                    push_file_write(&mut writes, &new_record, &track_dto)?;
+                    writes.push(PendingWrite {
+                        target: new_audio.clone(),
+                        bytes: None,
+                        copy_from: Some(safe_join(&self.root, &old_audio)?),
+                        expected: current.fingerprint.or(Some(ContentFingerprint::of_file(
+                            &safe_join(&self.root, &old_audio)?,
+                        )?)),
+                    });
+                    if let (Some(old), Some(new)) = (old_lyrics, new_lyrics) {
+                        writes.push(PendingWrite {
+                            target: new,
+                            bytes: Some(fs::read(old)?),
+                            copy_from: None,
+                            expected: None,
+                        });
+                    }
+                    cleanup.extend([old_audio, old_record]);
+                    cleanup.extend(plan_track_lyrics_rel(
+                        &self.track_records[&current.id],
+                        current.lyrics.as_deref(),
+                    ));
+                    let descriptor = catalog
+                        .tracks
+                        .iter_mut()
+                        .find(|entry| entry.id == current.id.get())
+                        .ok_or_else(|| {
+                            CanonicalError::Invalid("catalogue track missing".to_owned())
+                        })?;
+                    descriptor.owner_artist_id = new_owner.get();
+                    descriptor.album_id = destination_album.id.get();
+                    descriptor.audio_path = new_audio.display_lossy();
+                    descriptor.record_path = new_record.display_lossy();
+                    transferred += 1;
+                }
+                ArtistDeletionDecision::Delete { confirmed: true } => {
+                    deleted_tracks.insert(current.id);
+                    cleanup.extend([
+                        self.track_paths[&current.id].clone(),
+                        self.track_records[&current.id].clone(),
+                    ]);
+                    cleanup.extend(plan_track_lyrics_rel(
+                        &self.track_records[&current.id],
+                        current.lyrics.as_deref(),
+                    ));
+                    ratings.remove(&current.id);
+                    tracks.remove(&current.id);
+                    catalog.tracks.retain(|entry| entry.id != current.id.get());
+                    for playlist in playlists.values_mut() {
+                        playlist.track_ids.retain(|track| *track != current.id);
+                    }
+                }
+                _ => {
+                    return Err(CanonicalError::Invalid(
+                        "invalid owned-track decision".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        for planned in &plan.credited_tracks {
+            let current = tracks
+                .get(&planned.track_id)
+                .cloned()
+                .ok_or_else(|| CanonicalError::Invalid("credited track disappeared".to_owned()))?;
+            let ArtistDeletionDecision::RemoveCredit { replacement } = planned.decision else {
+                return Err(CanonicalError::Invalid(
+                    "invalid credited-only decision".to_owned(),
+                ));
+            };
+            let mut credits = current.credited_artist_ids.clone();
+            credits.retain(|artist| *artist != plan.artist_id);
+            if credits.is_empty() {
+                let replacement = replacement.ok_or_else(|| {
+                    CanonicalError::Invalid("replacement credit is required".to_owned())
+                })?;
+                if replacement == plan.artist_id || !self.artists.contains_key(&replacement) {
+                    return Err(CanonicalError::Invalid(
+                        "replacement credit must be a surviving artist".to_owned(),
+                    ));
+                }
+                credits.push(replacement);
+            }
+            if !credits.contains(&current.owner_artist_id) {
+                return Err(CanonicalError::Invalid(
+                    "resulting credits omit the physical owner".to_owned(),
+                ));
+            }
+            let record_path = self.track_records[&current.id].clone();
+            let mut updated = current.clone();
+            updated.credited_artist_ids = credits;
+            tracks.insert(updated.id, updated.clone());
+            let dto = TrackEntityDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: TRACK_KIND.to_owned(),
+                id: updated.id.get(),
+                title: updated.title,
+                credited_artist_ids: updated
+                    .credited_artist_ids
+                    .iter()
+                    .map(|artist| artist.get())
+                    .collect(),
+                owner_artist_id: updated.owner_artist_id.get(),
+                album_id: updated.album_id.get(),
+                track_number: updated.track_number,
+                disc_number: updated.disc_number,
+                duration_ms: updated.duration_ms,
+                lyrics: updated.lyrics,
+                fingerprint: updated.fingerprint,
+            };
+            push_file_write(&mut writes, &record_path, &dto)?;
+            credits_removed += 1;
+        }
+
+        // Remove every album owned by the deleted artist; all its owned tracks
+        // have been transferred or explicitly deleted above.
+        for album_id in &plan.owned_albums {
+            if let Some(album) = albums.remove(album_id) {
+                let rel = album_rel(album.owner_artist_id, album.id);
+                push_cleanup_album(&mut cleanup, &rel, &album)?;
+                catalog.albums.retain(|entry| entry.id != album.id.get());
+            }
+        }
+        // Add explicitly created destination albums and rewrite existing ones.
+        for album in new_albums.values() {
+            catalog.albums.push(CatalogAlbumDto {
+                id: album.id.get(),
+                artist_id: album.owner_artist_id.get(),
+                path: album_rel(album.owner_artist_id, album.id).display_lossy(),
+            });
+        }
+        catalog.albums.sort_by_key(|album| album.id);
+        let mut destination_ids = BTreeSet::new();
+        for track in &plan.owned_tracks {
+            if let ArtistDeletionDecision::Transfer {
+                new_owner,
+                destination,
+            } = &track.decision
+            {
+                match destination {
+                    ArtistDeletionDestination::Existing(id) => {
+                        destination_ids.insert(*id);
+                    }
+                    ArtistDeletionDestination::New { title, .. } => {
+                        if let Some(id) = new_album_keys.get(&(*new_owner, title.clone())) {
+                            destination_ids.insert(*id);
+                        }
+                    }
+                }
+            }
+        }
+        destination_ids.extend(new_albums.keys().copied());
+        for album_id in destination_ids
+            .into_iter()
+            .chain(new_albums.keys().copied())
+        {
+            if let Some(album) = albums.get(&album_id) {
+                let dto = AlbumEntityDto {
+                    schema_version: CANONICAL_SCHEMA_VERSION,
+                    kind: ALBUM_KIND.to_owned(),
+                    id: album.id.get(),
+                    owner_artist_id: album.owner_artist_id.get(),
+                    title: album.title.clone(),
+                    release_type: album.release_type,
+                    cover: album.cover.clone(),
+                    track_order: album.track_order.iter().map(|id| id.get()).collect(),
+                };
+                push_entity_write(
+                    &mut writes,
+                    &album_rel(album.owner_artist_id, album.id),
+                    "album.flux",
+                    &dto,
+                )?;
+            }
+        }
+        // Playlist and ratings consequences for explicitly deleted tracks.
+        for playlist in playlists.values() {
+            if self.playlists.get(&playlist.id) != Some(playlist) {
+                let rel = playlist_rel(playlist.id);
+                let dto = PlaylistEntityDto {
+                    schema_version: CANONICAL_SCHEMA_VERSION,
+                    kind: PLAYLIST_KIND.to_owned(),
+                    id: playlist.id.get(),
+                    name: playlist.name.clone(),
+                    track_ids: playlist.track_ids.iter().map(|track| track.get()).collect(),
+                };
+                push_file_write(&mut writes, &rel, &dto)?;
+            }
+        }
+        let ratings_dto = RatingsDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: RATINGS_KIND.to_owned(),
+            entries: ratings
+                .iter()
+                .map(|(track, rating)| RatingEntryDto {
+                    track_id: track.get(),
+                    rating: rating.rating,
+                    favorite: rating.favorite,
+                })
+                .collect(),
+        };
+        let ratings_bytes =
+            serde_json::to_vec_pretty(&ratings_dto).map_err(|err| CanonicalError::Malformed {
+                file: RATINGS_FILE_NAME.to_owned(),
+                message: err.to_string(),
+            })?;
+        writes.push(PendingWrite {
+            target: RelPath::from_utf8(RATINGS_FILE_NAME)?,
+            bytes: Some(ratings_bytes),
+            copy_from: None,
+            expected: None,
+        });
+        // Remove the artist only after all tracks/albums/credits are resolved.
+        if tracks.values().any(|track| {
+            track.owner_artist_id == plan.artist_id
+                || track.credited_artist_ids.contains(&plan.artist_id)
+        }) {
+            return Err(CanonicalError::Invalid(
+                "deletion would leave references to the artist".to_owned(),
+            ));
+        }
+        let artist_rel_path = artist_rel(plan.artist_id);
+        cleanup.push(RelPath::from_utf8(&format!(
+            "{}/artist.flux",
+            artist_rel_path.display_lossy()
+        ))?);
+        catalog
+            .artists
+            .retain(|artist| artist.id != plan.artist_id.get());
+        catalog.next_album_id = next_album;
+        catalog.tracks.sort_by_key(|track| track.id);
+        self.commit_writes_with_cleanup(Some(catalog), writes, cleanup)?;
+        self.reopen_after()?;
+        Ok(ArtistDeletionReport {
+            artist_id: plan.artist_id,
+            transferred: transferred as usize,
+            credits_removed: credits_removed as usize,
+            deleted_tracks: deleted_tracks.into_iter().collect(),
+            deleted_albums: plan.owned_albums.clone(),
         })
     }
+}
+
+fn album_cover_rel(album: &CanonicalAlbum) -> Result<Option<RelPath>, CanonicalError> {
+    Ok(album
+        .cover
+        .as_ref()
+        .map(|cover| {
+            RelPath::from_utf8(&format!(
+                "{}/{}",
+                album_rel(album.owner_artist_id, album.id).display_lossy(),
+                cover
+            ))
+        })
+        .transpose()?)
+}
+
+fn plan_track_lyrics_rel(record: &RelPath, lyrics: Option<&str>) -> Option<RelPath> {
+    lyrics.and_then(|name| {
+        RelPath::from_utf8(&format!(
+            "{}/{}",
+            record
+                .display_lossy()
+                .rsplit_once('/')
+                .map_or("", |(dir, _)| dir),
+            name
+        ))
+        .ok()
+    })
+}
+
+fn push_cleanup_album(
+    cleanup: &mut Vec<RelPath>,
+    album_rel: &RelPath,
+    album: &CanonicalAlbum,
+) -> Result<(), CanonicalError> {
+    cleanup.push(RelPath::from_utf8(&format!(
+        "{}/album.flux",
+        album_rel.display_lossy()
+    ))?);
+    if let Some(cover) = &album.cover {
+        cleanup.push(RelPath::from_utf8(&format!(
+            "{}/{}",
+            album_rel.display_lossy(),
+            cover
+        ))?);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4471,7 +5376,7 @@ mod ownership_recovery_tests {
         assert!(
             plan.issues
                 .iter()
-                .any(|issue| issue.contains("owned track"))
+                .any(|issue| issue.contains("choose transfer"))
         );
     }
 
@@ -5602,5 +6507,632 @@ mod filesystem_edge_tests {
         let reopened = CanonicalLibrary::open(&fx.root).expect("reopen missing source");
         assert!(reopened.track(fx.track).is_some());
         assert!(!reopened.track_available(fx.track));
+    }
+}
+
+#[cfg(test)]
+mod artist_deletion_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    fn lyrics(library: &CanonicalLibrary, id: TrackId) -> Option<String> {
+        library
+            .track_lyrics_path(id)
+            .and_then(|path| fs::read_to_string(path).ok())
+    }
+
+    struct Fixture {
+        _dir: TempDir,
+        root: std::path::PathBuf,
+        library: CanonicalLibrary,
+        deleted: ArtistId,
+        survivor: ArtistId,
+        collaborative: TrackId,
+        non_collaborative: TrackId,
+        credited_only: TrackId,
+        source_album: AlbumId,
+        destination_album: AlbumId,
+        playlist: PlaylistId,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let dir = TempDir::new(name);
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let deleted = library
+            .create_artist("Deleted", Vec::new())
+            .expect("deleted");
+        let survivor = library
+            .create_artist("Survivor", Vec::new())
+            .expect("survivor");
+        let source = dir.write("source/collab.wav", b"collaborative bytes");
+        let collaborative = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Collaboration".to_owned(),
+                artist_id: Some(deleted),
+                artist_name: "Deleted".to_owned(),
+                credited_artist_ids: vec![deleted, survivor],
+                album_title: Some("Source Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("collaborative");
+        let source = dir.write("source/solo.wav", b"solo bytes");
+        let non_collaborative = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Solo".to_owned(),
+                artist_id: Some(deleted),
+                artist_name: "Deleted".to_owned(),
+                credited_artist_ids: vec![deleted],
+                album_title: Some("Source Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("non-collaborative");
+        let source = dir.write("source/guest.wav", b"guest bytes");
+        let credited_only = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Guest".to_owned(),
+                artist_id: Some(survivor),
+                artist_name: "Survivor".to_owned(),
+                credited_artist_ids: vec![survivor, deleted],
+                album_title: Some("Survivor Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("credited-only");
+        let source_album = library.track(collaborative).expect("collab").album_id;
+        let destination_album = library.track(credited_only).expect("guest").album_id;
+        library
+            .set_lyrics(collaborative, Some("collab lyrics"))
+            .expect("collab lyrics");
+        library
+            .set_lyrics(non_collaborative, Some("solo lyrics"))
+            .expect("solo lyrics");
+        library
+            .set_lyrics(credited_only, Some("guest lyrics"))
+            .expect("guest lyrics");
+        library
+            .set_rating(collaborative, Some(5), true)
+            .expect("collab rating");
+        library
+            .set_rating(non_collaborative, Some(2), false)
+            .expect("solo rating");
+        library
+            .set_rating(credited_only, Some(3), true)
+            .expect("guest rating");
+        let playlist = library
+            .set_playlist(
+                None,
+                "Mixed",
+                vec![collaborative, non_collaborative, credited_only],
+            )
+            .expect("playlist");
+        Fixture {
+            _dir: dir,
+            root,
+            library,
+            deleted,
+            survivor,
+            collaborative,
+            non_collaborative,
+            credited_only,
+            source_album,
+            destination_album,
+            playlist,
+        }
+    }
+
+    fn prepared_plan(fx: &mut Fixture) -> ArtistDeletionPlan {
+        let mut plan = fx.library.plan_artist_deletion(fx.deleted).expect("plan");
+        plan.set_transfer(
+            fx.collaborative,
+            fx.survivor,
+            ArtistDeletionDestination::Existing(fx.destination_album),
+        )
+        .expect("transfer");
+        plan.set_delete(fx.non_collaborative, true).expect("delete");
+        plan.set_remove_credit(fx.credited_only, None)
+            .expect("credit");
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        plan
+    }
+
+    fn deletion_committed(point: TransactionFailPoint) -> bool {
+        matches!(
+            point,
+            TransactionFailPoint::AfterCatalogPublish
+                | TransactionFailPoint::BeforeCleanup
+                | TransactionFailPoint::DuringCleanup
+                | TransactionFailPoint::DuringLyricsCleanup
+                | TransactionFailPoint::AfterCleanup
+                | TransactionFailPoint::BeforeJournalFinalize
+        )
+    }
+
+    #[test]
+    fn multi_item_deletion_failure_matrix_is_all_or_nothing() {
+        let points = [
+            TransactionFailPoint::BeforeJournal,
+            TransactionFailPoint::AfterJournal,
+            TransactionFailPoint::BeforeStaging,
+            TransactionFailPoint::DuringCopy,
+            TransactionFailPoint::DuringAudioCopy,
+            TransactionFailPoint::AfterAudioCopyBeforeVerify,
+            TransactionFailPoint::DuringLyricsCopy,
+            TransactionFailPoint::AfterCopyBeforeVerify,
+            TransactionFailPoint::AfterVerify,
+            TransactionFailPoint::BeforeMetadataPublish,
+            TransactionFailPoint::DuringMetadataPublish,
+            TransactionFailPoint::BeforeCatalogPublish,
+            TransactionFailPoint::AfterCatalogPublish,
+            TransactionFailPoint::BeforeCleanup,
+            TransactionFailPoint::DuringCleanup,
+            TransactionFailPoint::DuringLyricsCleanup,
+            TransactionFailPoint::AfterCleanup,
+            TransactionFailPoint::BeforeJournalFinalize,
+        ];
+        for point in points {
+            let mut fx = fixture(&format!("delete-matrix-{point:?}"));
+            let plan = prepared_plan(&mut fx);
+            fx.library.set_transaction_failure(Some(TransactionFailure {
+                point,
+                interrupt: true,
+                abort: false,
+            }));
+            assert!(
+                fx.library.execute_artist_deletion(&plan).is_err(),
+                "{point:?} must return the injected error"
+            );
+            drop(fx.library);
+            let reopened = CanonicalLibrary::open(&fx.root)
+                .unwrap_or_else(|err| panic!("{point:?} recovery failed: {err}"));
+            let committed = deletion_committed(point);
+            if committed {
+                assert!(
+                    reopened.artist(fx.deleted).is_none(),
+                    "{point:?} artist removed"
+                );
+                assert!(
+                    reopened.track(fx.non_collaborative).is_none(),
+                    "{point:?} deleted track"
+                );
+                let collab = reopened.track(fx.collaborative).expect("collab");
+                assert_eq!(collab.owner_artist_id, fx.survivor, "{point:?} owner");
+                assert_eq!(
+                    collab.credited_artist_ids,
+                    vec![fx.survivor],
+                    "{point:?} credits"
+                );
+                assert_eq!(
+                    reopened
+                        .track(fx.credited_only)
+                        .map(|track| track.credited_artist_ids.clone()),
+                    Some(vec![fx.survivor]),
+                    "{point:?} credited-only"
+                );
+            } else {
+                assert!(
+                    reopened.artist(fx.deleted).is_some(),
+                    "{point:?} artist restored"
+                );
+                assert!(
+                    reopened.track(fx.non_collaborative).is_some(),
+                    "{point:?} track restored"
+                );
+                assert_eq!(
+                    reopened
+                        .track(fx.collaborative)
+                        .map(|track| track.owner_artist_id),
+                    Some(fx.deleted),
+                    "{point:?} old owner"
+                );
+                assert_eq!(
+                    reopened
+                        .track(fx.credited_only)
+                        .map(|track| track.credited_artist_ids.clone()),
+                    Some(vec![fx.survivor, fx.deleted]),
+                    "{point:?} old credits"
+                );
+            }
+            assert_eq!(
+                reopened
+                    .playlist(fx.playlist)
+                    .map(|playlist| playlist.track_ids.clone()),
+                if committed {
+                    Some(vec![fx.collaborative, fx.credited_only])
+                } else {
+                    Some(vec![
+                        fx.collaborative,
+                        fx.non_collaborative,
+                        fx.credited_only,
+                    ])
+                },
+                "{point:?} playlist"
+            );
+            assert_eq!(
+                reopened.rating(fx.collaborative),
+                Some(TrackRating {
+                    rating: Some(5),
+                    favorite: true
+                }),
+                "{point:?} collaborative rating"
+            );
+            assert_eq!(
+                reopened.rating(fx.non_collaborative),
+                if committed {
+                    None
+                } else {
+                    Some(TrackRating {
+                        rating: Some(2),
+                        favorite: false,
+                    })
+                },
+                "{point:?} deleted rating"
+            );
+            drop(reopened);
+            assert!(
+                CanonicalLibrary::open(&fx.root).is_ok(),
+                "{point:?} idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn artist_deletion_transfers_retains_and_deletes_in_one_commit() {
+        let mut fx = fixture("artist-delete");
+        let plan = fx.library.plan_artist_deletion(fx.deleted).expect("plan");
+        assert!(!plan.is_ready());
+        let mut plan = plan;
+        plan.set_transfer(
+            fx.collaborative,
+            fx.survivor,
+            ArtistDeletionDestination::Existing(fx.destination_album),
+        )
+        .expect("transfer decision");
+        plan.set_delete(fx.non_collaborative, true)
+            .expect("delete decision");
+        plan.set_remove_credit(fx.credited_only, None)
+            .expect("credit decision");
+        assert!(plan.is_ready(), "issues: {:?}", plan.issues);
+        let old_collab_audio = fx
+            .library
+            .track_audio_path(fx.collaborative)
+            .expect("old audio");
+        let old_solo_audio = fx
+            .library
+            .track_audio_path(fx.non_collaborative)
+            .expect("solo audio");
+        let old_guest_audio = fx
+            .library
+            .track_audio_path(fx.credited_only)
+            .expect("guest audio");
+        let report = fx
+            .library
+            .execute_artist_deletion(&plan)
+            .expect("delete artist");
+        assert_eq!(report.artist_id, fx.deleted);
+        assert_eq!(report.transferred, 1);
+        assert_eq!(report.credits_removed, 1);
+        assert_eq!(report.deleted_tracks, vec![fx.non_collaborative]);
+        assert_eq!(report.deleted_albums, vec![fx.source_album]);
+        assert!(fx.library.artist(fx.deleted).is_none());
+        assert!(!old_collab_audio.exists());
+        assert!(!old_solo_audio.exists());
+        assert!(
+            old_guest_audio.is_file(),
+            "credited-only audio is not moved"
+        );
+        let collab = fx.library.track(fx.collaborative).expect("collab retained");
+        assert_eq!(collab.owner_artist_id, fx.survivor);
+        assert_eq!(collab.credited_artist_ids, vec![fx.survivor]);
+        assert_eq!(collab.album_id, fx.destination_album);
+        assert_eq!(
+            fx.library.album_tracks(fx.destination_album),
+            vec![fx.credited_only, fx.collaborative]
+        );
+        assert!(fx.library.track(fx.non_collaborative).is_none());
+        let guest = fx.library.track(fx.credited_only).expect("guest retained");
+        assert_eq!(guest.credited_artist_ids, vec![fx.survivor]);
+        assert_eq!(
+            lyrics(&fx.library, fx.collaborative).as_deref(),
+            Some("collab lyrics")
+        );
+        assert!(lyrics(&fx.library, fx.non_collaborative).is_none());
+        assert_eq!(
+            lyrics(&fx.library, fx.credited_only).as_deref(),
+            Some("guest lyrics")
+        );
+        assert_eq!(
+            fx.library.rating(fx.collaborative),
+            Some(TrackRating {
+                rating: Some(5),
+                favorite: true
+            })
+        );
+        assert_eq!(fx.library.rating(fx.non_collaborative), None);
+        assert_eq!(
+            fx.library
+                .playlist(fx.playlist)
+                .map(|playlist| playlist.track_ids.clone()),
+            Some(vec![fx.collaborative, fx.credited_only])
+        );
+        assert!(fx.library.album(fx.source_album).is_none());
+        drop(fx.library);
+        let reopened = CanonicalLibrary::open(&fx.root).expect("reopen after deletion");
+        assert!(reopened.artist(fx.deleted).is_none());
+        assert_eq!(
+            reopened
+                .playlist(fx.playlist)
+                .map(|playlist| playlist.track_ids.clone()),
+            Some(vec![fx.collaborative, fx.credited_only])
+        );
+    }
+
+    #[test]
+    fn art_less_empty_artist_and_owned_cover_are_removed_without_track_loss() {
+        let dir = TempDir::new("delete-empty");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let a = library.create_artist("Empty", Vec::new()).expect("artist");
+        let album = library
+            .create_album(a, "Empty Album", ReleaseType::Album)
+            .expect("album");
+        let cover = dir.write("cover.png", b"fake png");
+        library.set_cover(album, &cover, "png").expect("cover");
+        let plan = library.plan_artist_deletion(a).expect("plan");
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        let report = library
+            .execute_artist_deletion(&plan)
+            .expect("delete empty");
+        assert_eq!(report.deleted_albums, vec![album]);
+        assert!(library.artist(a).is_none());
+        assert!(library.album(album).is_none());
+        assert!(
+            !root
+                .join("artists/artist_000001/albums/album_000001/album.flux")
+                .exists()
+        );
+        assert!(
+            !root
+                .join("artists/artist_000001/albums/album_000001/cover.png")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn artist_deletion_can_create_explicit_new_destination_album() {
+        let mut fx = fixture("delete-new-album");
+        let mut plan = fx.library.plan_artist_deletion(fx.deleted).expect("plan");
+        plan.set_transfer(
+            fx.collaborative,
+            fx.survivor,
+            ArtistDeletionDestination::New {
+                title: "Fresh Release".to_owned(),
+                release_type: ReleaseType::Single,
+            },
+        )
+        .expect("transfer");
+        plan.set_delete(fx.non_collaborative, true).expect("delete");
+        plan.set_remove_credit(fx.credited_only, None)
+            .expect("credit");
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        let report = fx.library.execute_artist_deletion(&plan).expect("delete");
+        assert_eq!(report.transferred, 1);
+        let collab = fx.library.track(fx.collaborative).expect("collab");
+        let album = fx.library.album(collab.album_id).expect("new album");
+        assert_eq!(album.title, "Fresh Release");
+        assert_eq!(album.release_type, ReleaseType::Single);
+        assert_eq!(album.track_order, vec![fx.collaborative]);
+        assert_eq!(album.owner_artist_id, fx.survivor);
+    }
+
+    #[test]
+    fn unresolved_and_stale_plans_are_rejected_without_changes() {
+        let mut fx = fixture("artist-delete-guards");
+        let mut plan = fx.library.plan_artist_deletion(fx.deleted).expect("plan");
+        assert!(!plan.is_ready());
+        assert!(fx.library.execute_artist_deletion(&plan).is_err());
+        assert!(fx.library.artist(fx.deleted).is_some());
+        plan.set_transfer(
+            fx.collaborative,
+            fx.survivor,
+            ArtistDeletionDestination::Existing(fx.destination_album),
+        )
+        .expect("transfer");
+        plan.set_delete(fx.non_collaborative, true).expect("delete");
+        plan.set_remove_credit(fx.credited_only, None)
+            .expect("credit");
+        assert!(plan.is_ready());
+        // Force a relevant catalogue change after planning.
+        fx.library
+            .set_rating(fx.collaborative, Some(1), false)
+            .expect("rating");
+        assert!(fx.library.execute_artist_deletion(&plan).is_err());
+        assert!(fx.library.artist(fx.deleted).is_some());
+        assert!(fx.library.track(fx.collaborative).is_some());
+    }
+}
+
+#[cfg(test)]
+mod deletion_process_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    const ROOT: &str = "FLUX_TEST_DELETE_ROOT";
+    const POINT: &str = "FLUX_TEST_DELETE_POINT";
+
+    fn point(name: &str) -> TransactionFailPoint {
+        match name {
+            "after-journal" => TransactionFailPoint::AfterJournal,
+            "during-metadata-publish" => TransactionFailPoint::DuringMetadataPublish,
+            "after-catalog-publish" => TransactionFailPoint::AfterCatalogPublish,
+            "during-cleanup" => TransactionFailPoint::DuringCleanup,
+            other => panic!("unknown deletion boundary {other}"),
+        }
+    }
+
+    #[test]
+    fn child_delete_helper() {
+        let Ok(root) = std::env::var(ROOT) else {
+            return;
+        };
+        let boundary = point(&std::env::var(POINT).expect("deletion boundary"));
+        let root = PathBuf::from(root);
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let b = library.create_artist("B", Vec::new()).expect("B");
+        let source_dir = root.parent().expect("parent").join("delete-source");
+        fs::create_dir_all(&source_dir).expect("source");
+        let mut import =
+            |name: &str, bytes: &[u8], credits: Vec<ArtistId>, owner: ArtistId, album: &str| {
+                let path = source_dir.join(name);
+                fs::write(&path, bytes).expect("audio");
+                library
+                    .import_track(CanonicalImportedTrack {
+                        source: path,
+                        title: name.to_owned(),
+                        artist_id: Some(owner),
+                        artist_name: if owner == a { "A" } else { "B" }.to_owned(),
+                        credited_artist_ids: credits,
+                        album_title: Some(album.to_owned()),
+                        release_type: ReleaseType::Album,
+                        track_number: None,
+                        disc_number: None,
+                        duration_ms: None,
+                    })
+                    .expect("import")
+            };
+        let collab = import(
+            "collab.wav",
+            b"delete child collab",
+            vec![a, b],
+            a,
+            "A Album",
+        );
+        let solo = import("solo.wav", b"delete child solo", vec![a], a, "A Album");
+        let guest = import("guest.wav", b"delete child guest", vec![b, a], b, "B Album");
+        let destination = library.track(guest).expect("guest").album_id;
+        library
+            .set_playlist(None, "P", vec![collab, solo, guest])
+            .expect("playlist");
+        library.set_rating(collab, Some(4), true).expect("rating");
+        let mut plan = library.plan_artist_deletion(a).expect("plan");
+        plan.set_transfer(collab, b, ArtistDeletionDestination::Existing(destination))
+            .expect("transfer");
+        plan.set_delete(solo, true).expect("delete");
+        plan.set_remove_credit(guest, None).expect("credit");
+        library.set_transaction_failure(Some(TransactionFailure {
+            point: boundary,
+            interrupt: true,
+            abort: true,
+        }));
+        let _ = library.execute_artist_deletion(&plan);
+        panic!("delete child did not terminate");
+    }
+
+    fn spawn(boundary: &str, root: &Path) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "canonical::deletion_process_tests::child_delete_helper",
+                "--nocapture",
+            ])
+            .env(ROOT, root)
+            .env(POINT, boundary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn deletion child")
+    }
+
+    #[test]
+    fn real_child_termination_during_artist_deletion_recovers() {
+        for (boundary, committed) in [
+            ("after-journal", false),
+            ("during-metadata-publish", false),
+            ("after-catalog-publish", true),
+            ("during-cleanup", true),
+        ] {
+            let dir = TempDir::new(&format!("delete-child-{boundary}"));
+            let root = dir.path().join("FluxLibrary");
+            let status = spawn(boundary, &root);
+            assert!(
+                !status.success(),
+                "{boundary} child must abort, got {status:?}"
+            );
+            let reopened = CanonicalLibrary::open(&root).expect("recover deletion");
+            if committed {
+                assert!(reopened.artist(ArtistId::new(1)).is_none());
+                assert!(reopened.track(TrackId::new(2)).is_none());
+                assert_eq!(
+                    reopened
+                        .track(TrackId::new(1))
+                        .map(|track| track.owner_artist_id),
+                    Some(ArtistId::new(2))
+                );
+                assert_eq!(
+                    reopened
+                        .track(TrackId::new(3))
+                        .map(|track| track.credited_artist_ids.clone()),
+                    Some(vec![ArtistId::new(2)])
+                );
+                assert_eq!(
+                    fs::read(reopened.track_audio_path(TrackId::new(1)).expect("audio"))
+                        .expect("audio"),
+                    b"delete child collab"
+                );
+            } else {
+                assert!(reopened.artist(ArtistId::new(1)).is_some());
+                assert!(reopened.track(TrackId::new(2)).is_some());
+                assert_eq!(
+                    reopened
+                        .track(TrackId::new(1))
+                        .map(|track| track.owner_artist_id),
+                    Some(ArtistId::new(1))
+                );
+                assert_eq!(
+                    reopened
+                        .track(TrackId::new(3))
+                        .map(|track| track.credited_artist_ids.clone()),
+                    Some(vec![ArtistId::new(2), ArtistId::new(1)])
+                );
+            }
+            assert_eq!(
+                reopened.rating(TrackId::new(1)),
+                Some(TrackRating {
+                    rating: Some(4),
+                    favorite: true
+                })
+            );
+            assert_eq!(
+                reopened
+                    .playlists()
+                    .next()
+                    .map(|playlist| playlist.track_ids.clone()),
+                if committed {
+                    Some(vec![TrackId::new(1), TrackId::new(3)])
+                } else {
+                    Some(vec![TrackId::new(1), TrackId::new(2), TrackId::new(3)])
+                }
+            );
+            drop(reopened);
+            assert!(CanonicalLibrary::open(&root).is_ok());
+        }
     }
 }

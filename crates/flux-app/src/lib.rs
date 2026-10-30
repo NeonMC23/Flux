@@ -94,8 +94,9 @@ pub use import::{
 };
 
 pub use flux_library::canonical::{
-    AlbumId, ArtistDeletionPlan, ArtistDeletionTrack, CanonicalImportedTrack, OwnershipDestination,
-    OwnershipTransferPlan, OwnershipTransferReport, PlaylistId, ReleaseType,
+    AlbumId, ArtistDeletionAlbum, ArtistDeletionDecision, ArtistDeletionDestination,
+    ArtistDeletionPlan, ArtistDeletionReport, ArtistDeletionTrack, CanonicalImportedTrack,
+    OwnershipDestination, OwnershipTransferPlan, OwnershipTransferReport, PlaylistId, ReleaseType,
 };
 pub use flux_library::canonical_migrate::{
     CanonicalMigrationError, CanonicalMigrationIssue, CanonicalMigrationPlan,
@@ -2400,9 +2401,9 @@ impl Controller {
         Ok(report)
     }
 
-    /// Builds a read-only artist-deletion inventory. Execution is intentionally
-    /// unavailable until every owned/credited track has an explicit transfer or
-    /// deletion decision and a resumable multi-item transaction.
+    /// Builds a generation-tagged artist-deletion preview. Every affected
+    /// track starts unresolved; execution is refused until the user resolves
+    /// transfers, credit removals and explicit deletions.
     pub fn plan_artist_deletion(&self, id: ArtistId) -> Result<ArtistDeletionPlan, String> {
         let Some(store) = self.canonical_store.as_ref() else {
             return Err("Artist deletion planning requires a canonical library.".to_owned());
@@ -2410,6 +2411,63 @@ impl Controller {
         store
             .plan_artist_deletion(id)
             .map_err(|err| format!("Could not plan artist deletion: {err}"))
+    }
+
+    /// Executes a fully resolved artist-deletion plan through one canonical
+    /// transaction. Queue entries for explicitly deleted tracks are removed;
+    /// playback stops if the current track is deleted. All unaffected queue
+    /// entries and stable track IDs remain.
+    pub fn execute_artist_deletion(
+        &mut self,
+        plan: &ArtistDeletionPlan,
+    ) -> Result<ArtistDeletionReport, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let deleted_tracks = plan.deleted_track_ids();
+        let current = self.current_id();
+        let current_deleted = current.is_some_and(|id| deleted_tracks.contains(&id));
+        let Some(store) = self.canonical_store.as_mut() else {
+            let message = "Artist deletion requires a canonical library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let report = match store.execute_artist_deletion(plan) {
+            Ok(report) => report,
+            Err(err) => {
+                let message = format!("Could not delete artist: {err}");
+                self.report_error(message.clone());
+                return Err(message);
+            }
+        };
+        let mut queue_changed = false;
+        for id in &deleted_tracks {
+            queue_changed |= self.player.queue_mut().remove(*id) > 0;
+        }
+        if current_deleted {
+            self.player.stop();
+            self.engine.stop();
+            self.engine_loaded = None;
+            self.engine_session = None;
+            self.stream_info = None;
+        }
+        self.refresh_from_canonical();
+        if queue_changed {
+            self.after_queue_change();
+        }
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        if current_deleted {
+            self.outbox.push(ControllerEvent::PlaybackChanged);
+        }
+        self.report_status(format!(
+            "Deleted artist {}: {} transferred, {} credit(s) removed, {} track(s) deleted.",
+            report.artist_id,
+            report.transferred,
+            report.credits_removed,
+            report.deleted_tracks.len()
+        ));
+        Ok(report)
     }
 
     /// Applies a full user metadata edit to one portable track without
@@ -8596,6 +8654,132 @@ mod tests {
         let audio = controller.track(id).expect("track").source().path();
         assert!(audio.starts_with(controller.canonical_root().expect("root")));
         assert!(audio.is_file());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_artist_deletion_keeps_queue_and_playlist_references_consistent() {
+        let dir = TempDir::new("canonical-artist-delete");
+        let root = dir.path().join("FluxLibrary");
+        create_canonical_library(&root).expect("create");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let a = controller.create_artist("A").expect("A");
+        let b = controller.create_artist("B").expect("B");
+        let collab_source = dir.path().join("source/collab.wav");
+        let solo_source = dir.path().join("source/solo.wav");
+        let guest_source = dir.path().join("source/guest.wav");
+        for (path, level) in [
+            (&collab_source, 0.2),
+            (&solo_source, 0.3),
+            (&guest_source, 0.4),
+        ] {
+            fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            write_dc_wav(
+                path.parent().expect("parent"),
+                path.file_name().expect("name").to_str().expect("utf8"),
+                4_410,
+                level,
+            );
+        }
+        let collab = controller
+            .import_canonical_track(super::CanonicalImportedTrack {
+                source: collab_source,
+                title: "Collab".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("A Album".to_owned()),
+                release_type: super::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("collab");
+        let solo = controller
+            .import_canonical_track(super::CanonicalImportedTrack {
+                source: solo_source,
+                title: "Solo".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a],
+                album_title: Some("A Album".to_owned()),
+                release_type: super::ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("solo");
+        let guest = controller
+            .import_canonical_track(super::CanonicalImportedTrack {
+                source: guest_source,
+                title: "Guest".to_owned(),
+                artist_id: Some(b),
+                artist_name: "B".to_owned(),
+                credited_artist_ids: vec![b, a],
+                album_title: Some("B Album".to_owned()),
+                release_type: super::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("guest");
+        let destination = controller.track_album_id(guest).expect("B album");
+        let playlist = controller
+            .set_playlist(None, "Keep", vec![collab, solo, guest])
+            .expect("playlist");
+        controller
+            .set_rating(collab, Some(5), true)
+            .expect("rating");
+        controller.enqueue_track(collab).expect("enqueue collab");
+        controller.play_track(solo);
+        assert_eq!(controller.queue_len(), 2, "queue entries before deletion");
+        assert_eq!(controller.current_id(), Some(solo));
+        let mut plan = controller.plan_artist_deletion(a).expect("plan");
+        plan.set_transfer(
+            collab,
+            b,
+            super::ArtistDeletionDestination::Existing(destination),
+        )
+        .expect("transfer");
+        plan.set_delete(solo, true).expect("delete");
+        plan.set_remove_credit(guest, None).expect("credit");
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        let report = controller.execute_artist_deletion(&plan).expect("execute");
+        assert_eq!(report.deleted_tracks, vec![solo]);
+        assert!(controller.artist(a).is_none());
+        assert_eq!(controller.track_artist_id(collab), Some(b));
+        assert_eq!(controller.track_credits(collab), vec![b]);
+        assert_eq!(controller.track_album_id(collab), Some(destination));
+        assert_eq!(controller.track_credits(guest), vec![b]);
+        assert!(controller.track(solo).is_none());
+        assert_eq!(
+            controller.current_id(),
+            Some(collab),
+            "queue advances to surviving entry"
+        );
+        assert_eq!(controller.player_state(), flux_core::PlaybackState::Stopped);
+        assert!(
+            controller
+                .queue_entries()
+                .iter()
+                .all(|entry| entry.track() != solo)
+        );
+        assert_eq!(
+            controller
+                .playlists()
+                .into_iter()
+                .find(|item| item.id == playlist)
+                .map(|item| item.track_ids),
+            Some(vec![collab, guest])
+        );
+        assert_eq!(
+            controller.rating(collab),
+            Some(flux_library::canonical::TrackRating {
+                rating: Some(5),
+                favorite: true
+            })
+        );
+        assert_eq!(controller.rating(solo), None);
         controller.shutdown();
     }
 }
