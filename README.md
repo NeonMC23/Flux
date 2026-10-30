@@ -6,50 +6,50 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: local library-management foundation delivered.**
-Both applications work end to end: scan or import a local music library
-(the GUI includes a review-first Import Manager with native pickers,
-drag-and-drop, duplicate decisions, copy/reference storage, and editable
-metadata), browse/search it, edit Flux-owned track metadata and stable artists,
-reconcile missing/moved files, edit a persistent user-managed play queue,
-and play WAV, FLAC, MP3, AAC (ADTS streams and MP4/M4A files), Ogg
-Vorbis, and Opus with play/pause/stop, next/previous, real seeking,
-volume, repeat modes, and automatic advancement, all coordinated by one
-shared controller. The GUI also has a real-time oscilloscope in the persistent
-player bar, driven by the same post-gain samples sent to the output
-device and reproducing Flow's Web Audio waveform processing. Portable
-library catalogues (with stable track and artist IDs) and per-library
-queues persist inside the library's `.flux/` folder; the app-data
-version-1 index remains a compatibility backend. The project owner
-has confirmed that real-device playback works on Nobara Linux; that is
-one machine and setup, not a claim that every codec or device has been
-independently verified — the development sandbox and CI have no audio
-device, so see the verification checklist below and judge accordingly.
+**Status: canonical library runtime integrated.**
+Both applications now open, create and switch canonical self-contained Flux
+libraries. The GUI and TUI share the same application controller; audio is
+copied into the library, metadata is inferred from filenames and folders and
+reviewed without reading tags, playback and queue identity use stable track IDs,
+and queues persist per library. Legacy app-data indexes and schema-v3 portable
+catalogues are migration sources only in the normal front-end workflows.
 
-## Canonical storage foundation (in progress)
+The GUI includes a review-first Import Manager with native pickers,
+drag-and-drop, duplicate decisions, editable metadata, copy-only staging,
+progress and cancellation. Existing playback, seeking, queue behavior and the
+real-time oscilloscope continue to use the same engine. Ownership transfer,
+album artwork display and playlist/rating UI remain incomplete and are called
+out below rather than presented as finished.
 
-The library crate now contains a canonical, self-contained storage engine and an
-isolated migration planner (`docs/canonical-library.md`). It is **not yet the
-GUI/TUI runtime backend**: the Controller still opens the legacy index or the
-schema-v3 portable catalogue, and existing import metadata still reads audio
-tags. The canonical format owns relative managed audio, stable artist/album/
-track IDs, per-entity `.flux` records, managed lyrics/cover primitives,
-playlists/ratings, transactional publication and recovery. Do not treat the
-migration as complete until the runtime integration listed in that document is
-finished and tested.
+## Canonical storage
+
+The canonical library is the normal runtime backend. Its layout and authority
+rules are documented in [`docs/canonical-library.md`](docs/canonical-library.md).
+A library owns its managed audio, stable artist/album/track IDs, per-entity
+`.flux` records, managed lyrics/cover primitives, playlists, ratings and
+transaction journals. Every persisted managed path is relative to the library
+root. `catalog.flux` is authoritative for identity/ownership/paths and is
+published last; per-entity files are validated against it. Audio tags are not a
+metadata source and are never rewritten.
+
+Older formats remain reachable only through the explicit migration planner:
+the legacy `library-index.json` and portable schema-v3 `.flux` catalogue are
+read-only sources. The public Controller still contains compatibility
+constructors for tests and migration integration; no GUI/TUI normal workflow
+selects or writes those backends.
 
 ## Crates
 
 | Crate | Kind | Responsibility |
 |---|---|---|
 | `flux-core` | library | Backend-independent domain model: tracks, IDs, sources, the play queue with stable per-entry identities (duplicates allowed), repeat/playback states, and the shared error type. No UI, filesystem, database, audio-device, or network implementation. |
-| `flux-library` | library | Local library: recursive folder scanning (tags via lofty, filename fallback, symlinks never followed) into an in-memory, insertion-ordered collection with path deduplication and search, plus the versioned portable `.flux` catalogue with stable track/artist IDs, sparse metadata overrides, file fingerprints, availability/relink maintenance, and a separate atomic queue store. The legacy app-data JSON index remains readable/writable for compatibility; scanning never prunes missing files. |
+| `flux-library` | library | Canonical self-contained library engine: stable artist/album/track/playlist IDs, relative managed paths, per-entity `.flux` metadata, transaction journal, copy verification, playlists/ratings/lyrics, and isolated migration from legacy/schema-v3 sources. The older in-memory scanner and portable store remain for compatibility tests and migration inventory. |
 | `flux-audio` | library | Playback, in two strictly separate layers: `Player`, the pure playback-control state machine and single authority for playback decisions; and a threaded engine that decodes WAV (hound), FLAC (claxon), MP3 (rmp3/minimp3), AAC in ADTS streams and MP4/M4A files (rusty_aac with the mp4 demuxer), and Ogg Vorbis and Opus (lewton and opus-pure over the ogg demuxer) on a worker thread and feeds an output backend (device-free `NullOutput`, or CPAL behind the non-default `cpal` feature) through a lock-free ring buffer. |
-| `flux-app` | library | The shared application controller: owns the library, `Player`, engine, volume, queue persistence, and backend; syncs the engine to playback decisions; runs scans in the background; provides the typed review-first import domain (discovery, metadata, duplicate decisions, copy/reference planning, cancellation, publication) plus portable-library metadata editing, stable artists, reconciliation, and relinking. Both front-ends use this one controller. |
+| `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, duplicate decisions, copy-only publication, artist/album/track edits, playlists/ratings/lyrics APIs, and the canonical migration workflow. Both front-ends use this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native file/folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application: review-first Import Manager (native pickers, Flux Browser, drag-and-drop, editable metadata, duplicate decisions, storage choice, progress/cancel), searchable track list, track metadata editor, stable-artist manager, missing-file/relink health panel, interactive queue, transport, volume, repeat, status/errors, and a real-time oscilloscope fed by actual post-gain output samples. |
-| `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, copy/in-place import, track/artist edit keys, missing-file marker, unique-candidate relink, queue add/play-next/remove/reorder, full keyboard control, same controller semantics as the GUI. |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
+| `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, copy-only quick import, folder import, track/artist edit keys, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
 `flux-tui → flux-app + flux-core + crossterm`,
@@ -57,11 +57,11 @@ Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`
 `flux-library → flux-core + lofty + walkdir + serde/serde_json`, and
 `flux-audio → flux-core + claxon + hound + rmp3 + lewton + ogg +
 opus-pure + rusty_aac + mp4 + ringbuf` (plus optional `cpal`). `flux-core`, `flux-providers`, and `flux-platform` have no
-dependencies. The engine never scans or persists the library; the
-catalogue store and queue store are separate files, and `Player` remains
-the only playback-decision authority — the controller just keeps the
-engine in sync with it. Queue files are namespaced by active library,
-never by audio tags or catalogue records.
+dependencies. The engine never scans or persists the library. The canonical catalogue
+and queue store are separate files, and `Player` remains the only
+playback-decision authority — the controller keeps the engine in sync
+with it. Queue files are namespaced by active library and never by audio
+tags or absolute audio paths.
 
 ## Using Flux
 
@@ -74,153 +74,88 @@ cargo run -p flux-gui --features cpal            # binary name: flux
 cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
 ```
 
-- **GUI:** type a music folder path and choose *Scan folder*
-  (*Refresh* re-scans this session's folders). Click a track to play
-  it; use the transport row for pause/stop/skip/repeat/volume; the
-  search box filters by title, artist, or album. The queue panel shows
-  the whole queue with the current entry highlighted. Drag a row by its
-  grip to reorder it; the pink insertion line shows the drop position.
-  `Ctrl+↑`/`Ctrl+↓` moves the current entry from the keyboard, `×`
-  removes an entry, and clicking a row plays it. `+` on a library row
-  appends it to the queue; `→` inserts it after the current entry.
-  The bottom player’s progress bar is a real seek control: click it or
-  drag the thumb to preview a position, then release to seek. When the
-  search box is not focused, `←`/`→` seek by five seconds (hold
-  `Shift` for thirty seconds); the `Space`, `N`/`P`, and `S` transport
-  shortcuts remain available. Transport tooltips name each icon, and
-  actions that cannot run are visibly disabled.
-  Use **Import music** for the review-first Import Manager: native file or
-  folder picker, integrated Flux Browser, drag-and-drop, editable review,
-  duplicate decisions, copy/reference storage, and real progress/cancel.
-  Open *Library setup* to create/open a portable library, create/rename
-  stable artists, and run *Reconcile library*. The pencil on a track opens
-  the metadata editor (title, album, track/disc numbers, artist identity);
-  this writes only Flux-owned overrides. Missing tracks stay listed with a
-  `missing` marker, and unique move candidates appear in *Library health*
-  with an explicit *Relink* action.
+- **GUI:** create or open a canonical library in *Library setup*. Use
+  **Import music** for the review-first copy-only Import Manager: native file
+  or folder picker, Flux Browser, drag-and-drop, name-inferred editable review,
+  duplicate decisions, and real progress/cancel. Click a track to play it; use
+  the transport row for pause/stop/skip/repeat/volume; the search box filters
+  by title, artist, or album. Artist and album views group canonical stable
+  identities. The queue panel supports drag reordering, keyboard moves,
+  removal and direct entry playback; the seek bar moves the decoder. The
+  pencil edits canonical metadata; changing the physical owner is intentionally
+  refused until ownership transfer is implemented. Missing managed audio stays
+  listed with a `missing` marker. *Refresh & validate* reopens the canonical
+  catalogue and validates its resource paths.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
-  stops, `n/p` skip, `+/-` volume, `R` repeat, `o` scan a folder
-  (type the path), `r` refresh, `/` search, `q` quit. `i` quick-copy-imports
-  paths (separated by `;`), `I` quick-imports paths already inside the portable
-  library, `e` edits the selected track as
-  `title|album|track|disc|artist-id`, `P` creates an artist, `Y` renames
-  an artist (`id|new-name`), `V` lists artist IDs, `X` reconciles, and
-  `L` applies a unique relocation candidate. For the queue, `a` appends
-  the selected library track, `x` plays it next, `Delete` removes the
-  current entry, and `Ctrl+↑`/`Ctrl+↓` reorder the current entry. The
-  terminal is always restored on exit, including on errors.
+  stops, `n/p` skip, `+/-` volume, `R` repeat, `o` imports a folder
+  (type the path), `r` refreshes, `/` search, `q` quit. `i` quick-imports
+  paths (separated by `;`) by copying them into the canonical library, `e`
+  edits the selected track as `title|album|track|disc|artist-id`, `P` creates
+  an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
+  refreshes/validates the canonical library, and `M` runs the canonical
+  migration workflow. For the queue, `a` appends, `x` plays next, `Delete`
+  removes the current entry, and `Ctrl+↑`/`Ctrl+↓` reorder. The terminal is
+  always restored on exit.
 
 ### Import Manager
 
-The GUI's **Import music** action opens a modal, review-first import workspace
-while the player remains visible and responsive:
+The GUI's **Import music** action opens a review-first workspace while the
+player remains visible:
 
-- choose files or a folder with the native OS dialog (zenity or kdialog on
-  Linux, `osascript` on macOS, PowerShell WinForms on Windows), or use the
-  integrated Flux Browser;
-- drop audio files or folders anywhere in the window (Iced/winit file-drop is
-  available on X11, Windows, and macOS; it is not implemented on Wayland);
-- choose **Copy into the library** or **Reference existing files**;
-- review every candidate before writing: title, artist, album, duration,
-  format, file size, source path, duplicate/conflict status, intended
-  destination, and incomplete-metadata state;
-- edit title, artist, album, track number, and disc number per track while
-  keeping the source values visible and marking modified candidates;
-- decide per track or in bulk to import, skip, or update an exact-path
-  existing track while preserving its stable `TrackId`; exact paths,
-  possible same-content files, and merely similar metadata are distinct;
-- see real discovery/metadata/copy/catalogue-write progress, cancel at safe
-  boundaries, and review partial failures or completion.
+- choose files or a folder with the native OS dialog (zenity/kdialog on Linux,
+  `osascript` on macOS, PowerShell WinForms on Windows), or use Flux Browser;
+- drop audio files or folders (Iced/winit X11/Windows/macOS; Wayland file-drop
+  is not supported by the toolkit);
+- infer provisional artist, album, title, track number and disc number only
+  from filenames and directory names — no embedded tag is read;
+- review and edit every candidate, with incomplete metadata visibly marked;
+- classify exact/repeated selection paths, identical content at different
+  paths, and similar metadata with different content; similar tracks are never
+  merged automatically;
+- copy every selected file into the canonical library, verify the copy by size
+  and content hash inside the catalogue transaction, and never expose a
+  partially copied file as a catalogue entry;
+- report progress and per-item failures, preserve successful items when later
+  items fail, and cancel before commit.
 
-Review edits become sparse Flux-owned overrides; audio tags and files are
-never modified. Copied files go into the library root with deterministic,
-collision-free names and never overwrite or remove originals. Reference mode
-only accepts files already inside the portable library, because the catalogue
-stores library-relative paths; external sources are blocked with a clear
-prompt to switch to Copy. No new Rust dependency is used for the native
-dialogs or the integrated browser. Artwork extraction/preview and stable
-album identities are not part of this stage; the existing album string model
-is reused. The TUI retains its direct shared-controller import keys; the full
-review manager is GUI-only.
+Reference-only/external imports are not available in canonical mode. Review
+edits become canonical Flux metadata; audio tags and source files are never
+modified. The canonical transaction stages files inside the library and only
+publishes `catalog.flux` after every copy verifies. Artwork extraction/preview
+is not implemented because no approved image decoder is present. The TUI uses
+the same filename inference and copy-only application path via its quick-import
+keys; the full review UI is GUI-only.
 
-Manual verification in this environment (Linux/X11 under Xephyr): the full
-Flux Browser import, review edits, duplicate decisions, completion, and OS
-file drag-and-drop were exercised against a real portable catalogue. The
-native zenity command was launched, but this headless X server had no window
-manager/portal that could map the GTK dialog, so native dialog completion was
-not claimed; the Flux Browser fallback was used and verified. Windows and
-macOS picker code compiles but was not runtime-tested. Wayland file-drop is
-not provided by Iced/winit.
+Migration is explicit: *Library setup* accepts a legacy index file or portable
+schema-v3 folder, presents a read-only inventory and disk estimate, builds and
+validates a separate canonical destination, and only then offers activation.
+The source is never modified or deleted. Migration execution and import
+copying currently run synchronously at their commit boundary; responsive
+background staging for very large migrations is still future work.
 
-- The legacy compatibility index lives at `library-index.json` in the
-  per-user data directory (e.g. `~/.local/share/flux/` on Linux,
-  `%LOCALAPPDATA%\flux\` on Windows, `~/Library/Application
-  Support/flux/` on macOS) and is saved after every scan. It cannot hold
-  Flux metadata overrides or stable artist identities; those require a
-  portable library. A legacy queue is stored beside the legacy index as
-  `<index>.queue.json`; a portable queue lives at
-  `<library>/.flux/queue/queue.json`. Queue files are written atomically,
-  survive restarts, and stay isolated per library. A malformed queue
-  file is reported and preserved (queue writes are disabled for that
-  session) rather than replaced with an empty queue.
-- **Library management (portable libraries).** The catalogue lives
-  inside the library at `<library>/.flux/`; no Flux-owned metadata is
-  written to app-data directories in portable mode. The commit record is
-  human-readable JSON (`catalog.flux`, plus the previous generation as
-  `catalog.flux.bak`) and references immutable, generation-qualified
-  track segments. The current schema is version 3: it adds a stable
-  artist table (ID, canonical name, optional aliases) and track-to-artist
-  references to the version-2 track/path/tag/override records. Version-2
-  stores remain readable and are upgraded on the first successful commit;
-  malformed/unsupported primary catalogues are never overwritten, and a
-  valid backup opens in an explicit read-only recovery state until
-  acknowledged.
-  - **Metadata precedence:** Flux-owned override → embedded tag →
-    filename/folder fallback, with an always-non-empty display title.
-    Editing a track writes only sparse overrides; audio tags and files
-    are never modified.
-  - **Stable identities:** track and artist IDs and their counters
-    persist. Artist renames change the canonical name while every related
-    track keeps its ID and overrides. Equal display names are allowed and
-    never auto-merged; the GUI shows the ID where names collide.
-  - **Import:** the GUI provides the review-first Import Manager and the
-    TUI keeps direct copy/in-place import keys. *Copy* imports external
-    files into the library root with collision-free names and never moves,
-    overwrites, or deletes originals; *reference/in-place* accepts only
-    files already inside the library. Repeated identical imports are
-    detected and never silently create a duplicate. External absolute
-    references without copying are rejected with a clear per-file error.
-  - **Rescans and maintenance:** scans add/update by path and preserve
-    IDs, overrides, artists, and queue references. Reconcile records
-    changed size/mtime fingerprints, keeps missing records, and reports
-    possible relocation candidates. Applying a candidate is explicit
-    (GUI *Relink* / TUI `L` for a unique candidate) and revalidates the
-    fingerprint; nothing is moved automatically.
-- A queue that has never been structurally edited follows newly scanned
-  tracks automatically; adding, removing, or reordering an entry turns
-  it into a fully user-managed queue. New imports join only an
-  auto-derived queue. Entries whose tracks disappear from the library
-  are retained and shown as missing until explicitly removed.
-- Seeking moves the actual decoder, not just the displayed timestamp.
-  The engine reopens the current file and pre-rolls to the target on its
-  worker thread, flushes buffered output from the old position, and
-  preserves playing, paused, or stopped state. On long files the
-  pre-roll is a short silent decode pass proportional to the target
-  time; the UI shows the intended position immediately.
-- The oscilloscope is reproduced from Flow's
-  `src/javascript/effect.js` Web Audio time-domain analyser. Flux uses
-  a bounded lock-free tap of the real post-gain output and the same
-  4096-sample, 8-bit processing: RMS smoothing (`0.85/0.15`), a
-  `0.45 / RMS` gain target clamped to `1.0..=2.6`, attack/release
-  interpolation (`0.25/0.05`), a 48 px rounded canvas, dark background,
-  glow, and a `#ff66cc` 1 px line. Flux taps device-rate
-  post-resampling output, so sample values are not bit-for-bit identical
-  to a browser's Web Audio graph. The native renderer samples the real
-  window with linear interpolation per pixel column and adds a faint
-  zero guide plus a translucent halo; these are presentation changes
-  only, never a synthetic waveform. The waveform algorithm, gain
-  envelope, colors, dimensions, and playback-state behavior mirror Flow;
-  native rasterization and pixel-level antialiasing necessarily differ.
+### Library storage
+
+- **Canonical library.** `library.flux` identifies the library, `catalog.flux`
+  is the authoritative committed catalogue, stable IDs are never reused,
+  per-entity metadata lives in `.flux` files, and `transactions/` records
+  recovery state. Queue state is stored at `<library>/queue.flux` and carries
+  stable TrackIds, not paths. A malformed queue file is reported and preserved
+  (queue writes disabled for that session) rather than replaced.
+- **Legacy/portable sources.** `library-index.json` and the schema-v3 `.flux`
+  catalogue are read only by the explicit migration workflow. The front-ends no
+  longer switch to or write them as normal runtime backends.
+- **Stable identities:** track, artist, album and playlist IDs and counters
+  persist. Artist and album renames change metadata while every related track
+  keeps its ID. Physical owner changes require the still-pending ownership
+  transfer workflow and are refused rather than simulated.
+- **Import:** every canonical import copies into the library and preserves the
+  original extension; sources are never moved, overwritten or deleted.
+  Identical content is deduplicated by fingerprint. Existing IDs are preserved
+  when the user explicitly updates an existing record.
+- **Missing resources:** a managed audio file can disappear; the track record
+  remains, playback fails clearly, and validation reports it. Missing audio
+  blocks migration activation until resolved or explicitly omitted by a future
+  policy.
 
 ### Playable vs. indexed formats
 
@@ -264,7 +199,7 @@ driven through a thin checked FFI wrapper of our own (see
 
 **Manual hardware verification** (compilation is not playback): on a
 machine with working audio, build either app with `--features cpal`,
-scan a folder containing one known-good file per format — FLAC, WAV,
+import a folder containing one known-good file per format — FLAC, WAV,
 MP3, M4A (iTunes/ffmpeg AAC), Ogg Vorbis, Opus, and an ADTS `.aac` if
 you have one — ideally including 44.1 kHz files on a 48 kHz device and
 a stereo Opus at 48 kHz. Play each fully: expect correct pitch/speed,
@@ -278,17 +213,15 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Playlists, artwork/cover management, gapless playback, crossfade, EQ,
-frequency/spectrum visualizers (the current oscilloscope is a
-time-domain waveform), still-more formats/codecs (AIFF, APE, WavPack,
-ALAC, surround Opus), folder watching, streaming providers, accounts,
-lyrics, installers, and updaters are future milestones. Native OS file
-pickers. External references without copying are intentionally rejected;
-album identities, artwork extraction/preview, and artist deletion are still
-future work. Native dialogs and file-drop are implemented, but cross-platform
-runtime verification is limited to the Linux/X11 environment described below. Nothing in
-this repository makes network requests, collects telemetry, or
-requires an account.
+Ownership transfer and artist deletion, playlist/rating/lyrics UI,
+artwork/cover decoding and display, gapless playback, crossfade, EQ,
+frequency/spectrum visualizers, more codecs, folder watching, streaming,
+accounts, installers and updaters remain future work. External reference
+imports are intentionally rejected in canonical mode. Canonical playlist,
+rating and lyrics storage APIs exist but are not yet exposed as screens.
+Native dialogs and file-drop are implemented; cross-platform runtime
+verification remains limited to Linux/X11. Nothing here makes network
+requests, collects telemetry, or requires an account.
 
 ## Building
 

@@ -1,29 +1,35 @@
 # Canonical Flux library foundation
 
-This document records the audited legacy/portable architecture and the canonical
-storage foundation implemented in `flux-library`. **The canonical engine is not
-yet the GUI/TUI runtime backend.** The existing Controller still opens the
-legacy index or schema-v3 portable store. Do not describe the migration as
-complete until the integration stages below are implemented and tested.
+This document records the canonical storage design and the application
+integration state. The canonical engine is now the normal GUI/TUI runtime
+backend: both front-ends open, create and switch canonical libraries through the
+shared Controller. Legacy and portable schema-v3 formats are explicit migration
+sources; normal front-end workflows no longer select or write them. The public
+Controller still retains compatibility constructors for migration/tests, so
+legacy retirement at the API level is not complete.
 
 ## Audit findings
 
-- The runtime has two persistent backends: the legacy app-data
+- The original runtime had two persistent backends: the legacy app-data
   `library-index.json` (`store.rs`) and the portable schema-v3 segmented
-  catalogue (`portable.rs`, `.flux/`). `flux-app::Controller` selects between
-  them (`new_portable`, `open_default`, `switch_to_*`).
+  catalogue (`portable.rs`, `.flux/`). The integrated Controller now defaults
+  to canonical (`open_default`, `new_canonical`, `switch_to_canonical`); the old
+  constructors remain compatibility/migration APIs.
 - Schema v3 already has stable `TrackId`/`ArtistId`, sparse overrides,
   immutable track segments, catalogue backups, generation checks, path
   validation and an explicit legacy migration (`migrate.rs`).
-- Track metadata scanning still uses `lofty` (`scan.rs`) to read embedded tags
-  for the existing import flow. The new canonical paths never call it.
+- The legacy scanner still uses `lofty` (`scan.rs`), but canonical startup,
+  import inference, editing and migration never call it. The review importer
+  now derives metadata only from filenames/folders.
 - Tracks are physically addressed by absolute paths in the runtime library and
   queue data. Portable records are relative, but the legacy index and runtime
   queue are not guaranteed to be library-owned.
-- There is no AlbumId, playlist persistence, managed artwork or managed lyrics
-  in the current runtime model. Ratings/favorites are not persisted today.
-- The GUI Import Manager is review-first and supports copy/reference; reference
-  mode is incompatible with the canonical ownership rule.
+- AlbumId, playlist, rating/favorite and managed-lyrics runtime types now exist
+  in the canonical engine. GUI/TUI screens for playlists/ratings/lyrics are not
+  implemented.
+- The GUI/TUI Import Manager is review-first and copy-only. Reference imports
+  are rejected in canonical mode; the old portable import tests still cover
+  their compatibility behavior.
 - No external image-decoding dependency is available without approval.
 
 ## Canonical layout
@@ -107,22 +113,27 @@ modifies the source. Destination collisions and existing directories are
 refused. The staging directory is retained on build/rename failure for explicit
 cleanup.
 
-## Known gaps before declaring the redesign complete
+## Known gaps
 
-1. `flux-app::Controller`, GUI and TUI still use the legacy/portable runtime;
-   the canonical engine is not wired to playback, queue, import UI or startup.
-2. Existing import metadata still reads audio tags. Floor inference from
-   filenames/directories, review UI and canonical copy-only publication are not
-   integrated.
-3. Artist ownership transfer/deletion with collaborative tracks, album moves
-   and collision planning is not implemented.
-4. Artwork is copied/validated by extension and bounded size only; there is no
-   image decode/dimension validation and no native image picker.
-5. Lyrics are storage-only; playlists/ratings APIs exist but are not exposed in
-   the GUI/TUI.
-6. Automatic catalogue-backup rollback is not generation-consistent and is
-   therefore disabled; transaction-journal recovery is implemented and tested.
-7. No legacy/portable runtime write path has been removed. Migration
-   compatibility remains in the old modules until integration is complete.
-8. Cross-platform native behavior and real GUI migration were not runtime
+1. The public Controller still exposes the old legacy/portable constructors and
+   switches for migration compatibility and existing tests. No GUI/TUI normal
+   workflow uses them, but the API-level retirement is incomplete.
+2. Import review supports one credited owner artist; ordered featuring credits,
+   release-type review and physical-owner selection are not exposed yet.
+3. Import copy/publication runs synchronously at the canonical commit boundary;
+   cancellation is safe before commit, but there is no background byte-copy
+   progress for very large files.
+4. Artist ownership transfer/deletion with collaborative tracks and album moves
+   is not implemented. Changing physical ownership is refused; destructive
+   deletion is not exposed.
+5. Artwork is copied/validated by extension and bounded size only; there is no
+   image decode/dimension validation or display and no native image picker.
+6. Playlists, ratings/favorites and lyrics have canonical Controller APIs and
+   persistence tests, but no GUI/TUI screens.
+7. Automatic catalogue-backup rollback is not generation-consistent and is
+   disabled; transaction-journal recovery is implemented and tested.
+8. Migration is application-level and bidirectional in the normal UI, but the
+   execute phase is synchronous; very large migrations need background progress
+   and cooperative cancellation.
+9. Cross-platform native behavior and real GUI migration were not runtime
    verified in this stage.
