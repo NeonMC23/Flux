@@ -109,13 +109,62 @@ committed state is an explicit no-op.
 
 ## Artist deletion
 
-`plan_artist_deletion` is a read-only inventory of owned albums/tracks,
-collaborative vs non-collaborative tracks, credited-only tracks and affected
-playlists. Execution is intentionally **not implemented or exposed**: every
-owned track needs an explicit transfer/delete decision, credited-only tracks
-need an explicit replacement credit list, and multi-item resumable recovery must
-exist before destructive deletion can be enabled. No GUI/TUI control deletes an
-artist.
+Artist deletion is a complete explicit workflow, not a directory removal.
+`plan_artist_deletion` builds a generation-tagged preview with:
+
+- every owned track, album, audio and lyrics resource;
+- every credited-only track owned by another artist;
+- ordered credits, physical owners, ratings and playlist references;
+- owned albums, including empty albums and managed covers;
+- eligible surviving owners and all blocking/resource issues.
+
+Each owned track must receive an explicit decision:
+
+- **Transfer** to an eligible surviving credited artist, into an existing album
+  owned by that artist or an explicitly named new release;
+- **Delete** after an explicit irreversible confirmation.
+
+Each credited-only track must receive **RemoveCredit**. Audio, TrackId, owner,
+album and ratings remain unchanged; the deleted artist is removed from the
+ordered credit list. The physical owner must remain credited.
+
+Unresolved tracks, no surviving owner, empty resulting credits, missing
+resources, invalid destinations, collisions, malformed playlists/ratings or a
+changed catalogue block execution. The plan records the catalogue generation
+and per-track album/owner/credit/audio/lyrics/rating snapshots; any relevant
+change rejects the plan as stale.
+
+Execution is **one** canonical transaction, not a sequence of transfers followed
+by an artist delete:
+
+1. revalidate the complete snapshot and every decision;
+2. stage all transferred audio/lyrics and all updated track/album metadata;
+3. stage playlist and ratings updates;
+4. publish staged resources and entity metadata;
+5. publish `catalog.flux` with the complete final state: transfers, credit
+   removals, deleted tracks, removed artist/albums and new albums;
+6. remove obsolete audio, lyrics, album files/covers and `artist.flux` only as
+   journal-owned cleanup;
+7. finalize the journal.
+
+Transfers preserve TrackId, ordered surviving credits, playlist/rating
+references, lyrics and queue identity. Explicit track deletion removes audio,
+track `.flux`, lyrics, rating and playlist entries in the same transaction.
+Queue entries are pruned by the application Controller after commit, and
+playback stops if the current track was deleted. The artist is never removed
+while an owned track or credit reference remains.
+
+The GUI opens **Delete artist** from the Artists setup card, shows the complete
+preview, edits per-track decisions and destinations, shows playlist/rating/lyrics
+consequences, blocks unresolved plans, and commits with an explicit destructive
+button. Cancellation before commit clears the preview and writes nothing. The TUI
+intentionally exposes no destructive deletion shortcut; it directs users to the
+GUI review workflow. No independent TUI transaction logic exists.
+
+The multi-item deletion path runs the same 18-point injected interruption matrix
+plus real child-process aborts at after-journal, metadata publication,
+post-catalogue commit and cleanup. Recovery is verified as complete-old or
+complete-new, never a partially deleted artist; a second recovery is idempotent.
 
 ## Transaction state machine and recovery
 
@@ -282,11 +331,10 @@ cleanup.
 3. Import copy/publication runs synchronously at the canonical commit boundary;
    cancellation is safe before commit, but there is no background byte-copy
    progress for very large files.
-4. Single-track ownership transfer is implemented with copy-first publication,
-   journal cleanup and no-op retry. Whole-album moves and artist-deletion
-   execution are not implemented. Deletion is inventory-only and not exposed;
-   the GUI transfer editor uses an explicit release title to select/create the
-   destination album. TUI refuses transfer and points to the GUI.
+4. Single-track ownership transfer and multi-item artist deletion are implemented
+   with copy-first publication, journal cleanup and no-op retry. Whole-album
+   moves are not implemented. The GUI exposes artist deletion and transfer; the
+   TUI refuses transfer/deletion and points to the GUI.
 5. Artwork is copied/validated by extension and bounded size only; there is no
    image decode/dimension validation or display and no native image picker.
 6. Playlists, ratings/favorites and lyrics have canonical Controller APIs and
@@ -300,7 +348,10 @@ cleanup.
    and cooperative cancellation.
 9. Cross-platform native behavior and real GUI migration were not runtime
    verified in this stage.
-10. ENOSPC and a true second mounted filesystem were not available for testing.
+10. Artist deletion execution is exposed in the GUI only. The TUI deliberately
+    refuses deletion/transfer and points to the GUI; this is a product limitation,
+    not a separate transaction implementation.
+11. ENOSPC and a true second mounted filesystem were not available for testing.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.

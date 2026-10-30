@@ -94,9 +94,10 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   edits the selected track as `title|album|track|disc|artist-id`, `P` creates
   an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. For the queue, `a` appends, `x` plays next, `Delete`
-  removes the current entry, and `Ctrl+↑`/`Ctrl+↓` reorder. The terminal is
-  always restored on exit.
+  migration workflow. `T` refuses ownership transfer and destructive artist
+  deletion, directing the user to the GUI review/confirmation workflow. For the
+  queue, `a` appends, `x` plays next, `Delete` removes the current entry, and
+  `Ctrl+↑`/`Ctrl+↓` reorder. The terminal is always restored on exit.
 
 ### Import Manager
 
@@ -155,8 +156,11 @@ background staging for very large migrations is still future work.
   from IDs, so case-only renames cannot break paths. Single-track ownership
   transfer uses an explicit destination release, copy-first verification and
   journal-owned cleanup; the GUI track editor exposes it, while the TUI refuses
-  and points to the GUI. Artist deletion remains inventory-only and is not
-  exposed until the full decision/transfer/recovery workflow exists.
+  and points to the GUI. **Delete artist** opens the canonical multi-item
+  deletion preview: transfers, credit-only retention and explicit permanent
+  deletions are reviewed per track, with playlist/rating/lyrics consequences,
+  stale-plan checks and one transactional commit. The artist is never removed
+  while a track or credit reference remains.
 - **Import:** every canonical import copies into the library and preserves the
   original extension; sources are never moved, overwritten or deleted.
   Identical content is deduplicated by fingerprint. Existing IDs are preserved
@@ -222,8 +226,8 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Whole-album moves and artist-deletion execution, playlist/rating/lyrics UI,
-artwork/cover decoding and display, gapless playback, crossfade, EQ,
+Whole-album ownership moves, playlist/rating/lyrics UI, artwork/cover decoding
+and display, gapless playback, crossfade, EQ,
 frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
 imports are intentionally rejected in canonical mode. Canonical playlist,
