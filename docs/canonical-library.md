@@ -143,6 +143,53 @@ playlist impact, credit blockers and explicit credit decisions. Cancellation
 writes nothing; stale plans are rejected. The TUI shows album ownership and
 directs album transfer to the GUI rather than offering an unsafe shortcut.
 
+## Independent album lifecycle
+
+Albums are first-class catalogue entities even with zero tracks. `create_album`
+writes `album.flux`, registers the stable AlbumId in `catalog.flux`, and never
+creates placeholder audio. Album title/release type can be edited without
+changing AlbumId or paths. Duplicate owner/title combinations are rejected.
+
+The GUI album list is catalogue-derived, not track-derived, so empty albums are
+visible. Selecting one opens a dedicated album detail view with AlbumId, owner,
+release type, track count, ordered track list, cover status and actions for
+metadata, artwork, transfer, reorder and empty-album deletion. Empty albums show
+a deliberate empty state rather than disappearing. The TUI `E` command lists all
+catalogue albums with owner, track count and cover availability; `D` shows the
+selected track's album.
+
+### Album artwork
+
+`set_cover` assigns or replaces the single managed cover file and cleans the
+previous cover only after commit. `remove_cover` clears the reference and
+journal-cleans the file. Missing declared covers are reported in GUI detail and
+block album transfer; PNG/JPEG/WebP extension and a bound of 16 MiB are checked,
+but image decoding/dimensions are not available without a new dependency.
+
+### Album ordering
+
+`set_album_track_order` requires exactly the existing track set, validates album
+membership, and writes the canonical album order. `reorder_album_track` moves one
+stable TrackId without recreating it. Order persists in `album.flux`, survives
+reopen and is never inferred from directory enumeration. Disc/track number fields
+are preserved independently; no disc numbers are invented.
+
+### Empty-album deletion and populated albums
+
+`delete_empty_album` is transactional and refuses an album containing tracks.
+Populated album deletion is blocked in the GUI; tracks must first be transferred
+or explicitly deleted through the existing reviewed workflows. Empty deletion
+removes `album.flux` and any cover as journal cleanup; the artist remains.
+
+### Import into an existing album
+
+`Controller::import_canonical_track_into_album` forces the album owner as physical
+owner, appends the new track to the existing album order and preserves title,
+release type and cover. The GUI Import Manager still routes through its normal
+artist/album review; a dedicated "target this AlbumId" review control is not yet
+implemented, so empty albums are currently populated by importing a matching
+owner/title through the existing manager or by application API.
+
 ## Artist deletion
 
 Artist deletion is a complete explicit workflow, not a directory removal.
@@ -385,10 +432,13 @@ cleanup.
    and cooperative cancellation.
 9. Cross-platform native behavior and real GUI migration were not runtime
    verified in this stage.
-10. Artist deletion execution is exposed in the GUI only. The TUI deliberately
+10. The GUI Import Manager does not yet have a dedicated target-AlbumId entry
+    point, although the Controller supports importing directly into an existing
+    album. Empty albums are otherwise fully first-class.
+11. Artist deletion execution is exposed in the GUI only. The TUI deliberately
     refuses deletion/transfer and points to the GUI; this is a product limitation,
     not a separate transaction implementation.
-11. ENOSPC and a true second mounted filesystem were not available for testing.
+12. ENOSPC and a true second mounted filesystem were not available for testing.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.

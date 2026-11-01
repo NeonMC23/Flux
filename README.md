@@ -94,8 +94,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   edits the selected track as `title|album|track|disc|artist-id`, `P` creates
   an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. `D` shows album ownership and whether tracks are
-  credited-only. `T` refuses ownership transfer and destructive artist deletion,
+  migration workflow. `D` shows the selected track's album ownership; `E` lists
+  every catalogue album, including empty albums, with owner, track count and
+  cover availability. `T` refuses ownership transfer and destructive artist deletion,
   directing the user to the GUI review/confirmation workflow. For the
   queue, `a` appends, `x` plays next, `Delete` removes the current entry, and
   `Ctrl+↑`/`Ctrl+↓` reorder. The terminal is always restored on exit.
@@ -165,7 +166,10 @@ background staging for very large migrations is still future work.
   **Transfer album…**: AlbumId, TrackIds, order, cover, lyrics, ratings,
   playlists and queue references are preserved; missing destination credits
   require an explicit per-track decision, and merging into another AlbumId is
-  intentionally blocked.
+  intentionally blocked. Albums are catalogue-first: empty albums remain
+  visible in the album list with a dedicated detail view for metadata, cover,
+  ordering, transfer and safe empty-album deletion. Populated album deletion is
+  blocked until tracks are transferred or explicitly deleted.
 - **Import:** every canonical import copies into the library and preserves the
   original extension; sources are never moved, overwritten or deleted.
   Identical content is deduplicated by fingerprint. Existing IDs are preserved
