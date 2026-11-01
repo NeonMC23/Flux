@@ -7136,3 +7136,1092 @@ mod deletion_process_tests {
         }
     }
 }
+
+// ------------------------------------------------ album ownership ---
+
+/// One track in an immutable whole-album transfer plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumTransferTrack {
+    /// Stable track identity.
+    pub track_id: TrackId,
+    /// Track title.
+    pub title: String,
+    /// Current physical owner (source album owner).
+    pub owner_artist_id: ArtistId,
+    /// Ordered credits at plan time.
+    pub credited_artist_ids: Vec<ArtistId>,
+    /// Canonical audio path at plan time.
+    pub audio_path: RelPath,
+    /// Managed lyrics path, if any.
+    pub lyrics_path: Option<RelPath>,
+    /// Lyrics content fingerprint at plan time.
+    pub lyrics_fingerprint: Option<ContentFingerprint>,
+    /// Rating/favorite at plan time.
+    pub rating: Option<TrackRating>,
+    /// Playlists referencing this track.
+    pub playlist_ids: Vec<PlaylistId>,
+    /// Whether the destination artist is absent from the credits.
+    pub requires_credit: bool,
+    /// Explicit review decision allowing the destination credit to be appended.
+    pub credit_allowed: bool,
+}
+
+/// Immutable, generation-aware whole-album transfer plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumTransferPlan {
+    /// Album whose ownership changes.
+    pub album_id: AlbumId,
+    /// Current owner.
+    pub from_owner: ArtistId,
+    /// Destination owner.
+    pub to_owner: ArtistId,
+    /// Album title.
+    pub title: String,
+    /// Release type.
+    pub release_type: ReleaseType,
+    /// Managed cover path at plan time.
+    pub cover: Option<RelPath>,
+    /// Cover content fingerprint.
+    pub cover_fingerprint: Option<ContentFingerprint>,
+    /// Ordered track list.
+    pub track_order: Vec<TrackId>,
+    /// Per-track snapshots and credit decisions.
+    pub tracks: Vec<AlbumTransferTrack>,
+    /// Catalogue generation captured by the plan.
+    pub generation: u64,
+    /// Blocking issues.
+    pub issues: Vec<String>,
+    /// Resource/ownership issues independent of credit decisions.
+    snapshot_issues: Vec<String>,
+}
+
+impl AlbumTransferPlan {
+    /// Whether the plan contains no blockers and every required credit decision
+    /// is resolved.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.issues.is_empty()
+    }
+
+    /// First blocking issue.
+    #[must_use]
+    pub fn blocking_reason(&self) -> Option<&str> {
+        self.issues.first().map(String::as_str)
+    }
+
+    /// Track IDs that need an explicit destination-credit decision.
+    #[must_use]
+    pub fn credit_decision_tracks(&self) -> Vec<TrackId> {
+        self.tracks
+            .iter()
+            .filter(|track| track.requires_credit)
+            .map(|track| track.track_id)
+            .collect()
+    }
+
+    /// Allows or rejects appending the destination artist to one track's
+    /// credits. The destination artist becomes physical owner regardless; a
+    /// rejected track blocks the whole transfer.
+    pub fn set_credit_allowed(&mut self, track_id: TrackId, allowed: bool) -> Result<(), String> {
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.track_id == track_id)
+            .ok_or_else(|| format!("track {track_id} is not in this album"))?;
+        if !track.requires_credit {
+            return Err("the destination artist is already credited".to_owned());
+        }
+        track.credit_allowed = allowed;
+        self.refresh_issues();
+        Ok(())
+    }
+
+    fn refresh_issues(&mut self) {
+        let snapshot_issues = self.snapshot_issues.clone();
+        self.issues.clear();
+        self.issues.extend(snapshot_issues);
+        for track in &self.tracks {
+            if track.requires_credit && !track.credit_allowed {
+                self.issues.push(format!(
+                    "track {} requires explicit destination-credit approval",
+                    track.track_id
+                ));
+            }
+        }
+    }
+}
+
+/// Result of a committed whole-album transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumTransferReport {
+    /// Stable AlbumId.
+    pub album_id: AlbumId,
+    /// Previous owner.
+    pub from_owner: ArtistId,
+    /// New owner.
+    pub to_owner: ArtistId,
+    /// Number of tracks transferred.
+    pub tracks: usize,
+    /// New relative album directory.
+    pub album_path: RelPath,
+}
+
+impl CanonicalLibrary {
+    /// Albums physically owned by an artist.
+    pub fn albums_owned_by(&self, artist: ArtistId) -> impl Iterator<Item = &CanonicalAlbum> + '_ {
+        self.albums
+            .values()
+            .filter(move |album| album.owner_artist_id == artist)
+    }
+
+    /// Albums containing at least one track credited to an artist but owned by
+    /// another artist.
+    #[must_use]
+    pub fn albums_credited_for(&self, artist: ArtistId) -> Vec<AlbumId> {
+        self.tracks
+            .values()
+            .filter(|track| track.credited_artist_ids.contains(&artist))
+            .map(|track| track.album_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|album_id| {
+                self.albums
+                    .get(album_id)
+                    .is_some_and(|album| album.owner_artist_id != artist)
+            })
+            .collect()
+    }
+
+    /// Builds a whole-album transfer plan. The destination is a new location
+    /// under the destination artist with the same AlbumId; merging into a
+    /// different existing AlbumId is intentionally rejected by design.
+    pub fn plan_album_transfer(
+        &self,
+        album_id: AlbumId,
+        to_owner: ArtistId,
+    ) -> Result<AlbumTransferPlan, CanonicalError> {
+        let album = self.albums.get(&album_id).ok_or_else(|| {
+            CanonicalError::Invalid(format!("album {album_id} is not in the library"))
+        })?;
+        if !self.artists.contains_key(&to_owner) {
+            return Err(CanonicalError::Invalid(format!(
+                "destination artist {to_owner} is not in the library"
+            )));
+        }
+        if album.owner_artist_id == to_owner {
+            return Err(CanonicalError::Invalid(
+                "album already belongs to the destination artist".to_owned(),
+            ));
+        }
+        let from_owner = album.owner_artist_id;
+        let old_album_rel = album_rel(from_owner, album_id);
+        let new_album_rel = album_rel(to_owner, album_id);
+        let cover = album.cover.as_ref().map(|cover| {
+            RelPath::from_utf8(&format!("{}/{}", old_album_rel.display_lossy(), cover))
+                .expect("cover path is valid")
+        });
+        let mut issues = Vec::new();
+        let cover_fingerprint = match cover.as_ref() {
+            Some(path) => match safe_join(&self.root, path)
+                .and_then(|path| ContentFingerprint::of_file(&path))
+            {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(_) => {
+                    issues.push("managed cover is missing or unreadable".to_owned());
+                    None
+                }
+            },
+            None => None,
+        };
+        if safe_join(&self.root, &new_album_rel)?.exists() {
+            issues.push(format!(
+                "destination album directory already exists: {}",
+                new_album_rel.display_lossy()
+            ));
+        }
+        let mut tracks = Vec::new();
+        for track_id in &album.track_order {
+            let track = self.tracks.get(track_id).ok_or_else(|| {
+                CanonicalError::Invalid(format!("album references missing track {track_id}"))
+            })?;
+            if track.album_id != album_id || track.owner_artist_id != from_owner {
+                issues.push(format!(
+                    "track {track_id} ownership/album is inconsistent with the source album"
+                ));
+            }
+            let audio_path = self.track_paths[track_id].clone();
+            let record_path = self.track_records[track_id].clone();
+            let lyrics_path = track
+                .lyrics
+                .as_ref()
+                .and_then(|lyrics| plan_track_lyrics_rel(&record_path, Some(lyrics)));
+            let lyrics_fingerprint = lyrics_path.as_ref().and_then(|path| {
+                safe_join(&self.root, path)
+                    .ok()
+                    .and_then(|path| ContentFingerprint::of_file(&path).ok())
+            });
+            if !self.track_available(*track_id) {
+                issues.push(format!("track {track_id} audio is missing"));
+            }
+            if track.lyrics.is_some() && lyrics_fingerprint.is_none() {
+                issues.push(format!("track {track_id} lyrics are missing"));
+            }
+            let extension = audio_path
+                .display_lossy()
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.to_owned())
+                .unwrap_or_default();
+            let new_audio = track_audio_rel(to_owner, album_id, *track_id, &extension);
+            let new_record = track_record_rel(to_owner, album_id, *track_id);
+            if safe_join(&self.root, &new_audio)?.exists()
+                || safe_join(&self.root, &new_record)?.exists()
+                || lyrics_path.as_ref().is_some_and(|old| {
+                    let new_lyrics = plan_track_lyrics_rel(
+                        &new_record,
+                        Some(
+                            old.display_lossy()
+                                .rsplit_once('/')
+                                .map_or("", |(_, name)| name),
+                        ),
+                    );
+                    new_lyrics
+                        .is_some_and(|new| safe_join(&self.root, &new).is_ok_and(|p| p.exists()))
+                })
+            {
+                issues.push(format!("track {track_id} destination path collision"));
+            }
+            let requires_credit = !track.credited_artist_ids.contains(&to_owner);
+            tracks.push(AlbumTransferTrack {
+                track_id: *track_id,
+                title: track.title.clone(),
+                owner_artist_id: track.owner_artist_id,
+                credited_artist_ids: track.credited_artist_ids.clone(),
+                audio_path,
+                lyrics_path,
+                lyrics_fingerprint,
+                rating: self.rating(*track_id),
+                playlist_ids: self
+                    .playlists
+                    .values()
+                    .filter(|playlist| playlist.track_ids.contains(track_id))
+                    .map(|playlist| playlist.id)
+                    .collect(),
+                requires_credit,
+                credit_allowed: false,
+            });
+        }
+        let mut plan = AlbumTransferPlan {
+            album_id,
+            from_owner,
+            to_owner,
+            title: album.title.clone(),
+            release_type: album.release_type,
+            cover,
+            cover_fingerprint,
+            track_order: album.track_order.clone(),
+            tracks,
+            generation: self.catalog.generation,
+            issues: Vec::new(),
+            snapshot_issues: issues,
+        };
+        plan.refresh_issues();
+        Ok(plan)
+    }
+
+    /// Executes an album transfer as one catalogue transaction. The plan must
+    /// still match the catalogue generation and all track/cover/lyrics
+    /// snapshots. The destination album keeps the same AlbumId and every track
+    /// keeps its TrackId and order.
+    pub fn execute_album_transfer(
+        &mut self,
+        plan: &AlbumTransferPlan,
+    ) -> Result<AlbumTransferReport, CanonicalError> {
+        self.ensure_writable()?;
+        self.ensure_no_pending_transactions()?;
+        if plan.generation != self.catalog.generation {
+            return Err(CanonicalError::Invalid(
+                "album transfer plan is stale: catalogue generation changed; re-plan".to_owned(),
+            ));
+        }
+        if !plan.is_ready() {
+            return Err(CanonicalError::Invalid(format!(
+                "album transfer is blocked: {}",
+                plan.blocking_reason().unwrap_or("unknown issue")
+            )));
+        }
+        let album = self.albums.get(&plan.album_id).cloned().ok_or_else(|| {
+            CanonicalError::Invalid("album disappeared since transfer preview".to_owned())
+        })?;
+        if album.owner_artist_id != plan.from_owner
+            || album.title != plan.title
+            || album.release_type != plan.release_type
+            || album.track_order != plan.track_order
+            || album_cover_rel(&album)? != plan.cover
+        {
+            return Err(CanonicalError::Invalid(
+                "album metadata changed since transfer preview; re-plan".to_owned(),
+            ));
+        }
+        if !self.artists.contains_key(&plan.to_owner) {
+            return Err(CanonicalError::Invalid(
+                "destination artist disappeared; re-plan".to_owned(),
+            ));
+        }
+        if plan.tracks.len() != plan.track_order.len() {
+            return Err(CanonicalError::Invalid(
+                "album transfer plan is missing tracks".to_owned(),
+            ));
+        }
+        let new_album_rel = album_rel(plan.to_owner, plan.album_id);
+        if safe_join(&self.root, &new_album_rel)?.exists() {
+            return Err(CanonicalError::Invalid(
+                "destination album directory already exists; re-plan".to_owned(),
+            ));
+        }
+        let old_album_rel = album_rel(plan.from_owner, plan.album_id);
+        let cover = plan.cover.as_ref().map(|old| {
+            let name = old
+                .display_lossy()
+                .rsplit_once('/')
+                .map_or("", |(_, name)| name)
+                .to_owned();
+            RelPath::from_utf8(&format!("{}/{}", new_album_rel.display_lossy(), name))
+                .expect("new cover path is valid")
+        });
+        let mut writes = Vec::new();
+        let mut cleanup = vec![RelPath::from_utf8(&format!(
+            "{}/album.flux",
+            old_album_rel.display_lossy()
+        ))?];
+        if let Some(old_cover) = &plan.cover {
+            cleanup.push(old_cover.clone());
+        }
+        let mut catalog = self.catalog.clone();
+        let album_dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: album.id.get(),
+            owner_artist_id: plan.to_owner.get(),
+            title: album.title,
+            release_type: album.release_type,
+            cover: album.cover.clone(),
+            track_order: album.track_order.iter().map(|id| id.get()).collect(),
+        };
+        push_entity_write(&mut writes, &new_album_rel, "album.flux", &album_dto)?;
+        if let (Some(old), Some(new), Some(expected)) =
+            (&plan.cover, &cover, plan.cover_fingerprint)
+        {
+            writes.push(PendingWrite {
+                target: new.clone(),
+                bytes: None,
+                copy_from: Some(safe_join(&self.root, old)?),
+                expected: Some(expected),
+            });
+        }
+        let mut updated_tracks = Vec::new();
+        for planned in &plan.tracks {
+            let track = self.tracks.get(&planned.track_id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("track {} disappeared", planned.track_id))
+            })?;
+            if track.owner_artist_id != plan.from_owner
+                || track.album_id != plan.album_id
+                || track.credited_artist_ids != planned.credited_artist_ids
+                || track.title != planned.title
+                || self.track_paths[&track.id] != planned.audio_path
+                || self.rating(track.id) != planned.rating
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} changed since transfer preview; re-plan",
+                    planned.track_id
+                )));
+            }
+            let current_lyrics = track.lyrics.as_deref().and_then(|lyrics| {
+                plan_track_lyrics_rel(&self.track_records[&track.id], Some(lyrics))
+            });
+            let current_lyrics_fingerprint = current_lyrics.as_ref().and_then(|path| {
+                safe_join(&self.root, path)
+                    .ok()
+                    .and_then(|path| ContentFingerprint::of_file(&path).ok())
+            });
+            if current_lyrics != planned.lyrics_path
+                || current_lyrics_fingerprint != planned.lyrics_fingerprint
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} lyrics changed since transfer preview; re-plan",
+                    planned.track_id
+                )));
+            }
+            if planned.requires_credit && !planned.credit_allowed {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} still requires a destination-credit decision",
+                    planned.track_id
+                )));
+            }
+            let mut credits = track.credited_artist_ids.clone();
+            if !credits.contains(&plan.to_owner) {
+                credits.push(plan.to_owner);
+            }
+            let old_audio = self.track_paths[&track.id].clone();
+            let old_record = self.track_records[&track.id].clone();
+            let extension = old_audio
+                .display_lossy()
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.to_owned())
+                .ok_or_else(|| CanonicalError::Invalid("audio has no extension".to_owned()))?;
+            let new_audio = track_audio_rel(plan.to_owner, plan.album_id, track.id, &extension);
+            let new_record = track_record_rel(plan.to_owner, plan.album_id, track.id);
+            if safe_join(&self.root, &new_audio)?.exists()
+                || safe_join(&self.root, &new_record)?.exists()
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {} destination collision",
+                    track.id
+                )));
+            }
+            let lyrics = track.lyrics.clone();
+            let new_lyrics = lyrics.as_ref().map(|name| {
+                RelPath::from_utf8(&format!(
+                    "{}/{}",
+                    new_record
+                        .display_lossy()
+                        .rsplit_once('/')
+                        .map_or("", |(dir, _)| dir),
+                    name
+                ))
+                .expect("lyrics path is valid")
+            });
+            let track_dto = TrackEntityDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: TRACK_KIND.to_owned(),
+                id: track.id.get(),
+                title: track.title.clone(),
+                credited_artist_ids: credits.iter().map(|artist| artist.get()).collect(),
+                owner_artist_id: plan.to_owner.get(),
+                album_id: plan.album_id.get(),
+                track_number: track.track_number,
+                disc_number: track.disc_number,
+                duration_ms: track.duration_ms,
+                lyrics,
+                fingerprint: track.fingerprint,
+            };
+            push_file_write(&mut writes, &new_record, &track_dto)?;
+            writes.push(PendingWrite {
+                target: new_audio.clone(),
+                bytes: None,
+                copy_from: Some(safe_join(&self.root, &old_audio)?),
+                expected: track
+                    .fingerprint
+                    .or(Some(ContentFingerprint::of_file(&safe_join(
+                        &self.root, &old_audio,
+                    )?)?)),
+            });
+            if let (Some(old), Some(new)) = (current_lyrics, new_lyrics) {
+                writes.push(PendingWrite {
+                    target: new,
+                    bytes: Some(fs::read(safe_join(&self.root, &old)?)?),
+                    copy_from: None,
+                    expected: None,
+                });
+            }
+            cleanup.extend([old_audio, old_record]);
+            if let Some(lyrics) = planned.lyrics_path.clone() {
+                cleanup.push(lyrics);
+            }
+            let descriptor = catalog
+                .tracks
+                .iter_mut()
+                .find(|entry| entry.id == track.id.get())
+                .ok_or_else(|| CanonicalError::Invalid("catalogue track missing".to_owned()))?;
+            descriptor.owner_artist_id = plan.to_owner.get();
+            descriptor.audio_path = new_audio.display_lossy();
+            descriptor.record_path = new_record.display_lossy();
+            updated_tracks.push(track.id);
+        }
+        if updated_tracks != plan.track_order {
+            return Err(CanonicalError::Invalid(
+                "album transfer plan track order is inconsistent".to_owned(),
+            ));
+        }
+        let album_entry = catalog
+            .albums
+            .iter_mut()
+            .find(|entry| entry.id == plan.album_id.get())
+            .ok_or_else(|| CanonicalError::Invalid("catalogue album missing".to_owned()))?;
+        album_entry.artist_id = plan.to_owner.get();
+        album_entry.path = new_album_rel.display_lossy();
+        self.commit_writes_with_cleanup(Some(catalog), writes, cleanup)?;
+        self.reopen_after()?;
+        Ok(AlbumTransferReport {
+            album_id: plan.album_id,
+            from_owner: plan.from_owner,
+            to_owner: plan.to_owner,
+            tracks: plan.tracks.len(),
+            album_path: new_album_rel,
+        })
+    }
+}
+
+#[cfg(test)]
+mod album_transfer_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    struct Fixture {
+        _dir: TempDir,
+        root: std::path::PathBuf,
+        library: CanonicalLibrary,
+        a: ArtistId,
+        b: ArtistId,
+        album: AlbumId,
+        first: TrackId,
+        second: TrackId,
+        playlist: PlaylistId,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let dir = TempDir::new(name);
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let b = library.create_artist("B", Vec::new()).expect("B");
+        let source = dir.write("source/first.wav", b"album first");
+        let first = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "First".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: Some(1),
+                duration_ms: None,
+            })
+            .expect("first");
+        let source = dir.write("source/second.wav", b"album second");
+        let second = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Second".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a],
+                album_title: Some("Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: Some(1),
+                duration_ms: None,
+            })
+            .expect("second");
+        let album = library.track(first).expect("first").album_id;
+        library
+            .set_lyrics(first, Some("first lyrics"))
+            .expect("lyrics");
+        library
+            .set_lyrics(second, Some("second lyrics"))
+            .expect("lyrics");
+        library.set_rating(first, Some(5), true).expect("rating");
+        let playlist = library
+            .set_playlist(None, "Album list", vec![first, second])
+            .expect("playlist");
+        let cover = dir.write("art/cover.png", b"cover bytes");
+        library.set_cover(album, &cover, "png").expect("cover");
+        Fixture {
+            _dir: dir,
+            root,
+            library,
+            a,
+            b,
+            album,
+            first,
+            second,
+            playlist,
+        }
+    }
+
+    #[test]
+    fn album_transfer_preserves_ids_order_cover_lyrics_ratings_and_playlist() {
+        let mut fx = fixture("album-transfer");
+        let mut plan = fx
+            .library
+            .plan_album_transfer(fx.album, fx.b)
+            .expect("plan");
+        assert!(!plan.is_ready());
+        assert_eq!(plan.credit_decision_tracks(), vec![fx.second]);
+        plan.set_credit_allowed(fx.second, true)
+            .expect("credit decision");
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        let old_album_dir = fx.library.album_dir(fx.album).expect("old album");
+        let old_cover = old_album_dir.join("cover.png");
+        let old_audio = fx.library.track_audio_path(fx.first).expect("old audio");
+        let report = fx.library.execute_album_transfer(&plan).expect("transfer");
+        assert_eq!(report.album_id, fx.album);
+        assert_eq!(report.from_owner, fx.a);
+        assert_eq!(report.to_owner, fx.b);
+        assert_eq!(report.tracks, 2);
+        let album = fx.library.album(fx.album).expect("album retained");
+        assert_eq!(album.owner_artist_id, fx.b);
+        assert_eq!(album.track_order, vec![fx.first, fx.second]);
+        assert_eq!(album.title, "Album");
+        assert_eq!(album.release_type, ReleaseType::Album);
+        let new_album_dir = fx.library.album_dir(fx.album).expect("new album");
+        assert!(new_album_dir.starts_with(fx.library.artist_dir(fx.b).expect("B dir")));
+        assert_eq!(
+            fs::read(new_album_dir.join("cover.png")).expect("cover"),
+            b"cover bytes"
+        );
+        assert!(!old_cover.exists());
+        assert!(!old_album_dir.join("album.flux").exists());
+        assert!(!old_audio.exists());
+        let first = fx.library.track(fx.first).expect("first");
+        let second = fx.library.track(fx.second).expect("second");
+        assert_eq!(first.owner_artist_id, fx.b);
+        assert_eq!(second.owner_artist_id, fx.b);
+        assert_eq!(first.credited_artist_ids, vec![fx.a, fx.b]);
+        assert_eq!(second.credited_artist_ids, vec![fx.a, fx.b]);
+        assert_eq!(first.track_number, Some(1));
+        assert_eq!(second.track_number, Some(2));
+        assert_eq!(
+            fs::read(fx.library.track_audio_path(fx.first).expect("first audio")).expect("audio"),
+            b"album first"
+        );
+        assert_eq!(
+            fs::read(
+                fx.library
+                    .track_audio_path(fx.second)
+                    .expect("second audio")
+            )
+            .expect("audio"),
+            b"album second"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.library.track_lyrics_path(fx.first).expect("lyrics"))
+                .expect("lyrics"),
+            "first lyrics"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.library.track_lyrics_path(fx.second).expect("lyrics"))
+                .expect("lyrics"),
+            "second lyrics"
+        );
+        assert_eq!(
+            fx.library.rating(fx.first),
+            Some(TrackRating {
+                rating: Some(5),
+                favorite: true
+            })
+        );
+        assert_eq!(
+            fx.library
+                .playlist(fx.playlist)
+                .map(|playlist| playlist.track_ids.clone()),
+            Some(vec![fx.first, fx.second])
+        );
+        assert!(fx.library.albums_owned_by(fx.a).next().is_none());
+        assert_eq!(
+            fx.library
+                .albums_owned_by(fx.b)
+                .map(|album| album.id)
+                .collect::<Vec<_>>(),
+            vec![fx.album]
+        );
+        drop(fx.library);
+        let reopened = CanonicalLibrary::open(&fx.root).expect("reopen");
+        assert_eq!(
+            reopened.album(fx.album).map(|album| album.owner_artist_id),
+            Some(fx.b)
+        );
+        assert_eq!(
+            reopened
+                .album(fx.album)
+                .map(|album| album.track_order.clone()),
+            Some(vec![fx.first, fx.second])
+        );
+    }
+
+    fn album_committed(point: TransactionFailPoint) -> bool {
+        matches!(
+            point,
+            TransactionFailPoint::AfterCatalogPublish
+                | TransactionFailPoint::BeforeCleanup
+                | TransactionFailPoint::DuringCleanup
+                | TransactionFailPoint::DuringLyricsCleanup
+                | TransactionFailPoint::AfterCleanup
+                | TransactionFailPoint::BeforeJournalFinalize
+        )
+    }
+
+    #[test]
+    fn album_transfer_failure_matrix_is_all_or_nothing() {
+        let points = [
+            TransactionFailPoint::BeforeJournal,
+            TransactionFailPoint::AfterJournal,
+            TransactionFailPoint::BeforeStaging,
+            TransactionFailPoint::DuringCopy,
+            TransactionFailPoint::DuringAudioCopy,
+            TransactionFailPoint::AfterAudioCopyBeforeVerify,
+            TransactionFailPoint::DuringLyricsCopy,
+            TransactionFailPoint::AfterCopyBeforeVerify,
+            TransactionFailPoint::AfterVerify,
+            TransactionFailPoint::BeforeMetadataPublish,
+            TransactionFailPoint::DuringMetadataPublish,
+            TransactionFailPoint::BeforeCatalogPublish,
+            TransactionFailPoint::AfterCatalogPublish,
+            TransactionFailPoint::BeforeCleanup,
+            TransactionFailPoint::DuringCleanup,
+            TransactionFailPoint::DuringLyricsCleanup,
+            TransactionFailPoint::AfterCleanup,
+            TransactionFailPoint::BeforeJournalFinalize,
+        ];
+        for point in points {
+            let mut fx = fixture(&format!("album-matrix-{point:?}"));
+            let old_album_dir = fx.library.album_dir(fx.album).expect("old dir");
+            let old_cover = old_album_dir.join("cover.png");
+            let old_audio = fx.library.track_audio_path(fx.first).expect("old audio");
+            let mut plan = fx
+                .library
+                .plan_album_transfer(fx.album, fx.b)
+                .expect("plan");
+            plan.set_credit_allowed(fx.second, true).expect("credit");
+            assert!(plan.is_ready());
+            fx.library.set_transaction_failure(Some(TransactionFailure {
+                point,
+                interrupt: true,
+                abort: false,
+            }));
+            assert!(
+                fx.library.execute_album_transfer(&plan).is_err(),
+                "{point:?}"
+            );
+            drop(fx.library);
+            let reopened = CanonicalLibrary::open(&fx.root)
+                .unwrap_or_else(|err| panic!("{point:?} recovery failed: {err}"));
+            let committed = album_committed(point);
+            assert_eq!(
+                reopened.album(fx.album).map(|album| album.owner_artist_id),
+                Some(if committed { fx.b } else { fx.a }),
+                "{point:?} album owner"
+            );
+            assert_eq!(
+                reopened
+                    .album(fx.album)
+                    .map(|album| album.track_order.clone()),
+                Some(vec![fx.first, fx.second]),
+                "{point:?} order"
+            );
+            let new_album_dir = fx.root.join(
+                album_rel(fx.b, fx.album)
+                    .to_os_path()
+                    .expect("new album path"),
+            );
+            if committed {
+                assert!(!old_cover.exists());
+                assert!(!old_audio.exists());
+                assert!(new_album_dir.join("cover.png").is_file());
+                assert_eq!(
+                    fs::read(new_album_dir.join("cover.png")).expect("cover"),
+                    b"cover bytes"
+                );
+                assert_eq!(
+                    reopened
+                        .track(fx.second)
+                        .map(|track| track.credited_artist_ids.clone()),
+                    Some(vec![fx.a, fx.b])
+                );
+                assert_eq!(
+                    fs::read_to_string(reopened.track_lyrics_path(fx.first).expect("lyrics"))
+                        .expect("lyrics"),
+                    "first lyrics"
+                );
+            } else {
+                assert!(old_cover.is_file());
+                assert!(old_audio.is_file());
+                assert!(!new_album_dir.join("album.flux").exists());
+                assert!(!new_album_dir.join("cover.png").exists());
+                assert_eq!(
+                    reopened
+                        .track(fx.second)
+                        .map(|track| track.credited_artist_ids.clone()),
+                    Some(vec![fx.a])
+                );
+            }
+            assert_eq!(
+                reopened.rating(fx.first),
+                Some(TrackRating {
+                    rating: Some(5),
+                    favorite: true
+                })
+            );
+            assert_eq!(
+                reopened
+                    .playlist(fx.playlist)
+                    .map(|playlist| playlist.track_ids.clone()),
+                Some(vec![fx.first, fx.second])
+            );
+            drop(reopened);
+            assert!(
+                CanonicalLibrary::open(&fx.root).is_ok(),
+                "{point:?} idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn unapproved_credit_blocks_album_transfer() {
+        let mut fx = fixture("album-blocked-credit");
+        let plan = fx
+            .library
+            .plan_album_transfer(fx.album, fx.b)
+            .expect("plan");
+        assert!(!plan.is_ready());
+        assert!(fx.library.execute_album_transfer(&plan).is_err());
+        assert_eq!(
+            fx.library
+                .album(fx.album)
+                .map(|album| album.owner_artist_id),
+            Some(fx.a)
+        );
+        assert_eq!(
+            fx.library
+                .track(fx.second)
+                .map(|track| track.owner_artist_id),
+            Some(fx.a)
+        );
+    }
+
+    #[test]
+    fn album_transfer_detects_destination_collision_and_stale_rating() {
+        let mut fx = fixture("album-collision");
+        let target = album_rel(fx.b, fx.album);
+        fs::create_dir_all(safe_join(&fx.root, &target).expect("target")).expect("target dir");
+        let plan = fx
+            .library
+            .plan_album_transfer(fx.album, fx.b)
+            .expect("plan");
+        assert!(!plan.is_ready(), "existing album directory blocks");
+        assert!(fx.library.execute_album_transfer(&plan).is_err());
+        let mut plan = {
+            fs::remove_dir_all(safe_join(&fx.root, &target).expect("target"))
+                .expect("remove target");
+            fx.library
+                .plan_album_transfer(fx.album, fx.b)
+                .expect("plan")
+        };
+        plan.set_credit_allowed(fx.second, true).expect("credit");
+        fx.library
+            .set_rating(fx.first, Some(1), false)
+            .expect("stale rating");
+        assert!(fx.library.execute_album_transfer(&plan).is_err());
+        assert_eq!(
+            fx.library
+                .album(fx.album)
+                .map(|album| album.owner_artist_id),
+            Some(fx.a)
+        );
+    }
+
+    #[test]
+    fn missing_managed_cover_blocks_album_transfer() {
+        let fx = fixture("album-missing-cover");
+        let cover = fx
+            .library
+            .album_dir(fx.album)
+            .expect("album dir")
+            .join("cover.png");
+        fs::remove_file(&cover).expect("remove cover");
+        let plan = fx
+            .library
+            .plan_album_transfer(fx.album, fx.b)
+            .expect("plan");
+        assert!(!plan.is_ready());
+        assert!(
+            plan.issues.iter().any(|issue| issue.contains("cover")),
+            "{:?}",
+            plan.issues
+        );
+    }
+
+    #[test]
+    fn empty_album_transfer_moves_album_and_cover() {
+        let dir = TempDir::new("album-empty");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let b = library.create_artist("B", Vec::new()).expect("B");
+        let album = library
+            .create_album(a, "Empty", ReleaseType::Ep)
+            .expect("album");
+        let cover = dir.write("cover.png", b"empty cover");
+        library.set_cover(album, &cover, "png").expect("cover");
+        let plan = library.plan_album_transfer(album, b).expect("plan");
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        let report = library.execute_album_transfer(&plan).expect("transfer");
+        assert_eq!(report.tracks, 0);
+        assert_eq!(
+            library.album(album).map(|album| album.owner_artist_id),
+            Some(b)
+        );
+        assert_eq!(
+            library.album(album).map(|album| album.track_order.clone()),
+            Some(Vec::new())
+        );
+        assert!(
+            library
+                .album_dir(album)
+                .expect("dir")
+                .join("cover.png")
+                .is_file()
+        );
+    }
+
+    #[cfg(test)]
+    mod album_process_tests {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::process::{Command, Stdio};
+
+        use super::*;
+        use crate::test_support::TempDir;
+
+        const ROOT: &str = "FLUX_TEST_ALBUM_ROOT";
+        const POINT: &str = "FLUX_TEST_ALBUM_POINT";
+
+        fn point(name: &str) -> TransactionFailPoint {
+            match name {
+                "after-journal" => TransactionFailPoint::AfterJournal,
+                "after-catalog-publish" => TransactionFailPoint::AfterCatalogPublish,
+                "during-cleanup" => TransactionFailPoint::DuringCleanup,
+                other => panic!("unknown album boundary {other}"),
+            }
+        }
+
+        #[test]
+        fn child_album_transfer_helper() {
+            let Ok(root) = std::env::var(ROOT) else {
+                return;
+            };
+            let boundary = point(&std::env::var(POINT).expect("album boundary"));
+            let root = PathBuf::from(root);
+            let mut library = CanonicalLibrary::create(&root).expect("create");
+            let a = library.create_artist("A", Vec::new()).expect("A");
+            let b = library.create_artist("B", Vec::new()).expect("B");
+            let source_dir = root.parent().expect("parent").join("album-source");
+            fs::create_dir_all(&source_dir).expect("source");
+            let mut import = |name: &str, credits: Vec<ArtistId>, number: u32| {
+                let path = source_dir.join(name);
+                fs::write(&path, format!("album {name}")).expect("audio");
+                library
+                    .import_track(CanonicalImportedTrack {
+                        source: path,
+                        title: name.to_owned(),
+                        artist_id: Some(a),
+                        artist_name: "A".to_owned(),
+                        credited_artist_ids: credits,
+                        album_title: Some("Album".to_owned()),
+                        release_type: ReleaseType::Album,
+                        track_number: Some(number),
+                        disc_number: Some(1),
+                        duration_ms: None,
+                    })
+                    .expect("import")
+            };
+            let first = import("first.wav", vec![a, b], 1);
+            let second = import("second.wav", vec![a], 2);
+            let album = library.track(first).expect("track").album_id;
+            library.set_lyrics(first, Some("lyrics")).expect("lyrics");
+            library.set_rating(first, Some(5), true).expect("rating");
+            let cover = source_dir.join("cover.png");
+            fs::write(&cover, b"cover").expect("cover");
+            library.set_cover(album, &cover, "png").expect("set cover");
+            let mut plan = library.plan_album_transfer(album, b).expect("plan");
+            plan.set_credit_allowed(second, true).expect("credit");
+            library.set_transaction_failure(Some(TransactionFailure {
+                point: boundary,
+                interrupt: true,
+                abort: true,
+            }));
+            let _ = library.execute_album_transfer(&plan);
+            panic!("album child did not terminate");
+        }
+
+        fn spawn(boundary: &str, root: &Path) -> std::process::ExitStatus {
+            Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "canonical::album_transfer_tests::album_process_tests::child_album_transfer_helper",
+                    "--nocapture",
+                ])
+                .env(ROOT, root)
+                .env(POINT, boundary)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn album child")
+        }
+
+        #[test]
+        fn real_child_termination_during_album_transfer_recovers() {
+            for (boundary, committed) in [
+                ("after-journal", false),
+                ("after-catalog-publish", true),
+                ("during-cleanup", true),
+            ] {
+                let dir = TempDir::new(&format!("album-child-{boundary}"));
+                let root = dir.path().join("FluxLibrary");
+                let status = spawn(boundary, &root);
+                assert!(
+                    !status.success(),
+                    "{boundary} child must abort, got {status:?}"
+                );
+                let reopened = CanonicalLibrary::open(&root).expect("recover album transfer");
+                let album = AlbumId::new(1);
+                assert_eq!(
+                    reopened.album(album).map(|album| album.owner_artist_id),
+                    Some(if committed {
+                        ArtistId::new(2)
+                    } else {
+                        ArtistId::new(1)
+                    })
+                );
+                assert_eq!(
+                    reopened.album(album).map(|album| album.track_order.clone()),
+                    Some(vec![TrackId::new(1), TrackId::new(2)])
+                );
+                let target_dir = root.join(
+                    album_rel(ArtistId::new(2), album)
+                        .to_os_path()
+                        .expect("path"),
+                );
+                if committed {
+                    assert!(target_dir.join("cover.png").is_file());
+                    assert_eq!(
+                        reopened
+                            .track(TrackId::new(2))
+                            .map(|track| track.credited_artist_ids.clone()),
+                        Some(vec![ArtistId::new(1), ArtistId::new(2)])
+                    );
+                } else {
+                    assert!(!target_dir.join("cover.png").exists());
+                    assert_eq!(
+                        reopened
+                            .track(TrackId::new(2))
+                            .map(|track| track.credited_artist_ids.clone()),
+                        Some(vec![ArtistId::new(1)])
+                    );
+                }
+                assert_eq!(
+                    reopened.rating(TrackId::new(1)),
+                    Some(TrackRating {
+                        rating: Some(5),
+                        favorite: true
+                    })
+                );
+                drop(reopened);
+                assert!(CanonicalLibrary::open(&root).is_ok());
+            }
+        }
+    }
+}

@@ -94,9 +94,10 @@ pub use import::{
 };
 
 pub use flux_library::canonical::{
-    AlbumId, ArtistDeletionAlbum, ArtistDeletionDecision, ArtistDeletionDestination,
-    ArtistDeletionPlan, ArtistDeletionReport, ArtistDeletionTrack, CanonicalImportedTrack,
-    OwnershipDestination, OwnershipTransferPlan, OwnershipTransferReport, PlaylistId, ReleaseType,
+    AlbumId, AlbumTransferPlan, AlbumTransferReport, AlbumTransferTrack, ArtistDeletionAlbum,
+    ArtistDeletionDecision, ArtistDeletionDestination, ArtistDeletionPlan, ArtistDeletionReport,
+    ArtistDeletionTrack, CanonicalImportedTrack, OwnershipDestination, OwnershipTransferPlan,
+    OwnershipTransferReport, PlaylistId, ReleaseType,
 };
 pub use flux_library::canonical_migrate::{
     CanonicalMigrationError, CanonicalMigrationIssue, CanonicalMigrationPlan,
@@ -1422,6 +1423,47 @@ impl Controller {
             .unwrap_or_default()
     }
 
+    /// One canonical album snapshot.
+    #[must_use]
+    pub fn album(&self, id: AlbumId) -> Option<CanonicalAlbum> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.album(id))
+            .cloned()
+    }
+
+    /// Albums physically owned by an artist.
+    #[must_use]
+    pub fn albums_owned_by(&self, artist: ArtistId) -> Vec<AlbumId> {
+        self.canonical_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .albums_owned_by(artist)
+                    .map(|album| album.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Albums containing credited tracks but not physically owned by the artist.
+    #[must_use]
+    pub fn albums_credited_for(&self, artist: ArtistId) -> Vec<AlbumId> {
+        self.canonical_store
+            .as_ref()
+            .map(|store| store.albums_credited_for(artist))
+            .unwrap_or_default()
+    }
+
+    /// Current canonical album owner.
+    #[must_use]
+    pub fn album_owner(&self, id: AlbumId) -> Option<ArtistId> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.album(id))
+            .map(|album| album.owner_artist_id)
+    }
+
     /// The canonical album owning a track.
     #[must_use]
     pub fn track_album_id(&self, id: TrackId) -> Option<AlbumId> {
@@ -2399,6 +2441,68 @@ impl Controller {
             report.track_id, report.from_owner, report.to_owner
         ));
         Ok(report)
+    }
+
+    /// Builds an immutable generation-aware whole-album transfer plan. The
+    /// destination is a new AlbumId-preserving location under the destination
+    /// artist; merging into a different existing AlbumId is not supported.
+    pub fn plan_album_transfer(
+        &self,
+        album_id: AlbumId,
+        to_owner: ArtistId,
+    ) -> Result<AlbumTransferPlan, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Album transfer requires a canonical library.".to_owned());
+        };
+        store
+            .plan_album_transfer(album_id, to_owner)
+            .map_err(|err| format!("Could not plan album transfer: {err}"))
+    }
+
+    /// Executes a resolved whole-album transfer through one canonical
+    /// transaction. AlbumId, TrackIds, order, credits, cover, lyrics, ratings
+    /// and playlist references are preserved.
+    pub fn execute_album_transfer(
+        &mut self,
+        plan: &AlbumTransferPlan,
+    ) -> Result<AlbumTransferReport, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            let message = "Album transfer requires a canonical library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        let report = store
+            .execute_album_transfer(plan)
+            .map_err(|err| format!("Could not transfer album: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "Album {} transferred from {} to {} ({} track(s)).",
+            report.album_id, report.from_owner, report.to_owner, report.tracks
+        ));
+        Ok(report)
+    }
+
+    /// Reassigns an album only when no explicit destination-credit decision is
+    /// required. Callers that need to append the destination credit must use
+    /// the plan/execute pair and make that decision explicitly.
+    pub fn reassign_album_owner(
+        &mut self,
+        album_id: AlbumId,
+        to_owner: ArtistId,
+    ) -> Result<AlbumTransferReport, String> {
+        let plan = self.plan_album_transfer(album_id, to_owner)?;
+        if !plan.is_ready() {
+            return Err(plan
+                .blocking_reason()
+                .unwrap_or("album reassignment requires explicit review")
+                .to_owned());
+        }
+        self.execute_album_transfer(&plan)
     }
 
     /// Builds a generation-tagged artist-deletion preview. Every affected
@@ -8780,6 +8884,92 @@ mod tests {
             })
         );
         assert_eq!(controller.rating(solo), None);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_album_transfer_preserves_album_track_queue_and_playlist_identity() {
+        let dir = TempDir::new("canonical-album-transfer");
+        let root = dir.path().join("FluxLibrary");
+        create_canonical_library(&root).expect("create");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let a = controller.create_artist("A").expect("A");
+        let b = controller.create_artist("B").expect("B");
+        let source = dir.path().join("source/one.wav");
+        fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        write_dc_wav(source.parent().expect("parent"), "one.wav", 4_410, 0.1);
+        let first = controller
+            .import_canonical_track(super::CanonicalImportedTrack {
+                source,
+                title: "One".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Album".to_owned()),
+                release_type: super::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("first");
+        let source = dir.path().join("source/two.wav");
+        write_dc_wav(source.parent().expect("parent"), "two.wav", 4_410, 0.2);
+        let second = controller
+            .import_canonical_track(super::CanonicalImportedTrack {
+                source,
+                title: "Two".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a],
+                album_title: Some("Album".to_owned()),
+                release_type: super::ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("second");
+        let album = controller.track_album_id(first).expect("album");
+        let playlist = controller
+            .set_playlist(None, "Keep", vec![first, second])
+            .expect("playlist");
+        controller.set_rating(first, Some(4), true).expect("rating");
+        controller.enqueue_track(first).expect("queue");
+        controller.play_track(first);
+        let current = controller.current_queue_entry_id().expect("current");
+        assert!(
+            controller.reassign_album_owner(album, b).is_err(),
+            "reassignment without explicit credit decisions must refuse"
+        );
+        let mut plan = controller.plan_album_transfer(album, b).expect("plan");
+        assert!(!plan.is_ready());
+        assert_eq!(plan.credit_decision_tracks(), vec![second]);
+        plan.set_credit_allowed(second, true).expect("credit");
+        let report = controller.execute_album_transfer(&plan).expect("transfer");
+        assert_eq!(report.album_id, album);
+        assert_eq!(controller.track_album_id(first), Some(album));
+        assert_eq!(controller.track_album_id(second), Some(album));
+        assert_eq!(controller.album_owner(album), Some(b));
+        assert_eq!(controller.track_artist_id(first), Some(b));
+        assert_eq!(controller.track_credits(second), vec![a, b]);
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_eq!(controller.current_id(), Some(first));
+        assert_eq!(
+            controller
+                .playlists()
+                .into_iter()
+                .find(|item| item.id == playlist)
+                .map(|item| item.track_ids),
+            Some(vec![first, second])
+        );
+        assert_eq!(
+            controller.rating(first),
+            Some(flux_library::canonical::TrackRating {
+                rating: Some(4),
+                favorite: true
+            })
+        );
+        assert_eq!(controller.albums_owned_by(a), Vec::<super::AlbumId>::new());
+        assert_eq!(controller.albums_owned_by(b), vec![album]);
         controller.shutdown();
     }
 }
