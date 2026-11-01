@@ -2494,15 +2494,17 @@ impl Controller {
         let Some(store) = self.canonical_store.as_mut() else {
             return Err("Album import requires a canonical library.".to_owned());
         };
+        let target_snapshot = flux_library::canonical::CanonicalAlbumImportTarget {
+            album_id: target.album_id,
+            generation: target.generation,
+            owner_artist_id: target.owner_artist_id,
+            title: target.title.clone(),
+            release_type: target.release_type,
+            cover: target.cover.clone(),
+            track_order: target.track_order.clone(),
+        };
         let ids = store
-            .import_tracks_into_album(
-                target.album_id,
-                target.generation,
-                target.owner_artist_id,
-                &target.title,
-                &target.track_order,
-                imports,
-            )
+            .import_tracks_into_album(&target_snapshot, imports)
             .map_err(|err| format!("Could not import into album: {err}"))?;
         self.refresh_from_canonical();
         self.sync_default_queue();

@@ -2016,6 +2016,7 @@ impl FluxReady {
             owner_name: owner.name().to_owned(),
             title: album.title,
             release_type: album.release_type,
+            cover: album.cover,
             track_order: album.track_order,
             generation: self.controller.generation(),
         };

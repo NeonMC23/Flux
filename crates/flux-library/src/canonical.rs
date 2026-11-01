@@ -875,6 +875,25 @@ pub struct CanonicalImportedTrack {
     pub duration_ms: Option<u64>,
 }
 
+/// Snapshot used to import reviewed tracks into an existing canonical album.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalAlbumImportTarget {
+    /// Target album identity.
+    pub album_id: AlbumId,
+    /// Catalogue generation captured by the review.
+    pub generation: u64,
+    /// Required album owner and track owner.
+    pub owner_artist_id: ArtistId,
+    /// Album title.
+    pub title: String,
+    /// Release type.
+    pub release_type: ReleaseType,
+    /// Cover file name.
+    pub cover: Option<String>,
+    /// Existing track order that new tracks append after.
+    pub track_order: Vec<TrackId>,
+}
+
 impl CanonicalLibrary {
     /// Creates an empty canonical library at `root`.
     ///
@@ -2528,25 +2547,23 @@ impl CanonicalLibrary {
     /// transaction, preserving album metadata/cover and append order.
     pub fn import_tracks_into_album(
         &mut self,
-        album_id: AlbumId,
-        expected_generation: u64,
-        expected_owner: ArtistId,
-        expected_title: &str,
-        expected_order: &[TrackId],
+        target: &CanonicalAlbumImportTarget,
         imported: Vec<CanonicalImportedTrack>,
     ) -> Result<Vec<TrackId>, CanonicalError> {
         self.ensure_writable()?;
-        if expected_generation != self.catalog.generation {
+        if target.generation != self.catalog.generation {
             return Err(CanonicalError::Invalid(
                 "album import plan is stale: catalogue generation changed; review again".to_owned(),
             ));
         }
-        let album = self.albums.get(&album_id).cloned().ok_or_else(|| {
+        let album = self.albums.get(&target.album_id).cloned().ok_or_else(|| {
             CanonicalError::Invalid("target album is no longer in the library".to_owned())
         })?;
-        if album.owner_artist_id != expected_owner
-            || album.title != expected_title
-            || album.track_order != expected_order
+        if album.owner_artist_id != target.owner_artist_id
+            || album.title != target.title
+            || album.release_type != target.release_type
+            || album.cover.as_deref() != target.cover.as_deref()
+            || album.track_order != target.track_order
         {
             return Err(CanonicalError::Invalid(
                 "target album changed since review; review again".to_owned(),
@@ -2614,12 +2631,13 @@ impl CanonicalLibrary {
                 .next_track_id
                 .checked_add(1)
                 .ok_or_else(|| CanonicalError::Invalid("track counter overflow".to_owned()))?;
-            let audio = track_audio_rel(album.owner_artist_id, album_id, track_id, &extension);
-            let record = track_record_rel(album.owner_artist_id, album_id, track_id);
+            let audio =
+                track_audio_rel(album.owner_artist_id, target.album_id, track_id, &extension);
+            let record = track_record_rel(album.owner_artist_id, target.album_id, track_id);
             catalog.tracks.push(CatalogTrackDto {
                 id: track_id.get(),
                 owner_artist_id: album.owner_artist_id.get(),
-                album_id: album_id.get(),
+                album_id: target.album_id.get(),
                 audio_path: audio.display_lossy(),
                 record_path: record.display_lossy(),
             });
@@ -2630,7 +2648,7 @@ impl CanonicalLibrary {
                 title,
                 credited_artist_ids: credits.iter().map(|artist| artist.get()).collect(),
                 owner_artist_id: album.owner_artist_id.get(),
-                album_id: album_id.get(),
+                album_id: target.album_id.get(),
                 track_number: imported.track_number,
                 disc_number: imported.disc_number,
                 duration_ms: imported.duration_ms,
@@ -2647,7 +2665,7 @@ impl CanonicalLibrary {
             album_order.push(track_id);
             ids.push(track_id);
         }
-        let album_rel_path = self.album_paths[&album_id].clone();
+        let album_rel_path = self.album_paths[&target.album_id].clone();
         let album_dto = AlbumEntityDto {
             schema_version: CANONICAL_SCHEMA_VERSION,
             kind: ALBUM_KIND.to_owned(),
@@ -8681,11 +8699,15 @@ mod album_lifecycle_tests {
         let order = library.album_tracks(album);
         let ids = library
             .import_tracks_into_album(
-                album,
-                generation,
-                artist,
-                "Target",
-                &order,
+                &CanonicalAlbumImportTarget {
+                    album_id: album,
+                    generation,
+                    owner_artist_id: artist,
+                    title: "Target".to_owned(),
+                    release_type: ReleaseType::Album,
+                    cover: Some("cover.png".to_owned()),
+                    track_order: order.clone(),
+                },
                 vec![first, second],
             )
             .expect("batch import");
@@ -8732,11 +8754,15 @@ mod album_lifecycle_tests {
         assert!(
             library
                 .import_tracks_into_album(
-                    album,
-                    old_generation + 1,
-                    artist,
-                    "Target",
-                    &old_order,
+                    &CanonicalAlbumImportTarget {
+                        album_id: album,
+                        generation: old_generation + 1,
+                        owner_artist_id: artist,
+                        title: "Target".to_owned(),
+                        release_type: ReleaseType::Album,
+                        cover: None,
+                        track_order: old_order.clone(),
+                    },
                     vec![source.clone()],
                 )
                 .is_err()
@@ -8744,11 +8770,15 @@ mod album_lifecycle_tests {
         assert!(
             library
                 .import_tracks_into_album(
-                    album,
-                    old_generation,
-                    artist,
-                    "Other Title",
-                    &old_order,
+                    &CanonicalAlbumImportTarget {
+                        album_id: album,
+                        generation: old_generation,
+                        owner_artist_id: artist,
+                        title: "Other Title".to_owned(),
+                        release_type: ReleaseType::Album,
+                        cover: None,
+                        track_order: old_order.clone(),
+                    },
                     vec![source],
                 )
                 .is_err()
@@ -8780,11 +8810,15 @@ mod album_lifecycle_tests {
             assert!(
                 library
                     .import_tracks_into_album(
-                        album,
-                        generation,
-                        artist,
-                        "Target",
-                        &order,
+                        &CanonicalAlbumImportTarget {
+                            album_id: album,
+                            generation,
+                            owner_artist_id: artist,
+                            title: "Target".to_owned(),
+                            release_type: ReleaseType::Album,
+                            cover: None,
+                            track_order: order.clone(),
+                        },
                         vec![first, second]
                     )
                     .is_err()

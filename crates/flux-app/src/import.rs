@@ -170,6 +170,8 @@ pub struct ImportAlbumTarget {
     pub title: String,
     /// Release type.
     pub release_type: ReleaseType,
+    /// Cover file name snapshot.
+    pub cover: Option<String>,
     /// Existing order snapshot; imports append after it.
     pub track_order: Vec<TrackId>,
     /// Catalogue generation at target capture.
