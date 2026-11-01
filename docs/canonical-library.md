@@ -183,12 +183,27 @@ removes `album.flux` and any cover as journal cleanup; the artist remains.
 
 ### Import into an existing album
 
-`Controller::import_canonical_track_into_album` forces the album owner as physical
-owner, appends the new track to the existing album order and preserves title,
-release type and cover. The GUI Import Manager still routes through its normal
-artist/album review; a dedicated "target this AlbumId" review control is not yet
-implemented, so empty albums are currently populated by importing a matching
-owner/title through the existing manager or by application API.
+The album detail view exposes **Add tracks…**, which opens the existing Import
+Manager in fixed-target mode. The target carries AlbumId, owner, album title,
+release type, existing track order and catalogue generation. Owner and album are
+displayed as fixed and cannot be changed inside review; choosing another
+destination requires closing and starting a new import.
+
+Filename/folder inference and the existing review/duplicate decisions remain the
+only metadata source. Ordered credits can be edited, but the fixed album owner
+remains the physical owner and must stay credited. The reviewed plan is rejected
+if the catalogue generation, album owner/title/order or target identity changed.
+
+All selected new tracks are published as **one canonical transaction** through
+`import_tracks_into_album`: new audio and `.flux` records are staged, verified,
+the existing album file is updated once with deterministic reviewed append order,
+and `catalog.flux` is published last. Existing album metadata, cover, tracks,
+lyrics, ratings, playlists and queue references are untouched. Cancellation
+before execution writes nothing. Duplicate content within the batch or existing
+catalogue is rejected; duplicate decisions remain explicit. The application API
+`import_canonical_track_into_album` remains available for single reviewed
+clients. The TUI does not expose fixed-target import; it retains its general
+quick-import behavior.
 
 ## Artist deletion
 
@@ -432,9 +447,8 @@ cleanup.
    and cooperative cancellation.
 9. Cross-platform native behavior and real GUI migration were not runtime
    verified in this stage.
-10. The GUI Import Manager does not yet have a dedicated target-AlbumId entry
-    point, although the Controller supports importing directly into an existing
-    album. Empty albums are otherwise fully first-class.
+10. Fixed-target album import is exposed in the GUI only; the TUI retains general
+    quick import and has no target-selection review flow.
 11. Artist deletion execution is exposed in the GUI only. The TUI deliberately
     refuses deletion/transfer and points to the GUI; this is a product limitation,
     not a separate transaction implementation.

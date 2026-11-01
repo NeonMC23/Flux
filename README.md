@@ -169,7 +169,11 @@ background staging for very large migrations is still future work.
   intentionally blocked. Albums are catalogue-first: empty albums remain
   visible in the album list with a dedicated detail view for metadata, cover,
   ordering, transfer and safe empty-album deletion. Populated album deletion is
-  blocked until tracks are transferred or explicitly deleted.
+  blocked until tracks are transferred or explicitly deleted. **Add tracks…**
+  opens the existing Import Manager in fixed-album mode: the AlbumId and owner
+  are locked through review, inferred metadata/credits remain editable, and all
+  selected new tracks are appended in one canonical transaction while existing
+  metadata, cover, order and references are preserved.
 - **Import:** every canonical import copies into the library and preserves the
   original extension; sources are never moved, overwritten or deleted.
   Identical content is deduplicated by fingerprint. Existing IDs are preserved
