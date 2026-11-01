@@ -321,6 +321,31 @@ impl Tui {
                 self.mode = Mode::MigrateSourceInput;
                 self.input.clear();
             }
+            KeyCode::Char('D') => {
+                if let Some(id) = self.rows().get(self.cursor).copied()
+                    && let Some(album_id) = self.controller.track_album_id(id)
+                    && let Some(album) = self.controller.album(album_id)
+                {
+                    let owner = self
+                        .controller
+                        .artist(album.owner_artist_id)
+                        .map(|artist| artist.name().to_owned())
+                        .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+                    let credited = self.controller.albums_credited_for(album.owner_artist_id);
+                    self.lifecycle_msg = Some(format!(
+                        "Album {} \"{}\" · owner {} · {} track(s) · AlbumId {} · credited-only albums for owner: {} · album transfer/deletion requires GUI review",
+                        album.id,
+                        album.title,
+                        owner,
+                        album.track_order.len(),
+                        album.id,
+                        credited.len(),
+                    ));
+                } else {
+                    self.lifecycle_msg =
+                        Some("Select a track with a canonical album first.".to_owned());
+                }
+            }
             KeyCode::Char('T') => {
                 self.lifecycle_msg = Some(
                     "Ownership transfer and artist deletion require the GUI review/confirm \
@@ -798,7 +823,7 @@ impl Tui {
                              · i/I quick copy-import · e edit track · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
-                             · T transfer (GUI) · B index · U fix · q quit"
+                             · D album · T transfer/delete (GUI) · B index · U fix · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
@@ -1217,6 +1242,13 @@ mod tests {
         let artist = tui.controller.track_artist_id(id).expect("inferred artist");
         let source_message = tui.lifecycle_msg.clone().expect("import summary");
         assert!(source_message.contains("1 added"), "{source_message}");
+
+        key(&mut tui, KeyCode::Char('D'));
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("Album") && message.contains("owner"))
+        );
 
         key(&mut tui, KeyCode::Char('P'));
         type_text(&mut tui, "Extra Artist");

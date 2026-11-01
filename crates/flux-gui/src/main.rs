@@ -1125,6 +1125,24 @@ struct DeletionManager {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlbumTransferUiStage {
+    Review,
+    Executing,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug)]
+struct AlbumTransferManager {
+    album_id: AlbumId,
+    destination_artist: Option<ArtistChoice>,
+    plan: flux_app::AlbumTransferPlan,
+    stage: AlbumTransferUiStage,
+    report: Option<flux_app::AlbumTransferReport>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct TrackEditor {
     id: TrackId,
@@ -1277,6 +1295,7 @@ struct FluxReady {
     track_editor: Option<TrackEditor>,
     import_manager: Option<ImportManager>,
     deletion_manager: Option<DeletionManager>,
+    album_transfer: Option<AlbumTransferManager>,
     external_drag_hover: bool,
     artist_selected: Option<ArtistId>,
     artist_name_input: String,
@@ -1330,6 +1349,12 @@ enum Message {
     ArtistDeletionExecute,
     ArtistDeletionCommit,
     ArtistDeletionCancel,
+    AlbumTransferOpen,
+    AlbumTransferDestinationArtist(Option<ArtistChoice>),
+    AlbumTransferAllowCredit(TrackId, bool),
+    AlbumTransferExecute,
+    AlbumTransferCommit,
+    AlbumTransferCancel,
     RelinkTrack(TrackId, RelPath),
     ImportOpen,
     ImportOpenSetup,
@@ -1437,6 +1462,7 @@ impl FluxReady {
             track_editor: None,
             import_manager: None,
             deletion_manager: None,
+            album_transfer: None,
             external_drag_hover: false,
             artist_selected: None,
             artist_name_input: String::new(),
@@ -1609,6 +1635,39 @@ impl FluxReady {
         }];
         choices.extend(self.artist_choices());
         choices
+    }
+
+    fn selected_album_id(&self) -> Option<AlbumId> {
+        if self.view != LibraryView::Albums {
+            return None;
+        }
+        let key = self.selected_group.as_deref()?;
+        let (_, raw) = album_key_parts(key);
+        raw.parse::<u64>().ok().map(AlbumId::new)
+    }
+
+    fn open_album_transfer(&mut self, album_id: AlbumId, destination: Artist) {
+        let destination_choice = ArtistChoice {
+            id: Some(destination.id()),
+            label: destination.name().to_owned(),
+        };
+        match self
+            .controller
+            .plan_album_transfer(album_id, destination.id())
+        {
+            Ok(plan) => {
+                self.deletion_manager = None;
+                self.album_transfer = Some(AlbumTransferManager {
+                    album_id,
+                    destination_artist: Some(destination_choice),
+                    plan,
+                    stage: AlbumTransferUiStage::Review,
+                    report: None,
+                    error: None,
+                });
+            }
+            Err(error) => self.lifecycle_msg = Some(error),
+        }
     }
 
     fn sync_deletion_defaults(&mut self) {
@@ -2416,6 +2475,88 @@ impl FluxReady {
             Message::ArtistDeletionCancel => {
                 self.deletion_manager = None;
             }
+            Message::AlbumTransferOpen => {
+                let Some(album_id) = self.selected_album_id() else {
+                    self.lifecycle_msg = Some("Select an album first.".to_owned());
+                    return Task::none();
+                };
+                let Some(owner) = self.controller.album_owner(album_id) else {
+                    self.lifecycle_msg =
+                        Some("The selected album is no longer in the library.".to_owned());
+                    return Task::none();
+                };
+                let destination = self
+                    .controller
+                    .artists()
+                    .into_iter()
+                    .find(|artist| artist.id() != owner);
+                let Some(destination) = destination else {
+                    self.lifecycle_msg =
+                        Some("No other artist is available as a destination.".to_owned());
+                    return Task::none();
+                };
+                self.open_album_transfer(album_id, destination);
+            }
+            Message::AlbumTransferDestinationArtist(choice) => {
+                let Some(album_id) = self.album_transfer.as_ref().map(|manager| manager.album_id)
+                else {
+                    return Task::none();
+                };
+                let Some(destination) =
+                    choice.and_then(|choice| choice.id.and_then(|id| self.controller.artist(id)))
+                else {
+                    return Task::none();
+                };
+                self.open_album_transfer(album_id, destination);
+            }
+            Message::AlbumTransferAllowCredit(track, allowed) => {
+                if let Some(manager) = self.album_transfer.as_mut() {
+                    match manager.plan.set_credit_allowed(track, allowed) {
+                        Ok(()) => manager.error = None,
+                        Err(error) => manager.error = Some(error),
+                    }
+                }
+            }
+            Message::AlbumTransferExecute => {
+                let Some(manager) = self.album_transfer.as_mut() else {
+                    return Task::none();
+                };
+                if !manager.plan.is_ready() {
+                    manager.error = manager
+                        .plan
+                        .blocking_reason()
+                        .map(str::to_owned)
+                        .or_else(|| Some("Resolve every blocker before transferring.".to_owned()));
+                    return Task::none();
+                }
+                manager.stage = AlbumTransferUiStage::Executing;
+                manager.error = None;
+                return Task::done(Message::AlbumTransferCommit);
+            }
+            Message::AlbumTransferCommit => {
+                let Some(manager) = self.album_transfer.as_mut() else {
+                    return Task::none();
+                };
+                let plan = manager.plan.clone();
+                match self.controller.execute_album_transfer(&plan) {
+                    Ok(report) => {
+                        if let Some(manager) = self.album_transfer.as_mut() {
+                            manager.report = Some(report);
+                            manager.stage = AlbumTransferUiStage::Completed;
+                        }
+                        self.lifecycle_msg = Some("Album transfer committed.".to_owned());
+                    }
+                    Err(error) => {
+                        if let Some(manager) = self.album_transfer.as_mut() {
+                            manager.error = Some(error);
+                            manager.stage = AlbumTransferUiStage::Failed;
+                        }
+                    }
+                }
+            }
+            Message::AlbumTransferCancel => {
+                self.album_transfer = None;
+            }
             Message::RelinkTrack(id, candidate) => {
                 match self.controller.relink_portable_track(id, &candidate) {
                     Ok(()) => {
@@ -3083,6 +3224,12 @@ impl FluxReady {
             Message::CycleRepeat => self.controller.cycle_repeat_mode(),
             Message::VolumeChanged(volume) => self.controller.set_volume(volume),
             Message::KeyPressed(key, modifiers) => {
+                if self.album_transfer.is_some() {
+                    if matches!(key, Key::Named(Named::Escape)) {
+                        self.album_transfer = None;
+                    }
+                    return Task::none();
+                }
                 if self.deletion_manager.is_some() {
                     if matches!(key, Key::Named(Named::Escape)) {
                         self.deletion_manager = None;
@@ -3225,7 +3372,11 @@ impl FluxReady {
         }
 
         let base: Element<'_, Message> = body.into();
-        let body: Element<'_, Message> = if self.deletion_manager.is_some() {
+        let body: Element<'_, Message> = if self.album_transfer.is_some() {
+            stack([base, self.album_transfer_overlay()])
+                .height(Length::Fill)
+                .into()
+        } else if self.deletion_manager.is_some() {
             stack([base, self.deletion_overlay()])
                 .height(Length::Fill)
                 .into()
@@ -3244,6 +3395,283 @@ impl FluxReady {
             .height(Length::Fill)
             .style(app_style)
             .into()
+    }
+
+    fn album_transfer_overlay(&self) -> Element<'_, Message> {
+        let Some(manager) = self.album_transfer.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let plan = &manager.plan;
+        let source = self
+            .controller
+            .artist(plan.from_owner)
+            .map(|artist| artist.name().to_owned())
+            .unwrap_or_else(|| format!("Artist {}", plan.from_owner));
+        let destination = self
+            .controller
+            .artist(plan.to_owner)
+            .map(|artist| artist.name().to_owned())
+            .unwrap_or_else(|| format!("Artist {}", plan.to_owner));
+        let artist_choices = self
+            .controller
+            .artists()
+            .into_iter()
+            .filter(|artist| artist.id() != plan.from_owner)
+            .map(|artist| ArtistChoice {
+                id: Some(artist.id()),
+                label: artist.name().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let selected_artist = manager.destination_artist.clone().filter(|choice| {
+            artist_choices
+                .iter()
+                .any(|candidate| candidate.id == choice.id)
+        });
+        let lyrics_count = plan
+            .tracks
+            .iter()
+            .filter(|track| track.lyrics_path.is_some())
+            .count();
+        let rated_count = plan
+            .tracks
+            .iter()
+            .filter(|track| track.rating.is_some())
+            .count();
+        let playlist_refs = plan
+            .tracks
+            .iter()
+            .map(|track| track.playlist_ids.len())
+            .sum::<usize>();
+        let decision_count = plan.credit_decision_tracks().len();
+        let mut panel = column![
+            row![
+                column![
+                    text(format!("Transfer album · {}", plan.title)).size(20).color(TEXT),
+                    text("One canonical transaction. AlbumId, TrackIds, track order, cover, lyrics, ratings, playlists and queue identities are preserved.")
+                        .size(10)
+                        .color(MUTED),
+                ]
+                .spacing(3)
+                .width(Length::Fill),
+                button(text("Cancel").size(11))
+                    .style(ghost_style)
+                    .padding([7, 11])
+                    .on_press(Message::AlbumTransferCancel),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            container(
+                column![
+                    text(format!(
+                        "AlbumId {} · {source} → {destination} · {} track(s) · cover {} · {lyrics_count} lyrics · {rated_count} rated · {playlist_refs} playlist reference(s)",
+                        plan.album_id,
+                        plan.tracks.len(),
+                        if plan.cover.is_some() { "managed" } else { "none" },
+                    ))
+                    .size(10)
+                    .color(MUTED),
+                    text("Destination is a new AlbumId-preserving location under the destination artist. Merging into a different existing AlbumId is intentionally blocked; no album is ever silently merged.")
+                        .size(9)
+                        .color(MUTED),
+                ]
+                .spacing(3),
+            )
+            .padding(10)
+            .style(card_style),
+            text("DESTINATION ARTIST").size(8).color(MUTED),
+            pick_list(artist_choices, selected_artist, |choice| {
+                Message::AlbumTransferDestinationArtist(Some(choice))
+            })
+            .placeholder("Destination artist…")
+            .text_size(10)
+            .padding([5, 7])
+            .width(Length::Fill),
+        ]
+        .spacing(8);
+        let mut rows = column![].spacing(4);
+        for track in &plan.tracks {
+            let credits = track
+                .credited_artist_ids
+                .iter()
+                .map(|artist| {
+                    self.controller
+                        .artist(*artist)
+                        .map(|artist| artist.name().to_owned())
+                        .unwrap_or_else(|| format!("Artist {artist}"))
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let owner = self
+                .controller
+                .artist(track.owner_artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {}", track.owner_artist_id));
+            let credit_ui: Element<'_, Message> = if track.requires_credit {
+                if track.credit_allowed {
+                    row![
+                        text("destination credit approved").size(9).color(SUCCESS),
+                        button(text("Revoke").size(9))
+                            .style(ghost_style)
+                            .padding([4, 7])
+                            .on_press(Message::AlbumTransferAllowCredit(track.track_id, false)),
+                    ]
+                    .spacing(6)
+                    .into()
+                } else {
+                    row![
+                        text("destination artist is not credited")
+                            .size(9)
+                            .color(DANGER),
+                        button(text("Append destination credit").size(9))
+                            .style(danger_button_style)
+                            .padding([4, 7])
+                            .on_press(Message::AlbumTransferAllowCredit(track.track_id, true)),
+                    ]
+                    .spacing(6)
+                    .into()
+                }
+            } else {
+                text("destination already credited")
+                    .size(9)
+                    .color(MUTED)
+                    .into()
+            };
+            rows = rows.push(
+                container(
+                    column![
+                        row![
+                            text(track.title.clone())
+                                .size(11)
+                                .color(TEXT)
+                                .width(Length::Fill),
+                            credit_ui,
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                        text(format!("owner {owner} · credits {credits}"))
+                            .size(9)
+                            .color(MUTED),
+                        text(format!(
+                            "lyrics {} · rating {} · playlists {}",
+                            track.lyrics_path.as_ref().map(|_| "yes").unwrap_or("no"),
+                            track
+                                .rating
+                                .map(|rating| format!("{:?}", rating.rating))
+                                .unwrap_or_else(|| "none".to_owned()),
+                            track.playlist_ids.len()
+                        ))
+                        .size(8)
+                        .color(MUTED),
+                    ]
+                    .spacing(2),
+                )
+                .padding(7)
+                .style(card_style),
+            );
+        }
+        panel = panel.push(
+            container(scrollable(rows).height(Length::Fixed(230.0)))
+                .padding(5)
+                .style(card_style),
+        );
+        if decision_count > 0 {
+            panel = panel.push(
+                text(format!(
+                    "{decision_count} track(s) require an explicit destination-credit decision. Rejecting or leaving them unresolved blocks the whole transfer."
+                ))
+                .size(9)
+                .color(DANGER),
+            );
+        }
+        if !plan.issues.is_empty() {
+            panel = panel.push(
+                text(format!(
+                    "Blocked: {}",
+                    plan.issues
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ))
+                .size(9)
+                .color(DANGER),
+            );
+        }
+        if manager.stage == AlbumTransferUiStage::Executing {
+            panel = panel.push(
+                text("Executing one canonical transaction (staging, verification, publication and cleanup)…")
+                    .size(10)
+                    .color(ACCENT),
+            );
+        }
+        if manager.stage == AlbumTransferUiStage::Failed {
+            panel = panel.push(
+                text("Album transfer did not commit cleanly. Reopen/refresh the library to run recovery before retrying.")
+                    .size(10)
+                    .color(DANGER),
+            );
+        }
+        if let Some(error) = &manager.error {
+            panel = panel.push(text(error.clone()).size(10).color(DANGER));
+        }
+        if let Some(report) = &manager.report {
+            panel = panel.push(
+                text(format!(
+                    "Committed: AlbumId {} transferred {} track(s) from {} to {}.",
+                    report.album_id, report.tracks, report.from_owner, report.to_owner
+                ))
+                .size(10)
+                .color(SUCCESS),
+            );
+        }
+        panel = panel.push(
+            row![
+                text("This changes physical ownership and paths but preserves album/track identities and order.")
+                    .size(9)
+                    .color(MUTED)
+                    .width(Length::Fill),
+                button(text("Cancel / close").size(10))
+                    .style(ghost_style)
+                    .padding([6, 10])
+                    .on_press(Message::AlbumTransferCancel),
+                button(text("Commit album transfer").size(11))
+                    .style(accent_button_style)
+                    .padding([7, 11])
+                    .on_press_maybe(
+                        (manager.stage == AlbumTransferUiStage::Review && plan.is_ready())
+                            .then_some(Message::AlbumTransferExecute)
+                    ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        let panel = container(scrollable(panel).height(Length::Fill))
+            .padding(16)
+            .width(Length::Fill)
+            .max_width(1_040.0)
+            .height(Length::Fill)
+            .max_height(720.0)
+            .style(import_panel_style);
+        stack([
+            container(
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(modal_backdrop_style)
+            .into(),
+            container(panel)
+                .padding(18)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center(Length::Fill)
+                .into(),
+        ])
+        .height(Length::Fill)
+        .into()
     }
 
     fn deletion_overlay(&self) -> Element<'_, Message> {
@@ -5514,15 +5942,53 @@ impl FluxReady {
             ));
         }
 
-        column![
-            header,
-            horizontal_rule(),
-            scrollable(list).height(Length::Fill),
-            pagination_footer(page, pages, start, end, total),
-        ]
-        .spacing(8)
-        .height(Length::Fill)
-        .into()
+        let mut content = column![].spacing(8);
+        if let Some(album_id) = self.selected_album_id()
+            && let Some(album) = self
+                .controller
+                .albums()
+                .into_iter()
+                .find(|album| album.id == album_id)
+        {
+            let owner = self
+                .controller
+                .artist(album.owner_artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+            content = content.push(
+                container(
+                    row![
+                        column![
+                            text(format!("Album · {}", album.title))
+                                .size(12)
+                                .color(TEXT),
+                            text(format!(
+                                "owner {owner} · {} track(s) · AlbumId {}",
+                                album.track_order.len(),
+                                album.id
+                            ))
+                            .size(9)
+                            .color(MUTED),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(text("Transfer album…").size(10))
+                            .style(accent_button_style)
+                            .padding([6, 10])
+                            .on_press(Message::AlbumTransferOpen),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding(9)
+                .style(card_style),
+            );
+        }
+        content = content.push(header);
+        content = content.push(horizontal_rule());
+        content = content.push(scrollable(list).height(Length::Fill));
+        content = content.push(pagination_footer(page, pages, start, end, total));
+        content.height(Length::Fill).into()
     }
 
     fn setup_view(&self) -> Element<'_, Message> {
@@ -6597,6 +7063,7 @@ mod tests {
             track_editor: None,
             import_manager: None,
             deletion_manager: None,
+            album_transfer: None,
             external_drag_hover: false,
             artist_selected: None,
             artist_name_input: String::new(),
@@ -7383,6 +7850,92 @@ mod tests {
         assert!(gui.controller.track(solo).is_none());
         assert_eq!(gui.controller.track_artist_id(collab), Some(b));
         assert_eq!(gui.controller.track_credits(collab), vec![b]);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn gui_album_transfer_reviews_credit_block_cancel_and_commit() {
+        let dir = TempDir::new("gui-album-transfer");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let a = gui.controller.create_artist("A").expect("A");
+        let b = gui.controller.create_artist("B").expect("B");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let one = source_dir.join("one.wav");
+        let two = source_dir.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        std::fs::write(&two, minimal_wav()).expect("two");
+        let first = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source: one,
+                title: "One".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Album".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("first");
+        let second = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source: two,
+                title: "Two".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a],
+                album_title: Some("Album".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("second");
+        let album = gui.controller.track_album_id(first).expect("album");
+        gui.view = LibraryView::Albums;
+        gui.selected_group = Some(format!("Album\u{1e}{}", album.get()));
+        gui.controller.enqueue_track(first).expect("queue");
+        gui.controller.play_track(first);
+        let current = gui.controller.current_queue_entry_id().expect("current");
+
+        send(&mut gui, Message::AlbumTransferOpen);
+        assert!(gui.album_transfer.is_some());
+        send(&mut gui, Message::AlbumTransferCancel);
+        assert!(gui.album_transfer.is_none(), "cancel writes nothing");
+        assert_eq!(gui.controller.album_owner(album), Some(a));
+
+        send(&mut gui, Message::AlbumTransferOpen);
+        send(&mut gui, Message::AlbumTransferExecute);
+        assert_eq!(
+            gui.album_transfer.as_ref().expect("manager").stage,
+            AlbumTransferUiStage::Review,
+            "unapproved credit blocks"
+        );
+        send(&mut gui, Message::AlbumTransferAllowCredit(second, true));
+        let plan = gui.album_transfer.as_ref().expect("manager").plan.clone();
+        assert!(plan.is_ready(), "{:?}", plan.issues);
+        send(&mut gui, Message::AlbumTransferExecute);
+        send(&mut gui, Message::AlbumTransferCommit);
+        assert_eq!(
+            gui.album_transfer.as_ref().expect("manager").stage,
+            AlbumTransferUiStage::Completed
+        );
+        assert_eq!(gui.controller.album_owner(album), Some(b));
+        assert_eq!(gui.controller.track_album_id(first), Some(album));
+        assert_eq!(gui.controller.track_album_id(second), Some(album));
+        assert_eq!(gui.controller.track_credits(second), vec![a, b]);
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
         gui.controller.shutdown();
     }
 }
