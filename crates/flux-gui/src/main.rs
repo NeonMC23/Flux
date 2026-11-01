@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 use flux_app::{
     AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
-    Controller, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan, ImportProgress,
-    ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport, RelPath,
-    ReleaseType, StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, format_duration,
+    Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan,
+    ImportProgress, ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport,
+    RelPath, ReleaseType, StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, format_duration,
     is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
@@ -1231,6 +1231,7 @@ struct FileBrowser {
 #[derive(Debug)]
 struct ImportManager {
     stage: ImportUiStage,
+    target_album: Option<ImportAlbumTarget>,
     sources: Vec<PathBuf>,
     recursive: bool,
     storage: ImportStorage,
@@ -1260,6 +1261,7 @@ impl ImportManager {
     fn new() -> Self {
         Self {
             stage: ImportUiStage::Choose,
+            target_album: None,
             sources: Vec::new(),
             recursive: true,
             storage: ImportStorage::Copy,
@@ -1284,6 +1286,21 @@ impl ImportManager {
             edit_disc_number: String::new(),
             number_error: None,
         }
+    }
+
+    fn target_album(&self) -> Option<ImportAlbumTarget> {
+        self.target_album.clone()
+    }
+
+    fn set_album_target(&mut self, target: ImportAlbumTarget) {
+        self.target_album = Some(target);
+        self.stage = ImportUiStage::Choose;
+        self.sources.clear();
+        self.plan = None;
+        self.selected = None;
+        self.error = None;
+        self.report = None;
+        self.prepared = None;
     }
 
     fn reset_for_selection(&mut self) {
@@ -1410,6 +1427,7 @@ enum Message {
     AlbumTrackMove(TrackId, isize),
     AlbumDeletePressed,
     AlbumDeleteConfirm,
+    AlbumAddTracks,
     RelinkTrack(TrackId, RelPath),
     ImportOpen,
     ImportOpenSetup,
@@ -1975,8 +1993,41 @@ impl FluxReady {
         if self.import_manager.is_none() {
             self.import_manager = Some(ImportManager::new());
         }
+        if let Some(manager) = self.import_manager.as_mut() {
+            manager.target_album = None;
+        }
         self.show_setup = false;
         self.track_editor = None;
+        self.external_drag_hover = false;
+    }
+
+    fn open_import_manager_for_album(&mut self, album_id: AlbumId) {
+        let Some(album) = self.controller.album(album_id) else {
+            self.lifecycle_msg = Some("Album is no longer in the library.".to_owned());
+            return;
+        };
+        let Some(owner) = self.controller.artist(album.owner_artist_id) else {
+            self.lifecycle_msg = Some("Album owner is unavailable.".to_owned());
+            return;
+        };
+        let target = ImportAlbumTarget {
+            album_id,
+            owner_artist_id: owner.id(),
+            owner_name: owner.name().to_owned(),
+            title: album.title,
+            release_type: album.release_type,
+            track_order: album.track_order,
+            generation: self.controller.generation(),
+        };
+        if self.import_manager.is_none() {
+            self.import_manager = Some(ImportManager::new());
+        }
+        if let Some(manager) = self.import_manager.as_mut() {
+            manager.set_album_target(target);
+        }
+        self.show_setup = false;
+        self.track_editor = None;
+        self.album_transfer = None;
         self.external_drag_hover = false;
     }
 
@@ -2035,6 +2086,7 @@ impl FluxReady {
                         .map(|artist| (*id, artist))
                 })
                 .collect(),
+            target_album: manager.target_album(),
         };
         manager.reset_for_selection();
         manager.stage = ImportUiStage::Scanning;
@@ -2167,11 +2219,23 @@ impl FluxReady {
         manager.progress_view.message = "Writing catalogue changes…".to_owned();
         match self.controller.apply_import_plan(&plan, &prepared) {
             Ok(report) => {
+                let failed = report.failed > 0 && report.imported == 0;
+                if failed {
+                    manager.error = report
+                        .items
+                        .iter()
+                        .find(|item| item.state == ImportItemState::Failed)
+                        .map(|item| item.message.clone());
+                    manager.stage = ImportUiStage::Failed;
+                    manager.progress_view.stage = ImportStage::Failed;
+                    manager.progress_view.message = "Import failed.".to_owned();
+                } else {
+                    manager.stage = ImportUiStage::Completed;
+                    manager.progress_view.stage = ImportStage::Completed;
+                    manager.progress_view.message = "Import complete.".to_owned();
+                }
                 manager.report = Some(report);
                 manager.prepared = Some(prepared);
-                manager.stage = ImportUiStage::Completed;
-                manager.progress_view.stage = ImportStage::Completed;
-                manager.progress_view.message = "Import complete.".to_owned();
             }
             Err(error) => {
                 manager.error = Some(error.clone());
@@ -2552,6 +2616,13 @@ impl FluxReady {
             Message::ArtistDeletionCancel => {
                 self.deletion_manager = None;
             }
+            Message::AlbumAddTracks => {
+                let Some(album) = self.selected_album_id() else {
+                    self.lifecycle_msg = Some("Select an album first.".to_owned());
+                    return Task::none();
+                };
+                self.open_import_manager_for_album(album);
+            }
             Message::AlbumTransferOpen => {
                 let Some(album_id) = self.selected_album_id() else {
                     self.lifecycle_msg = Some("Select an album first.".to_owned());
@@ -2779,15 +2850,23 @@ impl FluxReady {
             }
             Message::ImportClose => self.close_import_manager(),
             Message::ImportReset => {
-                self.open_import_manager();
+                let target = self
+                    .import_manager
+                    .as_ref()
+                    .and_then(|manager| manager.target_album.clone());
+                let recursive = self
+                    .import_manager
+                    .as_ref()
+                    .is_none_or(|manager| manager.recursive);
+                self.import_manager = Some(ImportManager::new());
                 if let Some(manager) = self.import_manager.as_mut() {
-                    let recursive = manager.recursive;
-                    let storage = manager.storage;
-                    *manager = ImportManager::new();
                     manager.recursive = recursive;
-                    let _ = storage;
                     manager.storage = ImportStorage::Copy;
+                    manager.target_album = target;
                 }
+                self.show_setup = false;
+                self.track_editor = None;
+                self.external_drag_hover = false;
             }
             Message::ImportNoop => {}
             Message::ImportNativeFiles => return self.native_files_task(),
@@ -4437,10 +4516,21 @@ impl FluxReady {
         );
         let library_label = self
             .controller
-            .portable_root()
+            .canonical_root()
+            .or_else(|| self.controller.portable_root())
             .map(|root| root.display().to_string())
             .unwrap_or_else(|| "No portable library is active".to_owned());
         let mut body = column![].spacing(10);
+        if let Some(target) = &manager.target_album {
+            body = body.push(
+                text(format!(
+                    "FIXED TARGET · \"{}\" · AlbumId {} · owner {}",
+                    target.title, target.album_id, target.owner_name
+                ))
+                .size(10)
+                .color(ACCENT),
+            );
+        }
         if !portable {
             body = body.push(
                 container(
@@ -4814,6 +4904,16 @@ impl FluxReady {
             return self.import_choose_body(manager);
         };
         let mut body = column![].spacing(8);
+        if let Some(target) = &plan.target_album {
+            body = body.push(
+                text(format!(
+                    "FIXED TARGET · \"{}\" · AlbumId {} · owner {}",
+                    target.title, target.album_id, target.owner_name
+                ))
+                .size(10)
+                .color(ACCENT),
+            );
+        }
         body = body.push(
             row![
                 text(format!(
@@ -5132,29 +5232,46 @@ impl FluxReady {
                 .style(input_style)
                 .width(Length::Fill),
         );
-        body = body.push(text("ARTIST").size(8).color(MUTED));
-        body = body.push(
-            text_input("Artist name", &manager.edit_artist)
-                .on_input(Message::ImportArtistChanged)
-                .style(input_style)
+        let targeted = plan.target_album.is_some();
+        if let Some(target) = &plan.target_album {
+            body = body.push(
+                text(format!(
+                    "FIXED TARGET ALBUM · {} · AlbumId {} · owner {}",
+                    target.title, target.album_id, target.owner_name
+                ))
+                .size(9)
+                .color(ACCENT),
+            );
+            body = body.push(
+                text("The target album and physical owner cannot be changed inside this review. Close and start a new import to choose another destination.")
+                    .size(8)
+                    .color(MUTED),
+            );
+        } else {
+            body = body.push(text("ARTIST").size(8).color(MUTED));
+            body = body.push(
+                text_input("Artist name", &manager.edit_artist)
+                    .on_input(Message::ImportArtistChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+            );
+            let mut choices = self.editor_artist_choices();
+            if let Some(choice) = choices.first_mut() {
+                choice.label = "No stable artist (create/link from artist name)".to_owned();
+            }
+            let selected_artist = candidate
+                .artist_id()
+                .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned())
+                .or_else(|| choices.first().cloned());
+            body = body.push(
+                pick_list(choices, selected_artist, |choice| {
+                    Message::ImportArtistPicked(Some(choice))
+                })
+                .text_size(11)
+                .padding([6, 8])
                 .width(Length::Fill),
-        );
-        let mut choices = self.editor_artist_choices();
-        if let Some(choice) = choices.first_mut() {
-            choice.label = "No stable artist (create/link from artist name)".to_owned();
+            );
         }
-        let selected_artist = candidate
-            .artist_id()
-            .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned())
-            .or_else(|| choices.first().cloned());
-        body = body.push(
-            pick_list(choices, selected_artist, |choice| {
-                Message::ImportArtistPicked(Some(choice))
-            })
-            .text_size(11)
-            .padding([6, 8])
-            .width(Length::Fill),
-        );
         body = body.push(text("ORDERED CREDITS").size(8).color(MUTED));
         for (credit_index, credit) in candidate.credits().iter().enumerate() {
             let owner = credit_index == candidate.owner_index();
@@ -5166,6 +5283,8 @@ impl FluxReady {
                         .width(Length::Fill),
                     if owner {
                         Element::from(text("OWNER").size(8).color(ACCENT))
+                    } else if targeted {
+                        Element::from(text("credit").size(8).color(MUTED))
                     } else {
                         Element::from(
                             button(text("Set owner").size(9))
@@ -5226,13 +5345,24 @@ impl FluxReady {
                 .size(9)
                 .color(MUTED),
         );
-        body = body.push(text("ALBUM").size(8).color(MUTED));
-        body = body.push(
-            text_input("Album", &manager.edit_album)
-                .on_input(Message::ImportAlbumChanged)
-                .style(input_style)
-                .width(Length::Fill),
-        );
+        if let Some(target) = &plan.target_album {
+            body = body.push(
+                text(format!(
+                    "Album: {} (fixed AlbumId {})",
+                    target.title, target.album_id
+                ))
+                .size(9)
+                .color(MUTED),
+            );
+        } else {
+            body = body.push(text("ALBUM").size(8).color(MUTED));
+            body = body.push(
+                text_input("Album", &manager.edit_album)
+                    .on_input(Message::ImportAlbumChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+            );
+        }
         body = body.push(
             row![
                 text_input("Track #", &manager.edit_track_number)
@@ -6117,8 +6247,12 @@ impl FluxReady {
                 ]
                 .spacing(3)
                 .width(Length::Fill),
-                button(text("Transfer album…").size(10))
+                button(text("Add tracks…").size(10))
                     .style(accent_button_style)
+                    .padding([7, 10])
+                    .on_press(Message::AlbumAddTracks),
+                button(text("Transfer album…").size(10))
+                    .style(ghost_style)
                     .padding([7, 10])
                     .on_press(Message::AlbumTransferOpen),
             ]
@@ -6199,6 +6333,10 @@ impl FluxReady {
                             .size(10)
                             .color(MUTED),
                         row![
+                            button(text("Add tracks…").size(10))
+                                .style(accent_button_style)
+                                .padding([6, 9])
+                                .on_press(Message::AlbumAddTracks),
                             button(text("Import music").size(10))
                                 .style(ghost_style)
                                 .padding([6, 9])
@@ -7689,7 +7827,9 @@ mod tests {
         let one = root.join("one.wav");
         let two = root.join("two.wav");
         std::fs::write(&one, minimal_wav()).expect("one");
-        std::fs::write(&two, minimal_wav()).expect("two");
+        let mut second = minimal_wav();
+        second.push(1);
+        std::fs::write(&two, second).expect("two");
         std::fs::write(
             dir.path().join("library-index.json"),
             format!(
@@ -7868,6 +8008,7 @@ mod tests {
             library_root: gui.controller.canonical_root().expect("root").to_path_buf(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
+            target_album: None,
         };
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -8522,6 +8663,153 @@ mod tests {
         assert!(
             !gui.album_delete_confirm,
             "populated album deletion is blocked"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn gui_import_manager_targets_existing_album_and_rejects_stale_target() {
+        let dir = TempDir::new("gui-album-import-target");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let artist = gui.controller.create_artist("Owner").expect("artist");
+        let album = gui
+            .controller
+            .create_album(artist, "Target Album", ReleaseType::Album)
+            .expect("album");
+        let cover = dir.path().join("cover.png");
+        std::fs::write(&cover, b"cover bytes").expect("cover");
+        gui.controller
+            .set_album_cover(album, &cover)
+            .expect("cover");
+        gui.view = LibraryView::Albums;
+        gui.selected_group = Some(album_key_for_title(album, "Target Album"));
+        gui.sync_album_editor();
+        send(&mut gui, Message::AlbumAddTracks);
+        assert_eq!(
+            gui.import_manager
+                .as_ref()
+                .and_then(|manager| manager.target_album.clone())
+                .map(|target| target.album_id),
+            Some(album)
+        );
+        send(&mut gui, Message::ImportCancel);
+        assert!(gui.import_manager.is_none());
+        assert!(
+            gui.controller.album_tracks(album).is_empty(),
+            "cancel writes nothing"
+        );
+
+        send(&mut gui, Message::AlbumAddTracks);
+        let target = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.target_album.clone())
+            .expect("target");
+        let one = dir.path().join("source/one.wav");
+        let two = dir.path().join("source/two.wav");
+        std::fs::create_dir_all(one.parent().expect("parent")).expect("dirs");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        let mut second = minimal_wav();
+        second.push(1);
+        std::fs::write(&two, second).expect("two");
+        let request = ImportRequest {
+            sources: vec![two.clone(), one.clone()],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: root.clone(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: Vec::new(),
+            target_album: Some(target.clone()),
+        };
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(
+            plan.target_album.as_ref().map(|target| target.album_id),
+            Some(album)
+        );
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| candidate.album() == Some("Target Album"))
+        );
+        send(&mut gui, Message::ImportPlanReady(Box::new(plan.clone())));
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(Box::new(prepared)));
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").stage,
+            ImportUiStage::Completed
+        );
+        assert_eq!(gui.controller.album_tracks(album).len(), 2);
+        assert_eq!(
+            gui.controller.album(album).map(|album| album.title.clone()),
+            Some("Target Album".to_owned())
+        );
+        assert_eq!(
+            gui.controller
+                .album(album)
+                .and_then(|album| album.cover.clone()),
+            Some("cover.png".to_owned())
+        );
+
+        // Stale target title after review must reject the whole batch.
+        send(&mut gui, Message::ImportReset);
+        let stale_target = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.target_album.clone());
+        // ImportReset keeps the fixed target; rebuild through album detail if needed.
+        let stale_target = stale_target.expect("target retained after reset");
+        gui.controller
+            .update_album_metadata(album, "Renamed Target", ReleaseType::Album)
+            .expect("rename");
+        let stale_source = dir.path().join("source/stale.wav");
+        let mut stale = minimal_wav();
+        stale.push(2);
+        std::fs::write(&stale_source, stale).expect("stale source");
+        let stale_plan = prepare_import_plan(
+            ImportRequest {
+                sources: vec![stale_source],
+                recursive: false,
+                storage: ImportStorage::Copy,
+                library_root: root,
+                existing_tracks: gui.controller.tracks().to_vec(),
+                existing_artists: Vec::new(),
+                target_album: Some(stale_target),
+            },
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(
+            &mut gui,
+            Message::ImportPlanReady(Box::new(stale_plan.clone())),
+        );
+        let stale_prepared = prepare_import_files(
+            &stale_plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(Box::new(stale_prepared)));
+        assert!(
+            gui.controller.album_tracks(album).len() == 2,
+            "stale import must not append"
+        );
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").stage,
+            ImportUiStage::Failed
         );
         gui.controller.shutdown();
     }
