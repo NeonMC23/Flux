@@ -27,7 +27,7 @@ use flux_core::{ArtistId, Track, TrackId, TrackSource};
 use flux_library::portable::{FLUX_DIR_NAME, sync_library_to_portable_store};
 use flux_library::{MetadataOverrides, PortableStore, is_supported_audio_path};
 
-use crate::{Controller, ControllerEvent, ImportIssue, StorageMode};
+use crate::{AlbumId, Controller, ControllerEvent, ImportIssue, ReleaseType, StorageMode};
 
 /// How the selected files will reach the portable library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -155,6 +155,25 @@ pub enum ImportDecision {
     UpdateExisting,
     /// Do nothing for this candidate.
     Skip,
+}
+
+/// Fixed existing-album context for an import workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportAlbumTarget {
+    /// Stable destination AlbumId.
+    pub album_id: AlbumId,
+    /// Current album owner and required physical track owner.
+    pub owner_artist_id: ArtistId,
+    /// Owner display name captured for review.
+    pub owner_name: String,
+    /// Album title.
+    pub title: String,
+    /// Release type.
+    pub release_type: ReleaseType,
+    /// Existing order snapshot; imports append after it.
+    pub track_order: Vec<TrackId>,
+    /// Catalogue generation at target capture.
+    pub generation: u64,
 }
 
 /// One ordered credit in the import review.
@@ -484,6 +503,23 @@ impl ImportCandidate {
         }
     }
 
+    /// Forces the fixed album target: owner, album title and owner credit.
+    pub fn force_album_target(&mut self, target: &ImportAlbumTarget) {
+        self.album = Some(target.title.clone());
+        self.artist_name = Some(target.owner_name.clone());
+        self.artist_id = Some(target.owner_artist_id);
+        self.credits = vec![ImportCredit::new(
+            Some(target.owner_artist_id),
+            target.owner_name.clone(),
+            false,
+        )];
+        self.owner_index = 0;
+        self.base_album = Some(target.title.clone());
+        self.base_artist_name = Some(target.owner_name.clone());
+        self.base_artist_id = Some(target.owner_artist_id);
+        self.base_credits = self.credits.clone();
+    }
+
     /// Chooses what to do with this candidate.
     ///
     /// Exact-path duplicates can only be skipped or updated; they can never
@@ -531,6 +567,8 @@ pub struct ImportPlan {
     pub cancelled: bool,
     /// Existing catalogue path spellings, used for destination previews.
     existing_paths: Vec<PathBuf>,
+    /// Fixed existing album target, when importing into an album.
+    pub target_album: Option<ImportAlbumTarget>,
 }
 
 impl ImportPlan {
@@ -670,6 +708,8 @@ pub struct ImportRequest {
     pub existing_tracks: Vec<(TrackId, Track)>,
     /// Existing track → artist relationships.
     pub existing_artists: Vec<(TrackId, ArtistId)>,
+    /// Fixed existing album target, when applicable.
+    pub target_album: Option<ImportAlbumTarget>,
 }
 
 /// One file ready for the catalogue after the copy phase.
@@ -1135,6 +1175,7 @@ pub fn prepare_import_plan(
         library_root,
         existing_tracks,
         existing_artists,
+        target_album,
     } = request;
     let mut issues = Vec::new();
     update_progress(
@@ -1164,6 +1205,7 @@ pub fn prepare_import_plan(
             .iter()
             .map(|(_, track)| track.source().path().to_path_buf())
             .collect(),
+        target_album: target_album.clone(),
     };
     if plan.cancelled {
         update_progress(
@@ -1216,6 +1258,11 @@ pub fn prepare_import_plan(
             total,
             format!("Checking duplicates… {}/{}", index + 1, total),
         );
+    }
+    if let Some(target) = plan.target_album.clone() {
+        for candidate in &mut plan.candidates {
+            candidate.force_album_target(&target);
+        }
     }
     plan.recompute_destinations();
     if plan.cancelled {
@@ -1594,6 +1641,117 @@ fn resolve_canonical_credits(
     Ok((ids, owner))
 }
 
+fn apply_import_plan_to_album(
+    controller: &mut Controller,
+    plan: &ImportPlan,
+    target: &ImportAlbumTarget,
+) -> Result<ImportApplyReport, String> {
+    use flux_library::canonical::CanonicalImportedTrack;
+
+    let mut report = ImportApplyReport::default();
+    let mut imports = Vec::new();
+    let mut indices = Vec::new();
+    for (index, candidate) in plan.candidates.iter().enumerate() {
+        match candidate.decision {
+            ImportDecision::Skip => {
+                report.skipped += 1;
+                report.items.push(AppliedImportItem {
+                    index,
+                    track_id: candidate.status.matched_track(),
+                    state: ImportItemState::Skipped,
+                    message: "Skipped".to_owned(),
+                });
+            }
+            ImportDecision::UpdateExisting => {
+                report.items.push(AppliedImportItem {
+                    index,
+                    track_id: candidate.status.matched_track(),
+                    state: ImportItemState::Failed,
+                    message: "Update-existing is not available in fixed-album import; edit that track separately or skip it."
+                        .to_owned(),
+                });
+            }
+            ImportDecision::ImportNew => {
+                let (credited_artist_ids, owner) =
+                    match resolve_canonical_credits(controller, candidate) {
+                        Ok(value) => value,
+                        Err(message) => {
+                            report.items.push(AppliedImportItem {
+                                index,
+                                track_id: None,
+                                state: ImportItemState::Failed,
+                                message,
+                            });
+                            continue;
+                        }
+                    };
+                if owner != target.owner_artist_id {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "The target album owner must remain the physical owner."
+                            .to_owned(),
+                    });
+                    continue;
+                }
+                imports.push(CanonicalImportedTrack {
+                    source: candidate.source_path.clone(),
+                    title: candidate.title.clone(),
+                    artist_id: Some(target.owner_artist_id),
+                    artist_name: target.owner_name.clone(),
+                    credited_artist_ids,
+                    album_title: Some(target.title.clone()),
+                    release_type: target.release_type,
+                    track_number: candidate.track_number,
+                    disc_number: candidate.disc_number,
+                    duration_ms: None,
+                });
+                indices.push(index);
+            }
+        }
+    }
+    if !imports.is_empty() {
+        match controller.import_tracks_into_album(target, imports) {
+            Ok(ids) => {
+                if ids.len() != indices.len() {
+                    return Err("Album import returned an unexpected track count.".to_owned());
+                }
+                for (index, id) in indices.into_iter().zip(ids) {
+                    report.imported += 1;
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(id),
+                        state: ImportItemState::Imported,
+                        message: "Imported into target album".to_owned(),
+                    });
+                }
+            }
+            Err(error) => {
+                for index in indices {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: error.clone(),
+                    });
+                }
+            }
+        }
+    }
+    report.failed = report
+        .items
+        .iter()
+        .filter(|item| item.state == ImportItemState::Failed)
+        .count();
+    report.items.sort_by_key(|item| item.index);
+    controller.report_status(format!(
+        "Album import: {} imported, {} failed, {} skipped.",
+        report.imported, report.failed, report.skipped
+    ));
+    Ok(report)
+}
+
 fn apply_import_plan_canonical(
     controller: &mut Controller,
     plan: &ImportPlan,
@@ -1608,6 +1766,9 @@ fn apply_import_plan_canonical(
     }
     if controller.is_scanning() {
         return Err("A library scan is running; import after it finishes.".to_owned());
+    }
+    if let Some(target) = plan.target_album.clone() {
+        return apply_import_plan_to_album(controller, plan, &target);
     }
     let mut report = ImportApplyReport::default();
     for (index, candidate) in plan.candidates.iter().enumerate() {
@@ -2081,6 +2242,7 @@ mod tests {
                 .iter()
                 .filter_map(|(id, _)| controller.track_artist_id(*id).map(|artist| (*id, artist)))
                 .collect(),
+            target_album: None,
         }
     }
 

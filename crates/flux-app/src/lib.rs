@@ -87,10 +87,10 @@ use flux_library::{
 pub mod import;
 
 pub use import::{
-    AppliedImportItem, CandidateStatus, ImportApplyReport, ImportCandidate, ImportCredit,
-    ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage,
-    ImportStorage, PreparedImport, PreparedImportItem, apply_import_plan, prepare_import_files,
-    prepare_import_plan,
+    AppliedImportItem, CandidateStatus, ImportAlbumTarget, ImportApplyReport, ImportCandidate,
+    ImportCredit, ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest,
+    ImportStage, ImportStorage, PreparedImport, PreparedImportItem, apply_import_plan,
+    prepare_import_files, prepare_import_plan,
 };
 
 pub use flux_library::canonical::{
@@ -1774,6 +1774,15 @@ impl Controller {
         }
     }
 
+    /// Committed canonical catalogue generation, when canonical mode is active.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.canonical_store
+            .as_ref()
+            .map(|store| store.generation())
+            .unwrap_or(0)
+    }
+
     /// The active canonical library root, when canonical mode is active.
     #[must_use]
     pub fn canonical_root(&self) -> Option<&Path> {
@@ -2468,6 +2477,42 @@ impl Controller {
         self.refresh_from_canonical();
         self.outbox.push(ControllerEvent::LibraryChanged);
         Ok(())
+    }
+
+    /// Imports a reviewed batch directly into an existing album as one
+    /// canonical transaction. The target snapshot and catalogue generation are
+    /// revalidated immediately before execution.
+    pub fn import_tracks_into_album(
+        &mut self,
+        target: &import::ImportAlbumTarget,
+        imports: Vec<CanonicalImportedTrack>,
+    ) -> Result<Vec<TrackId>, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Album import requires a canonical library.".to_owned());
+        };
+        let ids = store
+            .import_tracks_into_album(
+                target.album_id,
+                target.generation,
+                target.owner_artist_id,
+                &target.title,
+                &target.track_order,
+                imports,
+            )
+            .map_err(|err| format!("Could not import into album: {err}"))?;
+        self.refresh_from_canonical();
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "Imported {} track(s) into album {}.",
+            ids.len(),
+            target.album_id
+        ));
+        Ok(ids)
     }
 
     /// Imports a reviewed track directly into an existing album. The album
@@ -8675,6 +8720,7 @@ mod tests {
             library_root: root.clone(),
             existing_tracks: controller.tracks().to_vec(),
             existing_artists: Vec::new(),
+            target_album: None,
         };
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
