@@ -321,6 +321,34 @@ impl Tui {
                 self.mode = Mode::MigrateSourceInput;
                 self.input.clear();
             }
+            KeyCode::Char('E') => {
+                let albums = self.controller.albums();
+                if albums.is_empty() {
+                    self.lifecycle_msg = Some("No canonical albums.".to_owned());
+                } else {
+                    let summary = albums
+                        .into_iter()
+                        .map(|album| {
+                            let owner = self
+                                .controller
+                                .artist(album.owner_artist_id)
+                                .map(|artist| artist.name().to_owned())
+                                .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+                            format!(
+                                "{} \"{}\" [{}] owner {} · {} track(s) · cover {}",
+                                album.id,
+                                album.title,
+                                album.release_type.as_str(),
+                                owner,
+                                album.track_order.len(),
+                                if album.cover.is_some() { "yes" } else { "no" },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    self.lifecycle_msg = Some(format!("Albums: {summary}"));
+                }
+            }
             KeyCode::Char('D') => {
                 if let Some(id) = self.rows().get(self.cursor).copied()
                     && let Some(album_id) = self.controller.track_album_id(id)
@@ -823,7 +851,7 @@ impl Tui {
                              · i/I quick copy-import · e edit track · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
-                             · D album · T transfer/delete (GUI) · B index · U fix · q quit"
+                             · D album · E albums · T transfer/delete (GUI) · B index · U fix · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
@@ -1556,6 +1584,26 @@ mod tests {
                 .is_some_and(|message| message.contains("GUI"))
         );
         assert_eq!(tui.mode, Mode::Normal);
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_lists_empty_albums_with_owner_and_count() {
+        let dir = TempDir::new("tui-empty-albums");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        let artist = tui.controller.create_artist("Artist").expect("artist");
+        tui.controller
+            .create_album(artist, "Empty", flux_app::ReleaseType::Album)
+            .expect("album");
+        key(&mut tui, KeyCode::Char('E'));
+        let message = tui.lifecycle_msg.as_deref().expect("album listing");
+        assert!(message.contains("Empty"), "{message}");
+        assert!(message.contains("0 track(s)"), "{message}");
+        assert!(message.contains("cover no"), "{message}");
         tui.controller.shutdown();
     }
 }

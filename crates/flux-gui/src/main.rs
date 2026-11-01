@@ -21,8 +21,8 @@ use flux_app::{
     AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
     Controller, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan, ImportProgress,
     ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport, RelPath,
-    StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, format_duration, is_track_playable,
-    prepare_import_files, prepare_import_plan,
+    ReleaseType, StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, format_duration,
+    is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
     APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
@@ -881,6 +881,39 @@ fn parse_optional_number(value: &str, field: &str) -> Result<Option<u32>, String
     }
 }
 
+fn release_type_label(kind: ReleaseType) -> &'static str {
+    match kind {
+        ReleaseType::Album => "Album",
+        ReleaseType::Ep => "EP",
+        ReleaseType::Single => "Single",
+        ReleaseType::Compilation => "Compilation",
+        ReleaseType::Other => "Other",
+    }
+}
+
+fn release_type_buttons<'a>(
+    selected: ReleaseType,
+    message: fn(ReleaseType) -> Message,
+) -> Element<'a, Message> {
+    let kinds = [
+        ReleaseType::Album,
+        ReleaseType::Ep,
+        ReleaseType::Single,
+        ReleaseType::Compilation,
+        ReleaseType::Other,
+    ];
+    let mut row = row![].spacing(4);
+    for kind in kinds {
+        row = row.push(
+            button(text(release_type_label(kind)).size(9))
+                .style(nav_style(kind == selected))
+                .padding([4, 7])
+                .on_press(message(kind)),
+        );
+    }
+    row.into()
+}
+
 fn deletion_decision_label(decision: &flux_app::ArtistDeletionDecision) -> String {
     match decision {
         flux_app::ArtistDeletionDecision::Unresolved => "Unresolved".to_owned(),
@@ -1008,6 +1041,10 @@ fn artist_group_key(artist_id: Option<ArtistId>, track: &Track) -> String {
 fn artist_key_parts(key: &str) -> (&str, &str) {
     key.split_once(ARTIST_KEY_SEPARATOR)
         .unwrap_or((key, "none"))
+}
+
+fn album_key_for_title(album_id: AlbumId, title: &str) -> String {
+    format!("{title}{ALBUM_KEY_SEPARATOR}{album_id}")
 }
 
 fn album_group_key(album_id: Option<flux_app::AlbumId>, track: &Track) -> String {
@@ -1300,6 +1337,12 @@ struct FluxReady {
     artist_selected: Option<ArtistId>,
     artist_name_input: String,
     artist_rename_input: String,
+    new_album_title: String,
+    new_album_type: ReleaseType,
+    album_title_input: String,
+    album_type: ReleaseType,
+    album_cover_input: String,
+    album_delete_confirm: bool,
     last_reconcile: Option<ReconcileReport>,
     migrate_source: String,
     pending_plan: Option<CanonicalMigrationPlan>,
@@ -1355,6 +1398,18 @@ enum Message {
     AlbumTransferExecute,
     AlbumTransferCommit,
     AlbumTransferCancel,
+    AlbumCreatePressed,
+    NewAlbumTitleChanged(String),
+    NewAlbumType(ReleaseType),
+    AlbumTitleChanged(String),
+    AlbumType(ReleaseType),
+    AlbumMetadataSave,
+    AlbumCoverChanged(String),
+    AlbumCoverApply,
+    AlbumCoverRemove,
+    AlbumTrackMove(TrackId, isize),
+    AlbumDeletePressed,
+    AlbumDeleteConfirm,
     RelinkTrack(TrackId, RelPath),
     ImportOpen,
     ImportOpenSetup,
@@ -1467,6 +1522,12 @@ impl FluxReady {
             artist_selected: None,
             artist_name_input: String::new(),
             artist_rename_input: String::new(),
+            new_album_title: String::new(),
+            new_album_type: ReleaseType::Album,
+            album_title_input: String::new(),
+            album_type: ReleaseType::Album,
+            album_cover_input: String::new(),
+            album_delete_confirm: false,
             last_reconcile: None,
             migrate_source: String::new(),
             pending_plan: None,
@@ -1668,6 +1729,22 @@ impl FluxReady {
             }
             Err(error) => self.lifecycle_msg = Some(error),
         }
+    }
+
+    fn sync_album_editor(&mut self) {
+        self.album_delete_confirm = false;
+        let Some(album_id) = self.selected_album_id() else {
+            self.album_title_input.clear();
+            self.album_cover_input.clear();
+            self.album_type = ReleaseType::Album;
+            return;
+        };
+        let Some(album) = self.controller.album(album_id) else {
+            return;
+        };
+        self.album_title_input = album.title;
+        self.album_type = album.release_type;
+        self.album_cover_input.clear();
     }
 
     fn sync_deletion_defaults(&mut self) {
@@ -2557,6 +2634,130 @@ impl FluxReady {
             Message::AlbumTransferCancel => {
                 self.album_transfer = None;
             }
+            Message::AlbumCreatePressed => {
+                let Some(artist) = self.artist_selected else {
+                    self.lifecycle_msg = Some("Select an artist first.".to_owned());
+                    return Task::none();
+                };
+                let title = self.new_album_title.trim().to_owned();
+                if title.is_empty() {
+                    self.lifecycle_msg = Some("Album title is required.".to_owned());
+                    return Task::none();
+                }
+                match self
+                    .controller
+                    .create_album(artist, &title, self.new_album_type)
+                {
+                    Ok(album) => {
+                        self.new_album_title.clear();
+                        self.view = LibraryView::Albums;
+                        let title = self
+                            .controller
+                            .album(album)
+                            .map(|album| album.title)
+                            .unwrap_or(title);
+                        self.selected_group = Some(album_key_for_title(album, &title));
+                        self.sync_album_editor();
+                        self.lifecycle_msg = Some(format!("Created empty album {album}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::NewAlbumTitleChanged(value) => self.new_album_title = value,
+            Message::NewAlbumType(kind) => self.new_album_type = kind,
+            Message::AlbumTitleChanged(value) => self.album_title_input = value,
+            Message::AlbumType(kind) => self.album_type = kind,
+            Message::AlbumMetadataSave => {
+                let Some(album) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                match self.controller.update_album_metadata(
+                    album,
+                    &self.album_title_input,
+                    self.album_type,
+                ) {
+                    Ok(()) => {
+                        self.sync_album_editor();
+                        if let Some(updated) = self.controller.album(album) {
+                            self.selected_group = Some(album_key_for_title(album, &updated.title));
+                        }
+                        self.lifecycle_msg = Some(format!("Updated album {album}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::AlbumCoverChanged(value) => self.album_cover_input = value,
+            Message::AlbumCoverApply => {
+                let Some(album) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                let path = PathBuf::from(self.album_cover_input.trim());
+                if path.as_os_str().is_empty() {
+                    self.lifecycle_msg = Some("Choose a cover image path.".to_owned());
+                    return Task::none();
+                }
+                match self.controller.set_album_cover(album, &path) {
+                    Ok(()) => {
+                        self.album_cover_input.clear();
+                        self.sync_album_editor();
+                        self.lifecycle_msg = Some(format!("Updated cover for album {album}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::AlbumCoverRemove => {
+                let Some(album) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                match self.controller.remove_album_cover(album) {
+                    Ok(()) => {
+                        self.sync_album_editor();
+                        self.lifecycle_msg = Some(format!("Removed cover for album {album}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::AlbumTrackMove(track, delta) => {
+                let Some(album) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                match self.controller.reorder_album_track(album, track, delta) {
+                    Ok(()) => {
+                        self.lifecycle_msg = Some("Updated canonical album order.".to_owned())
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::AlbumDeletePressed => {
+                let Some(album) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                if self
+                    .controller
+                    .album(album)
+                    .is_some_and(|album| !album.track_order.is_empty())
+                {
+                    self.lifecycle_msg = Some(
+                        "Populated albums cannot be deleted here; transfer or delete tracks first."
+                            .to_owned(),
+                    );
+                } else {
+                    self.album_delete_confirm = true;
+                }
+            }
+            Message::AlbumDeleteConfirm => {
+                let Some(album) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                match self.controller.delete_empty_album(album) {
+                    Ok(()) => {
+                        self.selected_group = None;
+                        self.album_delete_confirm = false;
+                        self.lifecycle_msg = Some(format!("Deleted empty album {album}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
             Message::RelinkTrack(id, candidate) => {
                 match self.controller.relink_portable_track(id, &candidate) {
                     Ok(()) => {
@@ -3128,6 +3329,7 @@ impl FluxReady {
                     self.search.clear();
                 }
                 self.selected_group = group;
+                self.sync_album_editor();
                 self.page = 0;
                 self.show_setup = false;
             }
@@ -5773,6 +5975,19 @@ impl FluxReady {
     }
 
     fn groups_for(&self, view: LibraryView) -> Vec<(String, usize)> {
+        if view == LibraryView::Albums {
+            return self
+                .controller
+                .albums()
+                .into_iter()
+                .map(|album| {
+                    (
+                        album_key_for_title(album.id, &album.title),
+                        album.track_order.len(),
+                    )
+                })
+                .collect();
+        }
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
         for (id, track) in self.controller.tracks() {
             for key in self.group_keys_for(view, *id, track) {
@@ -5873,7 +6088,207 @@ impl FluxReady {
         rows
     }
 
-    fn track_list<'a>(&self, rows: Vec<(TrackId, &'a Track)>) -> Element<'a, Message> {
+    fn album_detail_view(&self, album_id: AlbumId) -> Element<'_, Message> {
+        let Some(album) = self.controller.album(album_id) else {
+            return text("Album is no longer in the library.")
+                .size(13)
+                .color(MUTED)
+                .into();
+        };
+        let owner = self
+            .controller
+            .artist(album.owner_artist_id)
+            .map(|artist| artist.name().to_owned())
+            .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+        let mut body = column![
+            row![
+                column![
+                    text(album.title.clone()).size(22).color(TEXT),
+                    text(format!(
+                        "AlbumId {} · owner {} · {} · {} track(s) · cover {}",
+                        album.id,
+                        owner,
+                        release_type_label(album.release_type),
+                        album.track_order.len(),
+                        if album.cover.is_some() { "managed" } else { "none" }
+                    ))
+                    .size(10)
+                    .color(MUTED),
+                ]
+                .spacing(3)
+                .width(Length::Fill),
+                button(text("Transfer album…").size(10))
+                    .style(accent_button_style)
+                    .padding([7, 10])
+                    .on_press(Message::AlbumTransferOpen),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            container(
+                column![
+                    text("METADATA").size(9).color(ACCENT),
+                    row![
+                        text_input("Album title…", &self.album_title_input)
+                            .on_input(Message::AlbumTitleChanged)
+                            .on_submit(Message::AlbumMetadataSave)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text("Save metadata").size(10))
+                            .style(accent_button_style)
+                            .padding([6, 9])
+                            .on_press(Message::AlbumMetadataSave),
+                    ]
+                    .spacing(6),
+                    row![
+                        text("RELEASE TYPE").size(8).color(MUTED),
+                        release_type_buttons(self.album_type, Message::AlbumType),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .style(card_style),
+            container(
+                column![
+                    text("COVER ARTWORK").size(9).color(ACCENT),
+                    text("Local image path; PNG/JPEG/WebP bytes are preserved. No online fetch or tag extraction.")
+                        .size(9)
+                        .color(MUTED),
+                    row![
+                        text_input("Cover image path…", &self.album_cover_input)
+                            .on_input(Message::AlbumCoverChanged)
+                            .on_submit(Message::AlbumCoverApply)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text("Assign / replace").size(10))
+                            .style(ghost_style)
+                            .padding([6, 9])
+                            .on_press(Message::AlbumCoverApply),
+                        button(text("Remove cover").size(10))
+                            .style(danger_button_style)
+                            .padding([6, 9])
+                            .on_press_maybe(album.cover.is_some().then_some(Message::AlbumCoverRemove)),
+                    ]
+                    .spacing(6),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .style(card_style),
+        ]
+        .spacing(10);
+        if self
+            .controller
+            .album_cover_path(album_id)
+            .is_some_and(|path| !path.is_file())
+        {
+            body = body.push(
+                text("The catalogue references a cover file that is missing or unreadable. Assign a new cover or remove the reference.")
+                    .size(10)
+                    .color(DANGER),
+            );
+        }
+        if album.track_order.is_empty() {
+            body = body.push(
+                container(
+                    column![
+                        text("This album is intentionally empty.").size(14).color(TEXT),
+                        text("It is a first-class catalogue album: metadata, artwork, transfer and safe deletion are available without fake tracks. Add audio through the Import Manager with the same owner and album title, or keep it as an independent release.")
+                            .size(10)
+                            .color(MUTED),
+                        row![
+                            button(text("Import music").size(10))
+                                .style(ghost_style)
+                                .padding([6, 9])
+                                .on_press(Message::ImportOpen),
+                            if self.album_delete_confirm {
+                                button(text("Confirm delete empty album").size(10))
+                                    .style(danger_button_style)
+                                    .padding([6, 9])
+                                    .on_press(Message::AlbumDeleteConfirm)
+                            } else {
+                                button(text("Delete empty album…").size(10))
+                                    .style(danger_button_style)
+                                    .padding([6, 9])
+                                    .on_press(Message::AlbumDeletePressed)
+                            },
+                        ]
+                        .spacing(6),
+                    ]
+                    .spacing(6),
+                )
+                .padding(14)
+                .style(card_style),
+            );
+        } else {
+            let mut list = column![].spacing(2);
+            for (index, track_id) in album.track_order.iter().enumerate() {
+                let Some(track) = self.controller.track(*track_id) else {
+                    continue;
+                };
+                list = list.push(
+                    container(
+                        row![
+                            text(format!("{}", index + 1))
+                                .size(10)
+                                .color(MUTED)
+                                .width(Length::Fixed(24.0)),
+                            column![
+                                text(track.title()).size(12).color(TEXT),
+                                text(self.credit_display(*track_id)).size(9).color(MUTED),
+                            ]
+                            .spacing(1)
+                            .width(Length::Fill),
+                            text(
+                                track
+                                    .duration()
+                                    .map(format_duration)
+                                    .unwrap_or_else(|| "--:--".to_owned())
+                            )
+                            .size(9)
+                            .color(MUTED)
+                            .width(Length::Fixed(46.0)),
+                            button(text("↑").size(10))
+                                .style(ghost_style)
+                                .padding([4, 6])
+                                .on_press(Message::AlbumTrackMove(*track_id, -1)),
+                            button(text("↓").size(10))
+                                .style(ghost_style)
+                                .padding([4, 6])
+                                .on_press(Message::AlbumTrackMove(*track_id, 1)),
+                            button(text("✎").size(10))
+                                .style(ghost_style)
+                                .padding([4, 6])
+                                .on_press(Message::EditTrack(*track_id)),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding(6)
+                    .style(card_style),
+                );
+            }
+            body = body.push(
+                container(scrollable(list).height(Length::Fill))
+                    .padding(6)
+                    .style(card_style),
+            );
+        }
+        if let Some(message) = &self.lifecycle_msg {
+            body = body.push(text(message.clone()).size(9).color(MUTED));
+        }
+        container(scrollable(body).height(Length::Fill))
+            .padding(16)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn track_list<'a>(&'a self, rows: Vec<(TrackId, &'a Track)>) -> Element<'a, Message> {
+        if let Some(album_id) = self.selected_album_id() {
+            return self.album_detail_view(album_id);
+        }
         let total = rows.len();
         if total == 0 {
             let message = if self.search.trim().is_empty() {
@@ -6166,6 +6581,27 @@ impl FluxReady {
                 .on_press_maybe(
                     (artist_editable && self.artist_selected.is_some())
                         .then_some(Message::ArtistDeleteOpen)
+                ),
+            text("CREATE EMPTY ALBUM").size(8).color(ACCENT),
+            text_input("New album title…", &self.new_album_title)
+                .on_input(Message::NewAlbumTitleChanged)
+                .on_submit(Message::AlbumCreatePressed)
+                .style(input_style)
+                .width(Length::Fill),
+            row![
+                text("RELEASE TYPE").size(8).color(MUTED),
+                release_type_buttons(self.new_album_type, Message::NewAlbumType),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            button(text("Create empty album").size(11))
+                .style(accent_button_style)
+                .padding([7, 10])
+                .on_press_maybe(
+                    (artist_editable
+                        && self.artist_selected.is_some()
+                        && !self.new_album_title.trim().is_empty())
+                    .then_some(Message::AlbumCreatePressed)
                 ),
         ]
         .spacing(8);
@@ -7068,6 +7504,12 @@ mod tests {
             artist_selected: None,
             artist_name_input: String::new(),
             artist_rename_input: String::new(),
+            new_album_title: String::new(),
+            new_album_type: ReleaseType::Album,
+            album_title_input: String::new(),
+            album_type: ReleaseType::Album,
+            album_cover_input: String::new(),
+            album_delete_confirm: false,
             last_reconcile: None,
             migrate_source: String::new(),
             pending_plan: None,
@@ -7936,6 +8378,151 @@ mod tests {
         assert_eq!(gui.controller.track_album_id(second), Some(album));
         assert_eq!(gui.controller.track_credits(second), vec![a, b]);
         assert_eq!(gui.controller.current_queue_entry_id(), Some(current));
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn gui_empty_album_create_metadata_cover_delete_and_reorder() {
+        let dir = TempDir::new("gui-album-lifecycle");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let artist = gui.controller.create_artist("Artist").expect("artist");
+        send(
+            &mut gui,
+            Message::ArtistSelected(Some(ArtistChoice {
+                id: Some(artist),
+                label: "Artist".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::NewAlbumTitleChanged("Empty".to_owned()));
+        send(&mut gui, Message::AlbumCreatePressed);
+        let empty = gui
+            .controller
+            .albums()
+            .into_iter()
+            .find(|album| album.title == "Empty")
+            .expect("empty album");
+        assert_eq!(gui.view, LibraryView::Albums);
+        assert_eq!(gui.selected_album_id(), Some(empty.id));
+        assert!(
+            gui.groups_for(LibraryView::Albums)
+                .iter()
+                .any(|(key, count)| {
+                    album_key_parts(key).1 == empty.id.to_string() && *count == 0
+                })
+        );
+        send(&mut gui, Message::AlbumTitleChanged("Renamed".to_owned()));
+        send(&mut gui, Message::AlbumType(ReleaseType::Ep));
+        send(&mut gui, Message::AlbumMetadataSave);
+        assert_eq!(
+            gui.controller
+                .album(empty.id)
+                .map(|album| album.title.clone()),
+            Some("Renamed".to_owned())
+        );
+        assert_eq!(
+            gui.controller
+                .album(empty.id)
+                .map(|album| album.release_type),
+            Some(ReleaseType::Ep)
+        );
+        let cover = dir.path().join("cover.png");
+        std::fs::write(&cover, b"not decoded cover bytes").expect("cover");
+        send(
+            &mut gui,
+            Message::AlbumCoverChanged(cover.display().to_string()),
+        );
+        send(&mut gui, Message::AlbumCoverApply);
+        assert_eq!(
+            gui.controller
+                .album(empty.id)
+                .and_then(|album| album.cover.clone()),
+            Some("cover.png".to_owned())
+        );
+        send(&mut gui, Message::AlbumCoverRemove);
+        assert!(
+            gui.controller
+                .album(empty.id)
+                .and_then(|album| album.cover.clone())
+                .is_none()
+        );
+        send(&mut gui, Message::AlbumDeletePressed);
+        assert!(gui.album_delete_confirm);
+        send(&mut gui, Message::AlbumDeleteConfirm);
+        assert!(gui.controller.album(empty.id).is_none());
+        assert!(gui.selected_group.is_none());
+
+        // Create a populated album and reorder through the same detail view.
+        send(
+            &mut gui,
+            Message::NewAlbumTitleChanged("Populated".to_owned()),
+        );
+        send(&mut gui, Message::AlbumCreatePressed);
+        let populated = gui
+            .controller
+            .albums()
+            .into_iter()
+            .find(|album| album.title == "Populated")
+            .expect("populated album");
+        let source = dir.path().join("source/one.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("audio");
+        let first = gui
+            .controller
+            .import_canonical_track_into_album(
+                populated.id,
+                flux_app::CanonicalImportedTrack {
+                    source,
+                    title: "One".to_owned(),
+                    artist_id: None,
+                    artist_name: "ignored".to_owned(),
+                    credited_artist_ids: Vec::new(),
+                    album_title: None,
+                    release_type: ReleaseType::Album,
+                    track_number: Some(1),
+                    disc_number: None,
+                    duration_ms: None,
+                },
+            )
+            .expect("first");
+        let source = dir.path().join("source/two.wav");
+        std::fs::write(&source, minimal_wav()).expect("audio");
+        let second = gui
+            .controller
+            .import_canonical_track_into_album(
+                populated.id,
+                flux_app::CanonicalImportedTrack {
+                    source,
+                    title: "Two".to_owned(),
+                    artist_id: None,
+                    artist_name: "ignored".to_owned(),
+                    credited_artist_ids: Vec::new(),
+                    album_title: None,
+                    release_type: ReleaseType::Album,
+                    track_number: Some(2),
+                    disc_number: None,
+                    duration_ms: None,
+                },
+            )
+            .expect("second");
+        gui.selected_group = Some(album_key_for_title(populated.id, "Populated"));
+        gui.sync_album_editor();
+        send(&mut gui, Message::AlbumTrackMove(second, -1));
+        assert_eq!(
+            gui.controller.album_tracks(populated.id),
+            vec![second, first]
+        );
+        send(&mut gui, Message::AlbumDeletePressed);
+        assert!(
+            !gui.album_delete_confirm,
+            "populated album deletion is blocked"
+        );
         gui.controller.shutdown();
     }
 }
