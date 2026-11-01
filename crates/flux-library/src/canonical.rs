@@ -518,6 +518,13 @@ impl CanonicalLibrary {
         self.track_audio_path(id)
             .is_some_and(|path| fs::symlink_metadata(path).is_ok_and(|m| m.is_file()))
     }
+    /// Absolute path to an album's managed cover, when recorded.
+    #[must_use]
+    pub fn album_cover_path(&self, id: AlbumId) -> Option<PathBuf> {
+        let album = self.albums.get(&id)?;
+        let cover = album.cover.as_ref()?;
+        Some(self.album_dir(id)?.join(cover))
+    }
     /// Absolute path for an album directory.
     #[must_use]
     pub fn album_dir(&self, id: AlbumId) -> Option<PathBuf> {
@@ -1807,6 +1814,21 @@ impl CanonicalLibrary {
         id: AlbumId,
         title: impl Into<String>,
     ) -> Result<(), CanonicalError> {
+        let release_type = self
+            .albums
+            .get(&id)
+            .map(|album| album.release_type)
+            .ok_or_else(|| CanonicalError::Invalid("album is not in the library".to_owned()))?;
+        self.update_album_metadata(id, title, release_type)
+    }
+
+    /// Updates supported album metadata without changing AlbumId or paths.
+    pub fn update_album_metadata(
+        &mut self,
+        id: AlbumId,
+        title: impl Into<String>,
+        release_type: ReleaseType,
+    ) -> Result<(), CanonicalError> {
         self.ensure_writable()?;
         let album = self
             .albums
@@ -1819,6 +1841,15 @@ impl CanonicalLibrary {
                 "album title must not be empty".to_owned(),
             ));
         }
+        if self.albums.values().any(|candidate| {
+            candidate.id != id
+                && candidate.owner_artist_id == album.owner_artist_id
+                && candidate.title == title
+        }) {
+            return Err(CanonicalError::Invalid(format!(
+                "owner already has an album titled {title:?}"
+            )));
+        }
         let rel = self
             .album_paths
             .get(&id)
@@ -1830,7 +1861,7 @@ impl CanonicalLibrary {
             id: id.get(),
             owner_artist_id: album.owner_artist_id.get(),
             title,
-            release_type: album.release_type,
+            release_type,
             cover: album.cover,
             track_order: album.track_order.iter().map(|track| track.get()).collect(),
         };
@@ -1840,6 +1871,163 @@ impl CanonicalLibrary {
         self.reopen_after()?;
         Ok(())
     }
+
+    /// Deletes an empty album. Populated albums are refused: tracks must first
+    /// be transferred or explicitly deleted through their own reviewed flows.
+    pub fn delete_empty_album(&mut self, id: AlbumId) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let album = self
+            .albums
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("album is not in the library".to_owned()))?;
+        if !album.track_order.is_empty() {
+            return Err(CanonicalError::Invalid(
+                "album still contains tracks; transfer or delete tracks first".to_owned(),
+            ));
+        }
+        let rel = self
+            .album_paths
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing album path".to_owned()))?;
+        let mut catalog = self.catalog.clone();
+        catalog.albums.retain(|entry| entry.id != id.get());
+        let mut cleanup = vec![RelPath::from_utf8(&format!(
+            "{}/album.flux",
+            rel.display_lossy()
+        ))?];
+        if let Some(cover) = &album.cover {
+            cleanup.push(RelPath::from_utf8(&format!(
+                "{}/{}",
+                rel.display_lossy(),
+                cover
+            ))?);
+        }
+        self.commit_writes_with_cleanup(Some(catalog), Vec::new(), cleanup)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Removes an album's managed cover while preserving all other metadata.
+    pub fn remove_cover(&mut self, album_id: AlbumId) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let album = self
+            .albums
+            .get(&album_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("album is not in the library".to_owned()))?;
+        let Some(cover) = album.cover.clone() else {
+            return Err(CanonicalError::Invalid(
+                "album has no managed cover".to_owned(),
+            ));
+        };
+        let rel = self
+            .album_paths
+            .get(&album_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing album path".to_owned()))?;
+        let dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: album_id.get(),
+            owner_artist_id: album.owner_artist_id.get(),
+            title: album.title,
+            release_type: album.release_type,
+            cover: None,
+            track_order: album.track_order.iter().map(|id| id.get()).collect(),
+        };
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &rel, "album.flux", &dto)?;
+        let cleanup = vec![RelPath::from_utf8(&format!(
+            "{}/{}",
+            rel.display_lossy(),
+            cover
+        ))?];
+        self.commit_writes_with_cleanup(None, writes, cleanup)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Sets a complete album track order, preserving every stable TrackId.
+    pub fn set_album_track_order(
+        &mut self,
+        album_id: AlbumId,
+        order: Vec<TrackId>,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let album = self
+            .albums
+            .get(&album_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("album is not in the library".to_owned()))?;
+        let current = album.track_order.iter().copied().collect::<HashSet<_>>();
+        let requested = order.iter().copied().collect::<HashSet<_>>();
+        if current != requested || current.len() != order.len() {
+            return Err(CanonicalError::Invalid(
+                "reordered album must contain exactly the existing tracks".to_owned(),
+            ));
+        }
+        for track in &order {
+            if self
+                .tracks
+                .get(track)
+                .is_none_or(|value| value.album_id != album_id)
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {track} does not belong to album {album_id}"
+                )));
+            }
+        }
+        let rel = self
+            .album_paths
+            .get(&album_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing album path".to_owned()))?;
+        let dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: album_id.get(),
+            owner_artist_id: album.owner_artist_id.get(),
+            title: album.title,
+            release_type: album.release_type,
+            cover: album.cover,
+            track_order: order.iter().map(|track| track.get()).collect(),
+        };
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &rel, "album.flux", &dto)?;
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Moves one album track by `delta` positions.
+    pub fn reorder_album_track(
+        &mut self,
+        album_id: AlbumId,
+        track_id: TrackId,
+        delta: isize,
+    ) -> Result<(), CanonicalError> {
+        let album = self
+            .albums
+            .get(&album_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("album is not in the library".to_owned()))?;
+        let mut order = album.track_order.clone();
+        let Some(index) = order.iter().position(|track| *track == track_id) else {
+            return Err(CanonicalError::Invalid(
+                "track is not in this album".to_owned(),
+            ));
+        };
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= order.len() {
+            return Ok(());
+        }
+        let track = order.remove(index);
+        order.insert(target as usize, track);
+        self.set_album_track_order(album_id, order)
+    }
+
     /// Rebuilds the legacy in-memory [`Library`] view from canonical data.
     /// This is a presentation adapter only; canonical files remain the
     /// authority.
@@ -2298,6 +2486,15 @@ impl CanonicalLibrary {
         }
         let title = title.into().trim().to_owned();
         self.ensure_no_duplicate_name(&title)?;
+        if self
+            .albums
+            .values()
+            .any(|album| album.owner_artist_id == owner && album.title == title)
+        {
+            return Err(CanonicalError::Invalid(format!(
+                "artist {owner} already has an album titled {title:?}"
+            )));
+        }
         let id = AlbumId::new(self.catalog.next_album_id);
         let rel = album_rel(owner, id);
         let dto = AlbumEntityDto {
@@ -2630,6 +2827,7 @@ impl CanonicalLibrary {
             album_rel_path.display_lossy(),
             cover_name
         ))?;
+        let old_cover = album.cover.clone();
         let mut writes = Vec::new();
         push_entity_write(&mut writes, &album_rel_path, "album.flux", &album_dto)?;
         writes.push(PendingWrite {
@@ -2638,7 +2836,17 @@ impl CanonicalLibrary {
             copy_from: Some(source.to_path_buf()),
             expected: Some(ContentFingerprint::of_file(source)?),
         });
-        self.commit_writes(None, writes)?;
+        let mut cleanup = Vec::new();
+        if let Some(old) = old_cover
+            && old != cover_name
+        {
+            cleanup.push(RelPath::from_utf8(&format!(
+                "{}/{}",
+                album_rel_path.display_lossy(),
+                old
+            ))?);
+        }
+        self.commit_writes_with_cleanup(None, writes, cleanup)?;
         self.reopen_after()?;
         Ok(())
     }
@@ -8223,5 +8431,153 @@ mod album_transfer_tests {
                 assert!(CanonicalLibrary::open(&root).is_ok());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod album_lifecycle_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn empty_album_lifecycle_metadata_cover_rename_delete_and_reopen() {
+        let dir = TempDir::new("album-lifecycle");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let artist = library.create_artist("Artist", Vec::new()).expect("artist");
+        let album = library
+            .create_album(artist, "Empty", ReleaseType::Album)
+            .expect("album");
+        assert_eq!(library.albums_owned_by(artist).count(), 1);
+        assert!(library.album_tracks(album).is_empty());
+        assert!(
+            library
+                .create_album(artist, "Empty", ReleaseType::Single)
+                .is_err(),
+            "duplicate owner/title rejected"
+        );
+        library
+            .update_album_metadata(album, "Renamed", ReleaseType::Ep)
+            .expect("metadata");
+        assert_eq!(
+            library.album(album).map(|album| album.title.as_str()),
+            Some("Renamed")
+        );
+        assert_eq!(
+            library.album(album).map(|album| album.release_type),
+            Some(ReleaseType::Ep)
+        );
+        let cover = dir.write("cover.png", b"first cover");
+        library.set_cover(album, &cover, "png").expect("cover");
+        let old_cover = library.album_dir(album).expect("dir").join("cover.png");
+        let replacement = dir.write("replacement.webp", b"replacement cover");
+        library
+            .set_cover(album, &replacement, "webp")
+            .expect("replace");
+        assert!(!old_cover.exists(), "old cover cleaned after commit");
+        assert_eq!(
+            fs::read(library.album_dir(album).expect("dir").join("cover.webp")).expect("cover"),
+            b"replacement cover"
+        );
+        library.remove_cover(album).expect("remove cover");
+        assert!(
+            library
+                .album(album)
+                .and_then(|album| album.cover.clone())
+                .is_none()
+        );
+        drop(library);
+        let mut reopened = CanonicalLibrary::open(&root).expect("reopen");
+        assert_eq!(
+            reopened.album(album).map(|album| album.title.as_str()),
+            Some("Renamed")
+        );
+        assert!(reopened.album_tracks(album).is_empty());
+        reopened.delete_empty_album(album).expect("delete empty");
+        assert!(reopened.album(album).is_none());
+        assert!(reopened.artist(artist).is_some());
+        drop(reopened);
+        assert!(CanonicalLibrary::open(&root).is_ok());
+    }
+
+    #[test]
+    fn populated_album_cannot_be_deleted_without_track_decisions() {
+        let dir = TempDir::new("album-populated-delete");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let artist = library.create_artist("Artist", Vec::new()).expect("artist");
+        let source = dir.write("song.wav", b"audio");
+        let track = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(artist),
+                artist_name: "Artist".to_owned(),
+                credited_artist_ids: Vec::new(),
+                album_title: Some("Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("track");
+        let album = library.track(track).expect("track").album_id;
+        assert!(library.delete_empty_album(album).is_err());
+        assert!(library.album(album).is_some());
+        assert!(library.track(track).is_some());
+    }
+
+    #[test]
+    fn album_reorder_preserves_track_ids_and_persists_order() {
+        let dir = TempDir::new("album-reorder");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let artist = library.create_artist("Artist", Vec::new()).expect("artist");
+        let mut tracks = Vec::new();
+        for (index, title) in ["One", "Two", "Three"].into_iter().enumerate() {
+            let source = dir.write(&format!("{index}.wav"), title.as_bytes());
+            tracks.push(
+                library
+                    .import_track(CanonicalImportedTrack {
+                        source,
+                        title: title.to_owned(),
+                        artist_id: Some(artist),
+                        artist_name: "Artist".to_owned(),
+                        credited_artist_ids: Vec::new(),
+                        album_title: Some("Album".to_owned()),
+                        release_type: ReleaseType::Album,
+                        track_number: Some(index as u32 + 1),
+                        disc_number: Some(1),
+                        duration_ms: None,
+                    })
+                    .expect("track"),
+            );
+        }
+        let album = library.track(tracks[0]).expect("track").album_id;
+        assert_eq!(library.album_tracks(album), tracks);
+        library
+            .reorder_album_track(album, tracks[2], -2)
+            .expect("reorder");
+        assert_eq!(
+            library.album_tracks(album),
+            vec![tracks[2], tracks[0], tracks[1]]
+        );
+        assert!(
+            library
+                .set_album_track_order(album, vec![tracks[0], tracks[2]])
+                .is_err()
+        );
+        drop(library);
+        let reopened = CanonicalLibrary::open(&root).expect("reopen");
+        assert_eq!(
+            reopened.album_tracks(album),
+            vec![tracks[2], tracks[0], tracks[1]]
+        );
+        assert_eq!(
+            reopened.track(tracks[2]).map(|track| track.id),
+            Some(tracks[2])
+        );
     }
 }

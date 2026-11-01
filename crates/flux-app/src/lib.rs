@@ -1455,6 +1455,14 @@ impl Controller {
             .unwrap_or_default()
     }
 
+    /// Absolute managed cover path, when an album declares one.
+    #[must_use]
+    pub fn album_cover_path(&self, id: AlbumId) -> Option<PathBuf> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.album_cover_path(id))
+    }
+
     /// Current canonical album owner.
     #[must_use]
     pub fn album_owner(&self, id: AlbumId) -> Option<ArtistId> {
@@ -2336,6 +2344,153 @@ impl Controller {
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(format!("Renamed artist {} to {}.", id, name.trim()));
         Ok(())
+    }
+
+    /// Creates an empty canonical album under an existing artist.
+    pub fn create_album(
+        &mut self,
+        owner: ArtistId,
+        title: &str,
+        release_type: ReleaseType,
+    ) -> Result<AlbumId, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Album creation requires a canonical library.".to_owned());
+        };
+        let id = store
+            .create_album(owner, title, release_type)
+            .map_err(|err| format!("Could not create album: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Created album {id}."));
+        Ok(id)
+    }
+
+    /// Updates album title and release type, preserving AlbumId and tracks.
+    pub fn update_album_metadata(
+        &mut self,
+        id: AlbumId,
+        title: &str,
+        release_type: ReleaseType,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Album metadata editing requires a canonical library.".to_owned());
+        };
+        store
+            .update_album_metadata(id, title, release_type)
+            .map_err(|err| format!("Could not update album: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
+    /// Deletes only an empty album. Populated albums require track-level
+    /// decisions through transfer/deletion workflows first.
+    pub fn delete_empty_album(&mut self, id: AlbumId) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Album deletion requires a canonical library.".to_owned());
+        };
+        store
+            .delete_empty_album(id)
+            .map_err(|err| format!("Could not delete album: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
+    /// Assigns or replaces an album cover. The extension is derived from the
+    /// source file; only png/jpg/jpeg/webp and bounded sizes are accepted.
+    pub fn set_album_cover(&mut self, id: AlbumId, source: &Path) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .ok_or_else(|| "cover file has no extension".to_owned())?;
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Artwork requires a canonical library.".to_owned());
+        };
+        store
+            .set_cover(id, source, extension)
+            .map_err(|err| format!("Could not set album cover: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
+    /// Removes managed cover artwork from an album.
+    pub fn remove_album_cover(&mut self, id: AlbumId) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Artwork requires a canonical library.".to_owned());
+        };
+        store
+            .remove_cover(id)
+            .map_err(|err| format!("Could not remove album cover: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
+    /// Moves one track in canonical album order while preserving all IDs.
+    pub fn reorder_album_track(
+        &mut self,
+        album_id: AlbumId,
+        track_id: TrackId,
+        delta: isize,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Track ordering requires a canonical library.".to_owned());
+        };
+        store
+            .reorder_album_track(album_id, track_id, delta)
+            .map_err(|err| format!("Could not reorder album tracks: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
+    /// Imports a reviewed track directly into an existing album. The album
+    /// owner is enforced as physical owner; existing metadata/cover/order are
+    /// preserved and the track is appended.
+    pub fn import_canonical_track_into_album(
+        &mut self,
+        album_id: AlbumId,
+        mut imported: CanonicalImportedTrack,
+    ) -> Result<TrackId, String> {
+        let Some(album) = self.album(album_id) else {
+            return Err("Album is not in the canonical library.".to_owned());
+        };
+        let Some(owner) = self.artist(album.owner_artist_id) else {
+            return Err("Album owner is unavailable.".to_owned());
+        };
+        imported.artist_id = Some(owner.id());
+        imported.artist_name = owner.name().to_owned();
+        imported.album_title = Some(album.title);
+        if !imported.credited_artist_ids.contains(&owner.id()) {
+            imported.credited_artist_ids.insert(0, owner.id());
+        }
+        self.import_canonical_track(imported)
     }
 
     /// Renames an album, preserving its stable ID, directory and every track
@@ -8970,6 +9125,83 @@ mod tests {
         );
         assert_eq!(controller.albums_owned_by(a), Vec::<super::AlbumId>::new());
         assert_eq!(controller.albums_owned_by(b), vec![album]);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_empty_album_cover_import_reorder_and_safe_deletion() {
+        let dir = TempDir::new("controller-album-lifecycle");
+        let root = dir.path().join("FluxLibrary");
+        create_canonical_library(&root).expect("create");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let artist = controller.create_artist("Artist").expect("artist");
+        let album = controller
+            .create_album(artist, "Empty Album", super::ReleaseType::Album)
+            .expect("album");
+        assert!(controller.album_tracks(album).is_empty());
+        assert_eq!(controller.albums_owned_by(artist), vec![album]);
+        let cover = dir.path().join("cover.png");
+        write_dc_wav(cover.parent().expect("parent"), "cover.png", 2, 0.0);
+        controller.set_album_cover(album, &cover).expect("cover");
+        controller
+            .update_album_metadata(album, "Renamed Album", super::ReleaseType::Ep)
+            .expect("metadata");
+        let mut imported = Vec::new();
+        for (index, value) in [(1u32, 0.1f32), (2, 0.2)] {
+            let source = dir.path().join(format!("source/{index}.wav"));
+            fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+            write_dc_wav(
+                source.parent().expect("parent"),
+                &format!("{index}.wav"),
+                4_410,
+                value,
+            );
+            imported.push(
+                controller
+                    .import_canonical_track_into_album(
+                        album,
+                        super::CanonicalImportedTrack {
+                            source,
+                            title: format!("Track {index}"),
+                            artist_id: None,
+                            artist_name: "ignored".to_owned(),
+                            credited_artist_ids: Vec::new(),
+                            album_title: Some("ignored".to_owned()),
+                            release_type: super::ReleaseType::Album,
+                            track_number: Some(index),
+                            disc_number: None,
+                            duration_ms: None,
+                        },
+                    )
+                    .expect("import into album"),
+            );
+        }
+        assert_eq!(controller.album_tracks(album), imported);
+        assert_eq!(
+            controller.album(album).map(|album| album.title.clone()),
+            Some("Renamed Album".to_owned())
+        );
+        assert_eq!(
+            controller
+                .album(album)
+                .and_then(|album| album.cover.clone()),
+            Some("cover.png".to_owned())
+        );
+        controller
+            .reorder_album_track(album, imported[1], -1)
+            .expect("reorder");
+        assert_eq!(
+            controller.album_tracks(album),
+            vec![imported[1], imported[0]]
+        );
+        assert!(controller.delete_empty_album(album).is_err());
+        controller.remove_album_cover(album).expect("remove cover");
+        assert!(
+            controller
+                .album(album)
+                .and_then(|album| album.cover.clone())
+                .is_none()
+        );
         controller.shutdown();
     }
 }
