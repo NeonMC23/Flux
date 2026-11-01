@@ -107,6 +107,42 @@ old files on the next open. TrackId, ordered credits, album order, lyrics,
 ratings, playlists and queue references are preserved. A retry against the
 committed state is an explicit no-op.
 
+## Album ownership and whole-album transfer
+
+Album ownership is the physical directory owner. Every track owner must equal
+the album owner and must appear in its ordered credits. `albums_owned_by` and
+`albums_credited_for` expose the distinction between owned releases and albums
+containing only collaborative/credited tracks.
+
+`plan_album_transfer` creates a generation-aware immutable plan for moving a
+whole album to a new AlbumId-preserving location under a destination artist.
+The source album remains one identity: AlbumId, TrackIds, track order, title,
+release type, cover, lyrics, ratings, playlists and queue references are
+preserved. The destination artist becomes physical owner of every track. If the
+destination is already credited, existing credits are untouched. If not, every
+such track requires an explicit per-track credit-addition decision; unresolved
+credit additions block the whole operation.
+
+Merging into a different existing AlbumId is intentionally unsupported because
+one AlbumId denotes one release; silently merging would violate stable album
+identity. The operation therefore rejects an existing destination directory and
+uses a new location under the destination artist. Destination collisions,
+missing cover/lyrics, stale generation, changed metadata, changed ratings,
+changed credits and changed resource fingerprints are rejected before commit.
+
+`execute_album_transfer` stages the album file, cover, every track `.flux`, audio
+and lyrics, verifies copies, publishes the catalogue last, and removes the old
+album-owned files only as journal cleanup. It is one transaction, not a loop of
+single-track transfers. Failure injection covers the same 18 boundaries and real
+child-process aborts before journal, after catalogue publication and during
+cleanup; recovery is complete-old or complete-new and idempotent.
+
+The GUI exposes **Transfer album…** from the selected album view. The review
+shows source/destination owner, track order, credits, cover/lyrics/rating and
+playlist impact, credit blockers and explicit credit decisions. Cancellation
+writes nothing; stale plans are rejected. The TUI shows album ownership and
+directs album transfer to the GUI rather than offering an unsafe shortcut.
+
 ## Artist deletion
 
 Artist deletion is a complete explicit workflow, not a directory removal.
@@ -331,10 +367,11 @@ cleanup.
 3. Import copy/publication runs synchronously at the canonical commit boundary;
    cancellation is safe before commit, but there is no background byte-copy
    progress for very large files.
-4. Single-track ownership transfer and multi-item artist deletion are implemented
-   with copy-first publication, journal cleanup and no-op retry. Whole-album
-   moves are not implemented. The GUI exposes artist deletion and transfer; the
-   TUI refuses transfer/deletion and points to the GUI.
+4. Single-track ownership transfer, whole-album transfer and multi-item artist
+   deletion are implemented with copy-first publication, journal cleanup and
+   no-op retry. Album transfer intentionally preserves AlbumId and does not merge
+   into a different existing AlbumId. The GUI exposes all three reviewed
+   operations; the TUI refuses transfer/deletion and points to the GUI.
 5. Artwork is copied/validated by extension and bounded size only; there is no
    image decode/dimension validation or display and no native image picker.
 6. Playlists, ratings/favorites and lyrics have canonical Controller APIs and

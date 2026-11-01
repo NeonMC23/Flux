@@ -94,8 +94,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   edits the selected track as `title|album|track|disc|artist-id`, `P` creates
   an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. `T` refuses ownership transfer and destructive artist
-  deletion, directing the user to the GUI review/confirmation workflow. For the
+  migration workflow. `D` shows album ownership and whether tracks are
+  credited-only. `T` refuses ownership transfer and destructive artist deletion,
+  directing the user to the GUI review/confirmation workflow. For the
   queue, `a` appends, `x` plays next, `Delete` removes the current entry, and
   `Ctrl+↑`/`Ctrl+↓` reorder. The terminal is always restored on exit.
 
@@ -160,7 +161,11 @@ background staging for very large migrations is still future work.
   deletion preview: transfers, credit-only retention and explicit permanent
   deletions are reviewed per track, with playlist/rating/lyrics consequences,
   stale-plan checks and one transactional commit. The artist is never removed
-  while a track or credit reference remains.
+  while a track or credit reference remains. Selecting an album exposes
+  **Transfer album…**: AlbumId, TrackIds, order, cover, lyrics, ratings,
+  playlists and queue references are preserved; missing destination credits
+  require an explicit per-track decision, and merging into another AlbumId is
+  intentionally blocked.
 - **Import:** every canonical import copies into the library and preserves the
   original extension; sources are never moved, overwritten or deleted.
   Identical content is deduplicated by fingerprint. Existing IDs are preserved
@@ -226,8 +231,8 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Whole-album ownership moves, playlist/rating/lyrics UI, artwork/cover decoding
-and display, gapless playback, crossfade, EQ,
+Playlist/rating/lyrics UI, artwork/cover decoding and display, gapless playback,
+crossfade, EQ,
 frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
 imports are intentionally rejected in canonical mode. Canonical playlist,
