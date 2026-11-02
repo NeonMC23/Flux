@@ -97,7 +97,8 @@ pub use flux_library::canonical::{
     AlbumId, AlbumTransferPlan, AlbumTransferReport, AlbumTransferTrack, ArtistDeletionAlbum,
     ArtistDeletionDecision, ArtistDeletionDestination, ArtistDeletionPlan, ArtistDeletionReport,
     ArtistDeletionTrack, CanonicalImportedTrack, OwnershipDestination, OwnershipTransferPlan,
-    OwnershipTransferReport, PlaylistId, ReleaseType,
+    OwnershipTransferReport, PlaylistId, ReleaseType, TrackAudioReplacementPlan,
+    TrackAudioReplacementReport, TrackMetadataUpdatePlan, TrackMovePlan, TrackMoveReport,
 };
 pub use flux_library::canonical_migrate::{
     CanonicalMigrationError, CanonicalMigrationIssue, CanonicalMigrationPlan,
@@ -176,8 +177,11 @@ pub enum StorageMode {
 pub struct TrackMetadataEdit {
     /// User-visible title override, or `None` to use source metadata.
     pub title: Option<String>,
-    /// Stable artist identity, or `None` to remove the relationship.
+    /// Stable artist identity for portable compatibility. Canonical editing
+    /// never changes the physical owner; ownership transfer is separate.
     pub artist_id: Option<ArtistId>,
+    /// Ordered canonical credits, or `None` to preserve the existing credits.
+    pub credited_artist_ids: Option<Vec<ArtistId>>,
     /// Album title override.
     pub album: Option<String>,
     /// Track number override.
@@ -2842,18 +2846,23 @@ impl Controller {
             return Err(message);
         }
         if self.canonical_store.is_some() {
-            let Some(store) = self.canonical_store.as_ref() else {
-                unreachable!()
-            };
-            let Some(track) = store.track(id).cloned() else {
-                let message = format!("Track {id} is not in the canonical library.");
-                self.report_error(message.clone());
-                return Err(message);
+            let plan = {
+                let Some(store) = self.canonical_store.as_ref() else {
+                    unreachable!()
+                };
+                match store.plan_track_metadata_update(id) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        let message = format!("Could not prepare the metadata edit: {err}");
+                        self.report_error(message.clone());
+                        return Err(message);
+                    }
+                }
             };
             if let Some(artist_id) = edit.artist_id
-                && artist_id != track.owner_artist_id
+                && artist_id != plan.owner_artist_id
             {
-                let message = "Changing the physical owner is not available yet; use an                                ownership-transfer operation instead."
+                let message = "Changing the physical owner is not available in the metadata editor; use the ownership-transfer operation instead."
                     .to_owned();
                 self.report_error(message.clone());
                 return Err(message);
@@ -2863,41 +2872,27 @@ impl Controller {
                 .as_deref()
                 .map(str::trim)
                 .filter(|title| !title.is_empty())
-                .unwrap_or(&track.title)
+                .unwrap_or(&plan.expected_title)
                 .to_owned();
-            let track_number = edit.track_number;
-            let disc_number = edit.disc_number;
-            let credits = track.credited_artist_ids.clone();
-            let album_change = edit
+            let album_title = edit
                 .album
                 .as_deref()
                 .map(str::trim)
                 .filter(|album| !album.is_empty())
-                .is_some_and(|album| {
-                    store
-                        .album(track.album_id)
-                        .is_none_or(|current| current.title != album)
-                });
+                .unwrap_or(&plan.expected_album_title)
+                .to_owned();
+            let credits = edit
+                .credited_artist_ids
+                .clone()
+                .unwrap_or_else(|| plan.expected_credited_artist_ids.clone());
             let store = self.canonical_store.as_mut().expect("canonical store");
-            if album_change
-                && let Some(album) = edit
-                    .album
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|a| !a.is_empty())
-                && let Err(err) = store.rename_album(track.album_id, album)
-            {
-                let message = format!("Could not rename album: {err}");
-                self.report_error(message.clone());
-                return Err(message);
-            }
-            if let Err(err) = store.update_track_metadata(
-                id,
+            if let Err(err) = store.execute_track_metadata_update(
+                &plan,
                 title,
                 credits,
-                track_number,
-                disc_number,
-                track.duration_ms,
+                edit.track_number,
+                edit.disc_number,
+                album_title,
             ) {
                 let message = format!("Could not update track metadata: {err}");
                 self.report_error(message.clone());
@@ -2960,6 +2955,154 @@ impl Controller {
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(format!("Updated metadata for track {id}."));
         Ok(())
+    }
+
+    /// Captures a reviewed metadata-edit plan without writing anything.
+    pub fn plan_track_metadata_update(
+        &self,
+        id: TrackId,
+    ) -> Result<TrackMetadataUpdatePlan, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Metadata review requires a canonical library.".to_owned());
+        };
+        store
+            .plan_track_metadata_update(id)
+            .map_err(|err| format!("Could not prepare the metadata edit: {err}"))
+    }
+
+    /// Executes a reviewed metadata edit as one canonical transaction.
+    pub fn execute_track_metadata_update(
+        &mut self,
+        plan: &TrackMetadataUpdatePlan,
+        edit: &TrackMetadataEdit,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Metadata editing requires a canonical library.".to_owned());
+        };
+        if let Some(artist_id) = edit.artist_id
+            && artist_id != plan.owner_artist_id
+        {
+            return Err(
+                "The metadata editor cannot change the physical owner; use the ownership transfer workflow."
+                    .to_owned(),
+            );
+        }
+        let title = edit
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(&plan.expected_title)
+            .to_owned();
+        let album_title = edit
+            .album
+            .as_deref()
+            .map(str::trim)
+            .filter(|album| !album.is_empty())
+            .unwrap_or(&plan.expected_album_title)
+            .to_owned();
+        let credits = edit
+            .credited_artist_ids
+            .clone()
+            .unwrap_or_else(|| plan.expected_credited_artist_ids.clone());
+        store
+            .execute_track_metadata_update(
+                plan,
+                title,
+                credits,
+                edit.track_number,
+                edit.disc_number,
+                album_title,
+            )
+            .map_err(|err| format!("Could not update track metadata: {err}"))?;
+        self.refresh_from_canonical();
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Updated metadata for track {}.", plan.track_id));
+        Ok(())
+    }
+
+    /// Plans a reviewed move into an existing album owned by the same artist.
+    pub fn plan_track_move(
+        &self,
+        id: TrackId,
+        to_album_id: AlbumId,
+        insertion_index: usize,
+    ) -> Result<TrackMovePlan, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Track moving requires a canonical library.".to_owned());
+        };
+        store
+            .plan_track_move(id, to_album_id, insertion_index)
+            .map_err(|err| format!("Could not prepare the move: {err}"))
+    }
+
+    /// Executes a reviewed move as one canonical transaction.
+    pub fn execute_track_move(&mut self, plan: &TrackMovePlan) -> Result<TrackMoveReport, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Track moving requires a canonical library.".to_owned());
+        };
+        let report = store
+            .execute_track_move(plan)
+            .map_err(|err| format!("Could not move track: {err}"))?;
+        self.refresh_from_canonical();
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "Moved track {} from album {} to album {} at position {}.",
+            report.track_id,
+            report.from_album_id,
+            report.to_album_id,
+            report.insertion_index + 1
+        ));
+        Ok(report)
+    }
+
+    /// Plans a reviewed managed-audio replacement without writing anything.
+    pub fn plan_track_audio_replacement(
+        &self,
+        id: TrackId,
+        source: &Path,
+    ) -> Result<TrackAudioReplacementPlan, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Audio replacement requires a canonical library.".to_owned());
+        };
+        store
+            .plan_track_audio_replacement(id, source)
+            .map_err(|err| format!("Could not prepare the replacement: {err}"))
+    }
+
+    /// Executes a reviewed audio replacement through the canonical journal.
+    pub fn execute_track_audio_replacement(
+        &mut self,
+        plan: &TrackAudioReplacementPlan,
+    ) -> Result<TrackAudioReplacementReport, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Audio replacement requires a canonical library.".to_owned());
+        };
+        let report = store
+            .execute_track_audio_replacement(plan)
+            .map_err(|err| format!("Could not replace audio: {err}"))?;
+        self.refresh_from_canonical();
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "Replaced managed audio for track {}; TrackId and references preserved.",
+            report.track_id
+        ));
+        Ok(report)
     }
 
     /// Imports individual audio files into the active library.
@@ -8473,6 +8616,7 @@ mod tests {
                 TrackMetadataEdit {
                     title: Some("Edited Title".to_owned()),
                     artist_id: Some(artist),
+                    credited_artist_ids: None,
                     album: Some("Edited Album".to_owned()),
                     track_number: Some(4),
                     disc_number: Some(2),
@@ -8715,6 +8859,193 @@ mod tests {
         assert_eq!(
             loaded.queue.current_entry_id(),
             controller.current_queue_entry_id()
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_track_move_preserves_ids_references_and_queue_identity() {
+        let dir = TempDir::new("canonical-track-move");
+        let (root, source) = canonical_track_fixture(&dir);
+        let source_before = fs::read(&source).expect("source before");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        let source_album = controller.track_album_id(id).expect("source album");
+        let owner = controller.track_artist_id(id).expect("owner");
+        let destination = controller
+            .create_album(owner, "Destination", crate::ReleaseType::Album)
+            .expect("destination");
+        controller
+            .set_lyrics(id, Some("move lyrics"))
+            .expect("lyrics");
+        controller.set_rating(id, Some(5), true).expect("rating");
+        let playlist = controller
+            .set_playlist(None, "Move keep", vec![id])
+            .expect("playlist");
+        let queue_entry = controller.current_queue_entry_id();
+        let playback_state = controller.player_state();
+        let plan = controller
+            .plan_track_move(id, destination, 0)
+            .expect("move plan");
+        let report = controller.execute_track_move(&plan).expect("move");
+        assert_eq!(report.track_id, id);
+        assert_eq!(controller.track_album_id(id), Some(destination));
+        assert_eq!(controller.album_tracks(source_album), Vec::<TrackId>::new());
+        assert!(
+            controller.album(source_album).is_some(),
+            "source album remains"
+        );
+        assert_eq!(controller.album_tracks(destination), vec![id]);
+        assert_eq!(controller.track_lyrics(id).as_deref(), Some("move lyrics"));
+        assert_eq!(
+            controller
+                .rating(id)
+                .map(|rating| (rating.rating, rating.favorite)),
+            Some((Some(5), true))
+        );
+        assert_eq!(
+            controller
+                .playlists()
+                .iter()
+                .find(|entry| entry.id == playlist)
+                .map(|entry| entry.track_ids.clone()),
+            Some(vec![id])
+        );
+        assert_eq!(controller.current_queue_entry_id(), queue_entry);
+        assert_eq!(controller.player_state(), playback_state);
+        assert_eq!(fs::read(&source).expect("source preserved"), source_before);
+        controller.shutdown();
+        let (reopened, _control) = boot_canonical_at(&root);
+        assert_eq!(reopened.track_album_id(id), Some(destination));
+        assert_eq!(reopened.track_lyrics(id).as_deref(), Some("move lyrics"));
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn canonical_audio_replacement_preserves_ids_references_and_queue_identity() {
+        let dir = TempDir::new("canonical-track-replace");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        let album = controller.track_album_id(id).expect("album");
+        let owner = controller.track_artist_id(id).expect("owner");
+        let old_audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let replacement_dir = dir.path().join("replacement");
+        fs::create_dir_all(&replacement_dir).expect("replacement dir");
+        let replacement = write_dc_wav(&replacement_dir, "new.wav", 4_410, -0.4);
+        let replacement_before = fs::read(&replacement).expect("replacement bytes");
+        controller
+            .set_lyrics(id, Some("replace lyrics"))
+            .expect("lyrics");
+        controller.set_rating(id, Some(3), false).expect("rating");
+        let playlist = controller
+            .set_playlist(None, "Replace keep", vec![id])
+            .expect("playlist");
+        let queue_entry = controller.current_queue_entry_id();
+        let playback_state = controller.player_state();
+        let plan = controller
+            .plan_track_audio_replacement(id, &replacement)
+            .expect("replacement plan");
+        let report = controller
+            .execute_track_audio_replacement(&plan)
+            .expect("replace");
+        assert_eq!(report.track_id, id);
+        assert_eq!(controller.track_album_id(id), Some(album));
+        assert_eq!(controller.track_artist_id(id), Some(owner));
+        assert_eq!(
+            controller.track_lyrics(id).as_deref(),
+            Some("replace lyrics")
+        );
+        assert_eq!(
+            controller
+                .rating(id)
+                .map(|rating| (rating.rating, rating.favorite)),
+            Some((Some(3), false))
+        );
+        assert_eq!(
+            controller
+                .playlists()
+                .iter()
+                .find(|entry| entry.id == playlist)
+                .map(|entry| entry.track_ids.clone()),
+            Some(vec![id])
+        );
+        assert_eq!(controller.current_queue_entry_id(), queue_entry);
+        assert_eq!(controller.player_state(), playback_state);
+        assert!(
+            !old_audio.exists(),
+            "old managed audio retired after commit"
+        );
+        assert_eq!(fs::read(&replacement).expect("source"), replacement_before);
+        assert_eq!(
+            fs::read(controller.track(id).expect("track").source().path()).expect("new"),
+            replacement_before
+        );
+        controller.shutdown();
+        let (reopened, _control) = boot_canonical_at(&root);
+        assert_eq!(
+            fs::read(reopened.track(id).expect("track").source().path()).expect("reopen"),
+            replacement_before
+        );
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn canonical_metadata_edit_plan_updates_credits_and_rejects_stale_plan() {
+        let dir = TempDir::new("canonical-track-metadata");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        let album_before = controller.track_album_id(id);
+        let owner = controller.track_artist_id(id).expect("owner");
+        let guest = controller.create_artist("Guest").expect("guest");
+        let plan = controller
+            .plan_track_metadata_update(id)
+            .expect("metadata plan");
+        controller
+            .execute_track_metadata_update(
+                &plan,
+                &TrackMetadataEdit {
+                    title: Some("Lifecycle title".to_owned()),
+                    artist_id: Some(owner),
+                    credited_artist_ids: Some(vec![owner, guest]),
+                    album: Some("Lifecycle album".to_owned()),
+                    track_number: Some(7),
+                    disc_number: Some(2),
+                },
+            )
+            .expect("edit");
+        assert_eq!(
+            controller.track(id).map(|track| track.title()),
+            Some("Lifecycle title")
+        );
+        assert_eq!(controller.track_credits(id), vec![owner, guest]);
+        assert_eq!(controller.track_artist_id(id), Some(owner));
+        assert_eq!(controller.track_album_id(id), album_before);
+        assert!(
+            controller
+                .execute_track_metadata_update(
+                    &plan,
+                    &TrackMetadataEdit {
+                        title: Some("Stale title".to_owned()),
+                        ..TrackMetadataEdit::default()
+                    },
+                )
+                .is_err()
         );
         controller.shutdown();
     }
