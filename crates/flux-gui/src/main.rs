@@ -11,6 +11,7 @@
 //! [`flux_app`]. Real audio output requires a build with `--features cpal`;
 //! otherwise the player bar says so and playback attempts report why.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,10 +21,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use flux_app::{
     AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
     Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan,
-    ImportProgress, ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport,
-    RelPath, ReleaseType, StorageMode, TrackAudioReplacementPlan, TrackMetadataEdit,
-    TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration, is_track_playable,
-    prepare_import_files, prepare_import_plan,
+    ImportProgress, ImportRequest, ImportStage, ImportStorage, PlaylistId, PreparedImport,
+    ReconcileReport, RelPath, ReleaseType, StorageMode, TrackAudioReplacementPlan,
+    TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration,
+    is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
     APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
@@ -62,6 +63,7 @@ const SUCCESS: Color = Color::from_rgb8(0x7d, 0xe2, 0xb4);
 
 const TRACK_PAGE_SIZE: usize = 150;
 const GROUP_PAGE_SIZE: usize = 100;
+const SEARCH_RESULT_LIMIT: usize = 20;
 const QUEUE_PAGE_SIZE: usize = 8;
 const QUEUE_ROW_HEIGHT: f32 = 38.0;
 const WAVE_TICK: Duration = Duration::from_millis(16);
@@ -1221,6 +1223,125 @@ impl LibraryView {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SearchCache {
+    query: String,
+    generation: u64,
+    artists: Vec<Artist>,
+    albums: Vec<(AlbumId, String)>,
+    track_ids: Vec<TrackId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TrackSort {
+    #[default]
+    Default,
+    Title,
+    Artist,
+    Album,
+    TrackNumber,
+    Favorites,
+}
+
+impl std::fmt::Display for TrackSort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Default => "Catalogue order",
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+            Self::TrackNumber => "Track / disc",
+            Self::Favorites => "Favorites first",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TriFilter {
+    #[default]
+    Any,
+    With,
+    Without,
+}
+
+impl TriFilter {
+    fn cycle(self) -> Self {
+        match self {
+            Self::Any => Self::With,
+            Self::With => Self::Without,
+            Self::Without => Self::Any,
+        }
+    }
+}
+
+impl std::fmt::Display for TriFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Any => "Any",
+            Self::With => "With",
+            Self::Without => "Without",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ReleaseFilter {
+    #[default]
+    Any,
+    Album,
+    Ep,
+    Single,
+    Compilation,
+    Other,
+}
+
+impl ReleaseFilter {
+    fn matches(self, release_type: ReleaseType) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Album => release_type == ReleaseType::Album,
+            Self::Ep => release_type == ReleaseType::Ep,
+            Self::Single => release_type == ReleaseType::Single,
+            Self::Compilation => release_type == ReleaseType::Compilation,
+            Self::Other => release_type == ReleaseType::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Any => "Any release",
+            Self::Album => "Album",
+            Self::Ep => "EP",
+            Self::Single => "Single",
+            Self::Compilation => "Compilation",
+            Self::Other => "Other",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlaylistChoice {
+    id: PlaylistId,
+    label: String,
+}
+
+impl std::fmt::Display for PlaylistChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BatchReview {
+    playlist_id: Option<PlaylistId>,
+    playlist_label: String,
+    new_playlist_name: String,
+    track_ids: Vec<TrackId>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct QueueDrag {
     entry: QueueEntryId,
@@ -1463,6 +1584,15 @@ impl ImportManager {
 struct FluxReady {
     controller: Controller,
     search: String,
+    search_cache: RefCell<SearchCache>,
+    selected_tracks: Vec<TrackId>,
+    focused_track: Option<TrackId>,
+    filter_favorites: bool,
+    filter_lyrics: TriFilter,
+    filter_artwork: TriFilter,
+    filter_release: ReleaseFilter,
+    sort_tracks: TrackSort,
+    batch_review: Option<BatchReview>,
     lib_input: String,
     track_editor: Option<TrackEditor>,
     import_manager: Option<ImportManager>,
@@ -1626,6 +1756,25 @@ enum Message {
     ReconcilePressed,
     RefreshPressed,
     SearchChanged(String),
+    ClearSearch,
+    SearchNavigateArtist(ArtistId),
+    SearchNavigateAlbum(AlbumId),
+    SearchNavigateTrack(TrackId),
+    TrackSelectionToggle(TrackId),
+    TrackSelectionSelectAll,
+    TrackSelectionClear,
+    FilterFavoritesToggled,
+    FilterLyricsCycle,
+    FilterArtworkCycle,
+    FilterReleaseChanged(ReleaseFilter),
+    SortTracksChanged(TrackSort),
+    ResetLibraryFilters,
+    BatchPlaylistAdd(PlaylistId),
+    BatchPlaylistCreateOpen,
+    BatchPlaylistNameChanged(String),
+    BatchReviewConfirm,
+    BatchReviewCancel,
+    BatchFavorites(bool),
     SelectView(LibraryView),
     SelectGroup(Option<String>),
     ToggleSetup,
@@ -1668,6 +1817,15 @@ impl FluxReady {
         Self {
             controller,
             search: String::new(),
+            search_cache: RefCell::new(SearchCache::default()),
+            selected_tracks: Vec::new(),
+            focused_track: None,
+            filter_favorites: false,
+            filter_lyrics: TriFilter::Any,
+            filter_artwork: TriFilter::Any,
+            filter_release: ReleaseFilter::Any,
+            sort_tracks: TrackSort::Default,
+            batch_review: None,
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
@@ -2861,6 +3019,7 @@ impl FluxReady {
                             self.artist_selected = Some(id);
                             self.artist_name_input.clear();
                             self.artist_rename_input = name.clone();
+                            self.invalidate_search_cache();
                             self.lifecycle_msg = Some(format!("Created artist {name} (ID {id})."));
                         }
                         Err(error) => self.lifecycle_msg = Some(error),
@@ -2874,6 +3033,7 @@ impl FluxReady {
                     if !name.is_empty() {
                         match self.controller.rename_artist(id, &name) {
                             Ok(()) => {
+                                self.invalidate_search_cache();
                                 self.lifecycle_msg =
                                     Some(format!("Renamed artist {id} to {name}."));
                             }
@@ -3178,6 +3338,7 @@ impl FluxReady {
                     self.album_type,
                 ) {
                     Ok(()) => {
+                        self.invalidate_search_cache();
                         self.sync_album_editor();
                         if let Some(updated) = self.controller.album(album) {
                             self.selected_group = Some(album_key_for_title(album, &updated.title));
@@ -3875,19 +4036,170 @@ impl FluxReady {
             Message::SearchChanged(value) => {
                 self.search = value;
                 self.page = 0;
-                if !self.search.trim().is_empty()
-                    && self.view != LibraryView::Tracks
-                    && self.selected_group.is_none()
-                {
-                    self.view = LibraryView::Tracks;
+                self.selected_tracks.clear();
+                self.focused_track = None;
+            }
+            Message::ClearSearch => {
+                self.search.clear();
+                self.page = 0;
+                self.selected_tracks.clear();
+                self.focused_track = None;
+            }
+            Message::SearchNavigateArtist(id) => {
+                if let Some(artist) = self.controller.artist(id) {
+                    self.view = LibraryView::Artists;
+                    self.selected_group =
+                        Some(format!("{}{ARTIST_KEY_SEPARATOR}{id}", artist.name()));
+                    self.search.clear();
+                    self.selected_tracks.clear();
+                    self.focused_track = None;
+                    self.page = 0;
+                    self.show_setup = false;
                 }
             }
-            Message::SelectView(view) => self.select_view(view),
+            Message::SearchNavigateAlbum(id) => {
+                if let Some(album) = self.controller.album(id) {
+                    self.view = LibraryView::Albums;
+                    self.selected_group = Some(album_key_for_title(id, &album.title));
+                    self.search.clear();
+                    self.selected_tracks.clear();
+                    self.focused_track = None;
+                    self.sync_album_editor();
+                    self.page = 0;
+                    self.show_setup = false;
+                }
+            }
+            Message::SearchNavigateTrack(id) => {
+                if self.controller.track(id).is_some() {
+                    let index = self
+                        .controller
+                        .tracks()
+                        .iter()
+                        .position(|(track_id, _)| *track_id == id)
+                        .unwrap_or(0);
+                    self.view = LibraryView::Tracks;
+                    self.selected_group = None;
+                    self.search.clear();
+                    self.focused_track = Some(id);
+                    self.selected_tracks.clear();
+                    self.filter_favorites = false;
+                    self.filter_lyrics = TriFilter::Any;
+                    self.filter_artwork = TriFilter::Any;
+                    self.filter_release = ReleaseFilter::Any;
+                    self.sort_tracks = TrackSort::Default;
+                    self.page = index / TRACK_PAGE_SIZE;
+                    self.show_setup = false;
+                }
+            }
+            Message::TrackSelectionToggle(id) => {
+                if self.controller.track(id).is_some() {
+                    if let Some(index) = self
+                        .selected_tracks
+                        .iter()
+                        .position(|selected| *selected == id)
+                    {
+                        self.selected_tracks.remove(index);
+                    } else {
+                        self.selected_tracks.push(id);
+                    }
+                }
+            }
+            Message::TrackSelectionSelectAll => {
+                let visible = self.visible_track_ids();
+                self.selected_tracks = visible;
+            }
+            Message::TrackSelectionClear => self.selected_tracks.clear(),
+            Message::FilterFavoritesToggled => {
+                self.filter_favorites = !self.filter_favorites;
+                self.page = 0;
+                self.selected_tracks.clear();
+            }
+            Message::FilterLyricsCycle => {
+                self.filter_lyrics = self.filter_lyrics.cycle();
+                self.page = 0;
+                self.selected_tracks.clear();
+            }
+            Message::FilterArtworkCycle => {
+                self.filter_artwork = self.filter_artwork.cycle();
+                self.page = 0;
+                self.selected_tracks.clear();
+            }
+            Message::FilterReleaseChanged(release) => {
+                self.filter_release = release;
+                self.page = 0;
+                self.selected_tracks.clear();
+            }
+            Message::SortTracksChanged(sort) => {
+                self.sort_tracks = sort;
+                self.page = 0;
+            }
+            Message::ResetLibraryFilters => {
+                self.filter_favorites = false;
+                self.filter_lyrics = TriFilter::Any;
+                self.filter_artwork = TriFilter::Any;
+                self.filter_release = ReleaseFilter::Any;
+                self.sort_tracks = TrackSort::Default;
+                self.page = 0;
+                self.selected_tracks.clear();
+            }
+            Message::BatchPlaylistAdd(playlist_id) => {
+                if let Some(playlist) = self
+                    .controller
+                    .playlists()
+                    .into_iter()
+                    .find(|playlist| playlist.id == playlist_id)
+                {
+                    self.batch_review = Some(BatchReview {
+                        playlist_id: Some(playlist_id),
+                        playlist_label: playlist.name,
+                        new_playlist_name: String::new(),
+                        track_ids: self.selected_tracks.clone(),
+                        error: None,
+                    });
+                }
+            }
+            Message::BatchPlaylistCreateOpen => {
+                self.batch_review = Some(BatchReview {
+                    playlist_id: None,
+                    playlist_label: String::new(),
+                    new_playlist_name: String::new(),
+                    track_ids: self.selected_tracks.clone(),
+                    error: None,
+                });
+            }
+            Message::BatchPlaylistNameChanged(value) => {
+                if let Some(review) = self.batch_review.as_mut() {
+                    review.new_playlist_name = value;
+                }
+            }
+            Message::BatchReviewCancel => self.batch_review = None,
+            Message::BatchReviewConfirm => self.confirm_batch_review(),
+            Message::BatchFavorites(favorite) => {
+                let ids = self.selected_tracks.clone();
+                match self.controller.set_favorites(&ids, favorite) {
+                    Ok(count) => {
+                        self.selected_tracks.clear();
+                        self.lifecycle_msg = Some(format!(
+                            "{} track(s) marked {}favorite.",
+                            count,
+                            if favorite { "" } else { "not " }
+                        ));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::SelectView(view) => {
+                self.selected_tracks.clear();
+                self.focused_track = None;
+                self.select_view(view);
+            }
             Message::SelectGroup(group) => {
                 if group.is_none() {
                     self.search.clear();
                 }
                 self.selected_group = group;
+                self.selected_tracks.clear();
+                self.focused_track = None;
                 self.sync_album_editor();
                 self.page = 0;
                 self.show_setup = false;
@@ -3985,6 +4297,12 @@ impl FluxReady {
             Message::CycleRepeat => self.controller.cycle_repeat_mode(),
             Message::VolumeChanged(volume) => self.controller.set_volume(volume),
             Message::KeyPressed(key, modifiers) => {
+                if self.batch_review.is_some() {
+                    if matches!(key, Key::Named(Named::Escape)) {
+                        self.batch_review = None;
+                    }
+                    return Task::none();
+                }
                 if self.album_transfer.is_some() {
                     if matches!(key, Key::Named(Named::Escape)) {
                         self.album_transfer = None;
@@ -4056,6 +4374,8 @@ impl FluxReady {
                         }
                         self.cancel_queue_drag();
                         self.search.clear();
+                        self.selected_tracks.clear();
+                        self.focused_track = None;
                         self.selected_group = None;
                         self.show_setup = false;
                         self.page = 0;
@@ -4133,7 +4453,11 @@ impl FluxReady {
         }
 
         let base: Element<'_, Message> = body.into();
-        let body: Element<'_, Message> = if self.album_transfer.is_some() {
+        let body: Element<'_, Message> = if self.batch_review.is_some() {
+            stack([base, self.batch_overlay()])
+                .height(Length::Fill)
+                .into()
+        } else if self.album_transfer.is_some() {
             stack([base, self.album_transfer_overlay()])
                 .height(Length::Fill)
                 .into()
@@ -4853,6 +5177,90 @@ impl FluxReady {
                 .into(),
         ])
         .height(Length::Fill)
+        .into()
+    }
+
+    fn batch_overlay(&self) -> Element<'_, Message> {
+        let Some(review) = self.batch_review.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let mut body = column![
+            text("Review playlist change").size(22).color(TEXT),
+            text(format!(
+                "{} selected track(s) will be written in one canonical playlist transaction.",
+                review.track_ids.len()
+            ))
+            .size(11)
+            .color(MUTED),
+        ]
+        .spacing(8);
+        if let Some(playlist_id) = review.playlist_id {
+            body = body.push(
+                text(format!(
+                    "Target: {} · playlist {} · existing entries are retained and selected tracks append in selection order.",
+                    review.playlist_label, playlist_id
+                ))
+                .size(10)
+                .color(ACCENT),
+            );
+        } else {
+            body = body.push(
+                text("New playlist from the current ordered selection.")
+                    .size(10)
+                    .color(ACCENT),
+            );
+            body = body.push(
+                text_input("Playlist name…", &review.new_playlist_name)
+                    .on_input(Message::BatchPlaylistNameChanged)
+                    .on_submit(Message::BatchReviewConfirm)
+                    .style(input_style)
+                    .width(Length::Fill),
+            );
+        }
+        let mut tracks = column![].spacing(2);
+        for id in review.track_ids.iter().take(6) {
+            let label = self
+                .controller
+                .track(*id)
+                .map(|track| format!("{} · {}", track.title(), display_artist(track)))
+                .unwrap_or_else(|| format!("Track {id} is no longer available"));
+            tracks = tracks.push(text(label).size(10).color(MUTED));
+        }
+        if review.track_ids.len() > 6 {
+            tracks = tracks.push(
+                text(format!("and {} more…", review.track_ids.len() - 6))
+                    .size(9)
+                    .color(MUTED),
+            );
+        }
+        body = body.push(tracks);
+        if let Some(error) = &review.error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        body = body.push(
+            row![
+                button(text("Confirm").size(12))
+                    .style(accent_button_style)
+                    .padding([8, 14])
+                    .on_press(Message::BatchReviewConfirm),
+                button(text("Cancel").size(11))
+                    .style(ghost_style)
+                    .padding([8, 12])
+                    .on_press(Message::BatchReviewCancel),
+            ]
+            .spacing(8),
+        );
+        container(
+            container(body)
+                .padding(18)
+                .width(Length::Fill)
+                .max_width(580.0)
+                .style(import_panel_style),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center(Length::Fill)
+        .style(modal_backdrop_style)
         .into()
     }
 
@@ -6326,6 +6734,14 @@ impl FluxReady {
         if let Some(banner) = self.error_banner() {
             content = content.push(banner);
         }
+        if !self.show_setup
+            && self.track_editor.is_none()
+            && self.search.trim().is_empty()
+            && !self.controller.tracks().is_empty()
+            && (self.view == LibraryView::Tracks || self.selected_group.is_some())
+        {
+            content = content.push(self.library_controls());
+        }
         content = content.push(
             container(if self.show_setup {
                 self.setup_view()
@@ -6360,6 +6776,11 @@ impl FluxReady {
                     "Track {} · Flux stores canonical metadata; the audio file and its tags stay untouched.",
                     editor.id
                 ),
+            )
+        } else if !self.search.trim().is_empty() {
+            (
+                "Search results".to_owned(),
+                "Artists, albums and tracks from the canonical catalogue.".to_owned(),
             )
         } else if let Some(group) = &self.selected_group {
             let rows = self.filtered_tracks();
@@ -6415,12 +6836,20 @@ impl FluxReady {
 
         if !self.show_setup && self.track_editor.is_none() {
             bar = bar.push(
-                text_input("Search title, artist, album…", &self.search)
+                text_input("Search artists, albums, tracks…", &self.search)
                     .id(iced::widget::Id::new("flux-search"))
                     .on_input(Message::SearchChanged)
                     .style(input_style)
                     .width(Length::Fixed(250.0)),
             );
+            if !self.search.trim().is_empty() {
+                bar = bar.push(
+                    button(text("Clear").size(10))
+                        .style(ghost_style)
+                        .padding([5, 8])
+                        .on_press(Message::ClearSearch),
+                );
+            }
         }
         if self.window_width >= 1_080.0 && self.track_editor.is_none() {
             bar = bar.push(
@@ -6480,6 +6909,9 @@ impl FluxReady {
     fn library_view(&self) -> Element<'_, Message> {
         if self.track_editor.is_some() {
             return self.track_editor_view();
+        }
+        if !self.search.trim().is_empty() {
+            return self.search_results_view();
         }
         if self.controller.tracks().is_empty() {
             return self.empty_library();
@@ -6565,6 +6997,9 @@ impl FluxReady {
                     targets.push(AlbumId::new(id));
                 }
             }
+        }
+        if !self.search.trim().is_empty() {
+            targets.extend(self.search_snapshot().albums.iter().map(|(id, _)| *id));
         }
         if let Some(album_id) = self
             .controller
@@ -7116,16 +7551,489 @@ impl FluxReady {
         .into()
     }
 
+    fn search_snapshot(&self) -> std::cell::RefMut<'_, SearchCache> {
+        let generation = self.controller.generation();
+        let mut cache = self.search_cache.borrow_mut();
+        if cache.query != self.search || cache.generation != generation {
+            let query = self.search.trim();
+            if query.is_empty() {
+                cache.artists.clear();
+                cache.albums.clear();
+                cache.track_ids.clear();
+            } else {
+                cache.artists = self.controller.search_artists(query);
+                cache.albums = self.controller.search_albums(query);
+                cache.track_ids = self
+                    .controller
+                    .search(query)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+            }
+            cache.query = self.search.clone();
+            cache.generation = generation;
+        }
+        cache
+    }
+
+    fn invalidate_search_cache(&mut self) {
+        self.search_cache.borrow_mut().generation = u64::MAX;
+    }
+
+    fn filters_active(&self) -> bool {
+        self.filter_favorites
+            || self.filter_lyrics != TriFilter::Any
+            || self.filter_artwork != TriFilter::Any
+            || self.filter_release != ReleaseFilter::Any
+            || self.sort_tracks != TrackSort::Default
+    }
+
     fn filtered_tracks(&self) -> Vec<(TrackId, &Track)> {
-        let mut rows = self.controller.search(&self.search);
-        if let Some(group) = &self.selected_group {
-            rows.retain(|(id, track)| {
-                self.group_keys_for(self.view, *id, track)
-                    .iter()
-                    .any(|key| key == group)
+        let album_mode = self.selected_album_id();
+        let mut rows = if let Some(album_id) = album_mode {
+            self.controller
+                .album_tracks(album_id)
+                .into_iter()
+                .filter_map(|id| self.controller.track(id).map(|track| (id, track)))
+                .collect::<Vec<_>>()
+        } else {
+            self.controller
+                .tracks()
+                .iter()
+                .filter(|(id, track)| {
+                    self.selected_group.as_ref().is_none_or(|group| {
+                        self.group_keys_for(self.view, *id, track)
+                            .iter()
+                            .any(|key| key == group)
+                    })
+                })
+                .map(|(id, track)| (*id, track))
+                .collect::<Vec<_>>()
+        };
+        rows.retain(|(id, _)| {
+            self.controller
+                .rating(*id)
+                .is_some_and(|rating| rating.favorite)
+                || !self.filter_favorites
+        });
+        rows.retain(|(id, _)| {
+            self.filter_lyrics == TriFilter::Any
+                || (self.filter_lyrics == TriFilter::With) == self.controller.track_has_lyrics(*id)
+        });
+        rows.retain(|(id, _)| {
+            let album = self
+                .controller
+                .track_album_id(*id)
+                .and_then(|album_id| self.controller.album(album_id));
+            if !self.filter_release.matches(
+                album
+                    .as_ref()
+                    .map_or(ReleaseType::Other, |a| a.release_type),
+            ) {
+                return false;
+            }
+            self.filter_artwork == TriFilter::Any
+                || (self.filter_artwork == TriFilter::With)
+                    == album.as_ref().is_some_and(|album| album.cover.is_some())
+        });
+
+        if album_mode.is_none() && self.sort_tracks != TrackSort::Default {
+            rows.sort_by(|(left_id, left), (right_id, right)| {
+                let ordering = match self.sort_tracks {
+                    TrackSort::Default => std::cmp::Ordering::Equal,
+                    TrackSort::Title => left
+                        .title()
+                        .to_lowercase()
+                        .cmp(&right.title().to_lowercase()),
+                    TrackSort::Artist => display_artist(left)
+                        .to_lowercase()
+                        .cmp(&display_artist(right).to_lowercase()),
+                    TrackSort::Album => display_album(left)
+                        .to_lowercase()
+                        .cmp(&display_album(right).to_lowercase()),
+                    TrackSort::TrackNumber => (left.disc_number(), left.track_number())
+                        .cmp(&(right.disc_number(), right.track_number())),
+                    TrackSort::Favorites => {
+                        let left_rating = self.controller.rating(*left_id);
+                        let right_rating = self.controller.rating(*right_id);
+                        right_rating
+                            .is_some_and(|rating| rating.favorite)
+                            .cmp(&left_rating.is_some_and(|rating| rating.favorite))
+                            .then_with(|| {
+                                right_rating
+                                    .and_then(|rating| rating.rating)
+                                    .cmp(&left_rating.and_then(|rating| rating.rating))
+                            })
+                    }
+                };
+                ordering.then_with(|| left_id.cmp(right_id))
             });
         }
         rows
+    }
+
+    fn visible_track_ids(&self) -> Vec<TrackId> {
+        if !self.search.trim().is_empty() {
+            return self
+                .search_snapshot()
+                .track_ids
+                .iter()
+                .take(SEARCH_RESULT_LIMIT)
+                .copied()
+                .collect();
+        }
+        let rows = self.filtered_tracks();
+        let pages = rows.len().div_ceil(TRACK_PAGE_SIZE).max(1);
+        let page = self.page.min(pages - 1);
+        let start = page * TRACK_PAGE_SIZE;
+        let end = (start + TRACK_PAGE_SIZE).min(rows.len());
+        rows[start..end].iter().map(|(id, _)| *id).collect()
+    }
+
+    fn playlist_choices(&self) -> Vec<PlaylistChoice> {
+        self.controller
+            .playlists()
+            .into_iter()
+            .map(|playlist| PlaylistChoice {
+                id: playlist.id,
+                label: format!("{} · {} track(s)", playlist.name, playlist.track_ids.len()),
+            })
+            .collect()
+    }
+
+    fn confirm_batch_review(&mut self) {
+        let Some(mut review) = self.batch_review.take() else {
+            return;
+        };
+        if review.track_ids.is_empty() {
+            review.error = Some("No tracks remain selected.".to_owned());
+            self.batch_review = Some(review);
+            return;
+        }
+        let result = if let Some(playlist_id) = review.playlist_id {
+            self.controller
+                .add_tracks_to_playlist(playlist_id, &review.track_ids)
+                .map(|count| format!("Added {count} track(s) to {}.", review.playlist_label))
+        } else {
+            let name = review.new_playlist_name.trim();
+            if name.is_empty() {
+                review.error = Some("Playlist name must not be empty.".to_owned());
+                self.batch_review = Some(review);
+                return;
+            }
+            self.controller
+                .create_playlist_from_tracks(name, &review.track_ids)
+                .map(|id| {
+                    format!(
+                        "Created playlist {id} with {} track(s).",
+                        review.track_ids.len()
+                    )
+                })
+        };
+        match result {
+            Ok(message) => {
+                self.selected_tracks.clear();
+                self.lifecycle_msg = Some(message);
+            }
+            Err(error) => {
+                review.error = Some(error);
+                self.batch_review = Some(review);
+            }
+        }
+    }
+
+    fn batch_action_bar(&self) -> Option<Element<'_, Message>> {
+        if self.selected_tracks.is_empty() {
+            return None;
+        }
+        let playlists = self.playlist_choices();
+        let mut row = row![
+            text(format!("{} selected", self.selected_tracks.len()))
+                .size(10)
+                .color(ACCENT),
+            button(text("Select all visible").size(10))
+                .style(ghost_style)
+                .padding([5, 8])
+                .on_press(Message::TrackSelectionSelectAll),
+            button(text("Clear").size(10))
+                .style(ghost_style)
+                .padding([5, 8])
+                .on_press(Message::TrackSelectionClear),
+            button(text("Favorite").size(10))
+                .style(ghost_style)
+                .padding([5, 8])
+                .on_press(Message::BatchFavorites(true)),
+            button(text("Unfavorite").size(10))
+                .style(ghost_style)
+                .padding([5, 8])
+                .on_press(Message::BatchFavorites(false)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if playlists.is_empty() {
+            row = row.push(
+                button(text("Create playlist…").size(10))
+                    .style(accent_button_style)
+                    .padding([5, 8])
+                    .on_press(Message::BatchPlaylistCreateOpen),
+            );
+        } else {
+            row = row.push(
+                pick_list(playlists, None::<PlaylistChoice>, |choice| {
+                    Message::BatchPlaylistAdd(choice.id)
+                })
+                .placeholder("Add to playlist…")
+                .text_size(10)
+                .padding([5, 7])
+                .width(Length::Fixed(190.0)),
+            );
+            row = row.push(
+                button(text("Create playlist…").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::BatchPlaylistCreateOpen),
+            );
+        }
+        Some(
+            container(row.wrap())
+                .padding([7, 9])
+                .width(Length::Fill)
+                .style(card_style)
+                .into(),
+        )
+    }
+
+    fn library_controls(&self) -> Element<'_, Message> {
+        let album_mode = self.selected_album_id().is_some();
+        let mut controls = row![
+            text("FILTER").size(8).color(MUTED),
+            button(text("Favorites").size(10))
+                .style(nav_style(self.filter_favorites))
+                .padding([5, 8])
+                .on_press(Message::FilterFavoritesToggled),
+            button(text(format!("Lyrics: {}", self.filter_lyrics)).size(10))
+                .style(nav_style(self.filter_lyrics != TriFilter::Any))
+                .padding([5, 8])
+                .on_press(Message::FilterLyricsCycle),
+            button(text(format!("Artwork: {}", self.filter_artwork)).size(10))
+                .style(nav_style(self.filter_artwork != TriFilter::Any))
+                .padding([5, 8])
+                .on_press(Message::FilterArtworkCycle),
+            pick_list(
+                vec![
+                    ReleaseFilter::Any,
+                    ReleaseFilter::Album,
+                    ReleaseFilter::Ep,
+                    ReleaseFilter::Single,
+                    ReleaseFilter::Compilation,
+                    ReleaseFilter::Other,
+                ],
+                Some(self.filter_release),
+                Message::FilterReleaseChanged,
+            )
+            .text_size(10)
+            .padding([5, 7]),
+            text("SORT").size(8).color(MUTED),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if album_mode {
+            controls = controls.push(text("Album order preserved").size(9).color(MUTED));
+        } else {
+            controls = controls.push(
+                pick_list(
+                    vec![
+                        TrackSort::Default,
+                        TrackSort::Title,
+                        TrackSort::Artist,
+                        TrackSort::Album,
+                        TrackSort::TrackNumber,
+                        TrackSort::Favorites,
+                    ],
+                    Some(self.sort_tracks),
+                    Message::SortTracksChanged,
+                )
+                .text_size(10)
+                .padding([5, 7]),
+            );
+        }
+        if self.filters_active() {
+            controls = controls.push(
+                button(text("Reset filters").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ResetLibraryFilters),
+            );
+        }
+        container(controls.wrap())
+            .padding([6, 8])
+            .width(Length::Fill)
+            .style(card_style)
+            .into()
+    }
+
+    fn search_results_view(&self) -> Element<'_, Message> {
+        let cache = self.search_snapshot().clone();
+        if cache.artists.is_empty() && cache.albums.is_empty() && cache.track_ids.is_empty() {
+            return container(
+                column![
+                    text(format!("No catalogue matches for “{}”.", self.search.trim()))
+                        .size(15)
+                        .color(TEXT),
+                    text("Search is case-insensitive and matches artist names, album titles and track titles.")
+                        .size(10)
+                        .color(MUTED),
+                    button(text("Clear search").size(11))
+                        .style(accent_button_style)
+                        .padding([7, 11])
+                        .on_press(Message::ClearSearch),
+                ]
+                .spacing(8)
+                .align_x(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill)
+            .into();
+        }
+
+        let mut body = column![
+            row![
+                column![
+                    text(format!("Search results for “{}”", self.search.trim()))
+                        .size(20)
+                        .color(TEXT),
+                    text(format!(
+                        "{} artist(s) · {} album(s) · {} track(s)",
+                        cache.artists.len(),
+                        cache.albums.len(),
+                        cache.track_ids.len()
+                    ))
+                    .size(10)
+                    .color(MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                button(text("Clear search").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::ClearSearch),
+            ]
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10);
+        if let Some(batch) = self.batch_action_bar() {
+            body = body.push(batch);
+        }
+
+        if !cache.artists.is_empty() {
+            body = body.push(text("ARTISTS").size(9).color(ACCENT));
+            let mut list = column![].spacing(4);
+            for artist in cache.artists.iter().take(SEARCH_RESULT_LIMIT) {
+                list = list.push(
+                    button(
+                        row![
+                            fallback_artwork(Some(artist.name()), 32.0),
+                            column![
+                                text(artist.name().to_owned()).size(13).color(TEXT),
+                                text(format!("Artist {}", artist.id())).size(9).color(MUTED),
+                            ]
+                            .spacing(1),
+                        ]
+                        .spacing(9)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([5, 7])
+                    .style(group_style)
+                    .on_press(Message::SearchNavigateArtist(artist.id())),
+                );
+            }
+            body = body.push(list);
+        }
+        if !cache.albums.is_empty() {
+            body = body.push(text("ALBUMS").size(9).color(ACCENT));
+            let mut list = column![].spacing(4);
+            for (album_id, title) in cache.albums.iter().take(SEARCH_RESULT_LIMIT) {
+                let owner = self
+                    .controller
+                    .album_owner(*album_id)
+                    .and_then(|id| self.controller.artist(id))
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| "unknown owner".to_owned());
+                list = list.push(
+                    button(
+                        row![
+                            self.album_artwork(Some(*album_id), 32.0, ContentFit::Cover),
+                            column![
+                                text(title.clone()).size(13).color(TEXT),
+                                text(format!("Album {} · {owner}", album_id))
+                                    .size(9)
+                                    .color(MUTED),
+                            ]
+                            .spacing(1),
+                        ]
+                        .spacing(9)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([5, 7])
+                    .style(group_style)
+                    .on_press(Message::SearchNavigateAlbum(*album_id)),
+                );
+            }
+            body = body.push(list);
+        }
+        if !cache.track_ids.is_empty() {
+            body = body.push(text("TRACKS").size(9).color(ACCENT));
+            let mut list = column![].spacing(2);
+            let current = self.controller.current_id();
+            let editable = matches!(
+                self.controller.storage_mode(),
+                StorageMode::Portable | StorageMode::Canonical
+            );
+            for (index, id) in cache.track_ids.iter().take(SEARCH_RESULT_LIMIT).enumerate() {
+                let Some(track) = self.controller.track(*id) else {
+                    continue;
+                };
+                let missing = matches!(
+                    self.controller.track_availability(*id),
+                    Some(Availability::Missing)
+                );
+                list = list.push(
+                    row![
+                        track_row(
+                            index + 1,
+                            *id,
+                            track,
+                            &self.credit_display(*id),
+                            TrackRowState {
+                                current,
+                                missing,
+                                editable,
+                                checked: self.selected_tracks.contains(id),
+                                focused: self.focused_track == Some(*id),
+                            },
+                        ),
+                        button(text("Locate").size(9))
+                            .style(ghost_style)
+                            .padding([5, 7])
+                            .on_press(Message::SearchNavigateTrack(*id)),
+                    ]
+                    .spacing(2)
+                    .align_y(Alignment::Center),
+                );
+            }
+            body = body.push(list);
+        }
+        body = body.push(
+            text(format!(
+                "Showing at most {SEARCH_RESULT_LIMIT} results per type. Refine the query to narrow matches."
+            ))
+            .size(9)
+            .color(MUTED),
+        );
+        scrollable(body).height(Length::Fill).into()
     }
 
     fn album_detail_view(&self, album_id: AlbumId) -> Element<'_, Message> {
@@ -7268,6 +8176,9 @@ impl FluxReady {
                     .color(DANGER),
             );
         }
+        if let Some(batch) = self.batch_action_bar() {
+            body = body.push(batch);
+        }
         if album.track_order.is_empty() {
             body = body.push(
                 container(
@@ -7405,6 +8316,7 @@ impl FluxReady {
         );
 
         let header = row![
+            text("SEL").size(8).color(MUTED).width(Length::Fixed(22.0)),
             text("#").size(9).color(MUTED).width(Length::Fixed(28.0)),
             text("TITLE")
                 .size(9)
@@ -7433,9 +8345,13 @@ impl FluxReady {
                 *id,
                 track,
                 &self.credit_display(*id),
-                current,
-                missing,
-                editable,
+                TrackRowState {
+                    current,
+                    missing,
+                    editable,
+                    checked: self.selected_tracks.contains(id),
+                    focused: self.focused_track == Some(*id),
+                },
             ));
         }
 
@@ -7480,6 +8396,9 @@ impl FluxReady {
                 .padding(9)
                 .style(card_style),
             );
+        }
+        if let Some(batch) = self.batch_action_bar() {
+            content = content.push(batch);
         }
         content = content.push(header);
         content = content.push(horizontal_rule());
@@ -8233,16 +9152,23 @@ fn setup_card<'a>(
     .into()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TrackRowState {
+    current: Option<TrackId>,
+    missing: bool,
+    editable: bool,
+    checked: bool,
+    focused: bool,
+}
+
 fn track_row<'a>(
     index: usize,
     id: TrackId,
     track: &'a Track,
     credits: &str,
-    current: Option<TrackId>,
-    missing: bool,
-    editable: bool,
+    state: TrackRowState,
 ) -> Element<'a, Message> {
-    let selected = current == Some(id);
+    let selected = state.current == Some(id) || state.focused;
     let marker = if selected {
         "▶".to_owned()
     } else {
@@ -8255,7 +9181,7 @@ fn track_row<'a>(
     let mut title = row![text(track.title()).size(13).color(title_color)]
         .spacing(8)
         .align_y(Alignment::Center);
-    if missing {
+    if state.missing {
         title = title.push(text("missing").size(9).color(DANGER));
     }
     if !playable {
@@ -8282,10 +9208,14 @@ fn track_row<'a>(
     .spacing(12)
     .align_y(Alignment::Center);
 
+    let check = button(text(if state.checked { "✓" } else { "○" }).size(11))
+        .style(ghost_style)
+        .padding([5, 7])
+        .on_press(Message::TrackSelectionToggle(id));
     let main = button(content)
         .width(Length::Fill)
         .padding([7, 10])
-        .style(track_row_style(selected))
+        .style(track_row_style(selected || state.checked))
         .on_press(Message::PlayTrack(id));
     let add = button(text("+").size(12))
         .style(ghost_style)
@@ -8298,11 +9228,11 @@ fn track_row<'a>(
     let edit = button(text("✎").size(11))
         .style(ghost_style)
         .padding([5, 7])
-        .on_press_maybe(editable.then_some(Message::EditTrack(id)));
+        .on_press_maybe(state.editable.then_some(Message::EditTrack(id)));
     let edit = tooltip(
         edit,
         container(
-            text(if editable {
+            text(if state.editable {
                 "Edit metadata"
             } else {
                 "Use a canonical library to edit"
@@ -8317,7 +9247,7 @@ fn track_row<'a>(
     .gap(6)
     .delay(Duration::from_millis(350));
 
-    row![main, add, next, edit]
+    row![check, main, add, next, edit]
         .spacing(2)
         .align_y(Alignment::Center)
         .into()
@@ -8584,6 +9514,15 @@ mod tests {
         FluxReady {
             controller,
             search: String::new(),
+            search_cache: RefCell::new(SearchCache::default()),
+            selected_tracks: Vec::new(),
+            focused_track: None,
+            filter_favorites: false,
+            filter_lyrics: TriFilter::Any,
+            filter_artwork: TriFilter::Any,
+            filter_release: ReleaseFilter::Any,
+            sort_tracks: TrackSort::Default,
+            batch_review: None,
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
@@ -10254,6 +11193,407 @@ mod tests {
                 .and_then(|manager| manager.target_album()),
             Some(target)
         );
+        gui.controller.shutdown();
+    }
+
+    fn import_named_track(
+        gui: &mut FluxReady,
+        dir: &TempDir,
+        title: &str,
+        artist_name: &str,
+        album_title: &str,
+        release_type: ReleaseType,
+        marker: u8,
+    ) -> TrackId {
+        let artist = gui
+            .controller
+            .create_artist(artist_name)
+            .expect("create artist");
+        let source_dir = dir.path().join("fixtures").join(format!("{marker}"));
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join(format!("{marker}.wav"));
+        let mut bytes = minimal_wav();
+        bytes.push(marker);
+        std::fs::write(&source, bytes).expect("source");
+        gui.controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source,
+                title: title.to_owned(),
+                artist_id: Some(artist),
+                artist_name: artist_name.to_owned(),
+                credited_artist_ids: vec![artist],
+                album_title: Some(album_title.to_owned()),
+                release_type,
+                track_number: Some(u32::from(marker)),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import")
+    }
+
+    #[test]
+    fn global_search_groups_entities_and_navigates_without_writes() {
+        let dir = TempDir::new("gui-global-search");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Zed Track",
+            "Zed Artist",
+            "Zed Album",
+            ReleaseType::Album,
+            1,
+        );
+        let album = gui.controller.track_album_id(id).expect("album");
+        let artist = gui.controller.track_artist_id(id).expect("artist");
+        let generation = gui.controller.generation();
+
+        send(&mut gui, Message::SearchChanged("zEd".to_owned()));
+        {
+            let cache = gui.search_snapshot();
+            assert_eq!(cache.artists.len(), 1);
+            assert_eq!(cache.albums, vec![(album, "Zed Album".to_owned())]);
+            assert_eq!(cache.track_ids, vec![id]);
+        }
+        assert_eq!(
+            gui.controller.generation(),
+            generation,
+            "search is read-only"
+        );
+
+        send(&mut gui, Message::SearchNavigateAlbum(album));
+        assert_eq!(gui.view, LibraryView::Albums);
+        assert_eq!(
+            gui.selected_group.as_deref(),
+            Some(album_key_for_title(album, "Zed Album").as_str())
+        );
+        assert!(gui.search.is_empty());
+
+        send(&mut gui, Message::SearchChanged("ZED".to_owned()));
+        send(&mut gui, Message::SearchNavigateArtist(artist));
+        assert_eq!(gui.view, LibraryView::Artists);
+        assert!(
+            gui.selected_group
+                .as_deref()
+                .is_some_and(|key| key.ends_with(&artist.to_string()))
+        );
+
+        send(&mut gui, Message::SearchChanged("zed".to_owned()));
+        send(&mut gui, Message::SearchNavigateTrack(id));
+        assert_eq!(gui.view, LibraryView::Tracks);
+        assert_eq!(gui.focused_track, Some(id));
+        assert!(gui.search.is_empty());
+
+        send(
+            &mut gui,
+            Message::SearchChanged("no-such-catalogue-entry".to_owned()),
+        );
+        {
+            let cache = gui.search_snapshot();
+            assert!(cache.artists.is_empty());
+            assert!(cache.albums.is_empty());
+            assert!(cache.track_ids.is_empty());
+        }
+        send(&mut gui, Message::ClearSearch);
+        assert!(gui.search.is_empty());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn filters_and_sorting_are_deterministic_and_album_order_is_preserved() {
+        let dir = TempDir::new("gui-filters-sort");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let charlie = import_named_track(
+            &mut gui,
+            &dir,
+            "Charlie",
+            "Charlie Artist",
+            "Charlie Album",
+            ReleaseType::Album,
+            3,
+        );
+        let alpha = import_named_track(
+            &mut gui,
+            &dir,
+            "Alpha",
+            "Alpha Artist",
+            "Alpha Album",
+            ReleaseType::Ep,
+            1,
+        );
+        let bravo = import_named_track(
+            &mut gui,
+            &dir,
+            "Bravo",
+            "Bravo Artist",
+            "Bravo Album",
+            ReleaseType::Single,
+            2,
+        );
+        gui.controller
+            .set_favorites(&[bravo], true)
+            .expect("favorite");
+        gui.controller
+            .set_lyrics(alpha, Some("lyrics"))
+            .expect("lyrics");
+
+        send(&mut gui, Message::SortTracksChanged(TrackSort::Title));
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![alpha, bravo, charlie]
+        );
+
+        send(&mut gui, Message::FilterFavoritesToggled);
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![bravo]
+        );
+        send(&mut gui, Message::FilterFavoritesToggled);
+        send(&mut gui, Message::FilterLyricsCycle);
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![alpha]
+        );
+        send(&mut gui, Message::ResetLibraryFilters);
+        send(&mut gui, Message::FilterReleaseChanged(ReleaseFilter::Ep));
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![alpha]
+        );
+        send(&mut gui, Message::ResetLibraryFilters);
+        assert!(!gui.filters_active(), "reset clears every filter and sort");
+
+        // Album detail always follows the canonical album order, even when a
+        // title sort is active in the general library view.
+        let owner = gui.controller.track_artist_id(charlie).expect("owner");
+        let album = gui.controller.track_album_id(charlie).expect("album");
+        let second = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source: {
+                    let source = dir.path().join("fixtures/album-second.wav");
+                    let mut bytes = minimal_wav();
+                    bytes.push(9);
+                    std::fs::write(&source, bytes).expect("second");
+                    source
+                },
+                title: "Aardvark".to_owned(),
+                artist_id: Some(owner),
+                artist_name: "Charlie Artist".to_owned(),
+                credited_artist_ids: vec![owner],
+                album_title: Some("Charlie Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("second album track");
+        let album = gui.controller.track_album_id(second).unwrap_or(album);
+        send(&mut gui, Message::SortTracksChanged(TrackSort::Title));
+        send(&mut gui, Message::SelectView(LibraryView::Albums));
+        send(
+            &mut gui,
+            Message::SelectGroup(Some(album_key_for_title(album, "Charlie Album"))),
+        );
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![charlie, second]
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn track_selection_is_id_based_and_batch_favorites_preserve_playback() {
+        let dir = TempDir::new("gui-selection-favorites");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let one = import_named_track(
+            &mut gui,
+            &dir,
+            "One",
+            "Artist One",
+            "Album One",
+            ReleaseType::Album,
+            1,
+        );
+        let two = import_named_track(
+            &mut gui,
+            &dir,
+            "Two",
+            "Artist Two",
+            "Album Two",
+            ReleaseType::Album,
+            2,
+        );
+        gui.controller
+            .set_rating(one, Some(4), false)
+            .expect("rating");
+        let queue_entry = gui.controller.current_queue_entry_id();
+        let playback_state = gui.controller.player_state();
+
+        send(&mut gui, Message::TrackSelectionToggle(one));
+        send(&mut gui, Message::TrackSelectionToggle(two));
+        assert_eq!(gui.selected_tracks, vec![one, two]);
+        send(&mut gui, Message::SortTracksChanged(TrackSort::Title));
+        assert_eq!(gui.selected_tracks, vec![one, two], "sorting keeps IDs");
+        send(&mut gui, Message::BatchFavorites(true));
+        assert!(gui.selected_tracks.is_empty());
+        assert!(gui.controller.rating(one).is_some_and(|r| r.favorite));
+        assert!(gui.controller.rating(two).is_some_and(|r| r.favorite));
+        assert_eq!(
+            gui.controller.rating(one).and_then(|r| r.rating),
+            Some(4),
+            "batch favorite preserves the rating value"
+        );
+        assert_eq!(gui.controller.current_queue_entry_id(), queue_entry);
+        assert_eq!(gui.controller.player_state(), playback_state);
+
+        send(&mut gui, Message::TrackSelectionToggle(one));
+        send(&mut gui, Message::FilterFavoritesToggled);
+        assert!(
+            gui.selected_tracks.is_empty(),
+            "filter changes clear selection"
+        );
+        send(&mut gui, Message::FilterFavoritesToggled);
+        send(&mut gui, Message::TrackSelectionSelectAll);
+        assert_eq!(
+            gui.selected_tracks.len(),
+            2,
+            "select all uses visible TrackIds"
+        );
+        send(&mut gui, Message::SelectView(LibraryView::Artists));
+        assert!(
+            gui.selected_tracks.is_empty(),
+            "view changes clear selection"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn batch_playlist_review_preserves_order_and_rejects_stale_ids() {
+        let dir = TempDir::new("gui-batch-playlist");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let one = import_named_track(
+            &mut gui,
+            &dir,
+            "One",
+            "Artist One",
+            "Album One",
+            ReleaseType::Album,
+            1,
+        );
+        let two = import_named_track(
+            &mut gui,
+            &dir,
+            "Two",
+            "Artist Two",
+            "Album Two",
+            ReleaseType::Album,
+            2,
+        );
+        let queue_entry = gui.controller.current_queue_entry_id();
+        let playback_state = gui.controller.player_state();
+
+        send(&mut gui, Message::TrackSelectionToggle(two));
+        send(&mut gui, Message::TrackSelectionToggle(one));
+        send(&mut gui, Message::BatchPlaylistCreateOpen);
+        assert!(gui.batch_review.is_some());
+        send(
+            &mut gui,
+            Message::BatchPlaylistNameChanged("Mix".to_owned()),
+        );
+        send(&mut gui, Message::BatchReviewConfirm);
+        assert!(gui.batch_review.is_none());
+        assert!(gui.selected_tracks.is_empty());
+        let playlist = gui
+            .controller
+            .playlists()
+            .into_iter()
+            .find(|playlist| playlist.name == "Mix")
+            .expect("created playlist");
+        assert_eq!(
+            playlist.track_ids,
+            vec![two, one],
+            "selection order preserved"
+        );
+
+        send(&mut gui, Message::TrackSelectionToggle(one));
+        send(&mut gui, Message::BatchPlaylistAdd(playlist.id));
+        assert!(gui.batch_review.is_some());
+        send(&mut gui, Message::BatchReviewConfirm);
+        let updated = gui
+            .controller
+            .playlists()
+            .into_iter()
+            .find(|entry| entry.id == playlist.id)
+            .expect("playlist");
+        assert_eq!(updated.track_ids, vec![two, one, one]);
+
+        let count = gui.controller.playlists().len();
+        gui.selected_tracks = vec![one, TrackId::new(99_999)];
+        send(&mut gui, Message::BatchPlaylistCreateOpen);
+        send(
+            &mut gui,
+            Message::BatchPlaylistNameChanged("Bad".to_owned()),
+        );
+        send(&mut gui, Message::BatchReviewConfirm);
+        assert!(gui.batch_review.is_some());
+        assert!(
+            gui.batch_review
+                .as_ref()
+                .and_then(|review| review.error.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            gui.controller.playlists().len(),
+            count,
+            "no partial playlist"
+        );
+        send(&mut gui, Message::BatchReviewCancel);
+        assert_eq!(gui.controller.current_queue_entry_id(), queue_entry);
+        assert_eq!(gui.controller.player_state(), playback_state);
         gui.controller.shutdown();
     }
 }
