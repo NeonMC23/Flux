@@ -2479,6 +2479,29 @@ impl Controller {
         Ok(())
     }
 
+    /// Atomically imports reviewed tracks plus every proposed artist/album in
+    /// one canonical transaction.
+    pub fn import_tracks_batch(
+        &mut self,
+        expected_generation: u64,
+        requests: Vec<flux_library::canonical::CanonicalImportTrackRequest>,
+    ) -> Result<Vec<TrackId>, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Import requires a canonical library.".to_owned());
+        };
+        let ids = store
+            .import_tracks_batch(expected_generation, requests)
+            .map_err(|err| format!("Could not import tracks: {err}"))?;
+        self.refresh_from_canonical();
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(ids)
+    }
+
     /// Imports a reviewed batch directly into an existing album as one
     /// canonical transaction. The target snapshot and catalogue generation are
     /// revalidated immediately before execution.
@@ -3147,12 +3170,18 @@ impl Controller {
         paths: &[PathBuf],
         _copy: bool,
     ) -> Result<ImportReport, String> {
-        let Some(store) = self.canonical_store.as_mut() else {
+        use flux_library::canonical::{
+            CanonicalImportAlbumRef, CanonicalImportArtistRef, CanonicalImportTrackRequest,
+        };
+        let Some(store) = self.canonical_store.as_ref() else {
             let message = "The canonical library is unavailable.".to_owned();
             self.report_error(message.clone());
             return Err(message);
         };
         let mut report = ImportReport::default();
+        let mut requests = Vec::new();
+        let mut request_sources = Vec::new();
+        let mut fingerprints = std::collections::HashSet::new();
         for source in paths {
             if !is_supported_audio_path(source) {
                 report.issues.push(ImportIssue {
@@ -3178,26 +3207,74 @@ impl Controller {
                     continue;
                 }
             };
-            if store.track_by_fingerprint(fingerprint).is_some() {
+            if store.track_by_fingerprint(fingerprint).is_some()
+                || !fingerprints.insert(fingerprint)
+            {
                 report.deduplicated += 1;
                 continue;
             }
-            match store.import_track(inferred) {
-                Ok(id) => {
-                    report.added += 1;
-                    if let Some(path) = store.track_audio_path(id) {
-                        report.copied.push(path);
+            let artist_ref = {
+                let matches = store
+                    .artists()
+                    .filter(|artist| artist.name == inferred.artist_name)
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [artist] => CanonicalImportArtistRef::Existing(artist.id),
+                    [] => CanonicalImportArtistRef::Proposed(inferred.artist_name.clone()),
+                    _ => {
+                        report.issues.push(ImportIssue {
+                            path: source.clone(),
+                            reason: format!(
+                                "several artists are named {:?}; resolve the identity explicitly",
+                                inferred.artist_name
+                            ),
+                        });
+                        continue;
                     }
                 }
-                Err(err) => report.issues.push(ImportIssue {
-                    path: source.clone(),
-                    reason: err.to_string(),
-                }),
+            };
+            let album_title = inferred
+                .album_title
+                .clone()
+                .unwrap_or_else(|| "Unknown Album".to_owned());
+            requests.push(CanonicalImportTrackRequest {
+                source: source.clone(),
+                title: inferred.title,
+                credited_artists: vec![artist_ref],
+                owner_index: 0,
+                album: CanonicalImportAlbumRef::ByName {
+                    title: album_title,
+                    release_type: inferred.release_type,
+                },
+                track_number: inferred.track_number,
+                disc_number: inferred.disc_number,
+                duration_ms: inferred.duration_ms,
+            });
+            request_sources.push(source.clone());
+        }
+        let generation = store.generation();
+        if !requests.is_empty() {
+            match self.import_tracks_batch(generation, requests) {
+                Ok(ids) => {
+                    for (id, source) in ids.into_iter().zip(request_sources) {
+                        report.added += 1;
+                        if let Some(track) = self.track(id) {
+                            report.copied.push(track.source().path().to_path_buf());
+                        } else {
+                            report.copied.push(source);
+                        }
+                    }
+                }
+                Err(error) => {
+                    for source in request_sources {
+                        report.issues.push(ImportIssue {
+                            path: source,
+                            reason: error.clone(),
+                        });
+                    }
+                }
             }
         }
-        self.refresh_from_canonical();
-        self.sync_default_queue();
-        self.outbox.push(ControllerEvent::LibraryChanged);
         if report.added > 0 || report.deduplicated > 0 {
             self.report_status(format!(
                 "Canonical import: {} added, {} duplicate(s), {} issue(s).",
@@ -6381,7 +6458,6 @@ mod tests {
             store.get(TrackId::new(9)).expect("new kept").availability(),
             Availability::Present
         );
-        drop(store);
         controller.shutdown();
 
         // Reopen and scan a third file: allocation continues at 10.
@@ -6416,7 +6492,6 @@ mod tests {
         let mut store = PortableStore::create(&root).expect("create");
         store.import_tracks(vec![record], 2).expect("seed");
         store.commit().expect("seed commit");
-        drop(store);
 
         let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
         let id = TrackId::new(1);
@@ -6495,7 +6570,6 @@ mod tests {
             )
             .expect("seed");
         store.commit().expect("seed commit");
-        drop(store);
 
         let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
         let id = TrackId::new(1);
@@ -6536,7 +6610,6 @@ mod tests {
             )
             .expect("seed");
         store.commit().expect("seed commit");
-        drop(store);
         let outside = two_track_dir(&dir, "outside");
 
         let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
@@ -6592,7 +6665,6 @@ mod tests {
         let mut store = PortableStore::create(&root).expect("create");
         store.import_tracks(vec![record], 2).expect("seed");
         store.commit().expect("seed commit");
-        drop(store);
 
         let (mut controller, control) = boot_portable_at(&root).expect("portable boot");
         let id = TrackId::new(1);
@@ -6721,7 +6793,6 @@ mod tests {
             )
             .expect("add b");
         store.commit().expect("commit with b");
-        drop(store);
         fs::write(root.join(".flux").join("catalog.flux"), b"junk").expect("damage primary");
 
         let (mut controller, control) =
@@ -6802,7 +6873,6 @@ mod tests {
         );
         let store = PortableStore::open(&root).expect("direct open").store;
         assert_eq!(store.len(), 0, "the failed commit published nothing");
-        drop(store);
 
         // The pending changes were retained: an explicit save retries
         // and now persists them without rescanning.
@@ -6841,7 +6911,6 @@ mod tests {
         assert_eq!(controller.tracks().len(), 2, "library unchanged");
         let store = PortableStore::open(&root).expect("direct open").store;
         assert_eq!(store.generation(), generation_before, "store untouched");
-        drop(store);
 
         // A subfolder of the root scans fine.
         let sub_file = write_dc_wav(&root.join("sub"), "s.wav", 4_410, 0.3);
@@ -7292,7 +7361,6 @@ mod tests {
             )
             .expect("add b");
         store.commit().expect("commit with b");
-        drop(store);
         // Damage the primary; the backup (with only “Aye”, ID 1)
         // must be what the switch sees.
         fs::write(catalog_path(&portable_root), b"garbage").expect("damage");
@@ -8723,6 +8791,7 @@ mod tests {
             existing_tracks: controller.tracks().to_vec(),
             existing_artists: Vec::new(),
             target_album: None,
+            generation: controller.generation(),
         };
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
