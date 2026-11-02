@@ -21,8 +21,9 @@ use flux_app::{
     AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
     Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan,
     ImportProgress, ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport,
-    RelPath, ReleaseType, StorageMode, TrackMetadataEdit, WAVEFORM_WINDOW, format_duration,
-    is_track_playable, prepare_import_files, prepare_import_plan,
+    RelPath, ReleaseType, StorageMode, TrackAudioReplacementPlan, TrackMetadataEdit,
+    TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration, is_track_playable,
+    prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
     APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
@@ -1199,6 +1200,14 @@ struct TrackEditor {
     artist_id: Option<ArtistId>,
     new_artist: String,
     error: Option<String>,
+    metadata_plan: Option<TrackMetadataUpdatePlan>,
+    credits: Vec<ArtistId>,
+    credit_artist: Option<ArtistId>,
+    replacement_source: String,
+    replacement_plan: Option<TrackAudioReplacementPlan>,
+    move_destination: Option<AlbumChoice>,
+    move_position: String,
+    move_plan: Option<TrackMovePlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1401,6 +1410,17 @@ enum Message {
     EditorSave,
     EditorTransferOwner,
     EditorCancel,
+    EditorCreditSelected(Option<ArtistChoice>),
+    EditorCreditAdd,
+    EditorCreditMove(usize, isize),
+    EditorCreditRemove(usize),
+    EditorReplacementChanged(String),
+    EditorPlanReplacement,
+    EditorConfirmReplacement,
+    EditorMoveDestination(Option<AlbumChoice>),
+    EditorMovePositionChanged(String),
+    EditorPlanMove,
+    EditorConfirmMove,
     ArtistSelected(Option<ArtistChoice>),
     ArtistNameChanged(String),
     ArtistCreatePressed,
@@ -1855,6 +1875,7 @@ impl FluxReady {
         let Some(track) = self.controller.track(id) else {
             return;
         };
+        let metadata_plan = self.controller.plan_track_metadata_update(id).ok();
         self.track_editor = Some(TrackEditor {
             id,
             title: track.title().to_owned(),
@@ -1870,26 +1891,206 @@ impl FluxReady {
             artist_id: self.controller.track_artist_id(id),
             new_artist: String::new(),
             error: None,
+            metadata_plan,
+            credits: self.controller.track_credits(id),
+            credit_artist: None,
+            replacement_source: String::new(),
+            replacement_plan: None,
+            move_destination: None,
+            move_position: "1".to_owned(),
+            move_plan: None,
         });
         self.show_setup = false;
     }
 
-    fn save_track_editor(&mut self) {
+    fn editor_move_album_choices(&self, track_id: TrackId) -> Vec<AlbumChoice> {
+        let Some(owner) = self.controller.track_artist_id(track_id) else {
+            return Vec::new();
+        };
+        let current = self.controller.track_album_id(track_id);
+        self.controller
+            .albums()
+            .into_iter()
+            .filter(|album| album.owner_artist_id == owner && Some(album.id) != current)
+            .map(|album| AlbumChoice {
+                id: album.id,
+                label: format!("{} · {}", album.title, album.id),
+            })
+            .collect()
+    }
+
+    fn add_editor_credit(&mut self) {
+        let Some(editor) = self.track_editor.as_mut() else {
+            return;
+        };
+        let Some(artist) = editor.credit_artist else {
+            editor.error = Some("Select an artist to add as a credit.".to_owned());
+            return;
+        };
+        if editor.credits.contains(&artist) {
+            editor.error = Some("That artist is already credited.".to_owned());
+            return;
+        }
+        editor.credits.push(artist);
+        editor.credit_artist = None;
+        editor.error = None;
+    }
+
+    fn move_editor_credit(&mut self, index: usize, delta: isize) {
+        let Some(editor) = self.track_editor.as_mut() else {
+            return;
+        };
+        if index >= editor.credits.len() {
+            return;
+        }
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= editor.credits.len() {
+            return;
+        }
+        editor.credits.swap(index, target as usize);
+    }
+
+    fn remove_editor_credit(&mut self, index: usize) {
+        let Some(editor) = self.track_editor.as_mut() else {
+            return;
+        };
+        if index >= editor.credits.len() || editor.credits.len() <= 1 {
+            return;
+        }
+        let owner = self.controller.track_artist_id(editor.id);
+        if owner == Some(editor.credits[index]) {
+            editor.error = Some("The physical owner must remain credited.".to_owned());
+            return;
+        }
+        editor.credits.remove(index);
+    }
+
+    fn plan_editor_replacement(&mut self) {
         let Some(editor) = self.track_editor.as_ref() else {
             return;
         };
         let id = editor.id;
-        let edit = match (
+        let path = PathBuf::from(editor.replacement_source.trim());
+        if editor.replacement_source.trim().is_empty() {
+            if let Some(editor) = self.track_editor.as_mut() {
+                editor.error = Some("Enter the replacement audio file path.".to_owned());
+            }
+            return;
+        }
+        match self.controller.plan_track_audio_replacement(id, &path) {
+            Ok(plan) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.replacement_plan = Some(plan);
+                    editor.error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.replacement_plan = None;
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn confirm_editor_replacement(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let Some(plan) = editor.replacement_plan.clone() else {
+            return;
+        };
+        match self.controller.execute_track_audio_replacement(&plan) {
+            Ok(report) => {
+                self.track_editor = None;
+                self.lifecycle_msg = Some(format!(
+                    "Replaced audio for track {}; TrackId, album, owner and references preserved.",
+                    report.track_id
+                ));
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.replacement_plan = None;
+                    editor.error = Some(format!("{error} Review the replacement again."));
+                }
+            }
+        }
+    }
+
+    fn plan_editor_move(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let id = editor.id;
+        let Some(destination) = editor.move_destination.as_ref().map(|choice| choice.id) else {
+            if let Some(editor) = self.track_editor.as_mut() {
+                editor.error = Some("Select a destination album.".to_owned());
+            }
+            return;
+        };
+        let index = match editor.move_position.trim().parse::<usize>() {
+            Ok(position) if position >= 1 => position - 1,
+            _ => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.error =
+                        Some("Insertion position must be a whole number starting at 1.".to_owned());
+                }
+                return;
+            }
+        };
+        match self.controller.plan_track_move(id, destination, index) {
+            Ok(plan) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_plan = Some(plan);
+                    editor.error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_plan = None;
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn confirm_editor_move(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let Some(plan) = editor.move_plan.clone() else {
+            return;
+        };
+        match self.controller.execute_track_move(&plan) {
+            Ok(report) => {
+                self.track_editor = None;
+                self.lifecycle_msg = Some(format!(
+                    "Moved track {} from album {} to album {} at position {}.",
+                    report.track_id,
+                    report.from_album_id,
+                    report.to_album_id,
+                    report.insertion_index + 1
+                ));
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_plan = None;
+                    editor.error = Some(format!("{error} Review the move again."));
+                }
+            }
+        }
+    }
+
+    fn save_track_editor(&mut self) {
+        let Some(editor) = self.track_editor.as_ref().cloned() else {
+            return;
+        };
+        let id = editor.id;
+        let (track_number, disc_number) = match (
             parse_optional_number(&editor.track_number, "track number"),
             parse_optional_number(&editor.disc_number, "disc number"),
         ) {
-            (Ok(track_number), Ok(disc_number)) => TrackMetadataEdit {
-                title: nonempty_string(&editor.title),
-                artist_id: editor.artist_id,
-                album: nonempty_string(&editor.album),
-                track_number,
-                disc_number,
-            },
+            (Ok(track_number), Ok(disc_number)) => (track_number, disc_number),
             (Err(error), _) | (_, Err(error)) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.error = Some(error);
@@ -1897,7 +2098,20 @@ impl FluxReady {
                 return;
             }
         };
-        match self.controller.edit_track_metadata(id, edit) {
+        let edit = TrackMetadataEdit {
+            title: nonempty_string(&editor.title),
+            artist_id: self.controller.track_artist_id(id),
+            credited_artist_ids: Some(editor.credits.clone()),
+            album: nonempty_string(&editor.album),
+            track_number,
+            disc_number,
+        };
+        let result = if let Some(plan) = &editor.metadata_plan {
+            self.controller.execute_track_metadata_update(plan, &edit)
+        } else {
+            self.controller.edit_track_metadata(id, edit)
+        };
+        match result {
             Ok(()) => {
                 self.track_editor = None;
                 self.lifecycle_msg = Some(format!("Saved metadata for track {id}."));
@@ -1983,10 +2197,16 @@ impl FluxReady {
         }
         match self.controller.create_artist(&name) {
             Ok(id) => {
+                let track_id = self.track_editor.as_ref().map(|editor| editor.id);
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.artist_id = Some(id);
+                    editor.credit_artist = Some(id);
                     editor.new_artist.clear();
                     editor.error = None;
+                    if let Some(track_id) = track_id {
+                        editor.metadata_plan =
+                            self.controller.plan_track_metadata_update(track_id).ok();
+                    }
                 }
                 self.lifecycle_msg = Some(format!("Created artist {name} (ID {id})."));
             }
@@ -2441,6 +2661,36 @@ impl FluxReady {
             Message::EditorSave => self.save_track_editor(),
             Message::EditorTransferOwner => self.transfer_track_editor_owner(),
             Message::EditorCancel => self.track_editor = None,
+            Message::EditorCreditSelected(choice) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.credit_artist = choice.and_then(|choice| choice.id);
+                }
+            }
+            Message::EditorCreditAdd => self.add_editor_credit(),
+            Message::EditorCreditMove(index, delta) => self.move_editor_credit(index, delta),
+            Message::EditorCreditRemove(index) => self.remove_editor_credit(index),
+            Message::EditorReplacementChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.replacement_source = value;
+                    editor.replacement_plan = None;
+                }
+            }
+            Message::EditorPlanReplacement => self.plan_editor_replacement(),
+            Message::EditorConfirmReplacement => self.confirm_editor_replacement(),
+            Message::EditorMoveDestination(choice) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_destination = choice;
+                    editor.move_plan = None;
+                }
+            }
+            Message::EditorMovePositionChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_position = value;
+                    editor.move_plan = None;
+                }
+            }
+            Message::EditorPlanMove => self.plan_editor_move(),
+            Message::EditorConfirmMove => self.confirm_editor_move(),
             Message::ArtistSelected(choice) => {
                 self.artist_selected = choice.as_ref().and_then(|choice| choice.id);
                 self.artist_rename_input = self
@@ -6116,6 +6366,21 @@ impl FluxReady {
         ]
         .spacing(8);
 
+        let credit_choices = self.artist_choices();
+        let credit_selected = editor.credit_artist.and_then(|id| {
+            credit_choices
+                .iter()
+                .find(|choice| choice.id == Some(id))
+                .cloned()
+        });
+        let move_choices = self.editor_move_album_choices(editor.id);
+        let move_selected = editor.move_destination.as_ref().and_then(|choice| {
+            move_choices
+                .iter()
+                .find(|entry| entry.id == choice.id)
+                .cloned()
+        });
+
         let mut body = column![
             text("Flux-owned overrides").size(9).color(ACCENT),
             text("These values are stored in the canonical library. The audio file and its embedded tags are never rewritten.")
@@ -6156,31 +6421,207 @@ impl FluxReady {
             ]
             .spacing(8),
         );
-        body = body.push(
-            text("Artist identity and ordered credits")
-                .size(9)
-                .color(MUTED),
-        );
+        body = body.push(text("ORDERED CREDITS").size(9).color(ACCENT));
         body = body.push(
             text(format!(
-                "{} · physical owner: {}",
-                self.credit_display(editor.id),
+                "Physical owner: {} — ownership is separate from credits and cannot be changed here.",
                 self.controller
                     .track_artist_id(editor.id)
                     .and_then(|artist| self.controller.artist(artist))
                     .map(|artist| artist.name().to_owned())
                     .unwrap_or_else(|| "unknown".to_owned())
             ))
-            .size(10)
+            .size(9)
             .color(MUTED),
+        );
+        let owner = self.controller.track_artist_id(editor.id);
+        for (credit_index, artist_id) in editor.credits.iter().enumerate() {
+            let name = self
+                .controller
+                .artist(*artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {artist_id}"));
+            body = body.push(
+                row![
+                    text(format!(
+                        "{}. {}{}",
+                        credit_index + 1,
+                        name,
+                        if owner == Some(*artist_id) {
+                            " · OWNER"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .size(10)
+                    .color(if owner == Some(*artist_id) {
+                        ACCENT
+                    } else {
+                        TEXT
+                    })
+                    .width(Length::Fill),
+                    button(text("↑").size(10))
+                        .style(ghost_style)
+                        .padding([4, 6])
+                        .on_press(Message::EditorCreditMove(credit_index, -1)),
+                    button(text("↓").size(10))
+                        .style(ghost_style)
+                        .padding([4, 6])
+                        .on_press(Message::EditorCreditMove(credit_index, 1)),
+                    button(text("×").size(10))
+                        .style(ghost_style)
+                        .padding([4, 6])
+                        .on_press_maybe(
+                            (editor.credits.len() > 1 && owner != Some(*artist_id))
+                                .then_some(Message::EditorCreditRemove(credit_index))
+                        ),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            );
+        }
+        body = body.push(
+            row![
+                pick_list(credit_choices, credit_selected, |choice| {
+                    Message::EditorCreditSelected(Some(choice))
+                })
+                .text_size(11)
+                .padding([6, 8])
+                .width(Length::Fill),
+                button(text("Add credit").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::EditorCreditAdd),
+            ]
+            .spacing(8),
+        );
+        body = body.push(
+            text("Transfer owner is a separate reviewed operation; changing this picker does not change metadata ownership.")
+                .size(9)
+                .color(MUTED),
         );
         body = body.push(artist_row);
         body = body.push(new_artist_row);
         body = body.push(
-            text("Clear album or number fields to fall back to source metadata. The title always has a filename fallback.")
+            text("Clear album or number fields to fall back to the current canonical values. The title always has a filename fallback.")
                 .size(9)
                 .color(MUTED),
         );
+        body = body.push(text("REPLACE MANAGED AUDIO").size(9).color(ACCENT));
+        body = body.push(
+            text("The replacement is staged and verified; the old managed audio remains available until the catalogue commit. The source file is never modified. Save metadata changes before confirming; replacement closes the editor and does not apply unsaved fields.")
+                .size(9)
+                .color(MUTED),
+        );
+        body = body.push(
+            text_input("Replacement audio path…", &editor.replacement_source)
+                .on_input(Message::EditorReplacementChanged)
+                .style(input_style)
+                .width(Length::Fill),
+        );
+        body = body.push(
+            row![
+                button(text("Review replacement").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::EditorPlanReplacement),
+                button(text("Confirm replacement").size(10))
+                    .style(accent_button_style)
+                    .padding([6, 9])
+                    .on_press_maybe(
+                        editor
+                            .replacement_plan
+                            .is_some()
+                            .then_some(Message::EditorConfirmReplacement)
+                    ),
+            ]
+            .spacing(8),
+        );
+        if let Some(plan) = &editor.replacement_plan {
+            body = body.push(
+                text(format!(
+                    "REVIEWED: Track {} · source {} · new managed path {} · old audio fingerprinted and preserved until commit",
+                    plan.track_id,
+                    plan.source.display(),
+                    plan.destination_audio_path.display_lossy()
+                ))
+                .size(9)
+                .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+            );
+        } else {
+            body = body.push(
+                text("Replacement is unavailable until a source is reviewed. No preview writes to the library.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        }
+        body = body.push(text("MOVE TO ANOTHER ALBUM").size(9).color(ACCENT));
+        body = body.push(
+            text("Save metadata changes before confirming a move. The source album remains even if it becomes empty.")
+                .size(9)
+                .color(MUTED),
+        );
+        if move_choices.is_empty() {
+            body = body.push(
+                text("No other album is owned by this track's physical owner. Ownership-transfer is a separate operation.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        } else {
+            body = body.push(
+                pick_list(move_choices, move_selected, |choice| {
+                    Message::EditorMoveDestination(Some(choice))
+                })
+                .text_size(11)
+                .padding([6, 8])
+                .width(Length::Fill),
+            );
+            body = body.push(
+                row![
+                    text_input("Insertion position", &editor.move_position)
+                        .on_input(Message::EditorMovePositionChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Review move").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorPlanMove),
+                    button(text("Confirm move").size(10))
+                        .style(accent_button_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            editor
+                                .move_plan
+                                .is_some()
+                                .then_some(Message::EditorConfirmMove)
+                        ),
+                ]
+                .spacing(8),
+            );
+            if let Some(plan) = &editor.move_plan {
+                body = body.push(
+                    text(format!(
+                        "REVIEWED: {} → {} at position {} · final order {} · source album remains even if empty",
+                        plan.from_album_title,
+                        plan.to_album_title,
+                        plan.insertion_index + 1,
+                        plan.destination_order
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .size(9)
+                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+                );
+            } else {
+                body = body.push(
+                    text("The move is unavailable until reviewed. It never redirects to a different owner or deletes the source album.")
+                        .size(9)
+                        .color(MUTED),
+                );
+            }
+        }
         if let Some(error) = &editor.error {
             body = body.push(text(error).size(10).color(DANGER));
         }
@@ -8518,6 +8959,169 @@ mod tests {
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&0u32.to_le_bytes());
         wav
+    }
+
+    #[test]
+    fn gui_track_editor_edits_ordered_credits_without_changing_owner() {
+        let dir = TempDir::new("gui-lifecycle-credits");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let a = gui.controller.create_artist("A").expect("A");
+        let b = gui.controller.create_artist("B").expect("B");
+        let c = gui.controller.create_artist("C").expect("C");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("song");
+        let id = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Album".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import");
+        let album = gui.controller.track_album_id(id);
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorCreditSelected(Some(ArtistChoice {
+                id: Some(c),
+                label: "C".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::EditorCreditAdd);
+        send(&mut gui, Message::EditorCreditMove(2, -1));
+        send(
+            &mut gui,
+            Message::EditorTitleChanged("Edited lifecycle".to_owned()),
+        );
+        send(&mut gui, Message::EditorSave);
+        assert!(gui.track_editor.is_none());
+        assert_eq!(gui.controller.track_credits(id), vec![a, c, b]);
+        assert_eq!(gui.controller.track_artist_id(id), Some(a));
+        assert_eq!(gui.controller.track_album_id(id), album);
+        assert_eq!(
+            gui.controller.track(id).map(|track| track.title()),
+            Some("Edited lifecycle")
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn gui_reviews_and_confirms_managed_audio_replacement() {
+        let dir = TempDir::new("gui-lifecycle-replace");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("song");
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let (id, track) = gui.controller.tracks()[0].clone();
+        let old_audio = track.source().path().to_path_buf();
+        let mut replacement_bytes = minimal_wav();
+        replacement_bytes.push(9);
+        let replacement = source_dir.join("replacement.wav");
+        std::fs::write(&replacement, &replacement_bytes).expect("replacement");
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorReplacementChanged(replacement.display().to_string()),
+        );
+        send(&mut gui, Message::EditorPlanReplacement);
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.replacement_plan.is_some())
+        );
+        send(&mut gui, Message::EditorConfirmReplacement);
+        assert!(gui.track_editor.is_none());
+        assert_eq!(gui.controller.tracks()[0].0, id);
+        assert_eq!(
+            std::fs::read(gui.controller.track(id).expect("track").source().path())
+                .expect("new audio"),
+            replacement_bytes
+        );
+        assert!(!old_audio.exists());
+        assert_eq!(
+            std::fs::read(&replacement).expect("source preserved"),
+            replacement_bytes
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn gui_reviews_and_confirms_move_into_existing_album() {
+        let dir = TempDir::new("gui-lifecycle-move");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let source_dir = dir.path().join("Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("song");
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = gui.controller.tracks()[0].0;
+        let source_album = gui.controller.track_album_id(id).expect("album");
+        let owner = gui.controller.track_artist_id(id).expect("owner");
+        let destination = gui
+            .controller
+            .create_album(owner, "Destination", flux_app::ReleaseType::Album)
+            .expect("destination");
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorMoveDestination(Some(AlbumChoice {
+                id: destination,
+                label: format!("Destination · {destination}"),
+            })),
+        );
+        send(&mut gui, Message::EditorMovePositionChanged("1".to_owned()));
+        send(&mut gui, Message::EditorPlanMove);
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.move_plan.is_some())
+        );
+        send(&mut gui, Message::EditorConfirmMove);
+        assert!(gui.track_editor.is_none());
+        assert_eq!(gui.controller.track_album_id(id), Some(destination));
+        assert_eq!(gui.controller.album_tracks(destination), vec![id]);
+        assert_eq!(
+            gui.controller.album_tracks(source_album),
+            Vec::<TrackId>::new()
+        );
+        assert!(gui.controller.album(source_album).is_some());
+        gui.controller.shutdown();
     }
 
     #[test]
