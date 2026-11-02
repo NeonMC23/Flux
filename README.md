@@ -173,7 +173,9 @@ background staging for very large migrations is still future work.
   opens the existing Import Manager in fixed-album mode: the AlbumId and owner
   are locked through review, inferred metadata/credits remain editable, and all
   selected new tracks are appended in one canonical transaction while existing
-  metadata, cover, order and references are preserved.
+  metadata, cover, order and references are preserved. General and fixed-album
+  imports stage proposed artists and albums in the same transaction; a failed
+  import cannot leave behind a newly created artist.
 - **Import:** every canonical import copies into the library and preserves the
   original extension; sources are never moved, overwritten or deleted.
   Identical content is deduplicated by fingerprint. Existing IDs are preserved

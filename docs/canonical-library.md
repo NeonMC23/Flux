@@ -181,29 +181,37 @@ Populated album deletion is blocked in the GUI; tracks must first be transferred
 or explicitly deleted through the existing reviewed workflows. Empty deletion
 removes `album.flux` and any cover as journal cleanup; the artist remains.
 
-### Import into an existing album
+### Atomic import and existing-album import
 
-The album detail view exposes **Add tracks…**, which opens the existing Import
-Manager in fixed-target mode. The target carries AlbumId, owner, album title,
-release type, existing track order and catalogue generation. Owner and album are
-displayed as fixed and cannot be changed inside review; choosing another
-destination requires closing and starting a new import.
+Every canonical import path now stages the complete reviewed batch in one
+transaction: proposed artists, proposed albums, tracks, ordered credits,
+ownership, album ordering and catalogue references. No artist or album is
+created by a separate write before the import. If publication fails or the plan
+is stale, recovery yields either the complete old catalogue or the complete new
+catalogue; no proposed artist, album or track survives an uncommitted import.
 
-Filename/folder inference and the existing review/duplicate decisions remain the
-only metadata source. Ordered credits can be edited, but the fixed album owner
-remains the physical owner and must stay credited. The reviewed plan is rejected
-if the catalogue generation, album owner/title/order or target identity changed.
+Artist references distinguish existing stable IDs from proposed names. Exact
+unique existing names can resolve to an existing ID; ambiguous names require an
+explicit artist selection in review. Proposed artists with the same exact name
+are allocated one new ID within the batch. The physical owner remains one of the
+ordered credits, and an existing destination album must have the same owner.
 
-All selected new tracks are published as **one canonical transaction** through
-`import_tracks_into_album`: new audio and `.flux` records are staged, verified,
-the existing album file is updated once with deterministic reviewed append order,
-and `catalog.flux` is published last. Existing album metadata, cover, tracks,
-lyrics, ratings, playlists and queue references are untouched. Cancellation
-before execution writes nothing. Duplicate content within the batch or existing
-catalogue is rejected; duplicate decisions remain explicit. The application API
-`import_canonical_track_into_album` remains available for single reviewed
-clients. The TUI does not expose fixed-target import; it retains its general
-quick-import behavior.
+The album detail view exposes **Add tracks…**, opening the existing Import
+Manager in fixed-target mode. The target carries AlbumId, owner, title, release
+type, cover reference, existing order and catalogue generation; owner and album
+are fixed through review. New selected tracks are appended in reviewed order by
+the same atomic batch used by the general Import Manager, preserving existing
+album metadata, cover, track IDs, order, lyrics, ratings, playlists and queue
+references. Cancellation before execution writes nothing. Change to the target
+generation, owner, title, release type, cover or order rejects the stale plan.
+"Update existing" is not performed by this atomic batch and is rejected with an
+actionable message; existing tracks must be edited separately.
+
+Newly created artists cannot survive a failed import: their `artist.flux` files,
+catalogue entries, IDs and relationships are journal-owned batch writes and are
+removed by rollback. They may survive only when the catalogue commit point was
+reached, in which case the complete import is authoritative.
+
 
 ## Artist deletion
 
@@ -449,10 +457,12 @@ cleanup.
    verified in this stage.
 10. Fixed-target album import is exposed in the GUI only; the TUI retains general
     quick import and has no target-selection review flow.
-11. Artist deletion execution is exposed in the GUI only. The TUI deliberately
+11. Atomic import deduplicates exact names only; approximate/fuzzy matching is
+    deliberately not performed. Ambiguous exact names require explicit review.
+12. Artist deletion execution is exposed in the GUI only. The TUI deliberately
     refuses deletion/transfer and points to the GUI; this is a product limitation,
     not a separate transaction implementation.
-12. ENOSPC and a true second mounted filesystem were not available for testing.
+13. ENOSPC and a true second mounted filesystem were not available for testing.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.
