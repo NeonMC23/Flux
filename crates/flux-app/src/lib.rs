@@ -2502,6 +2502,30 @@ impl Controller {
         Ok(ids)
     }
 
+    /// Atomically imports new tracks and applies approved metadata updates in
+    /// one canonical transaction.
+    pub fn import_review_batch(
+        &mut self,
+        expected_generation: u64,
+        requests: Vec<flux_library::canonical::CanonicalImportTrackRequest>,
+        updates: Vec<flux_library::canonical::CanonicalTrackMetadataUpdate>,
+    ) -> Result<Vec<TrackId>, String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Import requires a canonical library.".to_owned());
+        };
+        let ids = store
+            .import_review_batch(expected_generation, requests, updates)
+            .map_err(|err| format!("Could not import tracks: {err}"))?;
+        self.refresh_from_canonical();
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(ids)
+    }
+
     /// Imports a reviewed batch directly into an existing album as one
     /// canonical transaction. The target snapshot and catalogue generation are
     /// revalidated immediately before execution.
@@ -3249,6 +3273,8 @@ impl Controller {
                 track_number: inferred.track_number,
                 disc_number: inferred.disc_number,
                 duration_ms: inferred.duration_ms,
+                allow_duplicate_content: false,
+                expected_source_fingerprint: None,
             });
             request_sources.push(source.clone());
         }
@@ -8790,6 +8816,16 @@ mod tests {
             library_root: root.clone(),
             existing_tracks: controller.tracks().to_vec(),
             existing_artists: Vec::new(),
+            existing_credits: controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_album_id(*id).map(|album| (*id, album)))
+                .collect(),
             target_album: None,
             generation: controller.generation(),
         };

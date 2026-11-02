@@ -1792,6 +1792,111 @@ pub struct CanonicalImportTrackRequest {
     pub disc_number: Option<u32>,
     /// Optional technical duration.
     pub duration_ms: Option<u64>,
+    /// Explicit duplicate review decision permits identical content in this batch.
+    pub allow_duplicate_content: bool,
+    /// Source fingerprint captured at review time; changed sources are stale.
+    pub expected_source_fingerprint: Option<ContentFingerprint>,
+}
+
+/// An explicitly approved metadata update for an existing track. Audio and
+/// TrackId are preserved; the owner and album never change here.
+#[derive(Debug, Clone)]
+pub struct CanonicalTrackMetadataUpdate {
+    /// Stable existing track.
+    pub track_id: TrackId,
+    /// File fingerprint expected at review time.
+    pub expected_fingerprint: Option<ContentFingerprint>,
+    /// Album expected at review time; metadata updates cannot move tracks.
+    pub expected_album_id: AlbumId,
+    /// Title expected at review time.
+    pub expected_title: String,
+    /// Ordered credits expected at review time.
+    pub expected_credited_artist_ids: Vec<ArtistId>,
+    /// Track number expected at review time.
+    pub expected_track_number: Option<u32>,
+    /// Disc number expected at review time.
+    pub expected_disc_number: Option<u32>,
+    /// Duration expected at review time.
+    pub expected_duration_ms: Option<u64>,
+    /// Proposed new title.
+    pub title: String,
+    /// Proposed ordered credits; must include the existing physical owner.
+    pub credited_artists: Vec<CanonicalImportArtistRef>,
+    /// Proposed track number.
+    pub track_number: Option<u32>,
+    /// Proposed disc number.
+    pub disc_number: Option<u32>,
+    /// Proposed duration.
+    pub duration_ms: Option<u64>,
+}
+
+fn resolve_import_artists(
+    catalog: &mut CatalogDto,
+    artists: &mut BTreeMap<ArtistId, CanonicalArtist>,
+    new_artist_ids: &mut BTreeMap<String, ArtistId>,
+    writes: &mut Vec<PendingWrite>,
+    references: Vec<CanonicalImportArtistRef>,
+) -> Result<Vec<ArtistId>, CanonicalError> {
+    let mut credits = Vec::with_capacity(references.len());
+    for reference in references {
+        let id = match reference {
+            CanonicalImportArtistRef::Existing(id) => {
+                if !artists.contains_key(&id) {
+                    return Err(CanonicalError::Invalid(format!(
+                        "existing artist {id} is not in the library"
+                    )));
+                }
+                id
+            }
+            CanonicalImportArtistRef::Proposed(name) => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return Err(CanonicalError::Invalid(
+                        "proposed artist name must not be empty".to_owned(),
+                    ));
+                }
+                if let Some(id) = new_artist_ids.get(&name) {
+                    *id
+                } else {
+                    let id = ArtistId::new(catalog.next_artist_id);
+                    catalog.next_artist_id =
+                        catalog.next_artist_id.checked_add(1).ok_or_else(|| {
+                            CanonicalError::Invalid("artist counter overflow".to_owned())
+                        })?;
+                    let rel = artist_rel(id);
+                    catalog.artists.push(CatalogArtistDto {
+                        id: id.get(),
+                        path: rel.display_lossy(),
+                    });
+                    let dto = ArtistEntityDto {
+                        schema_version: CANONICAL_SCHEMA_VERSION,
+                        kind: ARTIST_KIND.to_owned(),
+                        id: id.get(),
+                        name: name.clone(),
+                        aliases: Vec::new(),
+                    };
+                    push_entity_write(writes, &rel, "artist.flux", &dto)?;
+                    artists.insert(
+                        id,
+                        CanonicalArtist {
+                            id,
+                            name: name.clone(),
+                            aliases: Vec::new(),
+                        },
+                    );
+                    new_artist_ids.insert(name, id);
+                    id
+                }
+            }
+        };
+        if credits.contains(&id) {
+            return Err(CanonicalError::Invalid(
+                "an artist cannot appear twice in ordered credits".to_owned(),
+            ));
+        }
+        credits.push(id);
+    }
+    Ok(credits)
 }
 
 impl CanonicalLibrary {
@@ -2595,6 +2700,18 @@ impl CanonicalLibrary {
         expected_generation: u64,
         requests: Vec<CanonicalImportTrackRequest>,
     ) -> Result<Vec<TrackId>, CanonicalError> {
+        self.import_review_batch(expected_generation, requests, Vec::new())
+    }
+
+    /// Atomically imports new tracks and applies approved metadata updates in
+    /// one canonical transaction. Proposed artists and albums are staged only
+    /// when referenced by this batch.
+    pub fn import_review_batch(
+        &mut self,
+        expected_generation: u64,
+        requests: Vec<CanonicalImportTrackRequest>,
+        updates: Vec<CanonicalTrackMetadataUpdate>,
+    ) -> Result<Vec<TrackId>, CanonicalError> {
         self.ensure_writable()?;
         if expected_generation != self.catalog.generation {
             return Err(CanonicalError::Invalid(
@@ -2619,7 +2736,16 @@ impl CanonicalLibrary {
         for request in requests {
             let source = request.source;
             let fingerprint = ContentFingerprint::of_file(&source)?;
-            if !fingerprints.insert(fingerprint) {
+            if request
+                .expected_source_fingerprint
+                .is_some_and(|expected| expected != fingerprint)
+            {
+                return Err(CanonicalError::Invalid(format!(
+                    "source changed after review: {}",
+                    source.display()
+                )));
+            }
+            if !fingerprints.insert(fingerprint) && !request.allow_duplicate_content {
                 return Err(CanonicalError::Invalid(format!(
                     "duplicate audio content in import batch: {}",
                     source.display()
@@ -2650,65 +2776,13 @@ impl CanonicalLibrary {
                     "import requires credits and a valid physical owner".to_owned(),
                 ));
             }
-            let mut credits = Vec::with_capacity(request.credited_artists.len());
-            for reference in request.credited_artists {
-                let id = match reference {
-                    CanonicalImportArtistRef::Existing(id) => {
-                        if !artists.contains_key(&id) {
-                            return Err(CanonicalError::Invalid(format!(
-                                "existing artist {id} is not in the library"
-                            )));
-                        }
-                        id
-                    }
-                    CanonicalImportArtistRef::Proposed(name) => {
-                        let name = name.trim().to_owned();
-                        if name.is_empty() {
-                            return Err(CanonicalError::Invalid(
-                                "proposed artist name must not be empty".to_owned(),
-                            ));
-                        }
-                        if let Some(id) = new_artist_ids.get(&name) {
-                            *id
-                        } else {
-                            let id = ArtistId::new(catalog.next_artist_id);
-                            catalog.next_artist_id =
-                                catalog.next_artist_id.checked_add(1).ok_or_else(|| {
-                                    CanonicalError::Invalid("artist counter overflow".to_owned())
-                                })?;
-                            let rel = artist_rel(id);
-                            catalog.artists.push(CatalogArtistDto {
-                                id: id.get(),
-                                path: rel.display_lossy(),
-                            });
-                            let dto = ArtistEntityDto {
-                                schema_version: CANONICAL_SCHEMA_VERSION,
-                                kind: ARTIST_KIND.to_owned(),
-                                id: id.get(),
-                                name: name.clone(),
-                                aliases: Vec::new(),
-                            };
-                            push_entity_write(&mut writes, &rel, "artist.flux", &dto)?;
-                            artists.insert(
-                                id,
-                                CanonicalArtist {
-                                    id,
-                                    name: name.clone(),
-                                    aliases: Vec::new(),
-                                },
-                            );
-                            new_artist_ids.insert(name, id);
-                            id
-                        }
-                    }
-                };
-                if credits.contains(&id) {
-                    return Err(CanonicalError::Invalid(
-                        "an artist cannot appear twice in ordered credits".to_owned(),
-                    ));
-                }
-                credits.push(id);
-            }
+            let credits = resolve_import_artists(
+                &mut catalog,
+                &mut artists,
+                &mut new_artist_ids,
+                &mut writes,
+                request.credited_artists,
+            )?;
             let owner = credits[request.owner_index];
             let album_id = match request.album {
                 CanonicalImportAlbumRef::Existing(id) => {
@@ -2815,6 +2889,66 @@ impl CanonicalLibrary {
                 expected: Some(fingerprint),
             });
             ids.push(track_id);
+        }
+        for update in updates {
+            let track = self.tracks.get(&update.track_id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("track {} is not in the library", update.track_id))
+            })?;
+            if track.album_id != update.expected_album_id {
+                return Err(CanonicalError::Invalid(
+                    "track moved albums after review; review the conflict again".to_owned(),
+                ));
+            }
+            if track.fingerprint != update.expected_fingerprint
+                || track.title != update.expected_title
+                || track.credited_artist_ids != update.expected_credited_artist_ids
+                || track.track_number != update.expected_track_number
+                || track.disc_number != update.expected_disc_number
+                || track.duration_ms != update.expected_duration_ms
+            {
+                return Err(CanonicalError::Invalid(
+                    "existing track metadata changed after review; review the conflict again"
+                        .to_owned(),
+                ));
+            }
+            let title = update.title.trim().to_owned();
+            if title.is_empty() {
+                return Err(CanonicalError::Invalid(
+                    "track title must not be empty".to_owned(),
+                ));
+            }
+            let credits = resolve_import_artists(
+                &mut catalog,
+                &mut artists,
+                &mut new_artist_ids,
+                &mut writes,
+                update.credited_artists,
+            )?;
+            if credits.is_empty() || !credits.contains(&track.owner_artist_id) {
+                return Err(CanonicalError::Invalid(
+                    "metadata updates must keep the physical owner in ordered credits".to_owned(),
+                ));
+            }
+            let record = self
+                .track_records
+                .get(&update.track_id)
+                .cloned()
+                .ok_or_else(|| CanonicalError::Invalid("missing track record path".to_owned()))?;
+            let dto = TrackEntityDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: TRACK_KIND.to_owned(),
+                id: update.track_id.get(),
+                title,
+                credited_artist_ids: credits.iter().map(|artist| artist.get()).collect(),
+                owner_artist_id: track.owner_artist_id.get(),
+                album_id: track.album_id.get(),
+                track_number: update.track_number,
+                disc_number: update.disc_number,
+                duration_ms: update.duration_ms,
+                lyrics: track.lyrics,
+                fingerprint: track.fingerprint,
+            };
+            push_file_write(&mut writes, &record, &dto)?;
         }
         for album_id in touched_albums {
             let Some(album) = albums.get(&album_id) else {
@@ -9244,6 +9378,8 @@ mod atomic_import_tests {
             track_number: None,
             disc_number: None,
             duration_ms: None,
+            allow_duplicate_content: false,
+            expected_source_fingerprint: None,
         }
     }
 
@@ -9389,6 +9525,8 @@ mod atomic_import_tests {
             track_number: Some(1),
             disc_number: None,
             duration_ms: None,
+            allow_duplicate_content: false,
+            expected_source_fingerprint: None,
         };
         let ids = library
             .import_tracks_batch(generation, vec![request])
@@ -9398,5 +9536,172 @@ mod atomic_import_tests {
         assert_eq!(track.credited_artist_ids.len(), 2);
         assert!(library.artists().any(|artist| artist.name == "Featured"));
         assert_eq!(library.album_tracks(album), ids);
+    }
+
+    fn base_track_fixture(
+        dir: &TempDir,
+        name: &str,
+    ) -> (CanonicalLibrary, ArtistId, AlbumId, TrackId) {
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let owner = library.create_artist("Owner", Vec::new()).expect("owner");
+        let album = library
+            .create_album(owner, "Album", ReleaseType::Album)
+            .expect("album");
+        let source = dir.write(name, b"original-audio");
+        let generation = library.generation();
+        let ids = library
+            .import_tracks_batch(
+                generation,
+                vec![CanonicalImportTrackRequest {
+                    source,
+                    title: "Original".to_owned(),
+                    credited_artists: vec![CanonicalImportArtistRef::Existing(owner)],
+                    owner_index: 0,
+                    album: CanonicalImportAlbumRef::Existing(album),
+                    track_number: Some(1),
+                    disc_number: None,
+                    duration_ms: Some(1_000),
+                    allow_duplicate_content: false,
+                    expected_source_fingerprint: None,
+                }],
+            )
+            .expect("base import");
+        (library, owner, album, ids[0])
+    }
+
+    fn update_request(
+        library: &CanonicalLibrary,
+        id: TrackId,
+        title: &str,
+        credits: Vec<CanonicalImportArtistRef>,
+    ) -> CanonicalTrackMetadataUpdate {
+        let track = library.track(id).expect("track");
+        CanonicalTrackMetadataUpdate {
+            track_id: id,
+            expected_fingerprint: track.fingerprint,
+            expected_album_id: track.album_id,
+            expected_title: track.title.clone(),
+            expected_credited_artist_ids: track.credited_artist_ids.clone(),
+            expected_track_number: track.track_number,
+            expected_disc_number: track.disc_number,
+            expected_duration_ms: track.duration_ms,
+            title: title.to_owned(),
+            credited_artists: credits,
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            duration_ms: track.duration_ms,
+        }
+    }
+
+    #[test]
+    fn approved_metadata_update_preserves_track_id_and_stages_new_artist() {
+        let dir = TempDir::new("atomic-update");
+        let (mut library, owner, album, id) = base_track_fixture(&dir, "base.wav");
+        let generation = library.generation();
+        let update = update_request(
+            &library,
+            id,
+            "Corrected",
+            vec![
+                CanonicalImportArtistRef::Existing(owner),
+                CanonicalImportArtistRef::Proposed("Guest".to_owned()),
+            ],
+        );
+        library
+            .import_review_batch(generation, Vec::new(), vec![update])
+            .expect("metadata update");
+        let track = library.track(id).expect("same track");
+        assert_eq!(track.title, "Corrected");
+        assert_eq!(track.album_id, album);
+        assert_eq!(track.owner_artist_id, owner);
+        assert_eq!(track.credited_artist_ids.len(), 2);
+        assert!(library.artists().any(|artist| artist.name == "Guest"));
+    }
+
+    #[test]
+    fn failed_metadata_update_never_leaves_new_artist_or_partial_metadata() {
+        let points = [
+            TransactionFailPoint::BeforeJournal,
+            TransactionFailPoint::AfterJournal,
+            TransactionFailPoint::BeforeStaging,
+            TransactionFailPoint::DuringCopy,
+            TransactionFailPoint::AfterCopyBeforeVerify,
+            TransactionFailPoint::AfterVerify,
+            TransactionFailPoint::BeforeMetadataPublish,
+            TransactionFailPoint::DuringMetadataPublish,
+            TransactionFailPoint::BeforeCatalogPublish,
+            TransactionFailPoint::AfterCatalogPublish,
+            TransactionFailPoint::BeforeCleanup,
+            TransactionFailPoint::AfterCleanup,
+            TransactionFailPoint::BeforeJournalFinalize,
+        ];
+        for point in points {
+            let committed = matches!(
+                point,
+                TransactionFailPoint::AfterCatalogPublish
+                    | TransactionFailPoint::BeforeCleanup
+                    | TransactionFailPoint::AfterCleanup
+                    | TransactionFailPoint::BeforeJournalFinalize
+            );
+            let dir = TempDir::new(&format!("atomic-update-failure-{point:?}"));
+            let (mut library, owner, _album, id) = base_track_fixture(&dir, "base.wav");
+            let generation = library.generation();
+            let update = update_request(
+                &library,
+                id,
+                "Changed",
+                vec![
+                    CanonicalImportArtistRef::Existing(owner),
+                    CanonicalImportArtistRef::Proposed("Guest".to_owned()),
+                ],
+            );
+            library.set_transaction_failure(Some(TransactionFailure {
+                point,
+                interrupt: true,
+                abort: false,
+            }));
+            assert!(
+                library
+                    .import_review_batch(generation, Vec::new(), vec![update])
+                    .is_err(),
+                "{point:?} did not trigger"
+            );
+            let root = library.root.clone();
+            drop(library);
+            let reopened = CanonicalLibrary::open(&root).expect("recover");
+            let track = reopened.track(id).expect("track");
+            assert_eq!(track.title, if committed { "Changed" } else { "Original" });
+            assert_eq!(
+                reopened.artists().any(|artist| artist.name == "Guest"),
+                committed
+            );
+            assert_eq!(reopened.artists().count(), if committed { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn stale_metadata_update_is_rejected_without_writes() {
+        let dir = TempDir::new("atomic-update-stale");
+        let (mut library, owner, _album, id) = base_track_fixture(&dir, "base.wav");
+        let generation = library.generation();
+        let mut update = update_request(
+            &library,
+            id,
+            "Changed",
+            vec![
+                CanonicalImportArtistRef::Existing(owner),
+                CanonicalImportArtistRef::Proposed("Guest".to_owned()),
+            ],
+        );
+        update.expected_title = "Something else".to_owned();
+        assert!(
+            library
+                .import_review_batch(generation, Vec::new(), vec![update])
+                .is_err()
+        );
+        assert_eq!(library.track(id).expect("track").title, "Original");
+        assert_eq!(library.artists().count(), 1);
+        assert!(!library.artists().any(|artist| artist.name == "Guest"));
     }
 }

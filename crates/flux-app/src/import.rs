@@ -1,4 +1,5 @@
-//! Review-first import planning and execution for portable libraries.
+//! Review-first import planning and execution for portable and canonical
+//! libraries.
 //!
 //! The import manager is deliberately split into three phases:
 //!
@@ -10,15 +11,14 @@
 //!    the background, with cooperative cancellation. It creates no
 //!    catalogue entries.
 //! 3. [`Controller::apply_import_plan`] inserts/updates tracks through the
-//!    existing in-memory library and portable store, then publishes once.
+//!    existing library. Canonical changes, including proposed artists and
+//!    approved metadata updates, publish in one transaction.
 //!
 //! A cancelled or failed copy phase therefore cannot leave a catalogue
 //! record pointing at an incomplete file. Reviewed imports never rewrite
 //! audio tags; user edits become sparse Flux overrides.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -124,8 +124,14 @@ pub enum CandidateStatus {
         /// Another selected source with the same content, if any.
         other_source: Option<PathBuf>,
     },
-    /// Different file, but title/artist/album match an existing track.
+    /// Different audio, but title/artist/album match an existing track.
     SimilarMetadata(TrackId),
+    /// Same title as an existing track, but the audio differs.
+    SameTitleDifferentAudio(TrackId),
+    /// Size/duration/title agree but the fingerprint differs; treat as uncertain.
+    ProbableAudio(TrackId),
+    /// Several existing tracks have the same audio fingerprint.
+    AmbiguousAudio(Vec<TrackId>),
 }
 
 impl CandidateStatus {
@@ -135,23 +141,58 @@ impl CandidateStatus {
         matches!(self, Self::ExistingPath(_))
     }
 
-    /// Stable track ID associated with an exact/similar existing match.
+    /// Whether this is an exact audio duplicate with a unique existing match.
+    #[must_use]
+    pub fn is_exact_audio(&self) -> bool {
+        matches!(self, Self::ExistingPath(_))
+            || matches!(
+                self,
+                Self::SameContent {
+                    track_id: Some(_),
+                    ..
+                }
+            )
+    }
+
+    /// Stable track ID associated with a unique existing match.
     #[must_use]
     pub fn matched_track(&self) -> Option<TrackId> {
         match self {
-            Self::ExistingPath(id) | Self::SimilarMetadata(id) => Some(*id),
+            Self::ExistingPath(id)
+            | Self::SimilarMetadata(id)
+            | Self::SameTitleDifferentAudio(id)
+            | Self::ProbableAudio(id) => Some(*id),
             Self::SameContent { track_id, .. } => *track_id,
-            Self::New => None,
+            Self::New | Self::AmbiguousAudio(_) => None,
         }
+    }
+
+    /// Whether any conflict evidence exists.
+    #[must_use]
+    pub fn has_conflict(&self) -> bool {
+        !matches!(self, Self::New)
+    }
+
+    /// Whether an incoming file can be deliberately imported separately.
+    #[must_use]
+    pub fn can_import_separately(&self) -> bool {
+        !self.is_exact_path()
+    }
+
+    /// Whether approved incoming metadata can update a unique exact-audio match.
+    #[must_use]
+    pub fn can_update_metadata(&self) -> bool {
+        self.is_exact_audio() && self.matched_track().is_some()
     }
 }
 
 /// What the user chose for one reviewed candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportDecision {
-    /// Add a new catalogue record (or update via an explicit exact-path choice).
+    /// Add a new catalogue record with a new TrackId.
     ImportNew,
-    /// Update the existing exact-path track's Flux metadata, preserving its ID.
+    /// Apply approved incoming metadata to a unique exact-audio match,
+    /// preserving its TrackId, audio and physical owner.
     UpdateExisting,
     /// Do nothing for this candidate.
     Skip,
@@ -201,6 +242,35 @@ impl ImportCredit {
     }
 }
 
+/// Snapshot of the existing track that a reviewed conflict was compared with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingTrackMatch {
+    /// Stable existing TrackId.
+    pub track_id: TrackId,
+    /// Album membership at review time.
+    pub album_id: Option<AlbumId>,
+    /// Existing title.
+    pub title: String,
+    /// Existing artist display name.
+    pub artist_name: Option<String>,
+    /// Existing album display name.
+    pub album_title: Option<String>,
+    /// Existing ordered credits, or the owner when credits were unavailable.
+    pub credited_artist_ids: Vec<ArtistId>,
+    /// Existing physical owner.
+    pub owner_artist_id: Option<ArtistId>,
+    /// Existing track number.
+    pub track_number: Option<u32>,
+    /// Existing disc number.
+    pub disc_number: Option<u32>,
+    /// Existing duration.
+    pub duration_ms: Option<u64>,
+    /// Existing managed audio path.
+    pub audio_path: PathBuf,
+    /// Existing managed audio fingerprint, when readable.
+    pub fingerprint: Option<flux_library::canonical::ContentFingerprint>,
+}
+
 /// One scanned file in the import review.
 #[derive(Debug, Clone)]
 pub struct ImportCandidate {
@@ -228,6 +298,9 @@ pub struct ImportCandidate {
     owner_index: usize,
     base_credits: Vec<ImportCredit>,
     metadata_incomplete: bool,
+    existing_match: Option<ExistingTrackMatch>,
+    metadata_matches_existing: bool,
+    source_fingerprint: Option<flux_library::canonical::ContentFingerprint>,
 }
 
 impl ImportCandidate {
@@ -259,6 +332,18 @@ impl ImportCandidate {
     #[must_use]
     pub fn status(&self) -> &CandidateStatus {
         &self.status
+    }
+
+    /// Existing track evidence used for this conflict, when unique.
+    #[must_use]
+    pub fn existing_match(&self) -> Option<&ExistingTrackMatch> {
+        self.existing_match.as_ref()
+    }
+
+    /// Whether incoming metadata equals the matched existing metadata.
+    #[must_use]
+    pub fn metadata_matches_existing(&self) -> bool {
+        self.metadata_matches_existing
     }
 
     /// Current decision.
@@ -525,14 +610,18 @@ impl ImportCandidate {
     /// Chooses what to do with this candidate.
     ///
     /// Exact-path duplicates can only be skipped or updated; they can never
-    /// create a second catalogue owner for the same path. Non-exact
-    /// candidates cannot be marked update-existing.
+    /// create a second catalogue owner for the same path. Metadata updates
+    /// require a unique exact-audio match. Other conflicts can be skipped or
+    /// imported separately after explicit review.
     pub fn set_decision(&mut self, decision: ImportDecision) {
-        self.decision = match (self.status.is_exact_path(), decision) {
-            (true, ImportDecision::ImportNew) | (false, ImportDecision::UpdateExisting) => {
+        self.decision = match decision {
+            ImportDecision::ImportNew if !self.status.can_import_separately() => {
                 ImportDecision::Skip
             }
-            (_, decision) => decision,
+            ImportDecision::UpdateExisting if !self.status.can_update_metadata() => {
+                ImportDecision::Skip
+            }
+            decision => decision,
         };
     }
 
@@ -582,10 +671,10 @@ impl ImportPlan {
         self.recompute_destinations();
     }
 
-    /// Sets every eligible exact-path duplicate to update-existing.
+    /// Sets every unique exact-audio duplicate to update-existing metadata.
     pub fn bulk_update_existing(&mut self) {
         for candidate in &mut self.candidates {
-            if candidate.status.is_exact_path() {
+            if candidate.status.can_update_metadata() && candidate.existing_match.is_some() {
                 candidate.decision = ImportDecision::UpdateExisting;
             }
         }
@@ -645,8 +734,14 @@ impl ImportPlan {
         !self.cancelled
             && (self.new_count() > 0 || self.update_count() > 0)
             && self.candidates.iter().all(|candidate| {
-                candidate.decision != ImportDecision::ImportNew
-                    || (candidate.storage_error.is_none() && candidate.validation_error().is_none())
+                if candidate.decision == ImportDecision::Skip {
+                    return true;
+                }
+                candidate.validation_error().is_none()
+                    && (candidate.decision != ImportDecision::ImportNew
+                        || candidate.storage_error.is_none())
+                    && (candidate.decision != ImportDecision::UpdateExisting
+                        || candidate.existing_match.is_some())
             })
     }
 
@@ -655,11 +750,29 @@ impl ImportPlan {
     pub fn blocking_reason(&self) -> Option<String> {
         self.candidates
             .iter()
-            .find(|candidate| candidate.decision == ImportDecision::ImportNew)
+            .find(|candidate| candidate.decision != ImportDecision::Skip)
             .and_then(|candidate| {
-                candidate
-                    .validation_error()
-                    .or_else(|| candidate.storage_error.clone())
+                if candidate.decision == ImportDecision::UpdateExisting
+                    && !candidate.status().can_update_metadata()
+                {
+                    return Some(
+                        "Metadata updates require a unique exact-audio match; import separately or skip."
+                            .to_owned(),
+                    );
+                }
+                if candidate.decision == ImportDecision::UpdateExisting
+                    && candidate.existing_match.is_none()
+                {
+                    return Some(
+                        "No reviewed existing track is available for this metadata update."
+                            .to_owned(),
+                    );
+                }
+                candidate.validation_error().or_else(|| {
+                    (candidate.decision == ImportDecision::ImportNew)
+                        .then(|| candidate.storage_error.clone())
+                        .flatten()
+                })
             })
     }
 
@@ -712,6 +825,10 @@ pub struct ImportRequest {
     pub existing_tracks: Vec<(TrackId, Track)>,
     /// Existing track → artist relationships.
     pub existing_artists: Vec<(TrackId, ArtistId)>,
+    /// Existing track → ordered credits, when available.
+    pub existing_credits: Vec<(TrackId, Vec<ArtistId>)>,
+    /// Existing track → album membership, when available.
+    pub existing_album_ids: Vec<(TrackId, AlbumId)>,
     /// Fixed existing album target, when applicable.
     pub target_album: Option<ImportAlbumTarget>,
     /// Canonical catalogue generation captured before review.
@@ -1010,25 +1127,17 @@ fn same_metadata(left: &Track, right: &Track) -> bool {
         && normalized(left.album()) == normalized(right.album())
 }
 
+fn same_core_metadata(track: &Track, existing: &ExistingTrackMatch) -> bool {
+    normalized(Some(track.title())) == normalized(Some(&existing.title))
+        && normalized(track.artist()) == normalized(existing.artist_name.as_deref())
+        && normalized(track.album()) == normalized(existing.album_title.as_deref())
+}
+
 fn file_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path)
         .ok()
         .filter(|metadata| metadata.is_file())
         .map(|metadata| metadata.len())
-}
-
-fn content_hash(path: &Path) -> Option<u64> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = DefaultHasher::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        buffer[..read].hash(&mut hasher);
-    }
-    Some(hasher.finish())
 }
 
 fn existing_path_map(existing: &[(TrackId, Track)]) -> HashMap<PathBuf, TrackId> {
@@ -1063,7 +1172,60 @@ fn make_candidate(
     status: CandidateStatus,
     existing: &[(TrackId, Track)],
     artist_links: &[(TrackId, ArtistId)],
+    credit_links: &[(TrackId, Vec<ArtistId>)],
+    album_links: &[(TrackId, AlbumId)],
 ) -> ImportCandidate {
+    let existing_match = status.matched_track().and_then(|id| {
+        let (_, track) = existing.iter().find(|(track_id, _)| *track_id == id)?;
+        let mut credits = credit_links
+            .iter()
+            .find(|(track_id, _)| *track_id == id)
+            .map(|(_, credits)| credits.clone())
+            .filter(|credits| !credits.is_empty())
+            .unwrap_or_else(|| {
+                artist_links
+                    .iter()
+                    .find(|(track_id, _)| *track_id == id)
+                    .map(|(_, artist)| vec![*artist])
+                    .unwrap_or_default()
+            });
+        if credits.is_empty()
+            && let Some(artist) = artist_links
+                .iter()
+                .find(|(track_id, _)| *track_id == id)
+                .map(|(_, artist)| *artist)
+        {
+            credits.push(artist);
+        }
+        Some(ExistingTrackMatch {
+            track_id: id,
+            album_id: album_links
+                .iter()
+                .find(|(track_id, _)| *track_id == id)
+                .map(|(_, album)| *album),
+            title: track.title().to_owned(),
+            artist_name: track.artist().map(ToOwned::to_owned),
+            album_title: track.album().map(ToOwned::to_owned),
+            credited_artist_ids: credits,
+            owner_artist_id: artist_links
+                .iter()
+                .find(|(track_id, _)| *track_id == id)
+                .map(|(_, artist)| *artist),
+            track_number: track.track_number(),
+            disc_number: track.disc_number(),
+            duration_ms: track.duration().map(|duration| duration.as_millis() as u64),
+            audio_path: track.source().path().to_path_buf(),
+            fingerprint: flux_library::canonical::ContentFingerprint::of_file(
+                track.source().path(),
+            )
+            .ok(),
+        })
+    });
+    let metadata_matches_existing = if let Some(existing) = &existing_match {
+        same_core_metadata(&source_track, existing)
+    } else {
+        false
+    };
     let base = match &status {
         CandidateStatus::ExistingPath(id) => base_for_existing(existing, artist_links, *id),
         _ => None,
@@ -1079,6 +1241,9 @@ fn make_candidate(
             ImportDecision::Skip
         }
         CandidateStatus::New | CandidateStatus::SimilarMetadata(_) => ImportDecision::ImportNew,
+        CandidateStatus::SameTitleDifferentAudio(_)
+        | CandidateStatus::ProbableAudio(_)
+        | CandidateStatus::AmbiguousAudio(_) => ImportDecision::Skip,
     };
     let metadata_incomplete = source_track.artist().is_none()
         || source_track.album().is_none()
@@ -1115,6 +1280,9 @@ fn make_candidate(
         base_disc_number,
         base_artist_id,
         metadata_incomplete,
+        existing_match,
+        metadata_matches_existing,
+        source_fingerprint: flux_library::canonical::ContentFingerprint::of_file(&source_path).ok(),
     }
 }
 
@@ -1123,35 +1291,42 @@ fn duplicate_status(
     track: &Track,
     existing: &[(TrackId, Track)],
     path_map: &HashMap<PathBuf, TrackId>,
-    hash_cache: &mut HashMap<TrackId, Option<u64>>,
-    candidate_hashes: &mut HashMap<u64, PathBuf>,
+    hash_cache: &mut HashMap<TrackId, Option<flux_library::canonical::ContentFingerprint>>,
+    candidate_hashes: &mut HashMap<flux_library::canonical::ContentFingerprint, PathBuf>,
 ) -> CandidateStatus {
     if let Some(id) = path_map.get(path) {
         return CandidateStatus::ExistingPath(*id);
     }
 
-    if let Some(hash) = content_hash(path) {
-        if let Some(other) = candidate_hashes.insert(hash, path.to_path_buf()) {
+    let Some(fingerprint) = flux_library::canonical::ContentFingerprint::of_file(path).ok() else {
+        return CandidateStatus::New;
+    };
+    if let Some(other) = candidate_hashes.insert(fingerprint, path.to_path_buf()) {
+        return CandidateStatus::SameContent {
+            track_id: None,
+            other_source: Some(other),
+        };
+    }
+
+    let mut exact_matches = Vec::new();
+    for (id, existing_track) in existing {
+        let existing_fingerprint = hash_cache.entry(*id).or_insert_with(|| {
+            flux_library::canonical::ContentFingerprint::of_file(existing_track.source().path())
+                .ok()
+        });
+        if *existing_fingerprint == Some(fingerprint) {
+            exact_matches.push(*id);
+        }
+    }
+    match exact_matches.as_slice() {
+        [id] => {
             return CandidateStatus::SameContent {
-                track_id: None,
-                other_source: Some(other),
+                track_id: Some(*id),
+                other_source: None,
             };
         }
-        let size = file_size(path).unwrap_or(0);
-        for (id, existing_track) in existing {
-            if file_size(existing_track.source().path()) != Some(size) {
-                continue;
-            }
-            let existing_hash = hash_cache
-                .entry(*id)
-                .or_insert_with(|| content_hash(existing_track.source().path()));
-            if *existing_hash == Some(hash) {
-                return CandidateStatus::SameContent {
-                    track_id: Some(*id),
-                    other_source: None,
-                };
-            }
-        }
+        [] => {}
+        ids => return CandidateStatus::AmbiguousAudio(ids.to_vec()),
     }
 
     if let Some((id, _)) = existing
@@ -1159,6 +1334,34 @@ fn duplicate_status(
         .find(|(_, existing_track)| same_metadata(track, existing_track))
     {
         return CandidateStatus::SimilarMetadata(*id);
+    }
+
+    let incoming_size = file_size(path).unwrap_or(0);
+    let incoming_duration = track.duration();
+    let probable = existing
+        .iter()
+        .filter(|(_, existing_track)| {
+            let durations_agree = match (incoming_duration, existing_track.duration()) {
+                (Some(incoming), Some(existing)) => incoming == existing,
+                _ => true,
+            };
+            file_size(existing_track.source().path()) == Some(incoming_size)
+                && incoming_size > 0
+                && durations_agree
+                && normalized(Some(track.title())) == normalized(Some(existing_track.title()))
+        })
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    match probable.as_slice() {
+        [id] => return CandidateStatus::ProbableAudio(*id),
+        [] => {}
+        ids => return CandidateStatus::AmbiguousAudio(ids.to_vec()),
+    }
+
+    if let Some((id, _)) = existing.iter().find(|(_, existing_track)| {
+        normalized(Some(track.title())) == normalized(Some(existing_track.title()))
+    }) {
+        return CandidateStatus::SameTitleDifferentAudio(*id);
     }
     CandidateStatus::New
 }
@@ -1181,6 +1384,8 @@ pub fn prepare_import_plan(
         library_root,
         existing_tracks,
         existing_artists,
+        existing_credits,
+        existing_album_ids,
         target_album,
         generation,
     } = request;
@@ -1236,8 +1441,10 @@ pub fn prepare_import_plan(
         "Checking duplicates and conflicts…",
     );
     let path_map = existing_path_map(&existing_tracks);
-    let mut hash_cache: HashMap<TrackId, Option<u64>> = HashMap::new();
-    let mut candidate_hashes: HashMap<u64, PathBuf> = HashMap::new();
+    let mut hash_cache: HashMap<TrackId, Option<flux_library::canonical::ContentFingerprint>> =
+        HashMap::new();
+    let mut candidate_hashes: HashMap<flux_library::canonical::ContentFingerprint, PathBuf> =
+        HashMap::new();
     for (index, (path, track)) in candidates.drain(..).enumerate() {
         if is_cancelled(&cancel) {
             plan.cancelled = true;
@@ -1257,6 +1464,8 @@ pub fn prepare_import_plan(
             status,
             &existing_tracks,
             &existing_artists,
+            &existing_credits,
+            &existing_album_ids,
         ));
         set_progress_item(&progress, index, ImportItemState::Ready);
         update_progress(
@@ -1678,7 +1887,9 @@ fn apply_import_plan_canonical(
 
     let mut report = ImportApplyReport::default();
     let mut requests = Vec::new();
-    let mut indices = Vec::new();
+    let mut request_indices = Vec::new();
+    let mut updates = Vec::new();
+    let mut update_indices = Vec::new();
     for (index, candidate) in plan.candidates.iter().enumerate() {
         match candidate.decision {
             ImportDecision::Skip => {
@@ -1691,13 +1902,107 @@ fn apply_import_plan_canonical(
                 });
             }
             ImportDecision::UpdateExisting => {
-                report.items.push(AppliedImportItem {
-                    index,
-                    track_id: candidate.status.matched_track(),
-                    state: ImportItemState::Failed,
-                    message: "Updating an existing track is not part of the atomic import batch; edit that track separately or skip it."
-                        .to_owned(),
+                let Some(existing) = candidate.existing_match() else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "No reviewed existing track is available for this update."
+                            .to_owned(),
+                    });
+                    continue;
+                };
+                if !candidate.status().can_update_metadata() {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(existing.track_id),
+                        state: ImportItemState::Failed,
+                        message: "This conflict is not an exact audio match; replacing or updating its audio is not supported. Import separately or skip.".to_owned(),
+                    });
+                    continue;
+                }
+                if let Some(target) = &plan.target_album
+                    && existing.album_id != Some(target.album_id)
+                {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(existing.track_id),
+                        state: ImportItemState::Failed,
+                        message: "That duplicate is in another album. The fixed target cannot silently redirect it; use the general import manager or skip."
+                            .to_owned(),
+                    });
+                    continue;
+                }
+                let refs = match resolve_import_artist_refs(controller, candidate) {
+                    Ok(refs) => refs,
+                    Err(message) => {
+                        report.items.push(AppliedImportItem {
+                            index,
+                            track_id: Some(existing.track_id),
+                            state: ImportItemState::Failed,
+                            message,
+                        });
+                        continue;
+                    }
+                };
+                let Some(owner) = existing.owner_artist_id else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(existing.track_id),
+                        state: ImportItemState::Failed,
+                        message: "The existing physical owner cannot be resolved.".to_owned(),
+                    });
+                    continue;
+                };
+                let mut refs = refs;
+                if !refs.contains(&CanonicalImportArtistRef::Existing(owner)) {
+                    // Metadata approval never changes physical ownership. Preserve
+                    // the existing owner even when the incoming metadata inferred a
+                    // different primary artist.
+                    let owner_ref = CanonicalImportArtistRef::Existing(owner);
+                    if candidate.owner_index() < refs.len() {
+                        refs[candidate.owner_index()] = owner_ref;
+                    } else {
+                        refs.push(owner_ref);
+                    }
+                }
+                let Some(expected_fingerprint) = existing.fingerprint else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(existing.track_id),
+                        state: ImportItemState::Failed,
+                        message:
+                            "The existing managed audio could not be fingerprinted; review again."
+                                .to_owned(),
+                    });
+                    continue;
+                };
+                let Some(expected_album_id) = existing.album_id else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(existing.track_id),
+                        state: ImportItemState::Failed,
+                        message: "The existing album membership is unavailable; review again."
+                            .to_owned(),
+                    });
+                    continue;
+                };
+                updates.push(flux_library::canonical::CanonicalTrackMetadataUpdate {
+                    track_id: existing.track_id,
+                    expected_fingerprint: Some(expected_fingerprint),
+                    expected_album_id,
+                    expected_title: existing.title.clone(),
+                    expected_credited_artist_ids: existing.credited_artist_ids.clone(),
+                    expected_track_number: existing.track_number,
+                    expected_disc_number: existing.disc_number,
+                    expected_duration_ms: existing.duration_ms,
+                    title: candidate.title().to_owned(),
+                    credited_artists: refs,
+                    track_number: candidate.track_number(),
+                    disc_number: candidate.disc_number(),
+                    duration_ms: existing.duration_ms,
                 });
+                update_indices.push(index);
             }
             ImportDecision::ImportNew => {
                 let refs = match resolve_import_artist_refs(controller, candidate) {
@@ -1755,30 +2060,45 @@ fn apply_import_plan_canonical(
                     track_number: candidate.track_number(),
                     disc_number: candidate.disc_number(),
                     duration_ms: None,
+                    allow_duplicate_content: matches!(
+                        candidate.status(),
+                        CandidateStatus::SameContent { .. }
+                    ),
+                    expected_source_fingerprint: candidate.source_fingerprint,
                 });
-                indices.push(index);
+                request_indices.push(index);
             }
         }
     }
-    if !requests.is_empty() {
+    if !requests.is_empty() || !updates.is_empty() {
         let generation = plan
             .target_album
             .as_ref()
             .map_or(plan.generation, |target| target.generation);
-        match controller.import_tracks_batch(generation, requests) {
+        match controller.import_review_batch(generation, requests, updates) {
             Ok(ids) => {
-                for (index, id) in indices.into_iter().zip(ids) {
+                for (index, id) in request_indices.into_iter().zip(ids) {
                     report.imported += 1;
                     report.items.push(AppliedImportItem {
                         index,
                         track_id: Some(id),
                         state: ImportItemState::Imported,
-                        message: "Imported".to_owned(),
+                        message: "Imported as a separate track".to_owned(),
+                    });
+                }
+                for index in update_indices {
+                    report.updated += 1;
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: plan.candidates[index].status().matched_track(),
+                        state: ImportItemState::Imported,
+                        message: "Existing metadata updated; audio and TrackId preserved"
+                            .to_owned(),
                     });
                 }
             }
             Err(error) => {
-                for index in indices {
+                for index in request_indices.into_iter().chain(update_indices) {
                     report.items.push(AppliedImportItem {
                         index,
                         track_id: None,
@@ -1796,8 +2116,8 @@ fn apply_import_plan_canonical(
         .count();
     report.items.sort_by_key(|item| item.index);
     controller.report_status(format!(
-        "Canonical import: {} imported, {} failed, {} skipped.",
-        report.imported, report.failed, report.skipped
+        "Canonical import: {} imported, {} updated, {} failed, {} skipped.",
+        report.imported, report.updated, report.failed, report.skipped
     ));
     Ok(report)
 }
@@ -2017,12 +2337,12 @@ mod tests {
     use flux_audio::output::NullControl;
     use flux_core::TrackId;
 
-    use crate::{AudioStatus, Controller, create_portable_library};
+    use crate::{AudioStatus, Controller, create_canonical_library, create_portable_library};
 
     use super::{
-        ArtistId, CandidateStatus, ImportCredit, ImportDecision, ImportItemState, ImportPlan,
-        ImportProgress, ImportRequest, ImportStage, ImportStorage, prepare_import_files,
-        prepare_import_plan,
+        ArtistId, CandidateStatus, ImportAlbumTarget, ImportCredit, ImportDecision,
+        ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
+        PreparedImport, prepare_import_files, prepare_import_plan,
     };
 
     struct TempDir(PathBuf);
@@ -2102,9 +2422,59 @@ mod tests {
                 .iter()
                 .filter_map(|(id, _)| controller.track_artist_id(*id).map(|artist| (*id, artist)))
                 .collect(),
+            existing_credits: controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_album_id(*id).map(|album| (*id, album)))
+                .collect(),
             target_album: None,
             generation: controller.generation(),
         }
+    }
+
+    fn canonical_request(
+        controller: &Controller,
+        root: &Path,
+        sources: Vec<PathBuf>,
+        target_album: Option<ImportAlbumTarget>,
+    ) -> ImportRequest {
+        ImportRequest {
+            sources,
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: root.to_path_buf(),
+            existing_tracks: controller.tracks().to_vec(),
+            existing_artists: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_artist_id(*id).map(|artist| (*id, artist)))
+                .collect(),
+            existing_credits: controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_album_id(*id).map(|album| (*id, album)))
+                .collect(),
+            target_album,
+            generation: controller.generation(),
+        }
+    }
+
+    fn canonical_controller(root: &Path) -> (Controller, NullControl) {
+        create_canonical_library(root).expect("canonical library");
+        let (engine, control) = EngineHandle::spawn_null(48_000, 1);
+        let controller = Controller::new_canonical(engine, AudioStatus::Ready, root)
+            .expect("canonical controller");
+        (controller, control)
     }
 
     fn plan(
@@ -2601,6 +2971,478 @@ mod tests {
         assert_eq!(candidate.credits()[0].name, "Featured Artist");
         candidate.set_credit_artist(0, ArtistId::new(99), "Named".to_owned());
         assert_eq!(candidate.credits()[0].artist_id, Some(ArtistId::new(99)));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_exact_audio_duplicate_can_update_metadata_without_changing_id_or_audio() {
+        let dir = TempDir::new("canonical-duplicate-update");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source = wav(&dir.path().join("Artist/Album"), "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("base import");
+        let (id, track) = controller.tracks()[0].clone();
+        let managed = track.source().path().to_path_buf();
+        let managed_before = fs::read(&managed).expect("managed audio");
+        controller
+            .set_lyrics(id, Some("managed lyrics"))
+            .expect("lyrics");
+        controller.set_rating(id, Some(4), true).expect("rating");
+        let playlist = controller
+            .set_playlist(None, "Keep me", vec![id])
+            .expect("playlist");
+        let queue_entry = controller.current_queue_entry_id();
+        let playback_state = controller.player_state();
+        let copy = source.clone();
+        fs::copy(&managed, &copy).expect("duplicate copy");
+
+        let request = canonical_request(&controller, &root, vec![copy], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            plan.candidates[0].status(),
+            CandidateStatus::SameContent {
+                track_id: Some(existing),
+                other_source: None,
+            } if *existing == id
+        ));
+        assert!(plan.candidates[0].metadata_matches_existing());
+        assert_eq!(plan.candidates[0].decision(), ImportDecision::Skip);
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        plan.candidates[0].set_title("Corrected title");
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("metadata update");
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.imported, 0);
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].0, id);
+        assert_eq!(
+            controller.track(id).map(|track| track.title()),
+            Some("Corrected title")
+        );
+        assert_eq!(
+            controller
+                .track(id)
+                .map(|track| track.source().path().to_path_buf()),
+            Some(managed.clone())
+        );
+        assert_eq!(fs::read(&managed).expect("managed after"), managed_before);
+        assert_eq!(
+            controller.track_lyrics(id).as_deref(),
+            Some("managed lyrics")
+        );
+        assert_eq!(
+            controller
+                .rating(id)
+                .map(|rating| (rating.rating, rating.favorite)),
+            Some((Some(4), true))
+        );
+        assert_eq!(
+            controller
+                .playlists()
+                .iter()
+                .find(|entry| entry.id == playlist)
+                .map(|entry| entry.track_ids.clone()),
+            Some(vec![id])
+        );
+        assert_eq!(controller.current_queue_entry_id(), queue_entry);
+        assert_eq!(controller.player_state(), playback_state);
+
+        // Same audio with different inferred metadata can still update only the
+        // existing track's metadata; album membership and audio stay unchanged.
+        let different_metadata = dir.path().join("Other/Other/Song.wav");
+        fs::create_dir_all(different_metadata.parent().expect("parent")).expect("dirs");
+        fs::copy(&managed, &different_metadata).expect("metadata duplicate");
+        let request = canonical_request(&controller, &root, vec![different_metadata], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            plan.candidates[0].status(),
+            CandidateStatus::SameContent {
+                track_id: Some(existing),
+                ..
+            } if *existing == id
+        ));
+        assert!(!plan.candidates[0].metadata_matches_existing());
+        let album_before = controller.track_album_id(id);
+        let owner = controller.track_artist_id(id).expect("owner");
+        plan.candidates[0].set_credit_artist(0, owner, "Artist".to_owned());
+        plan.candidates[0].add_credit(ImportCredit::new(None, "Other", true));
+        plan.candidates[0].set_owner_index(0);
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("same audio metadata update");
+        assert_eq!(report.updated, 1);
+        assert_eq!(controller.track_album_id(id), album_before);
+        assert_eq!(
+            fs::read(&managed).expect("managed unchanged"),
+            managed_before
+        );
+        assert!(
+            controller
+                .artists()
+                .iter()
+                .any(|artist| artist.name() == "Other")
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_metadata_collision_with_different_audio_cannot_update_existing() {
+        let dir = TempDir::new("canonical-collision");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source = wav(&dir.path().join("Artist/Album"), "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("base import");
+        let id = controller.tracks()[0].0;
+        let other = wav(&dir.path().join("Other/Other"), "Song.wav", 8_820, 0.3);
+        let request = canonical_request(&controller, &root, vec![other], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let status = plan.candidates[0].status();
+        assert!(status.has_conflict());
+        assert!(!status.can_update_metadata());
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        assert_eq!(plan.candidates[0].decision(), ImportDecision::Skip);
+        let original_title = controller.track(id).map(|track| track.title().to_owned());
+        plan.bulk_skip();
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("keep existing");
+        assert_eq!(report.skipped, 1);
+        assert_eq!(
+            controller.track(id).map(|track| track.title().to_owned()),
+            original_title
+        );
+        plan.candidates[0].set_decision(ImportDecision::ImportNew);
+        assert_eq!(plan.candidates[0].decision(), ImportDecision::ImportNew);
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("separate import");
+        assert_eq!(report.imported, 1);
+        assert_eq!(controller.tracks().len(), 2);
+        assert!(
+            controller
+                .tracks()
+                .iter()
+                .any(|(track_id, _)| *track_id == id)
+        );
+        assert_eq!(
+            controller
+                .tracks()
+                .iter()
+                .filter(|(_, track)| track.title() == "Song")
+                .count(),
+            2
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_incoming_audio_duplicates_and_all_skips_do_not_create_entities() {
+        let dir = TempDir::new("canonical-incoming-duplicates");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let first = wav(
+            &dir.path().join("New Artist/New Album"),
+            "One.wav",
+            4_410,
+            0.2,
+        );
+        let second = dir.path().join("New Artist/New Album/One copy.wav");
+        fs::copy(&first, &second).expect("duplicate copy");
+        let request = canonical_request(&controller, &root, vec![first, second], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(plan.candidates.len(), 2);
+        assert!(matches!(
+            plan.candidates[1].status(),
+            CandidateStatus::SameContent {
+                track_id: None,
+                other_source: Some(_),
+            }
+        ));
+        plan.bulk_skip();
+        assert!(!plan.can_import());
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("all skipped");
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.imported, 0);
+        assert!(controller.tracks().is_empty());
+        assert!(controller.artists().is_empty());
+        assert!(controller.albums().is_empty());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_mixed_batch_imports_and_updates_apply_together() {
+        let dir = TempDir::new("canonical-mixed-batch");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source = wav(&dir.path().join("Artist/Album"), "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("base import");
+        let existing = controller.tracks()[0].0;
+        let managed = controller
+            .track(existing)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let duplicate = source.clone();
+        fs::copy(&managed, &duplicate).expect("copy");
+        let new_source = wav(
+            &dir.path().join("New Artist/New Album"),
+            "New.wav",
+            4_410,
+            -0.2,
+        );
+        let request = canonical_request(&controller, &root, vec![duplicate, new_source], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(plan.candidates.len(), 2);
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        plan.candidates[0].set_title("Updated existing");
+        plan.candidates[1].set_decision(ImportDecision::ImportNew);
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("mixed batch");
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.imported, 1);
+        assert_eq!(controller.tracks().len(), 2);
+        assert_eq!(
+            controller.track(existing).map(|track| track.title()),
+            Some("Updated existing")
+        );
+        assert!(
+            controller
+                .artists()
+                .iter()
+                .any(|artist| artist.name() == "New Artist")
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_same_title_probable_and_ambiguous_audio_remain_uncertain() {
+        let dir = TempDir::new("canonical-uncertain-audio");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source = wav(&dir.path().join("Artist/Album"), "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("base import");
+        let id = controller.tracks()[0].0;
+
+        let different = wav(&dir.path().join("Other/Other"), "Song.wav", 8_820, 0.3);
+        let request = canonical_request(&controller, &root, vec![different], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            plan.candidates[0].status(),
+            CandidateStatus::SameTitleDifferentAudio(existing) if *existing == id
+        ));
+        assert!(!plan.candidates[0].status().can_update_metadata());
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        assert_eq!(plan.candidates[0].decision(), ImportDecision::Skip);
+        plan.candidates[0].set_decision(ImportDecision::ImportNew);
+        assert_eq!(plan.candidates[0].decision(), ImportDecision::ImportNew);
+        plan.bulk_skip();
+        controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("skip uncertain");
+        assert_eq!(controller.tracks().len(), 1);
+
+        let probable = wav(&dir.path().join("Other/Other"), "Song.wav", 4_410, 0.4);
+        let request = canonical_request(&controller, &root, vec![probable], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            matches!(
+                plan.candidates[0].status(),
+                CandidateStatus::ProbableAudio(existing) if *existing == id
+            ),
+            "{:?}",
+            plan.candidates[0].status()
+        );
+
+        // Keep a second copy of the exact same audio as an explicit separate track.
+        let request = canonical_request(&controller, &root, vec![source.clone()], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        plan.candidates[0].set_decision(ImportDecision::ImportNew);
+        controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("explicit separate duplicate");
+        assert_eq!(controller.tracks().len(), 2);
+
+        let request = canonical_request(&controller, &root, vec![source], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            plan.candidates[0].status(),
+            CandidateStatus::AmbiguousAudio(ids) if ids.len() == 2
+        ));
+        assert_eq!(plan.candidates[0].decision(), ImportDecision::Skip);
+        assert!(plan.candidates[0].existing_match().is_none());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_fixed_target_duplicate_update_preserves_album_and_rejects_other_album() {
+        let dir = TempDir::new("canonical-fixed-duplicate");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source = wav(&dir.path().join("Artist/Album"), "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("base import");
+        let (id, _track) = controller.tracks()[0].clone();
+        let album_id = controller.track_album_id(id).expect("album");
+        let album = controller.album(album_id).expect("album");
+        let managed = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        fs::copy(&managed, &source).expect("copy duplicate");
+        let target = ImportAlbumTarget {
+            album_id,
+            owner_artist_id: album.owner_artist_id,
+            owner_name: controller
+                .artist(album.owner_artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_default(),
+            title: album.title.clone(),
+            release_type: album.release_type,
+            cover: album.cover.clone(),
+            track_order: album.track_order.clone(),
+            generation: controller.generation(),
+        };
+        let request = canonical_request(
+            &controller,
+            &root,
+            vec![source.clone()],
+            Some(target.clone()),
+        );
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        plan.candidates[0].set_title("Target update");
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("target update");
+        assert_eq!(report.updated, 1);
+        assert_eq!(
+            controller.track(id).map(|track| track.title()),
+            Some("Target update")
+        );
+        assert_eq!(controller.album_tracks(album_id), vec![id]);
+
+        let other_album = controller
+            .create_album(
+                controller.album_owner(album_id).expect("owner"),
+                "Other target",
+                flux_library::canonical::ReleaseType::Album,
+            )
+            .expect("other album");
+        let other = controller.album(other_album).expect("album");
+        let other_target = ImportAlbumTarget {
+            album_id: other_album,
+            owner_artist_id: other.owner_artist_id,
+            owner_name: controller
+                .artist(other.owner_artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_default(),
+            title: other.title.clone(),
+            release_type: other.release_type,
+            cover: other.cover.clone(),
+            track_order: other.track_order.clone(),
+            generation: controller.generation(),
+        };
+        let request = canonical_request(&controller, &root, vec![source], Some(other_target));
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        plan.candidates[0].set_title("Illegal redirect");
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("off-album update is reported");
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            controller.track(id).map(|track| track.title()),
+            Some("Target update")
+        );
+        assert_eq!(controller.album_tracks(other_album), Vec::<TrackId>::new());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_stale_source_and_stale_metadata_are_rejected_without_writes() {
+        let dir = TempDir::new("canonical-stale-conflict");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source = wav(
+            &dir.path().join("New Artist/New Album"),
+            "New.wav",
+            4_410,
+            0.2,
+        );
+        let request = canonical_request(&controller, &root, vec![source.clone()], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        fs::write(&source, b"changed after review").expect("change source");
+        let report = controller
+            .apply_import_plan(&plan, &PreparedImport::default())
+            .expect("stale source is reported");
+        assert_eq!(report.failed, 1);
+        assert!(controller.tracks().is_empty());
+        assert!(controller.artists().is_empty());
         controller.shutdown();
     }
 }
