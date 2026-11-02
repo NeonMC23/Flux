@@ -161,6 +161,56 @@ a deliberate empty state rather than disappearing. The TUI `E` command lists all
 catalogue albums with owner, track count and cover availability; `D` shows the
 selected track's album.
 
+### Catalogue search, filtering and batch selection
+
+The GUI search field performs a case-insensitive partial match over canonical
+artist names, album titles and track titles. Results are grouped by entity type
+with stable IDs and direct navigation: artist and album results open their
+canonical group/detail, and track results offer both playback and a stable
+location in the track list. Empty results show a clear state and a Clear action.
+Search performs no catalogue writes and does not use audio tags.
+
+Search results are cached per query and catalogue generation to avoid rebuilding
+the same match set on every repaint. Results are limited to 20 items per entity
+type; the empty/partial query behavior and grouped type indicators stay
+deterministic. Artist and album renames explicitly invalidate the cache.
+
+Track views support these filters:
+
+- favorites only;
+- managed lyrics present, absent, or any;
+- managed artwork present, absent, or any (based on the album cover reference);
+- release type: album, EP, single, compilation, other, or any.
+
+Sorting options are catalogue order, title, artist, album, track/disc number and
+favorites-first. Ties fall back to stable TrackId order. Album detail always
+preserves canonical album order regardless of the general sort setting. Reset
+filters clears every filter and returns sorting to catalogue order. Filters are
+not applied to global search results.
+
+Track multi-selection uses stable TrackIds, never row indices. Tracks have an
+individual selection control; Select all visible selects the TrackIds in the
+current page or the currently displayed search-track results, and Clear removes
+the selection. Changing search, filters, view or group clears the selection;
+sorting keeps the same stable IDs selected. Navigating away cannot retarget a
+batch to different tracks because operations carry IDs and revalidate them.
+
+Batch favorites/unfavorites write all selected tracks in one ratings transaction
+and preserve existing rating values. Playlist actions open an explicit review
+showing the affected count, target playlist and selected tracks. Creating a
+playlist from the selection or appending to an existing playlist uses one
+canonical playlist transaction; existing order is retained, selected tracks
+append in selection order, and duplicate entries are preserved. Missing or stale
+TrackIds and missing playlists reject the whole operation without writes and
+leave the review open with an actionable error. Successful playlist/favorite
+operations preserve queue entries, current playback and all unrelated canonical
+references.
+
+Batch queue mutation and batch album moves are intentionally not exposed. The
+former would require a separate atomic queue-policy decision, and the latter
+requires a reviewed ordering/ownership plan across every selected track. They
+are not simulated through repeated independent writes.
+
 ### Album artwork
 
 `set_cover` assigns or replaces the single managed cover file and cleans the
@@ -609,3 +659,10 @@ cleanup.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.
+17. Global search/filtering/multi-selection and batch playlist/favorite actions
+    are GUI-only; the TUI retains its existing track search and safe single-track
+    operations. Range selection, batch queue mutation, playlist-entry removal and
+    batch album moves are not implemented.
+18. Search is substring matching only, not fuzzy; results are capped at 20 per
+    entity type. Track lists retain the existing page-based rendering rather than
+    adding a new virtualization layer.

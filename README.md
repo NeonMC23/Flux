@@ -78,9 +78,13 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   **Import music** for the review-first copy-only Import Manager: native file
   or folder picker, Flux Browser, drag-and-drop, name-inferred editable review,
   duplicate decisions, and real progress/cancel. Click a track to play it; use
-  the transport row for pause/stop/skip/repeat/volume; the search box filters
-  by title, artist, or album. Artist and album views group canonical stable
-  identities. The queue panel supports drag reordering, keyboard moves,
+  the transport row for pause/stop/skip/repeat/volume. The search box performs
+  a grouped, case-insensitive global search over canonical artists, albums and
+  tracks with direct navigation. Track views support favorites/lyrics/artwork/
+  release filters, deterministic sorting, and multi-selection by stable
+  TrackIds. Selection actions can set/unset favorites or create/append canonical
+  playlists after an explicit review. Artist and album views group canonical
+  stable identities. The queue panel supports drag reordering, keyboard moves,
   removal and direct entry playback; the seek bar moves the decoder. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
@@ -97,13 +101,15 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   flow. Cancellation leaves the workflow unchanged.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, `o` imports a folder
-  (type the path), `r` refreshes, `/` search, `q` quit. `i` quick-imports
+  (type the path), `r` refreshes, `/` searches tracks by title, artist or album,
+  `q` quit. `i` quick-imports
   paths (separated by `;`) by copying them into the canonical library, `e`
   edits the selected track as `title|album|track|disc|artist-id|credit-ids`, `P` creates
   an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. Track moves and managed-audio replacement require the GUI
-  Track-editor review. `D` shows the selected track's album ownership; `E` lists
+  migration workflow. Global artist/album/track search, filters, multi-selection
+  and batch playlist/favorite actions require the GUI. Track moves and
+  managed-audio replacement also require the GUI Track-editor review. `D` shows the selected track's album ownership; `E` lists
   every catalogue album, including empty albums, with owner, track count and
   cover availability. `T` refuses ownership transfer and destructive artist deletion,
   directing the user to the GUI review/confirmation workflow. For the
