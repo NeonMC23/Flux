@@ -185,7 +185,8 @@ removes `album.flux` and any cover as journal cleanup; the artist remains.
 
 Every canonical import path now stages the complete reviewed batch in one
 transaction: proposed artists, proposed albums, tracks, ordered credits,
-ownership, album ordering and catalogue references. No artist or album is
+ownership, album ordering, catalogue references and approved existing-track
+metadata updates. No artist or album is
 created by a separate write before the import. If publication fails or the plan
 is stale, recovery yields either the complete old catalogue or the complete new
 catalogue; no proposed artist, album or track survives an uncommitted import.
@@ -204,8 +205,51 @@ the same atomic batch used by the general Import Manager, preserving existing
 album metadata, cover, track IDs, order, lyrics, ratings, playlists and queue
 references. Cancellation before execution writes nothing. Change to the target
 generation, owner, title, release type, cover or order rejects the stale plan.
-"Update existing" is not performed by this atomic batch and is rejected with an
-actionable message; existing tracks must be edited separately.
+
+### Duplicate and conflict review
+
+The Import Manager classifies conflicts deterministically using managed content
+fingerprints (size plus FNV-1a hash), file size, duration when available,
+normalized title/artist/album, album membership and incoming-batch identity. It
+distinguishes:
+
+- exact audio duplicate at the same path;
+- exact audio duplicate at a different path;
+- identical incoming audio selected twice;
+- metadata collision with different audio;
+- same title with different audio;
+- probable duplicate when size, title and (when both are known) duration agree
+  but the fingerprint differs;
+- ambiguous audio when several existing tracks share the fingerprint.
+
+Each candidate exposes the matched TrackId, existing title/artist/album, album
+membership, managed audio path and fingerprint evidence. A match in the fixed
+target album is distinguished from a match in another album. The UI never
+silently chooses between multiple matches.
+
+Available decisions are **Skip**, **Import separately**, and **Update metadata**
+for a unique exact-audio match. Skipping keeps the existing canonical track and
+creates no proposed artist or album. Importing separately allocates a new
+TrackId and requires an explicit choice even when the fingerprint is identical.
+Updating metadata preserves the existing TrackId, managed audio, owner, album,
+lyrics, ratings/favorites, playlists, queue entries and playback selection; it
+changes only the approved title, ordered credits and track/disc numbers. The
+existing physical owner is always retained in the credit list.
+
+Replacement of an existing track's audio is **not implemented and is shown as
+unavailable**: the current duplicate workflow never deletes or overwrites
+managed audio. This is deliberate: a safe replacement needs a dedicated
+transactional operation with full before/after verification, and it is not faked
+by deleting and reimporting a track.
+
+Approved updates and new imports share one `import_review_batch` transaction, so
+new artists required by updated credits are staged with new tracks and albums.
+The plan records the catalogue generation, source fingerprint, existing
+track/album/credit/metadata snapshots. A changed generation, source file,
+fingerprint, album membership or reviewed metadata rejects the plan before
+publication. In fixed-target mode a metadata update is allowed only for a
+duplicate already in that album; an off-album duplicate is rejected rather than
+silently redirected.
 
 Newly created artists cannot survive a failed import: their `artist.flux` files,
 catalogue entries, IDs and relationships are journal-owned batch writes and are
@@ -462,7 +506,11 @@ cleanup.
 12. Artist deletion execution is exposed in the GUI only. The TUI deliberately
     refuses deletion/transfer and points to the GUI; this is a product limitation,
     not a separate transaction implementation.
-13. ENOSPC and a true second mounted filesystem were not available for testing.
+13. Transactional audio replacement is not implemented and is explicitly
+    unavailable in duplicate review; metadata updates preserve existing audio.
+14. The GUI owns the reviewed conflict workflow. The TUI quick import still
+    auto-skips detected duplicates and does not expose per-conflict decisions.
+15. ENOSPC and a true second mounted filesystem were not available for testing.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.

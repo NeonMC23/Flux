@@ -178,8 +178,14 @@ background staging for very large migrations is still future work.
   import cannot leave behind a newly created artist.
 - **Import:** every canonical import copies into the library and preserves the
   original extension; sources are never moved, overwritten or deleted.
-  Identical content is deduplicated by fingerprint. Existing IDs are preserved
-  when the user explicitly updates an existing record.
+  Identical content is deduplicated by fingerprint unless the user explicitly
+  chooses to import it as a separate track. The review classifies exact audio
+  duplicates, incoming duplicates, metadata collisions, same-title/different-audio
+  conflicts, probable duplicates and ambiguous matches. Users explicitly choose
+  Skip, Import separately, or Update metadata for a unique exact-audio match;
+  updates preserve TrackId, audio, owner, album, lyrics, ratings, playlists and
+  queue references. Transactional audio replacement is not implemented and is
+  shown as unavailable.
 - **Missing resources:** a managed audio file can disappear; the track record
   remains, playback fails clearly, and validation reports it. Missing audio
   blocks migration activation until resolved or explicitly omitted by a future
