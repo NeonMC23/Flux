@@ -3972,6 +3972,11 @@ impl CanonicalLibrary {
                 "replacement source is empty".to_owned(),
             ));
         }
+        if !crate::is_supported_audio_path(source) {
+            return Err(CanonicalError::Invalid(
+                "replacement source is not a supported audio file".to_owned(),
+            ));
+        }
         if fs::canonicalize(&current_audio_abs).ok() == fs::canonicalize(source).ok() {
             return Err(CanonicalError::Invalid(
                 "replacement source is the current managed audio".to_owned(),

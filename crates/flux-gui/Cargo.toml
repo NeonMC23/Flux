@@ -26,4 +26,8 @@ flux-platform.workspace = true
 # real waveform line. `tokio` selects iced's tokio-backed runtime, which
 # provides `iced::time::every` (the default thread-pool backend has no
 # timer) and gives Tasks a multi-threaded executor.
-iced = { workspace = true, features = ["advanced", "tokio"] }
+# `image-without-codecs` adds Iced's raster image widget; the `image`
+# dependency below supplies only the PNG/JPEG/WebP decoders used for
+# managed album artwork. No audio tags are consulted.
+iced = { workspace = true, features = ["advanced", "tokio", "image-without-codecs"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
