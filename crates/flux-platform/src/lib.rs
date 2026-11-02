@@ -195,6 +195,37 @@ pub fn pick_audio_files_in(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>,
     }
 }
 
+/// Native image-file picker for managed album artwork.
+///
+/// The filter offers PNG, JPEG and WebP. Selecting a file only returns its
+/// path; callers must still validate and explicitly assign it.
+pub fn pick_image_files() -> Result<Option<Vec<PathBuf>>, String> {
+    pick_image_files_in(None)
+}
+
+/// Native image-file picker with an optional starting directory.
+pub fn pick_image_files_in(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        pick_linux_images(start)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = start;
+        pick_macos_images()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = start;
+        pick_windows_images()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = start;
+        Err("native image dialogs are not implemented on this platform".to_owned())
+    }
+}
+
 /// Native folder picker with an optional starting directory.
 pub fn pick_folder_in(start: Option<&Path>) -> Result<Option<PathBuf>, String> {
     #[cfg(target_os = "linux")]
@@ -229,27 +260,48 @@ fn linux_start(start: Option<&Path>) -> OsString {
 #[cfg(target_os = "linux")]
 fn pick_linux_files(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>, String> {
     const FILTER: &str = "*.wav *.flac *.mp3 *.m4a *.m4b *.mp4 *.aac *.ogg *.oga *.opus *.aif *.aiff *.ape *.mpc *.spx *.wv";
+    pick_linux_files_filtered(start, "Import music", "Audio files", FILTER, true)
+}
+
+#[cfg(target_os = "linux")]
+fn pick_linux_images(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>, String> {
+    const FILTER: &str = "*.png *.jpg *.jpeg *.webp";
+    pick_linux_files_filtered(start, "Choose album artwork", "Image files", FILTER, false)
+}
+
+#[cfg(target_os = "linux")]
+fn pick_linux_files_filtered(
+    start: Option<&Path>,
+    title: &str,
+    description: &str,
+    filter: &str,
+    multiple: bool,
+) -> Result<Option<Vec<PathBuf>>, String> {
     let start = linux_start(start);
-    let zenity = std::process::Command::new("zenity")
+    let mut zenity = std::process::Command::new("zenity");
+    zenity
         .arg("--file-selection")
-        .arg("--multiple")
-        .arg("--separator=\n")
-        .arg("--title=Import music")
+        .arg(format!("--title={title}"))
         .arg(format!("--filename={}", start.to_string_lossy()))
-        .arg(format!("--file-filter=Audio files | {FILTER}"))
-        .arg("--file-filter=All files | *")
-        .output();
+        .arg(format!("--file-filter={description} | {filter}"))
+        .arg("--file-filter=All files | *");
+    if multiple {
+        zenity.arg("--multiple").arg("--separator=\n");
+    }
+    let zenity = zenity.output();
     if let Ok(output) = zenity {
         return parse_zenity_output(output);
     }
 
-    let kdialog = std::process::Command::new("kdialog")
+    let mut kdialog = std::process::Command::new("kdialog");
+    kdialog
         .arg("--getopenfilename")
         .arg(&start)
-        .arg(format!("Audio files ({FILTER})"))
-        .arg("--multiple")
-        .arg("--separate-output")
-        .output();
+        .arg(format!("{description} ({filter})"));
+    if multiple {
+        kdialog.arg("--multiple").arg("--separate-output");
+    }
+    let kdialog = kdialog.output();
     match kdialog {
         Ok(output) => parse_zenity_output(output),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(
@@ -377,6 +429,77 @@ end try"#
         return Ok((!value.is_empty()).then(|| vec![PathBuf::from(value)]));
     }
     let paths = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    Ok((!paths.is_empty()).then_some(paths))
+}
+
+#[cfg(target_os = "macos")]
+fn pick_macos_images() -> Result<Option<Vec<PathBuf>>, String> {
+    let script = r#"try
+set chosen to choose file with prompt "Choose album artwork" of type {"public.image"}
+set output to ""
+repeat with item_ in chosen
+set output to output & POSIX path of item_ & linefeed
+end repeat
+return output
+on error number -128
+return ""
+end try"#;
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|err| format!("could not start the native image dialog: {err}"))?;
+    if !output.status.success() {
+        return Err(dialog_error(&output.stderr, output.status.code()));
+    }
+    let paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    Ok((!paths.is_empty()).then_some(paths))
+}
+
+#[cfg(target_os = "windows")]
+fn pick_windows_images() -> Result<Option<Vec<PathBuf>>, String> {
+    const IMAGE_FILTER: &str = "*.png;*.jpg;*.jpeg;*.webp";
+    let script = format!(
+        r#"Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Multiselect = $false
+$d.Title = 'Choose album artwork'
+$d.Filter = 'Image files|{IMAGE_FILTER}|All files|*.*'
+if ($d.ShowDialog() -eq 'OK') {{ $d.FileNames }}"#
+    );
+    let output = match std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-STA")
+        .arg("-Command")
+        .arg(&script)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::process::Command::new("pwsh")
+                .arg("-NoProfile")
+                .arg("-STA")
+                .arg("-Command")
+                .arg(&script)
+                .output()
+                .map_err(|err| format!("could not start the native image dialog: {err}"))?
+        }
+        Err(err) => return Err(format!("could not start the native image dialog: {err}")),
+    };
+    if !output.status.success() {
+        return Err(dialog_error(&output.stderr, output.status.code()));
+    }
+    let paths = String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
