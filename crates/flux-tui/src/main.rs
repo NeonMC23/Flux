@@ -851,7 +851,8 @@ impl Tui {
                              · i/I quick copy-import · e edit track · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
-                             · D album · E albums · T transfer/delete (GUI) · B index · U fix · q quit"
+                             · D album · E albums · T transfer/delete (GUI) \
+                             · move/replace (GUI) · B index · U fix · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
@@ -863,7 +864,7 @@ impl Tui {
                 "Copy", self.input
             ),
             Mode::TrackEditInput => format!(
-                "Edit selected track as title|album|track|disc|artist-id (Enter save, Esc cancel): {}_",
+                "Edit selected track as title|album|track|disc|artist-id|credit-ids (Enter save, Esc cancel): {}_",
                 self.input
             ),
             Mode::ArtistCreateInput => format!(
@@ -1026,9 +1027,9 @@ fn track_edit_form(controller: &Controller, id: TrackId, track: &Track) -> Strin
 
 fn parse_track_edit_form(input: &str) -> Result<TrackMetadataEdit, String> {
     let fields: Vec<&str> = input.split('|').map(str::trim).collect();
-    if fields.len() != 5 {
+    if !(5..=6).contains(&fields.len()) {
         return Err(
-            "Track edit format: title|album|track-number|disc-number|artist-id (artist ID may be empty)."
+            "Track edit format: title|album|track-number|disc-number|artist-id|comma-separated-credit-ids (artist and credit IDs may be empty)."
                 .to_owned(),
         );
     }
@@ -1049,12 +1050,29 @@ fn parse_track_edit_form(input: &str) -> Result<TrackMetadataEdit, String> {
             "artist ID must be a whole number.".to_owned()
         })?))
     };
+    let credited_artist_ids = fields
+        .get(5)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .split(',')
+                .map(|id| {
+                    id.trim()
+                        .parse::<u64>()
+                        .map(ArtistId::new)
+                        .map_err(|_| "credit IDs must be comma-separated whole numbers.".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
     Ok(TrackMetadataEdit {
         title: (!fields[0].is_empty()).then(|| fields[0].to_owned()),
         album: (!fields[1].is_empty()).then(|| fields[1].to_owned()),
         track_number: number(fields[2], "track number")?,
         disc_number: number(fields[3], "disc number")?,
         artist_id,
+        credited_artist_ids,
     })
 }
 
@@ -1289,13 +1307,14 @@ mod tests {
 
         key(&mut tui, KeyCode::Char('e'));
         assert_eq!(tui.mode, Mode::TrackEditInput);
-        tui.input = format!("Tui Title | Tui Album | 3 | 1 | {artist}");
+        tui.input = format!("Tui Title | Tui Album | 3 | 1 | {artist} | {artist}");
         key(&mut tui, KeyCode::Enter);
         let track = tui.controller.track(id).expect("edited");
         assert_eq!(track.title(), "Tui Title");
         assert_eq!(track.album(), Some("Tui Album"));
         assert_eq!(track.artist(), Some("Tui Artist"));
         assert_eq!(tui.controller.track_artist_id(id), Some(artist));
+        assert_eq!(tui.controller.track_credits(id), vec![artist]);
 
         key(&mut tui, KeyCode::Char('V'));
         assert!(
