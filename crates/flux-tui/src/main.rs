@@ -852,7 +852,8 @@ impl Tui {
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
                              · D album · E albums · T transfer/delete (GUI) \
-                             · move/replace (GUI) · B index · U fix · q quit"
+                             · move/replace (GUI) · global search/filters/batch (GUI) \
+                             · B index · U fix · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
