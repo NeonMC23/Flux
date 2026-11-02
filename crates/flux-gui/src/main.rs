@@ -2088,6 +2088,7 @@ impl FluxReady {
                 })
                 .collect(),
             target_album: manager.target_album(),
+            generation: self.controller.generation(),
         };
         manager.reset_for_selection();
         manager.stage = ImportUiStage::Scanning;
@@ -5278,10 +5279,19 @@ impl FluxReady {
             let owner = credit_index == candidate.owner_index();
             body = body.push(
                 row![
-                    text(format!("{}. {}", credit_index + 1, credit.name))
-                        .size(10)
-                        .color(if owner { ACCENT } else { TEXT })
-                        .width(Length::Fill),
+                    text(format!(
+                        "{}. {} ({})",
+                        credit_index + 1,
+                        credit.name,
+                        if credit.artist_id.is_some() {
+                            "existing artist"
+                        } else {
+                            "proposed / unresolved"
+                        }
+                    ))
+                    .size(10)
+                    .color(if owner { ACCENT } else { TEXT })
+                    .width(Length::Fill),
                     if owner {
                         Element::from(text("OWNER").size(8).color(ACCENT))
                     } else if targeted {
@@ -8010,6 +8020,7 @@ mod tests {
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
             target_album: None,
+            generation: gui.controller.generation(),
         };
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -8728,6 +8739,7 @@ mod tests {
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
             target_album: Some(target.clone()),
+            generation: gui.controller.generation(),
         };
         let plan = prepare_import_plan(
             request,
@@ -8790,6 +8802,7 @@ mod tests {
                 existing_tracks: gui.controller.tracks().to_vec(),
                 existing_artists: Vec::new(),
                 target_album: Some(stale_target),
+                generation: gui.controller.generation(),
             },
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
