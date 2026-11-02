@@ -84,17 +84,21 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   removal and direct entry playback; the seek bar moves the decoder. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
-  then removes old files through journal cleanup. Missing managed audio stays
-  listed with a `missing` marker. *Refresh & validate* reopens the canonical
+  then removes old files through journal cleanup. The same editor supports
+  ordered credits, reviewed album moves (source album remains, even when empty)
+  and reviewed managed-audio replacement: new audio is staged and verified, the
+  old audio stays until the catalogue commit, and the user source file is never
+  modified. Missing managed audio stays listed with a `missing` marker. *Refresh & validate* reopens the canonical
   catalogue and validates its resource paths.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, `o` imports a folder
   (type the path), `r` refreshes, `/` search, `q` quit. `i` quick-imports
   paths (separated by `;`) by copying them into the canonical library, `e`
-  edits the selected track as `title|album|track|disc|artist-id`, `P` creates
+  edits the selected track as `title|album|track|disc|artist-id|credit-ids`, `P` creates
   an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. `D` shows the selected track's album ownership; `E` lists
+  migration workflow. Track moves and managed-audio replacement require the GUI
+  Track-editor review. `D` shows the selected track's album ownership; `E` lists
   every catalogue album, including empty albums, with owner, track count and
   cover availability. `T` refuses ownership transfer and destructive artist deletion,
   directing the user to the GUI review/confirmation workflow. For the
@@ -184,8 +188,8 @@ background staging for very large migrations is still future work.
   conflicts, probable duplicates and ambiguous matches. Users explicitly choose
   Skip, Import separately, or Update metadata for a unique exact-audio match;
   updates preserve TrackId, audio, owner, album, lyrics, ratings, playlists and
-  queue references. Transactional audio replacement is not implemented and is
-  shown as unavailable.
+  queue references. Duplicate review itself never overwrites managed audio; use
+  the separate Track editor replacement workflow for that operation.
 - **Missing resources:** a managed audio file can disappear; the track record
   remains, playback fails clearly, and validation reports it. Missing audio
   blocks migration activation until resolved or explicitly omitted by a future

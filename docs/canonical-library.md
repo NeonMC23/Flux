@@ -236,11 +236,8 @@ lyrics, ratings/favorites, playlists, queue entries and playback selection; it
 changes only the approved title, ordered credits and track/disc numbers. The
 existing physical owner is always retained in the credit list.
 
-Replacement of an existing track's audio is **not implemented and is shown as
-unavailable**: the current duplicate workflow never deletes or overwrites
-managed audio. This is deliberate: a safe replacement needs a dedicated
-transactional operation with full before/after verification, and it is not faked
-by deleting and reimporting a track.
+Duplicate review never deletes or overwrites managed audio. Audio replacement
+is a separate reviewed Track-editor operation described below.
 
 Approved updates and new imports share one `import_review_batch` transaction, so
 new artists required by updated credits are staged with new tracks and albums.
@@ -255,6 +252,62 @@ Newly created artists cannot survive a failed import: their `artist.flux` files,
 catalogue entries, IDs and relationships are journal-owned batch writes and are
 removed by rollback. They may survive only when the catalogue commit point was
 reached, in which case the complete import is authoritative.
+
+
+### Track lifecycle: metadata, moves and replacement
+
+The canonical Track editor uses three immutable, generation-checked plans.
+
+**Metadata edit.** A plan snapshots the TrackId, AlbumId, physical owner, title,
+ordered credits, track/disc numbers, duration, audio fingerprint and album title.
+Execution atomically writes the track record and, when approved, the album-title
+rename in the same `album.flux` transaction. TrackId, AlbumId and physical owner
+never change. Ordered credits must be non-empty, unique, reference known artists
+and include the owner; the owner is never silently replaced. Lyrics, ratings,
+favorites, playlists, queue entries and playback selection stay keyed by the
+stable TrackId. Any catalogue-generation change or track/album snapshot change
+rejects the plan before publication. The TUI supports the same safe edit form as
+`title|album|track|disc|artist-id|credit-ids`; move and replacement review remain
+GUI-only.
+
+**Track move.** A plan names the target TrackId, source AlbumId, destination
+AlbumId, explicit insertion index, source/destination order snapshots, metadata,
+audio path, lyrics path and fingerprints. The destination album must have the
+same physical owner as the track; ownership changes remain a separate transfer
+workflow. Execution copies audio (with fingerprint verification), writes the
+track record under the destination album, writes both album orders, updates the
+catalogue track's album/audio/record references and commits once. The source
+album is left in place, including when it becomes empty. Old audio, record and
+lyrics are journal-owned cleanup after the catalogue commit point. TrackId,
+owner, credits, ratings, playlists, queue entries and playback selection are
+preserved.
+
+**Managed-audio replacement.** A plan snapshots the TrackId, current managed
+audio path and fingerprint, replacement source path and fingerprint, album,
+owner, metadata, record path and generation. The replacement is installed at a
+new canonical path of the form
+`tracks/track_<id>.replacement-<version>.<extension>`; the old managed audio is
+never overwritten. Execution revalidates the catalogue generation, track
+metadata, current audio fingerprint, source fingerprint and destination
+collision, stages the new audio with copy verification, writes the new record
+fingerprint, updates the catalogue audio path, and publishes `catalog.flux`
+last. Only after that commit does journal cleanup remove the old audio. The
+user-supplied source file is never moved, modified or deleted. TrackId, album,
+owner, credits, lyrics, ratings, favorites, playlists, queue entries and playback
+selection remain unchanged. A stale track, audio file, source file or destination
+rejects the plan; recovery restores the complete old state or completes cleanup
+for the complete new state. Validation is file existence, non-empty content,
+fingerprint and extension safety; audio is not decoded and tags are not read.
+
+Move and replacement use the same transaction engine as imports, album transfer
+and deletion. Every meaningful boundary is failure-injected and reopened: before
+and after journal creation, staging, copy/audio verify, metadata publication,
+catalogue publication, cleanup and journal finalization. A committed catalogue
+is authoritative; an uncommitted transaction restores replaced files and removes
+only its journal-created paths. If the old managed audio is locked by an open
+playback handle on a platform that forbids deletion, catalogue publication is
+still complete and the journal-owned cleanup can be retried after the handle is
+released.
 
 
 ## Artist deletion
@@ -506,11 +559,16 @@ cleanup.
 12. Artist deletion execution is exposed in the GUI only. The TUI deliberately
     refuses deletion/transfer and points to the GUI; this is a product limitation,
     not a separate transaction implementation.
-13. Transactional audio replacement is not implemented and is explicitly
-    unavailable in duplicate review; metadata updates preserve existing audio.
-14. The GUI owns the reviewed conflict workflow. The TUI quick import still
-    auto-skips detected duplicates and does not expose per-conflict decisions.
-15. ENOSPC and a true second mounted filesystem were not available for testing.
+13. Move and managed-audio replacement review are GUI-only; the TUI supports
+    safe metadata/credit editing and its help directs these two operations to
+    the GUI review workflow.
+14. Audio replacement validates file existence, non-empty content, extension
+    safety and fingerprints only; it does not decode the audio or read tags.
+15. On platforms that block deleting an open file, replacing or moving the
+    currently playing track may leave old-file cleanup pending until playback
+    releases the handle. The catalogue commit remains authoritative and recovery
+    retries the journal-owned cleanup.
+16. ENOSPC and a true second mounted filesystem were not available for testing.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.
