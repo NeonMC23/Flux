@@ -4425,6 +4425,68 @@ impl CanonicalLibrary {
         Ok(())
     }
 
+    /// Applies a batch of favorite/rating updates in one canonical
+    /// transaction. Every TrackId is validated before any write.
+    pub fn set_ratings(
+        &mut self,
+        updates: &[(TrackId, Option<u8>, bool)],
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let mut seen = HashSet::new();
+        for (id, rating, _) in updates {
+            if !seen.insert(*id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} appears more than once in the batch"
+                )));
+            }
+            if !self.tracks.contains_key(id) {
+                return Err(CanonicalError::Invalid(format!(
+                    "track {id} is not in the library"
+                )));
+            }
+            if rating.is_some_and(|rating| rating > 5) {
+                return Err(CanonicalError::Invalid("rating must be 0..=5".to_owned()));
+            }
+        }
+        let mut ratings = self.ratings.clone();
+        for (id, rating, favorite) in updates {
+            ratings.insert(
+                *id,
+                TrackRating {
+                    rating: *rating,
+                    favorite: *favorite,
+                },
+            );
+        }
+        let entries = ratings
+            .iter()
+            .map(|(track, value)| RatingEntryDto {
+                track_id: track.get(),
+                rating: value.rating,
+                favorite: value.favorite,
+            })
+            .collect::<Vec<_>>();
+        let dto = RatingsDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: RATINGS_KIND.to_owned(),
+            entries,
+        };
+        let bytes = serde_json::to_vec_pretty(&dto).map_err(|err| CanonicalError::Malformed {
+            file: RATINGS_FILE_NAME.to_owned(),
+            message: err.to_string(),
+        })?;
+        let writes = vec![PendingWrite {
+            target: RelPath::from_utf8(RATINGS_FILE_NAME)?,
+            bytes: Some(bytes),
+            copy_from: None,
+            expected: None,
+        }];
+        let catalog = self.catalog.clone();
+        self.commit_writes(Some(catalog), writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
     fn ensure_writable(&self) -> Result<(), CanonicalError> {
         Ok(())
     }
@@ -10701,6 +10763,97 @@ mod atomic_import_tests {
             assert_eq!(
                 fx.library.track(fx.middle).expect("track").title,
                 "Changed later"
+            );
+        }
+
+        #[test]
+        fn batch_favorites_and_playlist_append_are_one_transaction() {
+            for (point, committed) in [
+                (TransactionFailPoint::BeforeCatalogPublish, false),
+                (TransactionFailPoint::AfterCatalogPublish, true),
+            ] {
+                let mut fx = fixture(&format!("lifecycle-batch-favorites-{point:?}"));
+                fx.library.set_transaction_failure(Some(TransactionFailure {
+                    point,
+                    interrupt: true,
+                    abort: false,
+                }));
+                assert!(
+                    fx.library
+                        .set_ratings(&[(fx.first, None, true), (fx.last, Some(3), true),])
+                        .is_err()
+                );
+                let root = fx.library.root.clone();
+                drop(fx.library);
+                let reopened = CanonicalLibrary::open(&root).expect("recover");
+                assert_eq!(
+                    reopened
+                        .rating(fx.first)
+                        .is_some_and(|rating| rating.favorite),
+                    committed,
+                    "{point:?}"
+                );
+                assert_eq!(
+                    reopened
+                        .rating(fx.last)
+                        .map(|rating| (rating.rating, rating.favorite)),
+                    if committed {
+                        Some((Some(3), true))
+                    } else {
+                        None
+                    },
+                    "{point:?}"
+                );
+
+                let mut fx = fixture(&format!("lifecycle-batch-playlist-{point:?}"));
+                let playlist = fx
+                    .library
+                    .set_playlist(None, "Batch", vec![fx.middle])
+                    .expect("playlist");
+                fx.library.set_transaction_failure(Some(TransactionFailure {
+                    point,
+                    interrupt: true,
+                    abort: false,
+                }));
+                assert!(
+                    fx.library
+                        .set_playlist(Some(playlist), "Batch", vec![fx.middle, fx.first])
+                        .is_err()
+                );
+                let root = fx.library.root.clone();
+                drop(fx.library);
+                let reopened = CanonicalLibrary::open(&root).expect("recover");
+                assert_eq!(
+                    reopened
+                        .playlist(playlist)
+                        .map(|playlist| playlist.track_ids.clone()),
+                    if committed {
+                        Some(vec![fx.middle, fx.first])
+                    } else {
+                        Some(vec![fx.middle])
+                    },
+                    "{point:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn batch_favorites_reject_missing_track_without_writes() {
+            let mut fx = fixture("lifecycle-batch-favorites-invalid");
+            let before = fx.library.rating(fx.first);
+            assert!(
+                fx.library
+                    .set_ratings(&[
+                        (fx.first, Some(3), true),
+                        (TrackId::new(99_999), None, true)
+                    ])
+                    .is_err()
+            );
+            assert_eq!(fx.library.rating(fx.first), before);
+            assert!(
+                !fx.library
+                    .rating(fx.first)
+                    .is_some_and(|rating| rating.favorite)
             );
         }
 

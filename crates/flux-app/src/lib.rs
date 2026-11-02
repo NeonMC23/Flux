@@ -1366,6 +1366,33 @@ impl Controller {
             .collect()
     }
 
+    /// Case-insensitive partial artist-name search over canonical identities.
+    #[must_use]
+    pub fn search_artists(&self, query: &str) -> Vec<Artist> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return self.artists();
+        }
+        self.artists()
+            .into_iter()
+            .filter(|artist| artist.name().to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Case-insensitive partial album-title search returning stable IDs.
+    #[must_use]
+    pub fn search_albums(&self, query: &str) -> Vec<(AlbumId, String)> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        self.albums()
+            .into_iter()
+            .filter(|album| album.title.to_lowercase().contains(&needle))
+            .map(|album| (album.id, album.title))
+            .collect()
+    }
+
     /// All stable artist identities in the active portable catalogue,
     /// ascending by ID. Empty in legacy mode or when no portable store is
     /// available. Duplicate display names are intentionally preserved.
@@ -1543,6 +1570,99 @@ impl Controller {
             .map_err(|err| format!("Could not save playlist: {err}"))
     }
 
+    /// Sets the favorite flag for several tracks in one canonical transaction.
+    /// Existing ratings are preserved.
+    pub fn set_favorites(&mut self, ids: &[TrackId], favorite: bool) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Err("Select at least one track.".to_owned());
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Favorites require a canonical library.".to_owned());
+        };
+        let updates = ids
+            .iter()
+            .map(|id| {
+                let current = store.rating(*id);
+                (*id, current.and_then(|rating| rating.rating), favorite)
+            })
+            .collect::<Vec<_>>();
+        store
+            .set_ratings(&updates)
+            .map_err(|err| format!("Could not update favorites: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "{} track(s) marked {}favorite.",
+            ids.len(),
+            if favorite { "" } else { "not " }
+        ));
+        Ok(ids.len())
+    }
+
+    /// Appends selected tracks to an existing canonical playlist in one
+    /// transaction. Existing order and duplicate entries are preserved.
+    pub fn add_tracks_to_playlist(
+        &mut self,
+        playlist_id: PlaylistId,
+        ids: &[TrackId],
+    ) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Err("Select at least one track.".to_owned());
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        let playlist = store
+            .playlist(playlist_id)
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        for id in ids {
+            if store.track(*id).is_none() {
+                return Err(format!("Track {id} is no longer in the library."));
+            }
+        }
+        let mut tracks = playlist.track_ids;
+        tracks.extend_from_slice(ids);
+        store
+            .set_playlist(Some(playlist_id), playlist.name, tracks)
+            .map_err(|err| format!("Could not update the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "Added {} track(s) to playlist {}.",
+            ids.len(),
+            playlist_id
+        ));
+        Ok(ids.len())
+    }
+
+    /// Creates a playlist from selected tracks in one canonical transaction.
+    pub fn create_playlist_from_tracks(
+        &mut self,
+        name: &str,
+        ids: &[TrackId],
+    ) -> Result<PlaylistId, String> {
+        if ids.is_empty() {
+            return Err("Select at least one track.".to_owned());
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        for id in ids {
+            if store.track(*id).is_none() {
+                return Err(format!("Track {id} is no longer in the library."));
+            }
+        }
+        let id = store
+            .set_playlist(None, name, ids.to_vec())
+            .map_err(|err| format!("Could not create the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!(
+            "Created playlist {} with {} track(s).",
+            id,
+            ids.len()
+        ));
+        Ok(id)
+    }
+
     /// Stores optional managed LRC text for a track.
     pub fn set_lyrics(&mut self, id: TrackId, lyrics: Option<&str>) -> Result<(), String> {
         let Some(store) = self.canonical_store.as_mut() else {
@@ -1551,6 +1671,15 @@ impl Controller {
         store
             .set_lyrics(id, lyrics)
             .map_err(|err| format!("Could not save lyrics: {err}"))
+    }
+
+    /// Whether the canonical catalogue records managed lyrics for a track.
+    #[must_use]
+    pub fn track_has_lyrics(&self, id: TrackId) -> bool {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.track(id))
+            .is_some_and(|track| track.lyrics.is_some())
     }
 
     /// Reads a canonical track's managed lyrics text, when present.
