@@ -30,7 +30,10 @@ legacy retirement at the API level is not complete.
 - The GUI/TUI Import Manager is review-first and copy-only. Reference imports
   are rejected in canonical mode; the old portable import tests still cover
   their compatibility behavior.
-- No external image-decoding dependency is available without approval.
+- Managed artwork decoding uses Iced's raster image widget plus the `image`
+  crate with only PNG, JPEG and WebP codecs enabled. The crate is already the
+  decoder behind Iced's optional image widget; enabling that existing optional
+  integration adds no separate image framework or network access.
 
 ## Canonical layout
 
@@ -163,8 +166,41 @@ selected track's album.
 `set_cover` assigns or replaces the single managed cover file and cleans the
 previous cover only after commit. `remove_cover` clears the reference and
 journal-cleans the file. Missing declared covers are reported in GUI detail and
-block album transfer; PNG/JPEG/WebP extension and a bound of 16 MiB are checked,
-but image decoding/dimensions are not available without a new dependency.
+block album transfer; PNG/JPEG/WebP extension and a bound of 16 MiB are checked
+by the canonical assignment path.
+
+The GUI decodes managed PNG, JPEG and WebP artwork off the UI thread for display.
+Decoding rejects files over 32 MiB, dimensions over 4096 px on either side or
+16 million pixels, zero-sized images and unsupported formats. A 512 px preview
+is generated with preserved aspect ratio, rendered with cover cropping in
+library/player thumbnails and contain fitting in album detail. Missing, invalid
+or unsupported artwork falls back to the existing generated glyph; album detail
+shows the decode error without changing the managed file. The cache key includes
+album identity, cover path, modification time and length, so replacement or
+removal invalidates the preview and a fresh decode is scheduled. The cache is
+bounded to 128 album previews; crossing the bound clears it rather than growing
+without limit. The cache is
+bounded to 128 album previews; crossing the bound clears it rather than growing
+without limit.
+
+### Native file selection
+
+The GUI uses the existing platform abstraction for native dialogs: zenity or
+kdialog on Linux, AppleScript on macOS and PowerShell/WinForms on Windows.
+Audio import offers audio-file and folder filters; managed-audio replacement
+offers audio-file filters; album artwork offers PNG/JPEG/WebP filters. Selecting
+a file only fills the existing path field. It never assigns artwork, replaces
+audio or starts an import by itself. Review, validation, fingerprinting and
+transactional confirmation remain mandatory, and cancellation is a no-op.
+Fixed-target import keeps its AlbumId and owner because native selection reuses
+the existing import manager rather than opening a fresh general import.
+
+The Linux paths invoke zenity and fall back to kdialog; if neither is installed,
+the caller gets an actionable error and the in-app Flux Browser remains
+available. macOS and Windows dialog scripts are compiled but are not
+runtime-verified by this Linux-based project. All file-dialog interaction in the
+test suite is message-level; real native dialogs are not claimed as manually
+exercised.
 
 ### Album ordering
 
@@ -539,8 +575,9 @@ cleanup.
    no-op retry. Album transfer intentionally preserves AlbumId and does not merge
    into a different existing AlbumId. The GUI exposes all three reviewed
    operations; the TUI refuses transfer/deletion and points to the GUI.
-5. Artwork is copied/validated by extension and bounded size only; there is no
-   image decode/dimension validation or display and no native image picker.
+5. Artwork selection has native PNG/JPEG/WebP pickers in addition to path entry.
+   Decoding is bounded as documented above; animated formats and tag artwork
+   are not supported.
 6. Playlists, ratings/favorites and lyrics have canonical Controller APIs and
    persistence tests, but no GUI/TUI screens.
 7. Automatic catalogue-backup rollback is not generation-consistent and is

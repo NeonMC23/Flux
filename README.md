@@ -17,9 +17,9 @@ catalogues are migration sources only in the normal front-end workflows.
 The GUI includes a review-first Import Manager with native pickers,
 drag-and-drop, duplicate decisions, editable metadata, copy-only staging,
 progress and cancellation. Existing playback, seeking, queue behavior and the
-real-time oscilloscope continue to use the same engine. Ownership transfer,
-album artwork display and playlist/rating UI remain incomplete and are called
-out below rather than presented as finished.
+real-time oscilloscope continue to use the same engine. Managed artwork is
+decoded and displayed in album and player views; playlist/rating UI remains
+incomplete and is called out below rather than presented as finished.
 
 ## Canonical storage
 
@@ -47,8 +47,8 @@ selects or writes those backends.
 | `flux-audio` | library | Playback, in two strictly separate layers: `Player`, the pure playback-control state machine and single authority for playback decisions; and a threaded engine that decodes WAV (hound), FLAC (claxon), MP3 (rmp3/minimp3), AAC in ADTS streams and MP4/M4A files (rusty_aac with the mp4 demuxer), and Ogg Vorbis and Opus (lewton and opus-pure over the ogg demuxer) on a worker thread and feeds an output backend (device-free `NullOutput`, or CPAL behind the non-default `cpal` feature) through a lock-free ring buffer. |
 | `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, duplicate decisions, copy-only publication, artist/album/track edits, playlists/ratings/lyrics APIs, and the canonical migration workflow. Both front-ends use this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
-| `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native file/folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
+| `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, reviewed track move/audio replacement, decoded managed album artwork, native artwork/audio pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
 | `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, copy-only quick import, folder import, track/artist edit keys, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
@@ -90,6 +90,11 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   old audio stays until the catalogue commit, and the user source file is never
   modified. Missing managed audio stays listed with a `missing` marker. *Refresh & validate* reopens the canonical
   catalogue and validates its resource paths.
+  Album artwork is rendered from the canonical managed cover (PNG/JPEG/WebP)
+  asynchronously with bounded dimensions and a fallback glyph. Native pickers
+  cover general import, album-target import, audio replacement and artwork
+  selection; every selection still enters the existing review/confirmation
+  flow. Cancellation leaves the workflow unchanged.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, `o` imports a folder
   (type the path), `r` refreshes, `/` search, `q` quit. `i` quick-imports
@@ -132,8 +137,8 @@ player remains visible:
 Reference-only/external imports are not available in canonical mode. Review
 edits become canonical Flux metadata; audio tags and source files are never
 modified. The canonical transaction stages files inside the library and only
-publishes `catalog.flux` after every copy verifies. Artwork extraction/preview
-is not implemented because no approved image decoder is present. The TUI uses
+publishes `catalog.flux` after every copy verifies. Managed covers are decoded
+asynchronously for display; no tag artwork extraction occurs. The TUI uses
 the same filename inference and copy-only application path via its quick-import
 keys; the full review UI is GUI-only.
 
@@ -251,8 +256,7 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Playlist/rating/lyrics UI, artwork/cover decoding and display, gapless playback,
-crossfade, EQ,
+Playlist/rating/lyrics UI, gapless playback, crossfade, EQ,
 frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
 imports are intentionally rejected in canonical mode. Canonical playlist,
