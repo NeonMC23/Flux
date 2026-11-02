@@ -864,7 +864,16 @@ fn status_description(status: &CandidateStatus) -> &'static str {
             "A different path appears to hold identical content. Skipping avoids a duplicate; importing separately is an explicit choice."
         }
         CandidateStatus::SimilarMetadata(_) => {
-            "A different audio file shares title/artist/album metadata. That alone is not treated as the same track."
+            "A different audio file shares title/artist/album metadata. That alone is not treated as the same track; importing separately is an explicit choice."
+        }
+        CandidateStatus::SameTitleDifferentAudio(_) => {
+            "The title matches an existing track, but the audio fingerprint differs. This is a metadata collision, not an audio duplicate."
+        }
+        CandidateStatus::ProbableAudio(_) => {
+            "Size, duration and title agree, but the audio fingerprint differs. Treat this as uncertain; import separately only after checking the files."
+        }
+        CandidateStatus::AmbiguousAudio(_) => {
+            "Several existing tracks match the evidence. No identity is selected automatically; import separately or skip."
         }
     }
 }
@@ -2085,6 +2094,22 @@ impl FluxReady {
                     self.controller
                         .track_artist_id(*id)
                         .map(|artist| (*id, artist))
+                })
+                .collect(),
+            existing_credits: self
+                .controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, self.controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: self
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| {
+                    self.controller
+                        .track_album_id(*id)
+                        .map(|album| (*id, album))
                 })
                 .collect(),
             target_album: manager.target_album(),
@@ -5014,13 +5039,29 @@ impl FluxReady {
         let selected = manager.selected == Some(index);
         let (status, color) = match candidate.status() {
             CandidateStatus::New => ("New", SUCCESS),
-            CandidateStatus::ExistingPath(_) => {
-                ("Already in library", Color::from_rgb8(0xff, 0xc2, 0x66))
+            CandidateStatus::ExistingPath(_) => (
+                "Exact audio · same path",
+                Color::from_rgb8(0xff, 0xc2, 0x66),
+            ),
+            CandidateStatus::SameContent {
+                track_id: Some(_), ..
+            } if candidate.metadata_matches_existing() => {
+                ("Exact audio duplicate", Color::from_rgb8(0xff, 0xc2, 0x66))
             }
-            CandidateStatus::SameContent { .. } => {
-                ("Possible same content", Color::from_rgb8(0xff, 0xc2, 0x66))
-            }
-            CandidateStatus::SimilarMetadata(_) => ("Similar metadata", MUTED),
+            CandidateStatus::SameContent {
+                track_id: Some(_), ..
+            } => (
+                "Same audio · metadata differs",
+                Color::from_rgb8(0xff, 0xc2, 0x66),
+            ),
+            CandidateStatus::SameContent { track_id: None, .. } => (
+                "Duplicate incoming audio",
+                Color::from_rgb8(0xff, 0xc2, 0x66),
+            ),
+            CandidateStatus::SimilarMetadata(_) => ("Metadata collision", MUTED),
+            CandidateStatus::SameTitleDifferentAudio(_) => ("Same title · different audio", MUTED),
+            CandidateStatus::ProbableAudio(_) => ("Probable duplicate · uncertain", MUTED),
+            CandidateStatus::AmbiguousAudio(_) => ("Ambiguous audio match", MUTED),
         };
         let decision = match candidate.decision() {
             ImportDecision::ImportNew => "import",
@@ -5149,15 +5190,82 @@ impl FluxReady {
                     .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
             );
         }
+        if let Some(existing) = candidate.existing_match() {
+            let target_relation = plan.target_album.as_ref().map_or(
+                "general destination; the existing TrackId remains authoritative",
+                |target| {
+                    if existing.album_id == Some(target.album_id) {
+                        "already in the fixed target album"
+                    } else {
+                        "in another album; the fixed target will never redirect it"
+                    }
+                },
+            );
+            body = body.push(
+                text(format!(
+                    "EXISTING · TrackId {} · {} · {} · {} · {}",
+                    existing.track_id,
+                    existing.title,
+                    existing.artist_name.as_deref().unwrap_or("Unknown artist"),
+                    existing.album_title.as_deref().unwrap_or("Unknown album"),
+                    target_relation
+                ))
+                .size(9)
+                .color(MUTED),
+            );
+            body = body.push(
+                text(format!(
+                    "Existing credits: {} · album id: {} · managed audio: {} · fingerprint recorded: {} · physical owner is preserved by metadata updates",
+                    if existing.credited_artist_ids.is_empty() {
+                        "unknown".to_owned()
+                    } else {
+                        existing
+                            .credited_artist_ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                    existing
+                        .album_id
+                        .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
+                    existing.audio_path.display(),
+                    if existing.fingerprint.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                ))
+                .size(8)
+                .color(MUTED),
+            );
+        }
+        if let CandidateStatus::AmbiguousAudio(ids) = candidate.status() {
+            body = body.push(
+                text(format!(
+                    "Ambiguous match candidates: {}",
+                    ids.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .size(8)
+                .color(MUTED),
+            );
+        }
+        if candidate.status().has_conflict() {
+            body = body.push(
+                text("Audio replacement is unavailable in this build: it is not exposed through the transactional replacement workflow. Existing audio is never deleted or overwritten by duplicate resolution.")
+                    .size(8)
+                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+            );
+        }
         match candidate.status() {
-            CandidateStatus::ExistingPath(id) => {
+            CandidateStatus::ExistingPath(_) => {
                 body = body.push(
-                    text(format!(
-                        "This exact path is track {id}. Update its Flux overrides to keep the \
-                         same TrackId and queue entries."
-                    ))
-                    .size(9)
-                    .color(MUTED),
+                    text(status_description(candidate.status()))
+                        .size(9)
+                        .color(MUTED),
                 );
                 body = body.push(
                     row![
@@ -5165,7 +5273,7 @@ impl FluxReady {
                             .style(nav_style(candidate.decision() == ImportDecision::Skip))
                             .padding([6, 9])
                             .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
-                        button(text("Update existing").size(10))
+                        button(text("Update metadata").size(10))
                             .style(nav_style(
                                 candidate.decision() == ImportDecision::UpdateExisting
                             ))
@@ -5178,7 +5286,9 @@ impl FluxReady {
                     .spacing(6),
                 );
             }
-            CandidateStatus::New | CandidateStatus::SimilarMetadata(_) => {
+            CandidateStatus::SameContent {
+                track_id: Some(_), ..
+            } => {
                 body = body.push(
                     text(status_description(candidate.status()))
                         .size(9)
@@ -5186,6 +5296,19 @@ impl FluxReady {
                 );
                 body = body.push(
                     row![
+                        button(text("Skip").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
+                        button(text("Update metadata").size(10))
+                            .style(nav_style(
+                                candidate.decision() == ImportDecision::UpdateExisting
+                            ))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(
+                                index,
+                                ImportDecision::UpdateExisting,
+                            )),
                         button(text("Import separately").size(10))
                             .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
                             .padding([6, 9])
@@ -5193,15 +5316,11 @@ impl FluxReady {
                                 index,
                                 ImportDecision::ImportNew,
                             )),
-                        button(text("Skip").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
                     ]
                     .spacing(6),
                 );
             }
-            CandidateStatus::SameContent { .. } => {
+            CandidateStatus::SameContent { track_id: None, .. } => {
                 body = body.push(
                     text(status_description(candidate.status()))
                         .size(9)
@@ -5209,6 +5328,10 @@ impl FluxReady {
                 );
                 body = body.push(
                     row![
+                        button(text("Skip").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
                         button(text("Import separately").size(10))
                             .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
                             .padding([6, 9])
@@ -5216,10 +5339,33 @@ impl FluxReady {
                                 index,
                                 ImportDecision::ImportNew,
                             )),
+                    ]
+                    .spacing(6),
+                );
+            }
+            CandidateStatus::New
+            | CandidateStatus::SimilarMetadata(_)
+            | CandidateStatus::SameTitleDifferentAudio(_)
+            | CandidateStatus::ProbableAudio(_)
+            | CandidateStatus::AmbiguousAudio(_) => {
+                body = body.push(
+                    text(status_description(candidate.status()))
+                        .size(9)
+                        .color(MUTED),
+                );
+                body = body.push(
+                    row![
                         button(text("Skip").size(10))
                             .style(nav_style(candidate.decision() == ImportDecision::Skip))
                             .padding([6, 9])
                             .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
+                        button(text("Import separately").size(10))
+                            .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
+                            .padding([6, 9])
+                            .on_press(Message::ImportDecisionChanged(
+                                index,
+                                ImportDecision::ImportNew,
+                            )),
                     ]
                     .spacing(6),
                 );
@@ -5373,6 +5519,13 @@ impl FluxReady {
                     .style(input_style)
                     .width(Length::Fill),
             );
+            if candidate.decision() == ImportDecision::UpdateExisting {
+                body = body.push(
+                    text("Metadata updates preserve the existing album membership and managed audio.")
+                        .size(8)
+                        .color(MUTED),
+                );
+            }
         }
         body = body.push(
             row![
@@ -8019,6 +8172,8 @@ mod tests {
             library_root: gui.controller.canonical_root().expect("root").to_path_buf(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
             target_album: None,
             generation: gui.controller.generation(),
         };
@@ -8076,6 +8231,121 @@ mod tests {
         assert_eq!(gui.controller.queue_len(), 1);
         assert_eq!(std::fs::read(&source).expect("source"), source_bytes);
         assert_ne!(track.source().path(), source);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn duplicate_review_updates_metadata_in_place_and_keeps_the_audio() {
+        let dir = TempDir::new("gui-duplicate-update");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("library root");
+        flux_app::create_canonical_library(&root).expect("create canonical library");
+        let source_dir = dir.path().join("Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("base import");
+        let (id, track) = gui.controller.tracks()[0].clone();
+        let managed = track.source().path().to_path_buf();
+        let managed_before = std::fs::read(&managed).expect("managed");
+        std::fs::copy(&managed, &source).expect("duplicate source");
+
+        let request = ImportRequest {
+            sources: vec![source],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: gui.controller.canonical_root().expect("root").to_path_buf(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: gui
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(track_id, _)| {
+                    gui.controller
+                        .track_artist_id(*track_id)
+                        .map(|artist| (*track_id, artist))
+                })
+                .collect(),
+            existing_credits: gui
+                .controller
+                .tracks()
+                .iter()
+                .map(|(track_id, _)| (*track_id, gui.controller.track_credits(*track_id)))
+                .collect(),
+            existing_album_ids: gui
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(track_id, _)| {
+                    gui.controller
+                        .track_album_id(*track_id)
+                        .map(|album| (*track_id, album))
+                })
+                .collect(),
+            target_album: None,
+            generation: gui.controller.generation(),
+        };
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportPlanReady(Box::new(plan)));
+        assert!(matches!(
+            gui.import_manager
+                .as_ref()
+                .and_then(|manager| manager.plan.as_ref())
+                .and_then(|plan| plan.candidates.first())
+                .map(flux_app::ImportCandidate::status),
+            Some(CandidateStatus::SameContent {
+                track_id: Some(existing),
+                ..
+            }) if *existing == id
+        ));
+        send(
+            &mut gui,
+            Message::ImportDecisionChanged(0, ImportDecision::UpdateExisting),
+        );
+        send(
+            &mut gui,
+            Message::ImportTitleChanged("GUI duplicate corrected".to_owned()),
+        );
+        let plan = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.clone())
+            .expect("plan");
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(Box::new(prepared)));
+        let manager = gui.import_manager.as_ref().expect("manager");
+        assert_eq!(manager.stage, ImportUiStage::Completed);
+        assert_eq!(
+            manager.report.as_ref().map(|report| report.updated),
+            Some(1)
+        );
+        assert_eq!(gui.controller.tracks().len(), 1);
+        assert_eq!(gui.controller.tracks()[0].0, id);
+        assert_eq!(
+            gui.controller.track(id).map(|track| track.title()),
+            Some("GUI duplicate corrected")
+        );
+        assert_eq!(
+            std::fs::read(&managed).expect("managed after"),
+            managed_before
+        );
         gui.controller.shutdown();
     }
 
@@ -8738,6 +9008,8 @@ mod tests {
             library_root: root.clone(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
             target_album: Some(target.clone()),
             generation: gui.controller.generation(),
         };
@@ -8801,6 +9073,8 @@ mod tests {
                 library_root: root,
                 existing_tracks: gui.controller.tracks().to_vec(),
                 existing_artists: Vec::new(),
+                existing_credits: Vec::new(),
+                existing_album_ids: Vec::new(),
                 target_album: Some(stale_target),
                 generation: gui.controller.generation(),
             },
