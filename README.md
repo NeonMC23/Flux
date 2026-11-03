@@ -108,7 +108,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   stable shuffle cycle that does not mutate playlist order. Previous restarts
   the current track after three seconds and otherwise moves backward. Queue
   order, current entry, mode, shuffle flag and position persist for canonical
-  libraries and restore paused. The
+  libraries and restore paused. The engine prepares the next queue entry in the
+  background, but transitions still occur after the current source drains and
+  are not gapless. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
   then removes old files through journal cleanup. The same editor supports

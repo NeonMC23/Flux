@@ -1078,6 +1078,8 @@ pub struct Controller {
     shuffle_order: Vec<QueueEntryId>,
     /// Position restored from persistence, applied on the next play.
     restored_position_ms: u64,
+    /// Queue entry whose decoder is currently prepared for the next transition.
+    preloaded_entry: Option<(QueueEntryId, TrackId)>,
     /// Session-local meaningful-play accumulator.
     play_session: Option<PlaySession>,
     /// Exclusive OS ownership of the active library's catalogue. Held
@@ -1432,6 +1434,7 @@ impl Controller {
             shuffle: false,
             shuffle_order: Vec::new(),
             restored_position_ms: 0,
+            preloaded_entry: None,
             play_session: None,
             library_lock,
             legacy_index_write_protected: false,
@@ -2842,6 +2845,7 @@ impl Controller {
         self.shuffle = false;
         self.shuffle_order.clear();
         self.restored_position_ms = 0;
+        self.preloaded_entry = None;
         self.play_session = None;
         *self.player.queue_mut() = queue;
 
@@ -4537,6 +4541,7 @@ impl Controller {
             self.shuffle_order.clear();
         }
         self.persist_queue();
+        self.preload_next_queue_entry();
         self.report_status(format!("Playback mode: {}.", mode.label()));
     }
 
@@ -4559,6 +4564,7 @@ impl Controller {
             self.shuffle_order.clear();
         }
         self.persist_queue();
+        self.preload_next_queue_entry();
     }
 
     /// Cycles the full playback mode.
@@ -4970,6 +4976,7 @@ impl Controller {
                     events.push(ControllerEvent::PlaybackChanged);
                 }
             }
+            EngineEvent::Preloaded { .. } | EngineEvent::PreloadFailed { .. } => {}
             EngineEvent::Started { session, .. } | EngineEvent::Paused { session, .. } => {
                 if self.engine_session == Some(session) {
                     events.push(ControllerEvent::PlaybackChanged);
@@ -5043,6 +5050,7 @@ impl Controller {
     fn after_queue_change(&mut self) {
         self.sync_shuffle_order();
         self.persist_queue();
+        self.preload_next_queue_entry();
         self.outbox.push(ControllerEvent::QueueChanged);
     }
 
@@ -5137,6 +5145,55 @@ impl Controller {
                 self.stream_info = None;
             }
         }
+        self.preload_next_queue_entry();
+    }
+
+    fn preload_next_queue_entry(&mut self) {
+        if self.player_state() == PlaybackState::Stopped {
+            if self.preloaded_entry.take().is_some() {
+                self.engine.cancel_preload();
+            }
+            return;
+        }
+        let Some(current) = self.player.queue().current_entry() else {
+            if self.preloaded_entry.take().is_some() {
+                self.engine.cancel_preload();
+            }
+            return;
+        };
+        let next = if self.player.repeat_mode() == RepeatMode::One {
+            Some(current)
+        } else if self.shuffle {
+            self.sync_shuffle_order();
+            self.shuffle_neighbor(1, self.player.repeat_mode() == RepeatMode::All)
+                .and_then(|entry| self.player.queue().entry(entry))
+        } else {
+            let queue = self.player.queue();
+            match queue.entry_index(current.id()) {
+                Some(index) if index + 1 < queue.len() => queue.entries().get(index + 1).copied(),
+                Some(_) if self.player.repeat_mode() == RepeatMode::All => {
+                    queue.entries().first().copied()
+                }
+                _ => None,
+            }
+        };
+        let Some(next) = next else {
+            if self.preloaded_entry.take().is_some() {
+                self.engine.cancel_preload();
+            }
+            return;
+        };
+        if self.preloaded_entry == Some((next.id(), next.track())) {
+            return;
+        }
+        let Some(track) = self.track(next.track()) else {
+            self.preloaded_entry = None;
+            self.engine.cancel_preload();
+            return;
+        };
+        let path = track.source().path().to_path_buf();
+        self.engine.preload(next.track(), path);
+        self.preloaded_entry = Some((next.id(), next.track()));
     }
 
     /// Resolves `id` to a file and asks the engine to load it.
@@ -6106,10 +6163,10 @@ mod tests {
     use flux_library::QueueStore;
 
     use super::{
-        AudioStatus, Controller, ControllerEvent, CreateLibraryError, PortableOpenError,
-        ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit, create_canonical_library,
-        create_portable_library, default_engine, execute_legacy_migration, is_track_playable,
-        migrate_legacy_library, plan_legacy_migration,
+        AudioStatus, Controller, ControllerEvent, CreateLibraryError, PlaybackMode,
+        PortableOpenError, ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit,
+        create_canonical_library, create_portable_library, default_engine,
+        execute_legacy_migration, is_track_playable, migrate_legacy_library, plan_legacy_migration,
     };
 
     struct TempDir(PathBuf);
@@ -7013,6 +7070,48 @@ mod tests {
                 .count(),
             0,
             "nothing may 'play' silently"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_preloads_the_next_entry_and_tracks_mode_changes() {
+        let dir = TempDir::new("preload-next");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        controller.play_track(a);
+        controller.enqueue_track(b).expect("enqueue b");
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        assert_eq!(
+            controller.preloaded_entry,
+            Some((entry_b, b)),
+            "normal playback preloads the next queue entry"
+        );
+
+        controller.set_repeat_mode(RepeatMode::One);
+        let entry_a = controller
+            .current_queue_entry_id()
+            .expect("a remains current");
+        assert_eq!(
+            controller.preloaded_entry,
+            Some((entry_a, a)),
+            "repeat-one preloads a fresh decoder for the current entry"
+        );
+
+        controller.set_playback_mode(PlaybackMode::Normal);
+        assert_eq!(
+            controller.preloaded_entry,
+            Some((entry_b, b)),
+            "leaving repeat-one restores the next-entry preload"
         );
         controller.shutdown();
     }

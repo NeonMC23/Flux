@@ -296,6 +296,40 @@ Play. Queue files without the optional playback fields remain readable with
 defaults. Saves remain atomic and malformed files are preserved. Non-canonical
 legacy/portable backends retain their existing queue workflow.
 
+### Audio engine and next-track preparation
+
+The audio crate keeps policy and mechanism separate. [`Controller`] decides
+which stable `QueueEntryId` should play; `flux-audio::engine` owns decoding,
+format conversion, the bounded sample ring and device output. Decoding and file
+I/O run on one worker thread. The CPAL callback only pops from a lock-free SPSC
+ring, emits silence on underrun, and publishes the oscilloscope tap; it performs
+no file I/O, locking or allocation. The output stream stays open across normal
+loads, but each load/stop still bumps a generation counter that makes the
+callback flush the previous generation, so the stream is continuous while the
+track content is not sample-contiguous.
+
+The Controller now prepares the next queue entry through
+`EngineHandle::preload`:
+
+- Normal playback prepares the following queue entry;
+- Repeat All prepares the first entry after the last;
+- Repeat One prepares a fresh decoder for the current entry;
+- Shuffle and Shuffle + Repeat All use the existing seeded queue-entry
+  traversal, preserving duplicate-track identity;
+- a changed queue or playback mode replaces or cancels the obsolete preload,
+  and an unchanged target is not reopened.
+
+The worker holds at most one active decoder and one prepared decoder. A
+matching load consumes the prepared decoder; a mismatched or cancelled load
+drops it deterministically. Preload failures are reported as
+`EngineEvent::PreloadFailed` and never interrupt current playback. This
+preparation removes decoder-open work from the later transition and is the
+foundation for a future continuous pipeline, but it is **not** gapless: the
+application still loads the next entry only after `TrackEnded` has drained the
+ring.
+
+[`Controller`]: ../crates/flux-app/src/lib.rs
+
 ### Discovery, ratings, history and dashboard
 
 Ratings/favorites remain canonical track data. Track rows expose a favorite
@@ -879,12 +913,14 @@ cleanup.
     objects/boundaries are not implemented; the aggregate `history.flux`
     cannot reconstruct them without fabricating chronology. Recent/Most Played
     remain aggregate views.
-24. Gapless playback and crossfade are deferred. The current engine owns one
-    decoder/output session at a time and performs explicit per-track loads; it
-    has no preloaded next decoder, mixed output graph, or testable sample-level
-    continuity path. Flux does not simulate either by shortening UI timers or
-    issuing GUI volume automation. Queue persistence/shuffle modes work without
-    gapless assumptions.
+24. Gapless playback and crossfade are deferred. The engine now retains one
+    prepared next decoder and a subsequent matching load consumes it, but the
+    transition is still driven by the application after the ring has drained;
+    every load starts a new generation and flushes the old samples. There is no
+    sample-boundary auto-advance, mixed output graph or testable frame-continuity
+    path. Flux does not simulate either feature by shortening UI timers or
+    issuing GUI volume automation. Queue persistence, shuffle modes and
+    next-track preparation work without gapless assumptions.
 25. Multi-entry queue removal and a dedicated queue clear action are not exposed
     in the GUI; individual removal/reorder and queue population from track/
     playlist actions remain available.

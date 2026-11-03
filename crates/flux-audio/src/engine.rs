@@ -7,8 +7,9 @@
 //! caller (any thread)                 engine worker thread
 //! ┌──────────────────┐  commands   ┌──────────────────────────────┐
 //! │  EngineHandle    │ ──────────▶ │ command loop                 │
-//! │  (this module)   │  (mpsc)     │  ├─ Decoder (decode.rs)      │
-//! │                  │ ◀────────── │  ├─ FormatConverter          │
+//! │  (this module)   │  (mpsc)     │  ├─ active Decoder           │
+//! │                  │ ◀────────── │  ├─ prepared next Decoder    │
+//! │                  │             │  ├─ FormatConverter          │
 //! └──────────────────┘   events    │  └─ ring buffer producer     │
 //!        ▲             (mpsc)      └──────────────┬───────────────┘
 //!        │ position()/volume: atomics             │ SPSC ring buffer
@@ -38,6 +39,13 @@
 //! - [`EngineEvent::TrackEnded`] fires only after the decoder reached
 //!   EOF **and** the ring buffer has fully drained through the backend
 //!   — never merely when decoding finished.
+//! - [`EngineHandle::preload`] opens at most one future decoder on the
+//!   worker, independently of the active one. A matching load consumes
+//!   it; a different load, cancellation or replacement drops it. A
+//!   preload failure is reported separately and cannot disturb the
+//!   active source. Preparation does not make the subsequent load
+//!   gapless: the normal load still starts a new generation and flushes
+//!   the ring.
 //!
 //! The engine knows nothing about libraries, queues, or scanning: the
 //! caller hands it a [`TrackId`] (echoed back in events) and a file
@@ -127,6 +135,20 @@ pub enum EngineEvent {
         /// The decoded stream's facts (file sample rate/channels).
         info: StreamInfo,
     },
+    /// A future source was decoded and prepared without touching playback.
+    Preloaded {
+        /// Caller-supplied track ID.
+        id: TrackId,
+        /// Decoded stream facts.
+        info: StreamInfo,
+    },
+    /// Preparing a future source failed. Current playback is unaffected.
+    PreloadFailed {
+        /// Caller-supplied track ID.
+        id: TrackId,
+        /// Failure detail.
+        error: EngineError,
+    },
     /// Playback of the track started or resumed.
     Started {
         /// The load session this playback belongs to.
@@ -176,6 +198,11 @@ enum Command {
         session: u64,
         position: Duration,
     },
+    Preload {
+        id: TrackId,
+        path: PathBuf,
+    },
+    CancelPreload,
     Play,
     Pause,
     Stop,
@@ -482,6 +509,19 @@ impl EngineHandle {
         session
     }
 
+    /// Prepares a future source in the worker without changing current
+    /// playback. At most one prepared decoder is retained; a new preload or
+    /// cancellation replaces it. A subsequent matching [`load`](Self::load)
+    /// can consume the prepared decoder.
+    pub fn preload(&self, id: TrackId, path: PathBuf) {
+        let _ = self.commands.send(Command::Preload { id, path });
+    }
+
+    /// Drops any prepared future decoder.
+    pub fn cancel_preload(&self) {
+        let _ = self.commands.send(Command::CancelPreload);
+    }
+
     /// Starts or resumes playback of the loaded track. If the track
     /// previously played to completion, it restarts from the beginning.
     /// Emits [`EngineEvent::Started`].
@@ -602,6 +642,13 @@ struct LoadedTrack {
     info: StreamInfo,
 }
 
+struct PreparedTrack {
+    id: TrackId,
+    path: PathBuf,
+    info: StreamInfo,
+    decoder: Box<dyn Decoder>,
+}
+
 /// The worker loop. Owns the backend, decoder, converter, and ring
 /// producer; everything else lives in [`Shared`] atomics.
 fn run_worker<F>(
@@ -656,6 +703,7 @@ fn run_worker<F>(
     };
 
     let mut decoder: Option<Box<dyn Decoder>> = None;
+    let mut prepared: Option<PreparedTrack> = None;
     let mut current: Option<LoadedTrack> = None;
     let mut converter: Option<FormatConverter> = None;
     let mut pending: Vec<f32> = Vec::new();
@@ -686,9 +734,21 @@ fn run_worker<F>(
                 eof_reached = false;
                 ended_sent = false;
                 last_load_failed = false;
-                match open_decoder(&path) {
-                    Ok(dec) => {
-                        let info = *dec.info();
+                let reusable = prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.id == id && prepared.path == path);
+                let opened = if reusable {
+                    let prepared = prepared.take().expect("prepared exists");
+                    Ok((prepared.decoder, prepared.info))
+                } else {
+                    prepared = None;
+                    open_decoder(&path).map(|decoder| {
+                        let info = *decoder.info();
+                        (decoder, info)
+                    })
+                };
+                match opened {
+                    Ok((dec, info)) => {
                         converter = Some(FormatConverter::new(&info, config));
                         decoder = Some(dec);
                         current = Some(LoadedTrack { id, path, info });
@@ -818,6 +878,30 @@ fn run_worker<F>(
                 }
                 shared.gate_open.store(playing, Ordering::Release);
             }
+            Ok(Command::Preload { id, path }) => {
+                prepared = None;
+                match open_decoder(&path) {
+                    Ok(decoder) => {
+                        let info = *decoder.info();
+                        prepared = Some(PreparedTrack {
+                            id,
+                            path,
+                            info,
+                            decoder,
+                        });
+                        send(EngineEvent::Preloaded { id, info });
+                    }
+                    Err(error) => {
+                        send(EngineEvent::PreloadFailed {
+                            id,
+                            error: error.into(),
+                        });
+                    }
+                }
+            }
+            Ok(Command::CancelPreload) => {
+                prepared = None;
+            }
             Ok(Command::Play) => match &current {
                 None => {
                     if !last_load_failed {
@@ -881,6 +965,7 @@ fn run_worker<F>(
                 current_session = 0;
                 last_load_failed = false;
                 decoder = None;
+                prepared = None;
                 current = None;
                 converter = None;
                 pending.clear();
@@ -1712,6 +1797,159 @@ mod tests {
             matches!(events.last(), Some(EngineEvent::Loaded { id, .. }) if *id == good_id),
             "the follow-up load must succeed: {events:?}"
         );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn matching_load_consumes_the_preloaded_decoder() {
+        let dir = TempDir::new("preload-consume");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_024, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_024, 0.8);
+        let (engine, _control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+
+        engine.load(id_a, a);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_a),
+        );
+        engine.preload(id_b, b.clone());
+        let events = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Preloaded { info, .. }) if info.sample_rate == 44_100),
+            "expected Preloaded: {events:?}"
+        );
+
+        // A matching load must take ownership of the already-open decoder
+        // instead of opening the path again.
+        fs::remove_file(&b).expect("remove preloaded source");
+        engine.load(id_b, b);
+        let events = collect_events_until(&engine, |event| {
+            matches!(
+                event,
+                EngineEvent::Loaded { id, .. } | EngineEvent::Error { id: Some(id), .. }
+                    if *id == id_b
+            )
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Loaded { id, .. }) if *id == id_b),
+            "matching load should reuse the prepared decoder: {events:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn cancelled_preload_is_released_and_not_reused() {
+        let dir = TempDir::new("preload-cancel");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_024, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_024, 0.8);
+        let (engine, _control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+
+        engine.load(id_a, a);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_a),
+        );
+        engine.preload(id_b, b.clone());
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        engine.cancel_preload();
+        fs::remove_file(&b).expect("remove cancelled source");
+
+        engine.load(id_b, b);
+        let events = collect_events_until(&engine, |event| {
+            matches!(
+                event,
+                EngineEvent::Loaded { id, .. } | EngineEvent::Error { id: Some(id), .. }
+                    if *id == id_b
+            )
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Error { id: Some(id), .. }) if *id == id_b),
+            "a cancelled preload must not be reused: {events:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn mismatched_load_discards_a_preloaded_decoder() {
+        let dir = TempDir::new("preload-mismatch");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_024, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_024, 0.8);
+        let (engine, _control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+
+        engine.load(id_a, a.clone());
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_a),
+        );
+        engine.preload(id_b, b.clone());
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        engine.load(id_a, a);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_a),
+        );
+        fs::remove_file(&b).expect("remove stale source");
+
+        engine.load(id_b, b);
+        let events = collect_events_until(&engine, |event| {
+            matches!(
+                event,
+                EngineEvent::Loaded { id, .. } | EngineEvent::Error { id: Some(id), .. }
+                    if *id == id_b
+            )
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Error { id: Some(id), .. }) if *id == id_b),
+            "a stale preload must be dropped by a mismatched load: {events:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn preload_failure_never_interrupts_current_playback() {
+        let dir = TempDir::new("preload-failure");
+        let good = write_dc_wav(&dir, "good.wav", 44_100, 8_192, 0.4);
+        let bad = dir.0.join("bad.wav");
+        fs::write(&bad, b"not a real wav").expect("bad fixture");
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (good_id, bad_id) = (TrackId::new(1), TrackId::new(2));
+
+        engine.load(good_id, good);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == good_id),
+        );
+        engine.preload(bad_id, bad);
+        let events = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::PreloadFailed { id, .. } if *id == bad_id),
+        );
+        assert!(
+            matches!(events.last(), Some(EngineEvent::PreloadFailed { id, .. }) if *id == bad_id),
+            "expected PreloadFailed: {events:?}"
+        );
+
+        engine.play();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            matches!(events.last(), Some(EngineEvent::TrackEnded { id, .. }) if *id == good_id),
+            "the active source must survive a failed preload: {events:?}"
+        );
+        assert_eq!(nonzero_frames(&control, 1), 8_192);
         engine.shutdown();
     }
 
