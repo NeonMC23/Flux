@@ -4369,6 +4369,27 @@ impl CanonicalLibrary {
         Ok(id)
     }
 
+    /// Deletes only the playlist entity and its metadata file. Tracks, albums,
+    /// artists, ratings, queue entries and media are untouched.
+    pub fn delete_playlist(&mut self, id: PlaylistId) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        if !self.playlists.contains_key(&id) {
+            return Err(CanonicalError::Invalid(format!(
+                "playlist {id} is not in the library"
+            )));
+        }
+        let path = self
+            .playlist_paths
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing playlist path".to_owned()))?;
+        let mut catalog = self.catalog.clone();
+        catalog.playlists.retain(|entry| entry.id != id.get());
+        self.commit_writes_with_cleanup(Some(catalog), Vec::new(), vec![path])?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
     /// Stores/removes a rating and favorite flag.
     pub fn set_rating(
         &mut self,
@@ -10834,6 +10855,44 @@ mod atomic_import_tests {
                     },
                     "{point:?}"
                 );
+            }
+        }
+
+        #[test]
+        fn playlist_delete_is_transactional_and_never_deletes_tracks() {
+            for (point, committed) in [
+                (TransactionFailPoint::BeforeCatalogPublish, false),
+                (TransactionFailPoint::AfterCatalogPublish, true),
+            ] {
+                let mut fx = fixture(&format!("lifecycle-playlist-delete-{point:?}"));
+                let playlist = fx
+                    .library
+                    .set_playlist(None, "Delete me", vec![fx.middle])
+                    .expect("playlist");
+                let track_before = fx.library.track(fx.middle).expect("track").clone();
+                fx.library.set_transaction_failure(Some(TransactionFailure {
+                    point,
+                    interrupt: true,
+                    abort: false,
+                }));
+                assert!(fx.library.delete_playlist(playlist).is_err());
+                let root = fx.library.root.clone();
+                drop(fx.library);
+                let reopened = CanonicalLibrary::open(&root).expect("recover");
+                assert_eq!(
+                    reopened.playlist(playlist).is_some(),
+                    !committed,
+                    "{point:?}"
+                );
+                assert_eq!(
+                    reopened.track(fx.middle).expect("track").title,
+                    track_before.title
+                );
+                assert_eq!(
+                    reopened.track_audio_path(fx.middle).expect("audio"),
+                    fx.original_audio
+                );
+                assert!(fx.original_audio.exists());
             }
         }
 

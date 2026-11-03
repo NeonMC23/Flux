@@ -1531,6 +1531,14 @@ impl Controller {
             .unwrap_or_default()
     }
 
+    /// One canonical playlist by stable identity.
+    #[must_use]
+    pub fn playlist(&self, id: PlaylistId) -> Option<&flux_library::canonical::CanonicalPlaylist> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.playlist(id))
+    }
+
     /// The canonical rating/favorite value for a track.
     #[must_use]
     pub fn rating(&self, id: TrackId) -> Option<TrackRating> {
@@ -1570,6 +1578,286 @@ impl Controller {
             .map_err(|err| format!("Could not save playlist: {err}"))
     }
 
+    /// Creates an empty canonical playlist.
+    pub fn create_playlist(&mut self, name: &str) -> Result<PlaylistId, String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        let id = store
+            .set_playlist(None, name, Vec::new())
+            .map_err(|err| format!("Could not create the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Created empty playlist {id}."));
+        Ok(id)
+    }
+
+    /// Renames a playlist only if its reviewed name and contents still match.
+    pub fn rename_playlist(
+        &mut self,
+        id: PlaylistId,
+        new_name: &str,
+        expected_name: &str,
+        expected_track_ids: &[TrackId],
+    ) -> Result<(), String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        let current = store
+            .playlist(id)
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        if current.name != expected_name || current.track_ids != expected_track_ids {
+            return Err("The playlist changed since review; reopen it and try again.".to_owned());
+        }
+        store
+            .set_playlist(Some(id), new_name, current.track_ids)
+            .map_err(|err| format!("Could not rename the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Renamed playlist {id}."));
+        Ok(())
+    }
+
+    /// Removes selected positions from one playlist in a single transaction.
+    pub fn remove_playlist_entries(
+        &mut self,
+        id: PlaylistId,
+        positions: &[usize],
+        expected_track_ids: &[TrackId],
+    ) -> Result<usize, String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        let current = store
+            .playlist(id)
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        if current.track_ids != expected_track_ids {
+            return Err("The playlist changed since review; reopen it and try again.".to_owned());
+        }
+        let mut unique = std::collections::HashSet::new();
+        for position in positions {
+            if *position >= current.track_ids.len() || !unique.insert(*position) {
+                return Err("Playlist-entry selection is stale or invalid.".to_owned());
+            }
+        }
+        let tracks = current
+            .track_ids
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !unique.contains(index))
+            .map(|(_, track)| *track)
+            .collect::<Vec<_>>();
+        let removed = current.track_ids.len() - tracks.len();
+        store
+            .set_playlist(Some(id), current.name, tracks)
+            .map_err(|err| format!("Could not update the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Removed {removed} entr(ies) from playlist {id}."));
+        Ok(removed)
+    }
+
+    /// Moves an entry to a final position after validating the reviewed order.
+    pub fn reorder_playlist_entry(
+        &mut self,
+        id: PlaylistId,
+        from: usize,
+        to: usize,
+        expected_track_ids: &[TrackId],
+    ) -> Result<(), String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        let current = store
+            .playlist(id)
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        if current.track_ids != expected_track_ids
+            || from >= current.track_ids.len()
+            || to >= current.track_ids.len()
+        {
+            return Err("Playlist order changed since review; reopen it and try again.".to_owned());
+        }
+        if from == to {
+            return Ok(());
+        }
+        let mut tracks = current.track_ids;
+        let track = tracks.remove(from);
+        tracks.insert(to, track);
+        store
+            .set_playlist(Some(id), current.name, tracks)
+            .map_err(|err| format!("Could not reorder the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Moved playlist entry within playlist {id}."));
+        Ok(())
+    }
+
+    /// Clears playlist contents without touching any canonical track.
+    pub fn clear_playlist(
+        &mut self,
+        id: PlaylistId,
+        expected_track_ids: &[TrackId],
+    ) -> Result<(), String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        let current = store
+            .playlist(id)
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        if current.track_ids != expected_track_ids {
+            return Err("The playlist changed since review; reopen it and try again.".to_owned());
+        }
+        store
+            .set_playlist(Some(id), current.name, Vec::new())
+            .map_err(|err| format!("Could not clear the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Cleared playlist {id}."));
+        Ok(())
+    }
+
+    /// Deletes only the playlist entity after validating its reviewed state.
+    pub fn delete_playlist(
+        &mut self,
+        id: PlaylistId,
+        expected_name: &str,
+        expected_track_ids: &[TrackId],
+    ) -> Result<(), String> {
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Playlists require a canonical library.".to_owned());
+        };
+        let current = store
+            .playlist(id)
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        if current.name != expected_name || current.track_ids != expected_track_ids {
+            return Err("The playlist changed since review; reopen it and try again.".to_owned());
+        }
+        store
+            .delete_playlist(id)
+            .map_err(|err| format!("Could not delete the playlist: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Deleted playlist {id}; no tracks were removed."));
+        Ok(())
+    }
+
+    /// Appends every playlist entry to the queue without changing playback.
+    pub fn enqueue_playlist(&mut self, id: PlaylistId) -> Result<usize, String> {
+        let playlist = self
+            .canonical_store
+            .as_ref()
+            .and_then(|store| store.playlist(id))
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        self.enqueue_validated_tracks(&playlist.track_ids)
+    }
+
+    /// Appends selected playlist positions to the queue without changing playback.
+    pub fn enqueue_playlist_entries(
+        &mut self,
+        id: PlaylistId,
+        positions: &[usize],
+    ) -> Result<usize, String> {
+        let playlist = self
+            .canonical_store
+            .as_ref()
+            .and_then(|store| store.playlist(id))
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        let mut tracks = Vec::with_capacity(positions.len());
+        for position in positions {
+            let track = playlist
+                .track_ids
+                .get(*position)
+                .copied()
+                .ok_or_else(|| "Playlist-entry selection is stale or invalid.".to_owned())?;
+            tracks.push(track);
+        }
+        self.enqueue_validated_tracks(&tracks)
+    }
+
+    fn enqueue_validated_tracks(&mut self, tracks: &[TrackId]) -> Result<usize, String> {
+        if tracks.is_empty() {
+            return Err("The playlist has no entries.".to_owned());
+        }
+        for track in tracks {
+            if self.track(*track).is_none() {
+                return Err(format!("Track {track} is no longer in the library."));
+            }
+        }
+        for track in tracks {
+            self.player.queue_mut().push(*track);
+        }
+        self.queue_auto_library = false;
+        self.after_queue_change();
+        self.report_status(format!(
+            "Added {} playlist entr(ies) to the queue.",
+            tracks.len()
+        ));
+        Ok(tracks.len())
+    }
+
+    /// Replaces the queue with the playlist and starts at `start_index`.
+    pub fn play_playlist(&mut self, id: PlaylistId, start_index: usize) -> Result<(), String> {
+        self.play_playlist_inner(id, start_index, false)
+    }
+
+    /// Replaces the queue with a shuffled copy of the playlist. Canonical
+    /// playlist order is not changed.
+    pub fn play_playlist_shuffled(&mut self, id: PlaylistId) -> Result<(), String> {
+        self.play_playlist_inner(id, 0, true)
+    }
+
+    fn play_playlist_inner(
+        &mut self,
+        id: PlaylistId,
+        start_index: usize,
+        shuffle: bool,
+    ) -> Result<(), String> {
+        let mut start_index = start_index;
+        let playlist = self
+            .canonical_store
+            .as_ref()
+            .and_then(|store| store.playlist(id))
+            .cloned()
+            .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        if playlist.track_ids.is_empty() {
+            return Err("The playlist has no entries.".to_owned());
+        }
+        for track in &playlist.track_ids {
+            if self.track(*track).is_none() {
+                return Err(format!("Track {track} is no longer in the library."));
+            }
+        }
+        let mut tracks = playlist.track_ids;
+        if shuffle {
+            shuffle_track_ids(&mut tracks);
+            start_index = 0;
+        }
+        if start_index >= tracks.len() {
+            return Err("Playlist start position is out of range.".to_owned());
+        }
+        let start_entry = {
+            let queue = self.player.queue_mut();
+            queue.clear();
+            let entries = tracks
+                .iter()
+                .map(|track| queue.push(*track))
+                .collect::<Vec<_>>();
+            entries[start_index]
+        };
+        self.player
+            .play_entry(start_entry)
+            .map_err(|err| format!("Cannot play that playlist entry: {err}"))?;
+        self.queue_auto_library = false;
+        self.after_queue_change();
+        self.sync_engine(true);
+        self.report_status(format!(
+            "Playing playlist {id}{}.",
+            if shuffle { " shuffled" } else { "" }
+        ));
+        Ok(())
+    }
+
     /// Sets the favorite flag for several tracks in one canonical transaction.
     /// Existing ratings are preserved.
     pub fn set_favorites(&mut self, ids: &[TrackId], favorite: bool) -> Result<usize, String> {
@@ -1604,6 +1892,7 @@ impl Controller {
         &mut self,
         playlist_id: PlaylistId,
         ids: &[TrackId],
+        expected_track_ids: &[TrackId],
     ) -> Result<usize, String> {
         if ids.is_empty() {
             return Err("Select at least one track.".to_owned());
@@ -1615,6 +1904,9 @@ impl Controller {
             .playlist(playlist_id)
             .cloned()
             .ok_or_else(|| "The playlist is no longer in the library.".to_owned())?;
+        if playlist.track_ids != expected_track_ids {
+            return Err("The playlist changed since review; reopen it and try again.".to_owned());
+        }
         for id in ids {
             if store.track(*id).is_none() {
                 return Err(format!("Track {id} is no longer in the library."));
@@ -4996,6 +5288,22 @@ fn legacy_queue_path(canonical_index: &Path) -> PathBuf {
 /// The queue file for a portable library: inside a private subdirectory
 /// of `.flux`, away from immutable segments and from the store's GC
 /// patterns.
+fn shuffle_track_ids(tracks: &mut [TrackId]) {
+    if tracks.len() < 2 {
+        return;
+    }
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9e37_79b9_7f4a_7c15, |duration| duration.as_nanos() as u64);
+    for index in (1..tracks.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let swap = (seed as usize) % (index + 1);
+        tracks.swap(index, swap);
+    }
+}
+
 fn portable_queue_path(root: &Path) -> PathBuf {
     root.join(FLUX_DIR_NAME).join("queue").join("queue.json")
 }
