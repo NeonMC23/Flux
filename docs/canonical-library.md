@@ -25,8 +25,8 @@ legacy retirement at the API level is not complete.
   queue data. Portable records are relative, but the legacy index and runtime
   queue are not guaranteed to be library-owned.
 - AlbumId, playlist, rating/favorite and managed-lyrics runtime types now exist
-  in the canonical engine. GUI/TUI screens for playlists/ratings/lyrics are not
-  implemented.
+  in the canonical engine. The GUI implements playlist management; dedicated
+  rating and lyrics screens are not implemented.
 - The GUI/TUI Import Manager is review-first and copy-only. Reference imports
   are rejected in canonical mode; the old portable import tests still cover
   their compatibility behavior.
@@ -210,6 +210,55 @@ Batch queue mutation and batch album moves are intentionally not exposed. The
 former would require a separate atomic queue-policy decision, and the latter
 requires a reviewed ordering/ownership plan across every selected track. They
 are not simulated through repeated independent writes.
+
+### Playlist management
+
+The canonical playlist model has a stable `PlaylistId`, a name and an ordered
+`Vec<TrackId>`. It intentionally has no description, artwork or timestamp
+field; the GUI does not invent those. Playlist names are not unique: duplicate
+names are allowed and identity remains the stable PlaylistId, so no rename or
+create silently overwrites another playlist. Duplicate TrackIds are allowed and remain
+meaningful by position. There are no separate playlist-entry IDs: operations
+that target one or more duplicate entries capture the complete reviewed
+playlist order and reject the plan if that order changed before publication.
+
+The GUI has a dedicated Playlists library with name, entry count and a short
+track preview, plus empty/create states. A playlist detail view provides:
+
+- rename with a stable PlaylistId and preserved contents;
+- ordered entries with title, artist, album, duration when known and current
+  playback indication;
+- adding one/multiple selected library tracks through the existing reviewed
+  batch playlist action;
+- single or multi-entry removal by reviewed positions;
+- arrow reordering and drag-handle reordering with insertion feedback;
+- explicit clear and delete confirmations;
+- play from the beginning, play a specific entry, shuffle play, add the whole
+  playlist to the queue and add selected entries to the queue.
+
+Removing entries or clearing a playlist never deletes canonical tracks, audio,
+albums, artwork or artist identities. Deleting a playlist removes only its
+catalogue entry and playlist file through journal cleanup. Rename, content edits,
+clear and delete are one canonical transaction each; stale reviewed order/name
+snapshots are rejected. Delete/open recovery leaves either the complete old or
+complete new catalogue, and unrelated queue entries/playback remain valid.
+Playlist operations never change album track order.
+
+Playlist playback uses a queue made from canonical TrackIds, including duplicate
+entries. Play/shuffle replace the queue explicitly; shuffle does not mutate the
+canonical playlist order. Enqueue operations append and preserve existing queue
+order/current playback. Editing canonical playlist contents does not touch the
+queue. Missing tracks are shown as missing entries and can be removed; playback
+or enqueue operations that require missing tracks fail before changing the queue.
+
+Drag reorder is implemented inside the playlist detail view using stable
+reviewed positions. Dragging library tracks or selections into a playlist is not
+implemented; use the selection-bar/album/search playlist action and explicit
+review instead. A drag snapshot captured at drag start is revalidated before the
+one-transaction reorder.
+
+The TUI does not expose playlist management; its help and documentation direct
+these operations to the GUI.
 
 ### Album artwork
 
@@ -628,8 +677,9 @@ cleanup.
 5. Artwork selection has native PNG/JPEG/WebP pickers in addition to path entry.
    Decoding is bounded as documented above; animated formats and tag artwork
    are not supported.
-6. Playlists, ratings/favorites and lyrics have canonical Controller APIs and
-   persistence tests, but no GUI/TUI screens.
+6. Ratings/favorites and lyrics have canonical Controller APIs and persistence
+   tests, but only favorites are currently exposed in a batch GUI action; no
+   dedicated rating/lyrics screen exists.
 7. Automatic catalogue-backup rollback is not generation-consistent and is
    disabled; transaction-journal recovery is implemented and test-injected at
    every listed boundary. A recovery-required malformed journal requires manual
@@ -659,10 +709,10 @@ cleanup.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.
-17. Global search/filtering/multi-selection and batch playlist/favorite actions
-    are GUI-only; the TUI retains its existing track search and safe single-track
-    operations. Range selection, batch queue mutation, playlist-entry removal and
-    batch album moves are not implemented.
+17. Global search/filtering/multi-selection, playlist management and batch
+    playlist/favorite actions are GUI-only; the TUI retains its existing track
+    search and safe single-track operations. Range selection, library-to-playlist
+    drag, batch queue mutation and batch album moves are not implemented.
 18. Search is substring matching only, not fuzzy; results are capped at 20 per
     entity type. Track lists retain the existing page-based rendering rather than
     adding a new virtualization layer.
