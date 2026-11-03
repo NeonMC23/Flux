@@ -101,8 +101,14 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   UTF-8 export with overwrite confirmation, and a karaoke view. The player has a
   Lyrics entry point and can follow current playback without changing audio.
   Artist and album views
-  group canonical stable identities. The queue panel supports drag reordering, keyboard moves,
-  removal and direct entry playback; the seek bar moves the decoder. The
+  group canonical stable identities. The queue panel supports stable
+  per-entry duplicate disambiguation, drag/keyboard reordering, removal and
+  direct entry playback; the seek bar moves the decoder. Playback modes cycle
+  Normal → Repeat All → Repeat One → Shuffle → Shuffle + Repeat All, with a
+  stable shuffle cycle that does not mutate playlist order. Previous restarts
+  the current track after three seconds and otherwise moves backward. Queue
+  order, current entry, mode, shuffle flag and position persist for canonical
+  libraries and restore paused. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
   then removes old files through journal cleanup. The same editor supports

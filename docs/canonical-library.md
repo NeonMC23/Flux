@@ -261,6 +261,41 @@ one-transaction reorder.
 The TUI does not expose playlist management; its help and documentation direct
 these operations to the GUI.
 
+### Advanced queue and playback modes
+
+Queue entries already have stable `QueueEntryId` identities, so duplicate
+TrackIds remain distinct and the active entry is never confused with another
+occurrence. Existing operations support append, insert-next, explicit reorder,
+single removal and duplicate-safe selection. Queue entry identity and TrackId
+are different concepts.
+
+Playback modes are a combination of the existing repeat model and controller
+shuffle state:
+
+- Normal;
+- Repeat One;
+- Repeat All;
+- Shuffle;
+- Shuffle + Repeat All.
+
+`R` in the GUI/TUI cycles all five modes. Repeat One disables shuffle and
+replays the current entry when it ends. Shuffle builds a seeded traversal of
+queue-entry IDs with the current entry first, avoids adjacent duplicate TrackIds
+where an alternative exists, and does not mutate canonical playlist order.
+Queue changes retain the existing shuffle order and append newly added entry IDs;
+removed entries are dropped. Explicit skips use the traversal, while Repeat All
+wraps and Repeat Off stops at the end. Previous restarts the current track when
+the actual playback position is at least three seconds; otherwise it moves to
+the previous queue/shuffle entry.
+
+For canonical libraries, the queue file persists ordered entries, stable
+entry IDs, current entry, repeat mode, shuffle flag, playback position and
+whether playback was active. Restoration always installs the queue paused and
+does not start audio implicitly. Position is applied only when the user presses
+Play. Queue files without the optional playback fields remain readable with
+defaults. Saves remain atomic and malformed files are preserved. Non-canonical
+legacy/portable backends retain their existing queue workflow.
+
 ### Discovery, ratings, history and dashboard
 
 Ratings/favorites remain canonical track data. Track rows expose a favorite
@@ -840,3 +875,16 @@ cleanup.
     there are no separate artist/album statistics screens. History storage is
     aggregated per TrackId, so individual play-event timestamps beyond the last
     play are not retained.
+23. Detailed event-level listening history and explicit listening-session
+    objects/boundaries are not implemented; the aggregate `history.flux`
+    cannot reconstruct them without fabricating chronology. Recent/Most Played
+    remain aggregate views.
+24. Gapless playback and crossfade are deferred. The current engine owns one
+    decoder/output session at a time and performs explicit per-track loads; it
+    has no preloaded next decoder, mixed output graph, or testable sample-level
+    continuity path. Flux does not simulate either by shortening UI timers or
+    issuing GUI volume automation. Queue persistence/shuffle modes work without
+    gapless assumptions.
+25. Multi-entry queue removal and a dedicated queue clear action are not exposed
+    in the GUI; individual removal/reorder and queue population from track/
+    playlist actions remain available.
