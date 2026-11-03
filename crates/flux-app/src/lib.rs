@@ -644,6 +644,35 @@ pub enum ControllerEvent {
     Error(String),
 }
 
+/// User-facing playback mode combining repeat and shuffle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackMode {
+    /// Play through the queue once.
+    Normal,
+    /// Repeat the current entry when it ends.
+    RepeatOne,
+    /// Repeat the full queue.
+    RepeatAll,
+    /// Shuffle the current queue without repeat.
+    Shuffle,
+    /// Shuffle and repeat the full queue.
+    ShuffleAll,
+}
+
+impl PlaybackMode {
+    /// Stable user-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::RepeatOne => "repeat one",
+            Self::RepeatAll => "repeat all",
+            Self::Shuffle => "shuffle",
+            Self::ShuffleAll => "shuffle + repeat all",
+        }
+    }
+}
+
 /// How the scan worker persists the scanned library — the active
 /// backend travels with the work so a scan can only ever write to
 /// the backend the controller was constructed with.
@@ -1043,6 +1072,12 @@ pub struct Controller {
     history_write_protected: bool,
     /// Increments when history changes so derived GUI summaries can invalidate.
     history_generation: u64,
+    /// Shuffle traversal active.
+    shuffle: bool,
+    /// Stable shuffle order for the current queue cycle.
+    shuffle_order: Vec<QueueEntryId>,
+    /// Position restored from persistence, applied on the next play.
+    restored_position_ms: u64,
     /// Session-local meaningful-play accumulator.
     play_session: Option<PlaySession>,
     /// Exclusive OS ownership of the active library's catalogue. Held
@@ -1288,6 +1323,10 @@ impl Controller {
         let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
             load_queue(queue_store.as_ref(), &library);
+        let restored_playback = queue_store
+            .as_ref()
+            .and_then(|store| store.load().ok().flatten())
+            .and_then(|loaded| loaded.playback);
         let history_store = Some(PlaybackHistoryStore::new(canonical_history_path(&root)));
         let (playback_history, history_write_protected, history_error) =
             load_history(history_store.as_ref());
@@ -1317,6 +1356,7 @@ impl Controller {
         if let Some(error) = history_error {
             controller.report_error(error);
         }
+        controller.restore_queue_playback(restored_playback);
         controller.report_status(format!("Opened canonical library at {}.", root.display()));
         Ok(controller)
     }
@@ -1389,6 +1429,9 @@ impl Controller {
             history_store,
             history_write_protected,
             history_generation: 0,
+            shuffle: false,
+            shuffle_order: Vec::new(),
+            restored_position_ms: 0,
             play_session: None,
             library_lock,
             legacy_index_write_protected: false,
@@ -2289,6 +2332,7 @@ impl Controller {
         if self.player.state() == PlaybackState::Playing && !had_loaded_track {
             self.engine.play();
         }
+        self.persist_queue();
         Ok(target)
     }
 
@@ -2476,6 +2520,10 @@ impl Controller {
         let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
             load_queue(queue_store.as_ref(), &library);
+        let restored_playback = queue_store
+            .as_ref()
+            .and_then(|store| store.load().ok().flatten())
+            .and_then(|loaded| loaded.playback);
         let history_store = Some(PlaybackHistoryStore::new(canonical_history_path(&root)));
         let (playback_history, history_write_protected, history_error) =
             load_history(history_store.as_ref());
@@ -2495,6 +2543,7 @@ impl Controller {
             history_store,
             history_write_protected,
         });
+        self.restore_queue_playback(restored_playback);
         self.report_status(format!(
             "Switched to the canonical library at {}.",
             root.display()
@@ -2790,6 +2839,9 @@ impl Controller {
         self.history_store = history_store;
         self.history_write_protected = history_write_protected;
         self.history_generation = self.history_generation.wrapping_add(1);
+        self.shuffle = false;
+        self.shuffle_order.clear();
+        self.restored_position_ms = 0;
         self.play_session = None;
         *self.player.queue_mut() = queue;
 
@@ -4282,7 +4334,23 @@ impl Controller {
     /// Starts or resumes playback of the current selection.
     pub fn play(&mut self) {
         match self.player.play() {
-            Ok(()) => self.sync_engine(false),
+            Ok(()) => {
+                if self.restored_position_ms > 0
+                    && let Some(id) = self.player.current_track()
+                {
+                    let position = Duration::from_millis(self.restored_position_ms);
+                    if let Err(error) = self.load_into_engine(id, false) {
+                        self.fail_playback(error);
+                        return;
+                    }
+                    let session = self.engine.seek(position);
+                    self.engine_session = Some(session);
+                    self.engine.play();
+                    self.restored_position_ms = 0;
+                } else {
+                    self.sync_engine(false);
+                }
+            }
             Err(err) => self.report_error(format!("Nothing to play: {err}")),
         }
     }
@@ -4290,6 +4358,7 @@ impl Controller {
     /// Pauses playback (no-op unless playing).
     pub fn pause(&mut self) {
         self.player.pause();
+        self.persist_queue();
         self.sync_engine(false);
     }
 
@@ -4305,6 +4374,7 @@ impl Controller {
     /// Stops playback. The selection is retained.
     pub fn stop(&mut self) {
         self.player.stop();
+        self.persist_queue();
         self.sync_engine(false);
     }
 
@@ -4312,37 +4382,188 @@ impl Controller {
     /// playback stops. While paused, the new track is loaded paused.
     pub fn next(&mut self) {
         let before = self.current_queue_entry_id();
-        self.player.next_track();
+        if self.shuffle {
+            self.sync_shuffle_order();
+            let wrap = self.player.repeat_mode() == RepeatMode::All;
+            if let Some(entry) = self.shuffle_neighbor(1, wrap) {
+                let _ = self.player.queue_mut().set_current_entry(entry);
+            } else {
+                self.player.stop();
+            }
+        } else {
+            self.player.next_track();
+        }
         if before != self.current_queue_entry_id() {
             self.after_queue_change();
         }
         self.sync_engine(true);
     }
 
-    /// Skips to the previous track; on the first track, restarts it.
+    /// Skips to the previous entry. After three seconds of playback this
+    /// restarts the current track instead, matching common player behavior.
     pub fn previous(&mut self) {
+        if self.position() >= Duration::from_secs(3)
+            && self.current_id().is_some()
+            && self.seek(Duration::ZERO).is_ok()
+        {
+            self.persist_queue();
+            return;
+        }
         let before = self.current_queue_entry_id();
-        self.player.previous_track();
+        if self.shuffle {
+            self.sync_shuffle_order();
+            if let Some(entry) = self.shuffle_neighbor(-1, false) {
+                let _ = self.player.queue_mut().set_current_entry(entry);
+            }
+        } else {
+            self.player.previous_track();
+        }
         if before != self.current_queue_entry_id() {
             self.after_queue_change();
         }
         self.sync_engine(true);
+    }
+
+    fn rebuild_shuffle_order(&mut self) {
+        let current = self.player.queue().current_entry_id();
+        let entries = self
+            .player
+            .queue()
+            .entries()
+            .iter()
+            .map(|entry| (entry.id(), entry.track()))
+            .collect::<Vec<_>>();
+        self.shuffle_order = make_shuffle_order(entries, current, shuffle_seed());
+    }
+
+    fn sync_shuffle_order(&mut self) {
+        if !self.shuffle {
+            return;
+        }
+        let present = self
+            .player
+            .queue()
+            .entries()
+            .iter()
+            .map(|entry| entry.id())
+            .collect::<std::collections::HashSet<_>>();
+        self.shuffle_order.retain(|entry| present.contains(entry));
+        for entry in self.player.queue().entries() {
+            if !self.shuffle_order.contains(&entry.id()) {
+                self.shuffle_order.push(entry.id());
+            }
+        }
+        if self.shuffle_order.is_empty() {
+            self.rebuild_shuffle_order();
+        }
+    }
+
+    fn shuffle_neighbor(&self, direction: isize, wrap: bool) -> Option<QueueEntryId> {
+        let current = self.player.queue().current_entry_id()?;
+        if self.shuffle_order.is_empty() {
+            return None;
+        }
+        let index = self
+            .shuffle_order
+            .iter()
+            .position(|entry| *entry == current)
+            .unwrap_or(0) as isize;
+        let mut target = index + direction;
+        if target < 0 {
+            if wrap {
+                target = self.shuffle_order.len() as isize - 1;
+            } else {
+                return Some(current);
+            }
+        }
+        if target >= self.shuffle_order.len() as isize {
+            if wrap {
+                target = 0;
+            } else {
+                return None;
+            }
+        }
+        self.shuffle_order.get(target as usize).copied()
+    }
+
+    fn advance_shuffle_on_end(&mut self) -> Option<QueueEntryId> {
+        self.sync_shuffle_order();
+        let next = self.shuffle_neighbor(1, self.player.repeat_mode() == RepeatMode::All);
+        if let Some(entry) = next {
+            let _ = self.player.queue_mut().set_current_entry(entry);
+        }
+        next
+    }
+
+    /// Current combined playback mode.
+    #[must_use]
+    pub fn playback_mode(&self) -> PlaybackMode {
+        match (self.player.repeat_mode(), self.shuffle) {
+            (RepeatMode::One, _) => PlaybackMode::RepeatOne,
+            (RepeatMode::All, true) => PlaybackMode::ShuffleAll,
+            (RepeatMode::All, false) => PlaybackMode::RepeatAll,
+            (_, true) => PlaybackMode::Shuffle,
+            _ => PlaybackMode::Normal,
+        }
+    }
+
+    /// Applies a combined playback mode.
+    pub fn set_playback_mode(&mut self, mode: PlaybackMode) {
+        match mode {
+            PlaybackMode::Normal => {
+                self.player.set_repeat_mode(RepeatMode::Off);
+                self.shuffle = false;
+            }
+            PlaybackMode::RepeatOne => {
+                self.player.set_repeat_mode(RepeatMode::One);
+                self.shuffle = false;
+            }
+            PlaybackMode::RepeatAll => {
+                self.player.set_repeat_mode(RepeatMode::All);
+                self.shuffle = false;
+            }
+            PlaybackMode::Shuffle => {
+                self.player.set_repeat_mode(RepeatMode::Off);
+                self.shuffle = true;
+            }
+            PlaybackMode::ShuffleAll => {
+                self.player.set_repeat_mode(RepeatMode::All);
+                self.shuffle = true;
+            }
+        }
+        if self.shuffle {
+            self.rebuild_shuffle_order();
+        } else {
+            self.shuffle_order.clear();
+        }
+        self.persist_queue();
+        self.report_status(format!("Playback mode: {}.", mode.label()));
+    }
+
+    /// Cycles Normal → Repeat All → Repeat One → Shuffle → Shuffle + Repeat All.
+    pub fn cycle_playback_mode(&mut self) {
+        self.set_playback_mode(match self.playback_mode() {
+            PlaybackMode::Normal => PlaybackMode::RepeatAll,
+            PlaybackMode::RepeatAll => PlaybackMode::RepeatOne,
+            PlaybackMode::RepeatOne => PlaybackMode::Shuffle,
+            PlaybackMode::Shuffle => PlaybackMode::ShuffleAll,
+            PlaybackMode::ShuffleAll => PlaybackMode::Normal,
+        });
     }
 
     /// Sets the repeat mode used for skips and end-of-track handling.
     pub fn set_repeat_mode(&mut self, mode: RepeatMode) {
         self.player.set_repeat_mode(mode);
+        if mode == RepeatMode::One {
+            self.shuffle = false;
+            self.shuffle_order.clear();
+        }
+        self.persist_queue();
     }
 
-    /// Cycles repeat: Off → All → One → Off.
+    /// Cycles the full playback mode.
     pub fn cycle_repeat_mode(&mut self) {
-        let next = match self.player.repeat_mode() {
-            RepeatMode::Off => RepeatMode::All,
-            RepeatMode::All => RepeatMode::One,
-            RepeatMode::One => RepeatMode::Off,
-        };
-        self.set_repeat_mode(next);
-        self.report_status(format!("Repeat: {}", repeat_label(next)));
+        self.cycle_playback_mode();
     }
 
     /// Sets the volume (clamped to `0.0..=1.0`) and applies it to the
@@ -4535,6 +4756,7 @@ impl Controller {
     /// Clean shutdown: waits for any running scan to finish (its save
     /// included), then stops the audio engine and joins its worker.
     pub fn shutdown(mut self) {
+        self.persist_queue();
         if let Some(rx) = self.scan_rx.take()
             && let Ok(outcome) = rx.recv()
         {
@@ -4552,6 +4774,23 @@ impl Controller {
     /// completion, and engine events (end-of-track advancement and
     /// playback errors are handled here). Never blocks; call it on a
     /// short timer from the UI event loop.
+    /// Restores persisted playback mode/position. Queue loading remains
+    /// paused; position is applied only when the user explicitly plays.
+    fn restore_queue_playback(&mut self, state: Option<flux_library::PersistedPlaybackState>) {
+        let Some(state) = state else {
+            return;
+        };
+        self.player.set_repeat_mode(state.repeat_mode);
+        self.shuffle = state.shuffle;
+        self.restored_position_ms = state.position_ms;
+        if self.player.queue().current_entry().is_some() {
+            self.player.restore_paused();
+        }
+        if self.shuffle {
+            self.rebuild_shuffle_order();
+        }
+    }
+
     /// Aggregated local playback history for the active canonical library.
     #[must_use]
     pub fn playback_history(&self) -> &PlaybackHistory {
@@ -4748,8 +4987,16 @@ impl Controller {
                     // clears the sync ledger so a later Play performs a
                     // fresh load instead of restarting an old session.
                     let before = self.current_queue_entry_id();
-                    self.player.on_track_ended();
-                    if before != self.current_queue_entry_id() {
+                    if self.shuffle {
+                        if self.advance_shuffle_on_end().is_none() {
+                            self.player.stop();
+                        }
+                    } else {
+                        self.player.on_track_ended();
+                    }
+                    if before != self.current_queue_entry_id()
+                        || self.player.state() != PlaybackState::Playing
+                    {
                         self.after_queue_change();
                     }
                     self.sync_engine(true);
@@ -4794,6 +5041,7 @@ impl Controller {
     /// or a protected/recovered catalogue leaves the original file
     /// untouched.
     fn after_queue_change(&mut self) {
+        self.sync_shuffle_order();
         self.persist_queue();
         self.outbox.push(ControllerEvent::QueueChanged);
     }
@@ -4805,7 +5053,15 @@ impl Controller {
         let Some(store) = &self.queue_store else {
             return;
         };
-        let result = store.save(self.player.queue(), self.queue_auto_library);
+        let position_ms = self.engine.position().as_millis().min(u128::from(u64::MAX)) as u64;
+        let playback = flux_library::PersistedPlaybackState {
+            repeat_mode: self.player.repeat_mode(),
+            shuffle: self.shuffle,
+            was_playing: self.player.state() == PlaybackState::Playing,
+            position_ms,
+        };
+        let result =
+            store.save_with_state(self.player.queue(), self.queue_auto_library, Some(playback));
         if let Err(error) = result {
             let message = format!(
                 "Could not save the playback queue ({}): {error}. \
@@ -5371,14 +5627,6 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, String> {
     }
 }
 
-fn repeat_label(mode: RepeatMode) -> &'static str {
-    match mode {
-        RepeatMode::Off => "off",
-        RepeatMode::All => "all",
-        RepeatMode::One => "one",
-    }
-}
-
 /// Checks that `root` can be scanned as a *folder*: it must exist and
 /// be a directory. Checked with `symlink_metadata`, so a symbolic link
 /// is reported as a link rather than silently followed — consistent
@@ -5567,6 +5815,44 @@ fn legacy_queue_path(canonical_index: &Path) -> PathBuf {
 /// The queue file for a portable library: inside a private subdirectory
 /// of `.flux`, away from immutable segments and from the store's GC
 /// patterns.
+fn shuffle_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9e37_79b9_7f4a_7c15, |duration| duration.as_nanos() as u64)
+}
+
+fn make_shuffle_order(
+    mut entries: Vec<(QueueEntryId, TrackId)>,
+    current: Option<QueueEntryId>,
+    mut seed: u64,
+) -> Vec<QueueEntryId> {
+    if let Some(current) = current
+        && let Some(index) = entries.iter().position(|(entry, _)| *entry == current)
+    {
+        let entry = entries.remove(index);
+        entries.insert(0, entry);
+    }
+    let start = usize::from(current.is_some());
+    for index in ((start + 1)..entries.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let swap = start + (seed as usize % (index + 1 - start));
+        entries.swap(index, swap);
+    }
+    // Avoid adjacent duplicate TrackIds when an alternative exists. Entry IDs
+    // remain distinct even when the track repeats.
+    for index in 1..entries.len() {
+        if entries[index].1 == entries[index - 1].1
+            && let Some(swap) = (index + 1..entries.len())
+                .find(|candidate| entries[*candidate].1 != entries[index - 1].1)
+        {
+            entries.swap(index, swap);
+        }
+    }
+    entries.into_iter().map(|(entry, _)| entry).collect()
+}
+
 fn shuffle_track_ids(tracks: &mut [TrackId]) {
     if tracks.len() < 2 {
         return;
@@ -9076,10 +9362,10 @@ mod tests {
             queue.push(a);
             let missing = queue.push(TrackId::new(999));
             queue.set_current_entry(missing).expect("missing current");
+            controller.shutdown();
             QueueStore::new(legacy_queue_file(&dir))
                 .save(&queue, false)
                 .expect("write missing-entry queue");
-            controller.shutdown();
         }
 
         let (mut controller, _control) = boot(&dir);
@@ -9579,13 +9865,13 @@ mod tests {
         fs::remove_file(&queue_file).expect("remove queue for observation");
 
         controller.set_volume(0.42);
-        controller.cycle_repeat_mode();
+        assert!(!queue_file.exists(), "volume is not a queue write");
         controller.toggle_play_pause();
         controller.stop();
         controller.pause();
         assert!(
-            !queue_file.exists(),
-            "volume, repeat, pause, and stop are not queue writes"
+            queue_file.exists(),
+            "playback state is persisted on pause/stop"
         );
 
         controller.next();
@@ -10543,5 +10829,46 @@ mod tests {
         assert_eq!(reopened.track_last_played_unix_ms(id), Some(234_567));
         assert_eq!(reopened.history_generation(), 0, "loaded history is stable");
         reopened.shutdown();
+    }
+
+    #[test]
+    fn shuffle_order_is_deterministic_distinct_and_avoids_adjacent_duplicate_tracks() {
+        let entries = vec![
+            (QueueEntryId::new(1), TrackId::new(10)),
+            (QueueEntryId::new(2), TrackId::new(10)),
+            (QueueEntryId::new(3), TrackId::new(20)),
+            (QueueEntryId::new(4), TrackId::new(30)),
+        ];
+        let first = super::make_shuffle_order(entries.clone(), Some(QueueEntryId::new(1)), 7);
+        let second = super::make_shuffle_order(entries.clone(), Some(QueueEntryId::new(1)), 7);
+        assert_eq!(first, second, "seed is deterministic");
+        assert_eq!(
+            first[0],
+            QueueEntryId::new(1),
+            "current entry remains first"
+        );
+        assert_eq!(first.len(), 4);
+        let mut unique = first.clone();
+        unique.sort_by_key(|id| id.get());
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            4,
+            "duplicate entry identities remain distinct"
+        );
+        for pair in first.windows(2) {
+            let left = entries
+                .iter()
+                .find(|(id, _)| *id == pair[0])
+                .map(|(_, t)| *t);
+            let right = entries
+                .iter()
+                .find(|(id, _)| *id == pair[1])
+                .map(|(_, t)| *t);
+            assert_ne!(
+                left, right,
+                "shuffle avoids adjacent same-track entries when possible"
+            );
+        }
     }
 }

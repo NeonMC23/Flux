@@ -15,7 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use flux_core::{Queue, QueueEntry, QueueEntryId, TrackId};
+use flux_core::{Queue, QueueEntry, QueueEntryId, RepeatMode, TrackId};
 use serde::{Deserialize, Serialize};
 
 use crate::fs_ops::replace_file;
@@ -32,6 +32,21 @@ pub struct LoadedQueue {
     /// (and may receive newly scanned tracks) rather than a queue the user
     /// has structurally edited.
     pub auto_library: bool,
+    /// Last persisted playback mode and position, when present.
+    pub playback: Option<PersistedPlaybackState>,
+}
+
+/// Minimum playback state persisted with the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedPlaybackState {
+    /// Repeat mode.
+    pub repeat_mode: RepeatMode,
+    /// Whether shuffle traversal was active.
+    pub shuffle: bool,
+    /// Whether playback was active at save time.
+    pub was_playing: bool,
+    /// Current engine position in milliseconds.
+    pub position_ms: u64,
 }
 
 /// A versioned queue file at a caller-supplied path.
@@ -87,9 +102,11 @@ impl QueueStore {
                 "entry IDs, counter, or current-entry selection are inconsistent".to_owned(),
             )
         })?;
+        let playback = file.playback.map(PersistedPlaybackState::from);
         Ok(Some(LoadedQueue {
             queue,
             auto_library: file.auto_library,
+            playback,
         }))
     }
 
@@ -100,6 +117,16 @@ impl QueueStore {
     /// [`QueueStoreError::Io`] when the file cannot be written, synced, or
     /// replaced. A failed save leaves the previous queue file in place.
     pub fn save(&self, queue: &Queue, auto_library: bool) -> Result<(), QueueStoreError> {
+        self.save_with_state(queue, auto_library, None)
+    }
+
+    /// Atomically writes the queue and optional playback state.
+    pub fn save_with_state(
+        &self,
+        queue: &Queue,
+        auto_library: bool,
+        playback: Option<PersistedPlaybackState>,
+    ) -> Result<(), QueueStoreError> {
         let file = QueueFile {
             version: QUEUE_SCHEMA_VERSION,
             next_entry_id: queue.next_entry_id(),
@@ -113,6 +140,7 @@ impl QueueStore {
                     track_id: entry.track().get(),
                 })
                 .collect(),
+            playback: playback.map(PersistedPlaybackRecord::from),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(QueueStoreError::Serialize)?;
 
@@ -150,12 +178,56 @@ struct QueueFile {
     auto_library: bool,
     #[serde(default)]
     entries: Vec<QueueEntryRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    playback: Option<PersistedPlaybackRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct QueueEntryRecord {
     id: u64,
     track_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedPlaybackRecord {
+    #[serde(default)]
+    repeat_mode: u8,
+    #[serde(default)]
+    shuffle: bool,
+    #[serde(default)]
+    was_playing: bool,
+    #[serde(default)]
+    position_ms: u64,
+}
+
+impl From<PersistedPlaybackState> for PersistedPlaybackRecord {
+    fn from(state: PersistedPlaybackState) -> Self {
+        Self {
+            repeat_mode: match state.repeat_mode {
+                RepeatMode::Off => 0,
+                RepeatMode::All => 1,
+                RepeatMode::One => 2,
+            },
+            shuffle: state.shuffle,
+            was_playing: state.was_playing,
+            position_ms: state.position_ms,
+        }
+    }
+}
+
+impl From<PersistedPlaybackRecord> for PersistedPlaybackState {
+    fn from(state: PersistedPlaybackRecord) -> Self {
+        Self {
+            repeat_mode: match state.repeat_mode {
+                1 => RepeatMode::All,
+                2 => RepeatMode::One,
+                _ => RepeatMode::Off,
+            },
+            shuffle: state.shuffle,
+            was_playing: state.was_playing,
+            position_ms: state.position_ms,
+        }
+    }
 }
 
 /// Errors produced while loading or saving a queue file.
@@ -230,7 +302,7 @@ fn sync_parent(path: &Path) -> Result<(), QueueStoreError> {
 mod tests {
     use std::fs;
 
-    use flux_core::{Queue, TrackId};
+    use flux_core::{Queue, RepeatMode, TrackId};
 
     use super::{QUEUE_SCHEMA_VERSION, QueueStore};
     use crate::test_support::TempDir;
@@ -265,6 +337,33 @@ mod tests {
         );
         assert_eq!(loaded.queue.len(), 3, "duplicate tracks stay distinct");
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn playback_state_round_trips_and_old_files_remain_readable() {
+        let dir = TempDir::new("queue-playback-state");
+        let path = dir.path().join("queue.json");
+        let store = QueueStore::new(&path);
+        let queue = queue_with_duplicates();
+        let state = super::PersistedPlaybackState {
+            repeat_mode: RepeatMode::All,
+            shuffle: true,
+            was_playing: true,
+            position_ms: 42_500,
+        };
+        store
+            .save_with_state(&queue, false, Some(state))
+            .expect("save state");
+        let loaded = store.load().expect("load").expect("exists");
+        assert_eq!(loaded.playback, Some(state));
+
+        fs::write(
+            &path,
+            r#"{"version":1,"next_entry_id":2,"current_entry_id":1,"entries":[{"id":1,"track_id":10}]}"#,
+        )
+        .expect("old fixture");
+        let old = store.load().expect("old load").expect("exists");
+        assert_eq!(old.playback, None);
     }
 
     #[test]

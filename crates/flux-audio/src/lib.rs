@@ -178,6 +178,13 @@ impl Player {
         }
     }
 
+    /// Marks a restored queue as paused without starting audio.
+    pub fn restore_paused(&mut self) {
+        if self.queue.current_entry().is_some() {
+            self.state = PlaybackState::Paused;
+        }
+    }
+
     /// Stops playback from any state. The queue and its current selection
     /// are retained, so a later [`play`](Player::play) resumes from the
     /// same selected track.
