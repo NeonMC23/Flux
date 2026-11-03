@@ -38,14 +38,23 @@
 //!   `TrackEnded` events.
 //! - [`EngineEvent::TrackEnded`] fires only after the decoder reached
 //!   EOF **and** the ring buffer has fully drained through the backend
-//!   — never merely when decoding finished.
+//!   — never merely when decoding finished. It is the fallback when no
+//!   prepared successor exists.
+//! - A matching prepared source is consumed at the active decoder's
+//!   end-of-stream **inside the same generation**. The converter tail
+//!   is pushed first, then the prepared decoder continues into the same
+//!   ring. No device restart, ring flush or artificial gap is inserted.
+//!   [`EngineEvent::Transitioned`] is emitted exactly once when the
+//!   device has consumed up to the old source's final output frame.
 //! - [`EngineHandle::preload`] opens at most one future decoder on the
 //!   worker, independently of the active one. A matching load consumes
 //!   it; a different load, cancellation or replacement drops it. A
 //!   preload failure is reported separately and cannot disturb the
-//!   active source. Preparation does not make the subsequent load
-//!   gapless: the normal load still starts a new generation and flushes
-//!   the ring.
+//!   active source.
+//! - Load, seek, stop and restart bump the generation and flush buffered
+//!   audio. A natural handoff does **not** bump it: seek/stop/replacement
+//!   invalidate stale samples explicitly, while adjacent sources stay in
+//!   one continuous output generation.
 //!
 //! The engine knows nothing about libraries, queues, or scanning: the
 //! caller hands it a [`TrackId`] (echoed back in events) and a file
@@ -60,7 +69,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flux_core::TrackId;
+use flux_core::{QueueEntryId, TrackId};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
@@ -132,6 +141,8 @@ pub enum EngineEvent {
         session: u64,
         /// The caller-supplied track ID.
         id: TrackId,
+        /// The stable queue entry this source belongs to.
+        entry: QueueEntryId,
         /// The decoded stream's facts (file sample rate/channels).
         info: StreamInfo,
     },
@@ -139,6 +150,8 @@ pub enum EngineEvent {
     Preloaded {
         /// Caller-supplied track ID.
         id: TrackId,
+        /// Stable queue entry the prepared source belongs to.
+        entry: QueueEntryId,
         /// Decoded stream facts.
         info: StreamInfo,
     },
@@ -146,6 +159,8 @@ pub enum EngineEvent {
     PreloadFailed {
         /// Caller-supplied track ID.
         id: TrackId,
+        /// Stable queue entry the preparation was for.
+        entry: QueueEntryId,
         /// Failure detail.
         error: EngineError,
     },
@@ -165,11 +180,34 @@ pub enum EngineEvent {
     },
     /// Playback stopped and the loaded track was unloaded.
     Stopped,
+    /// The engine completed a natural gapless handoff at the exact
+    /// output-frame boundary. No new load was requested and no output
+    /// generation was flushed.
+    Transitioned {
+        /// Load session for the active pipeline generation.
+        session: u64,
+        /// Output generation that contains the transition.
+        generation: u64,
+        /// Source that just ended.
+        from_id: TrackId,
+        /// Stable queue entry of the source that ended.
+        from_entry: QueueEntryId,
+        /// Source that is now active.
+        to_id: TrackId,
+        /// Stable queue entry of the source that is now active.
+        to_entry: QueueEntryId,
+        /// Monotonic output-frame boundary since the generation began.
+        boundary_frame: u64,
+        /// Decoded facts for the new source.
+        info: StreamInfo,
+    },
     /// The track played to completion: every decoded sample has been
     /// consumed by the backend.
     TrackEnded {
         /// The load session that ended.
         session: u64,
+        /// The stable queue entry that ended.
+        entry: QueueEntryId,
         /// The track that ended.
         id: TrackId,
     },
@@ -192,6 +230,7 @@ enum Command {
     Load {
         session: u64,
         id: TrackId,
+        entry: QueueEntryId,
         path: PathBuf,
     },
     Seek {
@@ -200,6 +239,7 @@ enum Command {
     },
     Preload {
         id: TrackId,
+        entry: QueueEntryId,
         path: PathBuf,
     },
     CancelPreload,
@@ -230,8 +270,16 @@ struct Shared {
     decoder_eof: AtomicBool,
     /// Callback → worker: EOF was reached and the ring has drained.
     drained: AtomicBool,
-    /// Device frames actually delivered for the current generation.
+    /// Device audio frames actually delivered for the current generation.
     played_frames: AtomicU64,
+    /// Output frames pushed into the ring for the current generation.
+    /// This is a pipeline diagnostic; consumed position still comes only
+    /// from `played_frames`.
+    pushed_frames: AtomicU64,
+    /// Output-frame position within the generation where the currently
+    /// reported source began. Zero after load/seek; advanced only when a
+    /// natural transition actually reaches the output boundary.
+    source_start_frame: AtomicU64,
     /// Device frames represented by an earlier seek. Reset on load/stop;
     /// preserved across the callback's generation flush so a seek is
     /// reflected immediately in [`EngineHandle::position`].
@@ -248,6 +296,8 @@ impl Shared {
             decoder_eof: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             played_frames: AtomicU64::new(0),
+            pushed_frames: AtomicU64::new(0),
+            source_start_frame: AtomicU64::new(0),
             base_frames: AtomicU64::new(0),
         }
     }
@@ -258,6 +308,8 @@ impl Shared {
         self.gate_open.store(false, Ordering::Release);
         self.decoder_eof.store(false, Ordering::Release);
         self.drained.store(false, Ordering::Release);
+        self.pushed_frames.store(0, Ordering::Release);
+        self.source_start_frame.store(0, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
@@ -498,6 +550,13 @@ impl EngineHandle {
     /// caller ignore delayed events from an earlier load of the same
     /// track.
     pub fn load(&self, id: TrackId, path: PathBuf) -> u64 {
+        self.load_entry(id, QueueEntryId::new(0), path)
+    }
+
+    /// Queue-entry-aware load. The stable entry identity is carried
+    /// through load, preload and transition events so duplicate TrackIds
+    /// cannot be confused during a natural handoff.
+    pub fn load_entry(&self, id: TrackId, entry: QueueEntryId, path: PathBuf) -> u64 {
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
         assert!(
             session != 0,
@@ -505,7 +564,13 @@ impl EngineHandle {
         );
         self.shared.base_frames.store(0, Ordering::Release);
         self.shared.played_frames.store(0, Ordering::Release);
-        let _ = self.commands.send(Command::Load { session, id, path });
+        self.shared.source_start_frame.store(0, Ordering::Release);
+        let _ = self.commands.send(Command::Load {
+            session,
+            id,
+            entry,
+            path,
+        });
         session
     }
 
@@ -514,7 +579,14 @@ impl EngineHandle {
     /// cancellation replaces it. A subsequent matching [`load`](Self::load)
     /// can consume the prepared decoder.
     pub fn preload(&self, id: TrackId, path: PathBuf) {
-        let _ = self.commands.send(Command::Preload { id, path });
+        self.preload_entry(id, QueueEntryId::new(0), path);
+    }
+
+    /// Queue-entry-aware preparation. The engine will only consume this
+    /// decoder at a natural end-of-stream when its entry and source path
+    /// still match the active pipeline's authorized successor.
+    pub fn preload_entry(&self, id: TrackId, entry: QueueEntryId, path: PathBuf) {
+        let _ = self.commands.send(Command::Preload { id, entry, path });
     }
 
     /// Drops any prepared future decoder.
@@ -544,6 +616,7 @@ impl EngineHandle {
     pub fn stop(&self) {
         self.shared.base_frames.store(0, Ordering::Release);
         self.shared.played_frames.store(0, Ordering::Release);
+        self.shared.source_start_frame.store(0, Ordering::Release);
         let _ = self.commands.send(Command::Stop);
     }
 
@@ -569,6 +642,7 @@ impl EngineHandle {
         let frames = (position.as_secs_f64() * f64::from(self.config.sample_rate)).round() as u64;
         self.shared.base_frames.store(frames, Ordering::Release);
         self.shared.played_frames.store(0, Ordering::Release);
+        self.shared.source_start_frame.store(0, Ordering::Release);
         let _ = self.commands.send(Command::Seek { session, position });
         session
     }
@@ -593,11 +667,13 @@ impl EngineHandle {
         if self.config.sample_rate == 0 {
             return Duration::ZERO;
         }
+        let played = self.shared.played_frames.load(Ordering::Relaxed);
+        let source_start = self.shared.source_start_frame.load(Ordering::Relaxed);
         let frames = self
             .shared
             .base_frames
             .load(Ordering::Relaxed)
-            .saturating_add(self.shared.played_frames.load(Ordering::Relaxed));
+            .saturating_add(played.saturating_sub(source_start));
         Duration::from_secs_f64(frames as f64 / f64::from(self.config.sample_rate))
     }
 
@@ -638,15 +714,129 @@ impl Drop for EngineHandle {
 /// The currently loaded track on the worker side.
 struct LoadedTrack {
     id: TrackId,
+    entry: QueueEntryId,
     path: PathBuf,
     info: StreamInfo,
 }
 
 struct PreparedTrack {
     id: TrackId,
+    entry: QueueEntryId,
     path: PathBuf,
     info: StreamInfo,
     decoder: Box<dyn Decoder>,
+}
+
+struct PendingTransition {
+    from_id: TrackId,
+    from_entry: QueueEntryId,
+    to_id: TrackId,
+    to_entry: QueueEntryId,
+    boundary_frame: u64,
+    info: StreamInfo,
+}
+
+/// Reopens the currently audible source at its present source-relative
+/// position after a queue mutation invalidated an already-installed
+/// (but not yet promoted) handoff. The generation bump flushes both the
+/// old tail and the obsolete successor; the caller then prepares the
+/// newly authorized successor. This path may introduce silence, unlike
+/// a valid natural handoff.
+#[allow(clippy::too_many_arguments)]
+fn resume_current_after_invalidation(
+    shared: &Shared,
+    config: OutputConfig,
+    current: &LoadedTrack,
+    playing: bool,
+    decoder: &mut Option<Box<dyn Decoder>>,
+    converter: &mut Option<FormatConverter>,
+    pending: &mut Vec<f32>,
+    pending_sent: &mut usize,
+    incoming: &mut Option<LoadedTrack>,
+    pending_transition: &mut Option<PendingTransition>,
+    eof_reached: &mut bool,
+    ended_sent: &mut bool,
+) -> Result<(), DecodeError> {
+    let output_rate = f64::from(config.sample_rate);
+    let source_rate = f64::from(current.info.sample_rate);
+    let position_frames = shared.base_frames.load(Ordering::Acquire).saturating_add(
+        shared
+            .played_frames
+            .load(Ordering::Acquire)
+            .saturating_sub(shared.source_start_frame.load(Ordering::Acquire)),
+    );
+    let position = Duration::from_secs_f64(position_frames as f64 / output_rate);
+    let target = current
+        .info
+        .duration
+        .map_or(position, |duration| position.min(duration));
+    let target_output_frames = (target.as_secs_f64() * output_rate).round() as u64;
+
+    shared.bump_generation();
+    shared
+        .base_frames
+        .store(target_output_frames, Ordering::Release);
+    shared.played_frames.store(0, Ordering::Release);
+    *decoder = None;
+    *converter = None;
+    pending.clear();
+    *pending_sent = 0;
+    *incoming = None;
+    *pending_transition = None;
+    *ended_sent = false;
+
+    if current
+        .info
+        .duration
+        .is_some_and(|duration| target >= duration)
+    {
+        *eof_reached = true;
+        shared.gate_open.store(playing, Ordering::Release);
+        return Ok(());
+    }
+
+    let mut dec = open_decoder(&current.path)?;
+    let source_frames = (target.as_secs_f64() * source_rate).round() as u64;
+    let channels = usize::from(current.info.channels);
+    let mut skipped = 0u64;
+    let mut hit_eof = false;
+    while skipped < source_frames {
+        let want = (source_frames - skipped)
+            .min(DECODE_CHUNK_FRAMES as u64)
+            .max(1) as usize;
+        match dec.next_chunk(want) {
+            Ok(samples) if samples.is_empty() => {
+                hit_eof = true;
+                break;
+            }
+            Ok(samples) => {
+                let frames = samples.len() / channels;
+                if frames == 0 {
+                    hit_eof = true;
+                    break;
+                }
+                skipped = skipped.saturating_add(frames as u64);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let actual_source_frames = skipped.min(source_frames);
+    let actual_output_frames =
+        (actual_source_frames as f64 / source_rate * output_rate).round() as u64;
+    let actual_target_frames = if hit_eof {
+        actual_output_frames
+    } else {
+        target_output_frames
+    };
+    shared
+        .base_frames
+        .store(actual_target_frames, Ordering::Release);
+    *eof_reached = hit_eof;
+    *converter = Some(FormatConverter::new(&current.info, config));
+    *decoder = if hit_eof { None } else { Some(dec) };
+    shared.gate_open.store(playing, Ordering::Release);
+    Ok(())
 }
 
 /// The worker loop. Owns the backend, decoder, converter, and ring
@@ -705,6 +895,8 @@ fn run_worker<F>(
     let mut decoder: Option<Box<dyn Decoder>> = None;
     let mut prepared: Option<PreparedTrack> = None;
     let mut current: Option<LoadedTrack> = None;
+    let mut incoming: Option<LoadedTrack> = None;
+    let mut pending_transition: Option<PendingTransition> = None;
     let mut converter: Option<FormatConverter> = None;
     let mut pending: Vec<f32> = Vec::new();
     let mut pending_sent = 0usize;
@@ -719,14 +911,22 @@ fn run_worker<F>(
     // A failed load already reported the meaningful error; a Play that
     // arrives immediately afterwards must not add NoTrackLoaded.
     let mut last_load_failed = false;
+    let output_channels = usize::from(config.channels);
 
     'worker: loop {
         match commands.recv_timeout(WORKER_TICK) {
-            Ok(Command::Load { session, id, path }) => {
+            Ok(Command::Load {
+                session,
+                id,
+                entry,
+                path,
+            }) => {
                 current_session = session;
                 current_generation = shared.bump_generation();
                 decoder = None;
                 current = None;
+                incoming = None;
+                pending_transition = None;
                 converter = None;
                 pending.clear();
                 pending_sent = 0;
@@ -734,9 +934,9 @@ fn run_worker<F>(
                 eof_reached = false;
                 ended_sent = false;
                 last_load_failed = false;
-                let reusable = prepared
-                    .as_ref()
-                    .is_some_and(|prepared| prepared.id == id && prepared.path == path);
+                let reusable = prepared.as_ref().is_some_and(|prepared| {
+                    prepared.id == id && prepared.entry == entry && prepared.path == path
+                });
                 let opened = if reusable {
                     let prepared = prepared.take().expect("prepared exists");
                     Ok((prepared.decoder, prepared.info))
@@ -751,8 +951,18 @@ fn run_worker<F>(
                     Ok((dec, info)) => {
                         converter = Some(FormatConverter::new(&info, config));
                         decoder = Some(dec);
-                        current = Some(LoadedTrack { id, path, info });
-                        send(EngineEvent::Loaded { session, id, info });
+                        current = Some(LoadedTrack {
+                            id,
+                            entry,
+                            path,
+                            info,
+                        });
+                        send(EngineEvent::Loaded {
+                            session,
+                            id,
+                            entry,
+                            info,
+                        });
                     }
                     Err(err) => {
                         last_load_failed = true;
@@ -787,6 +997,8 @@ fn run_worker<F>(
                     .store(target_output_frames, Ordering::Release);
                 shared.played_frames.store(0, Ordering::Release);
                 decoder = None;
+                incoming = None;
+                pending_transition = None;
                 converter = None;
                 pending.clear();
                 pending_sent = 0;
@@ -794,11 +1006,11 @@ fn run_worker<F>(
                 last_load_failed = false;
 
                 if total.is_some_and(|duration| target >= duration) {
-                    // The requested point is the end of the track. There
-                    // is no audio left to pre-roll; let the callback's
-                    // normal drained path report TrackEnded if playing.
+                    // The requested point is the end of the track. If a
+                    // prepared successor exists, the pump below will hand
+                    // off to it; otherwise the normal drained path ends
+                    // this source.
                     eof_reached = true;
-                    shared.decoder_eof.store(true, Ordering::Release);
                     shared.gate_open.store(playing, Ordering::Release);
                     continue 'worker;
                 }
@@ -870,30 +1082,71 @@ fn run_worker<F>(
                 decoder = Some(dec);
                 converter = Some(FormatConverter::new(&info, config));
                 if hit_eof {
-                    // The decoder is already at end-of-stream. Expose
-                    // the actual endpoint and let the normal drained
-                    // path decide whether playback ends.
+                    // The decoder is already at end-of-stream. The pump
+                    // below either hands off to a prepared successor or
+                    // lets the normal drained path end this source.
                     decoder = None;
-                    shared.decoder_eof.store(true, Ordering::Release);
                 }
                 shared.gate_open.store(playing, Ordering::Release);
             }
-            Ok(Command::Preload { id, path }) => {
+            Ok(Command::Preload { id, entry, path }) => {
+                let incoming_matches = incoming.as_ref().is_some_and(|track| {
+                    track.id == id && track.entry == entry && track.path == path
+                });
+                if pending_transition.is_some() && incoming_matches {
+                    // The newly authorized successor is exactly the one
+                    // already installed. Keep it and do not open a
+                    // redundant decoder.
+                    continue 'worker;
+                }
+                if pending_transition.is_some() && incoming.is_some() {
+                    let Some(track) = current.as_ref() else {
+                        continue 'worker;
+                    };
+                    if let Err(error) = resume_current_after_invalidation(
+                        &shared,
+                        config,
+                        track,
+                        playing,
+                        &mut decoder,
+                        &mut converter,
+                        &mut pending,
+                        &mut pending_sent,
+                        &mut incoming,
+                        &mut pending_transition,
+                        &mut eof_reached,
+                        &mut ended_sent,
+                    ) {
+                        playing = false;
+                        shared.gate_open.store(false, Ordering::Release);
+                        ended_sent = true;
+                        eof_reached = true;
+                        prepared = None;
+                        send(EngineEvent::Error {
+                            session: Some(current_session),
+                            id: Some(track.id),
+                            error: error.into(),
+                        });
+                        continue 'worker;
+                    }
+                }
                 prepared = None;
                 match open_decoder(&path) {
                     Ok(decoder) => {
                         let info = *decoder.info();
                         prepared = Some(PreparedTrack {
                             id,
+                            entry,
                             path,
                             info,
                             decoder,
                         });
-                        send(EngineEvent::Preloaded { id, info });
+                        send(EngineEvent::Preloaded { id, entry, info });
                     }
                     Err(error) => {
                         send(EngineEvent::PreloadFailed {
                             id,
+                            entry,
                             error: error.into(),
                         });
                     }
@@ -901,6 +1154,35 @@ fn run_worker<F>(
             }
             Ok(Command::CancelPreload) => {
                 prepared = None;
+                if pending_transition.is_some() && incoming.is_some() {
+                    let Some(track) = current.as_ref() else {
+                        continue 'worker;
+                    };
+                    if let Err(error) = resume_current_after_invalidation(
+                        &shared,
+                        config,
+                        track,
+                        playing,
+                        &mut decoder,
+                        &mut converter,
+                        &mut pending,
+                        &mut pending_sent,
+                        &mut incoming,
+                        &mut pending_transition,
+                        &mut eof_reached,
+                        &mut ended_sent,
+                    ) {
+                        playing = false;
+                        shared.gate_open.store(false, Ordering::Release);
+                        ended_sent = true;
+                        eof_reached = true;
+                        send(EngineEvent::Error {
+                            session: Some(current_session),
+                            id: Some(track.id),
+                            error: error.into(),
+                        });
+                    }
+                }
             }
             Ok(Command::Play) => match &current {
                 None => {
@@ -913,7 +1195,7 @@ fn run_worker<F>(
                     }
                 }
                 Some(track) => {
-                    if decoder.is_none() {
+                    if decoder.is_none() && incoming.is_none() {
                         // The track previously ended (or errored):
                         // pressing play restarts it from the beginning.
                         current_generation = shared.bump_generation();
@@ -923,6 +1205,7 @@ fn run_worker<F>(
                         pending_sent = 0;
                         eof_reached = false;
                         ended_sent = false;
+                        pending_transition = None;
                         match open_decoder(&track.path) {
                             Ok(dec) => {
                                 converter = Some(FormatConverter::new(&track.info, config));
@@ -967,6 +1250,8 @@ fn run_worker<F>(
                 decoder = None;
                 prepared = None;
                 current = None;
+                incoming = None;
+                pending_transition = None;
                 converter = None;
                 pending.clear();
                 pending_sent = 0;
@@ -989,61 +1274,166 @@ fn run_worker<F>(
         // ring applies backpressure), so resuming is instant; only an
         // absent/exhausted decoder idles.
         let generation_live = shared.acked_generation.load(Ordering::Acquire) == current_generation;
-        if generation_live && pending_sent < pending.len() {
-            pending_sent += producer.push_slice(&pending[pending_sent..]);
-            if pending_sent == pending.len() {
-                pending.clear();
-                pending_sent = 0;
-            }
-        } else if generation_live
-            && !eof_reached
-            && let Some(dec) = decoder.as_mut()
-        {
-            let chunk_samples = DECODE_CHUNK_FRAMES * usize::from(config.channels);
-            if producer.vacant_len() >= chunk_samples {
-                match dec.next_chunk(DECODE_CHUNK_FRAMES) {
-                    Ok(samples) if samples.is_empty() => {
-                        if let Some(conv) = converter.as_mut() {
-                            pending = conv.finish();
+        if generation_live {
+            // Several small state advances can happen in one tick. In
+            // particular, a prepared decoder is installed only after
+            // the old source's converter tail has been pushed, and the
+            // new source may then decode immediately into the same
+            // ring and generation.
+            'pump: loop {
+                let mut progressed = false;
+                if pending_sent < pending.len() {
+                    let pushed = producer.push_slice(&pending[pending_sent..]);
+                    if pushed > 0 {
+                        pending_sent += pushed;
+                        let frames = (pushed / output_channels) as u64;
+                        shared.pushed_frames.fetch_add(frames, Ordering::Relaxed);
+                        progressed = true;
+                    }
+                    if pending_sent == pending.len() {
+                        pending.clear();
+                        pending_sent = 0;
+                    }
+                } else if eof_reached && incoming.is_none() {
+                    let Some(next) = prepared.take() else {
+                        break 'pump;
+                    };
+                    let Some(from) = current.as_ref() else {
+                        prepared = Some(next);
+                        break 'pump;
+                    };
+                    let boundary_frame = shared.pushed_frames.load(Ordering::Acquire);
+                    let transition = PendingTransition {
+                        from_id: from.id,
+                        from_entry: from.entry,
+                        to_id: next.id,
+                        to_entry: next.entry,
+                        boundary_frame,
+                        info: next.info,
+                    };
+                    converter = Some(FormatConverter::new(&next.info, config));
+                    decoder = Some(next.decoder);
+                    incoming = Some(LoadedTrack {
+                        id: next.id,
+                        entry: next.entry,
+                        path: next.path,
+                        info: next.info,
+                    });
+                    pending.clear();
+                    pending_sent = 0;
+                    eof_reached = false;
+                    ended_sent = false;
+                    shared.decoder_eof.store(false, Ordering::Release);
+                    shared.drained.store(false, Ordering::Release);
+                    pending_transition = Some(transition);
+                    progressed = true;
+                } else if !eof_reached && pending.is_empty() {
+                    let Some(dec) = decoder.as_mut() else {
+                        break 'pump;
+                    };
+                    let chunk_samples = DECODE_CHUNK_FRAMES * output_channels;
+                    if producer.vacant_len() < chunk_samples {
+                        break 'pump;
+                    }
+                    match dec.next_chunk(DECODE_CHUNK_FRAMES) {
+                        Ok(samples) if samples.is_empty() => {
+                            if let Some(conv) = converter.as_mut() {
+                                pending = conv.finish();
+                            }
+                            eof_reached = true;
+                            progressed = true;
                         }
-                        eof_reached = true;
-                    }
-                    Ok(samples) => {
-                        if let Some(conv) = converter.as_mut() {
-                            pending = conv.process(&samples);
+                        Ok(samples) => {
+                            if let Some(conv) = converter.as_mut() {
+                                pending = conv.process(&samples);
+                            }
+                            progressed = true;
+                        }
+                        Err(err) => {
+                            let source_id = incoming
+                                .as_ref()
+                                .map(|track| track.id)
+                                .or_else(|| current.as_ref().map(|track| track.id));
+                            send(EngineEvent::Error {
+                                session: Some(current_session),
+                                id: source_id,
+                                error: err.into(),
+                            });
+                            decoder = None;
+                            prepared = None;
+                            incoming = None;
+                            pending_transition = None;
+                            converter = None;
+                            pending.clear();
+                            pending_sent = 0;
+                            playing = false;
+                            shared.gate_open.store(false, Ordering::Release);
+                            // Output stops here: with the gate closed the
+                            // callback emits silence, so samples still
+                            // buffered are never played (the next
+                            // generation change discards them). Never
+                            // report a clean TrackEnded after an error.
+                            ended_sent = true;
+                            eof_reached = true;
+                            break 'pump;
                         }
                     }
-                    Err(err) => {
-                        let id = current.as_ref().map(|t| t.id);
-                        send(EngineEvent::Error {
-                            session: Some(current_session),
-                            id,
-                            error: err.into(),
-                        });
-                        decoder = None;
-                        playing = false;
-                        shared.gate_open.store(false, Ordering::Release);
-                        // Output stops here: with the gate closed the
-                        // callback emits silence, so samples still
-                        // buffered are never played (the next
-                        // generation change discards them). Never
-                        // report a clean TrackEnded after an error.
-                        ended_sent = true;
-                        eof_reached = true;
-                    }
+                } else {
+                    break 'pump;
+                }
+                if !progressed {
+                    break 'pump;
                 }
             }
         }
-        if eof_reached && pending_sent == pending.len() {
+        if eof_reached && pending.is_empty() && (incoming.is_some() || prepared.is_none()) {
             shared.decoder_eof.store(true, Ordering::Release);
+        }
+
+        // Promote the new source only when its first output frame is the
+        // next one the device consumes. Until then the reported active
+        // source and its source-relative position remain the old one.
+        let transition_reached = pending_transition.as_ref().is_some_and(|transition| {
+            shared.played_frames.load(Ordering::Acquire) >= transition.boundary_frame
+        });
+        if transition_reached {
+            let transition = pending_transition.take().expect("transition checked");
+            if let Some(next) = incoming.take() {
+                current = Some(next);
+                // Keep the generation's seek base (usually zero) and
+                // fold it into the new source start in one atomic store.
+                // This avoids a visible position window between two
+                // stores: position remains base + played - source_start.
+                let base = shared.base_frames.load(Ordering::Acquire);
+                shared.source_start_frame.store(
+                    transition.boundary_frame.saturating_add(base),
+                    Ordering::Release,
+                );
+                send(EngineEvent::Transitioned {
+                    session: current_session,
+                    generation: current_generation,
+                    from_id: transition.from_id,
+                    from_entry: transition.from_entry,
+                    to_id: transition.to_id,
+                    to_entry: transition.to_entry,
+                    boundary_frame: transition.boundary_frame,
+                    info: transition.info,
+                });
+            }
         }
 
         // End-of-track: decoder EOF + ring fully drained (reported by
         // the callback through Shared::drained).
-        if playing && !ended_sent && shared.drained.load(Ordering::Acquire) {
+        if playing
+            && !ended_sent
+            && incoming.is_none()
+            && pending_transition.is_none()
+            && shared.drained.load(Ordering::Acquire)
+        {
             if let Some(track) = &current {
                 send(EngineEvent::TrackEnded {
                     session: current_session,
+                    entry: track.entry,
                     id: track.id,
                 });
             }
@@ -1147,7 +1537,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use flux_core::TrackId;
+    use flux_core::{QueueEntryId, TrackId};
 
     use super::{
         EngineError, EngineEvent, EngineHandle, FormatConverter, SampleSource, Shared,
@@ -1192,6 +1582,34 @@ mod tests {
         let sample = (value * 32_767.0) as i32;
         for _ in 0..frames {
             writer.write_sample(sample).expect("write sample");
+        }
+        writer.finalize().expect("finalize");
+        path
+    }
+
+    /// A 16-bit WAV with `channels` interleaved constant samples per
+    /// frame, used for channel/rate boundary tests.
+    fn write_dc_wav_channels(
+        dir: &TempDir,
+        name: &str,
+        rate: u32,
+        channels: u16,
+        frames: usize,
+        value: f32,
+    ) -> PathBuf {
+        let path = dir.0.join(name);
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        let sample = (value * 32_767.0) as i32;
+        for _ in 0..frames {
+            for _ in 0..channels {
+                writer.write_sample(sample).expect("write sample");
+            }
         }
         writer.finalize().expect("finalize");
         path
@@ -1257,6 +1675,23 @@ mod tests {
             .chunks_exact(channels)
             .filter(|frame| frame.iter().any(|s| s.abs() > 0.001))
             .count()
+    }
+
+    /// Acknowledges generation changes and waits until the worker has
+    /// pushed `frames` output frames into the ring. Draining zero frames
+    /// runs the callback's generation-flush path without consuming audio.
+    fn wait_for_pushed_frames(engine: &EngineHandle, control: &NullControl, frames: u64) {
+        for _ in 0..4_000 {
+            control.drain_frames(0);
+            if engine.shared.pushed_frames.load(Ordering::Acquire) >= frames {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "worker pushed {} of {frames} expected frames",
+            engine.shared.pushed_frames.load(Ordering::Acquire)
+        );
     }
 
     #[test]
@@ -1379,17 +1814,21 @@ mod tests {
         });
         assert!(matches!(events.last(), Some(EngineEvent::Started { .. })));
         control.clear_captured();
-        for _ in 0..20 {
+        let mut later_samples = 0;
+        for _ in 0..4_000 {
             control.drain_frames(512);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let captured = control.captured();
-        assert!(
-            captured
+            later_samples = control
+                .captured()
                 .iter()
                 .filter(|sample| (**sample + 0.3).abs() < 0.01)
-                .count()
-                > 1_000,
+                .count();
+            if later_samples > 1_000 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            later_samples > 1_000,
             "playing after a stopped seek must use the later source region"
         );
         engine.shutdown();
@@ -1420,17 +1859,21 @@ mod tests {
             "seek must update the reported position immediately"
         );
         control.clear_captured();
-        for _ in 0..20 {
+        let mut later_samples = 0;
+        for _ in 0..4_000 {
             control.drain_frames(512);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let captured = control.captured();
-        assert!(
-            captured
+            later_samples = control
+                .captured()
                 .iter()
                 .filter(|sample| (**sample + 0.3).abs() < 0.01)
-                .count()
-                > 1_000,
+                .count();
+            if later_samples > 1_000 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            later_samples > 1_000,
             "post-seek output must come from the later source region"
         );
 
@@ -1950,6 +2393,740 @@ mod tests {
             "the active source must survive a failed preload: {events:?}"
         );
         assert_eq!(nonzero_frames(&control, 1), 8_192);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn natural_handoff_is_frame_exact_and_reports_the_boundary_once() {
+        let dir = TempDir::new("gapless-exact");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_000, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(10), QueueEntryId::new(11));
+
+        let session = engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_a),
+        );
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 2_200);
+        let generation = engine.shared.generation.load(Ordering::Acquire);
+        let start_count = control.start_count();
+        control.clear_captured();
+
+        // Consume exactly one frame of the successor. The transition
+        // event must name boundary 1000, and the captured output must be
+        // 1000 old frames followed immediately by frame 0 of the new
+        // source.
+        control.drain_frames(1_001);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        let captured = control.captured();
+        assert_eq!(captured.len(), 1_001, "exactly one output frame per drain");
+        assert!(
+            captured[..1_000].iter().all(|s| (*s - 0.2).abs() < 0.01),
+            "first source frames changed"
+        );
+        assert!(
+            (*captured.get(1_000).expect("successor frame") - 0.8).abs() < 0.01,
+            "successor must begin at the immediately following frame"
+        );
+        let transition = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::Transitioned {
+                    session: got_session,
+                    generation: got_generation,
+                    from_id,
+                    from_entry,
+                    to_id,
+                    to_entry,
+                    boundary_frame,
+                    info,
+                } => Some((
+                    *got_session,
+                    *got_generation,
+                    *from_id,
+                    *from_entry,
+                    *to_id,
+                    *to_entry,
+                    *boundary_frame,
+                    info.sample_rate,
+                )),
+                _ => None,
+            })
+            .expect("transition event");
+        assert_eq!(
+            transition,
+            (
+                session, generation, id_a, entry_a, id_b, entry_b, 1_000, 44_100,
+            )
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackEnded { id, .. } if *id == id_a
+            )),
+            "a gapless handoff must not also emit TrackEnded for the old source"
+        );
+        assert_eq!(
+            engine.position(),
+            Duration::from_secs_f64(1.0 / 44_100.0),
+            "source-relative position must start at the new source"
+        );
+        assert_eq!(
+            engine.shared.generation.load(Ordering::Acquire),
+            generation,
+            "a natural handoff must not bump the output generation"
+        );
+        assert_eq!(
+            control.start_count(),
+            start_count,
+            "the output stream must not be recreated"
+        );
+
+        // Further consumption must not emit the same transition again.
+        control.drain_frames(500);
+        while let Ok(event) = engine.events().try_recv() {
+            assert!(
+                !matches!(event, EngineEvent::Transitioned { .. }),
+                "natural transition reported more than once: {event:?}"
+            );
+        }
+        engine.shutdown();
+    }
+
+    #[test]
+    fn duplicate_track_ids_transition_by_queue_entry_identity() {
+        let dir = TempDir::new("gapless-duplicate");
+        let path = write_dc_wav(&dir, "same.wav", 44_100, 1_000, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let id = TrackId::new(7);
+        let (entry_a, entry_b) = (QueueEntryId::new(20), QueueEntryId::new(21));
+
+        engine.load_entry(id, entry_a, path.clone());
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id, entry_b, path);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 2_000);
+        control.clear_captured();
+        control.drain_frames(1_001);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned {
+                    from_id,
+                    from_entry,
+                    to_id,
+                    to_entry,
+                    boundary_frame: 1_000,
+                    ..
+                } if *from_id == id
+                    && *to_id == id
+                    && *from_entry == entry_a
+                    && *to_entry == entry_b
+            )),
+            "duplicate TrackIds must keep distinct queue entries: {events:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn replacing_a_preload_routes_the_handoff_to_the_latest_entry() {
+        let dir = TempDir::new("gapless-replace");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 800, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 900, 0.5);
+        let c = write_dc_wav(&dir, "c.wav", 44_100, 1_100, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b, id_c) = (TrackId::new(1), TrackId::new(2), TrackId::new(3));
+        let (entry_a, entry_b, entry_c) = (
+            QueueEntryId::new(30),
+            QueueEntryId::new(31),
+            QueueEntryId::new(32),
+        );
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        engine.preload_entry(id_c, entry_c, c);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_c),
+        );
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 1_900);
+        control.clear_captured();
+        control.drain_frames(801);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned {
+                    to_id,
+                    to_entry,
+                    boundary_frame: 800,
+                    ..
+                } if *to_id == id_c && *to_entry == entry_c
+            )),
+            "the latest preload must win: {events:?}"
+        );
+        let captured = control.captured();
+        assert!((*captured.last().expect("successor frame") - 0.9).abs() < 0.01);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn reauthorizing_after_install_discards_the_obsolete_successor() {
+        let dir = TempDir::new("gapless-reauthorize");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 800, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 900, 0.5);
+        let c = write_dc_wav(&dir, "c.wav", 44_100, 1_100, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b, id_c) = (TrackId::new(1), TrackId::new(2), TrackId::new(3));
+        let (entry_a, entry_b, entry_c) = (
+            QueueEntryId::new(100),
+            QueueEntryId::new(101),
+            QueueEntryId::new(102),
+        );
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        engine.play();
+        // A and B are fully queued and the B handoff is installed, but
+        // no boundary frame has been consumed. Re-authorizing C must
+        // flush and rewind the current source rather than promote B.
+        wait_for_pushed_frames(&engine, &control, 1_700);
+        control.drain_frames(300);
+        engine.preload_entry(id_c, entry_c, c);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_c),
+        );
+        // The invalidation reopens A at frame 300, leaving 500 A frames
+        // before C's 1100 output frames.
+        wait_for_pushed_frames(&engine, &control, 1_600);
+        control.clear_captured();
+        control.drain_frames(501);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned {
+                    to_id,
+                    to_entry,
+                    boundary_frame: 500,
+                    ..
+                } if *to_id == id_c && *to_entry == entry_c
+            )),
+            "C must replace the invalidated B handoff: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned { to_id, .. } if *to_id == id_b
+            )),
+            "obsolete B must never become active: {events:?}"
+        );
+        let captured = control.captured();
+        assert!(captured[..500].iter().all(|s| (*s - 0.2).abs() < 0.01));
+        assert!((*captured.last().expect("C frame") - 0.9).abs() < 0.01);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn cancelling_after_install_discards_the_successor_and_ends_current() {
+        let dir = TempDir::new("gapless-cancel-installed");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 800, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 900, 0.5);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(110), QueueEntryId::new(111));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 1_700);
+        engine.cancel_preload();
+        // Pause follows cancellation on the command channel, so its
+        // event proves the invalidation has been processed.
+        engine.pause();
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Paused { .. }));
+        // Cancellation flushes and rewinds A; only its 800 frames may
+        // remain in the rebuilt generation.
+        wait_for_pushed_frames(&engine, &control, 800);
+        engine.play();
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(800);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackEnded { entry, id, .. }
+                    if *entry == entry_a && *id == id_a
+            )),
+            "A must end normally after cancellation: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. }))
+        );
+        control.drain_frames(128);
+        assert!(
+            control.captured()[800..].iter().all(|s| *s == 0.0),
+            "the invalidated successor must not be audible"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn cancelled_preload_falls_back_to_track_ended_with_silence() {
+        let dir = TempDir::new("gapless-cancel");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_000, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_000, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(40), QueueEntryId::new(41));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.cancel_preload();
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 1_000);
+        control.clear_captured();
+        control.drain_frames(1_000);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackEnded { entry, id, .. }
+                    if *entry == entry_a && *id == id_a
+            )),
+            "without a prepared source the track must end normally: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. })),
+            "a cancelled preload must not fabricate a transition"
+        );
+        control.drain_frames(256);
+        let captured = control.captured();
+        assert!(
+            captured[1_000..].iter().all(|s| *s == 0.0),
+            "fallback silence must not be presented as a gapless successor"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn pause_before_the_boundary_delays_promotion_until_resume() {
+        let dir = TempDir::new("gapless-pause");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_000, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_000, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(50), QueueEntryId::new(51));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 2_000);
+        control.drain_frames(900);
+        engine.pause();
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Paused { .. }));
+        control.drain_frames(200);
+        while let Ok(event) = engine.events().try_recv() {
+            assert!(
+                !matches!(event, EngineEvent::Transitioned { .. }),
+                "paused playback advanced across the boundary: {event:?}"
+            );
+        }
+        assert!(engine.position() < Duration::from_secs(1));
+
+        engine.play();
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        control.drain_frames(101);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned {
+                    to_id,
+                    to_entry,
+                    boundary_frame: 1_000,
+                    ..
+                } if *to_id == id_b && *to_entry == entry_b
+            )),
+            "resume must complete the prepared handoff: {events:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn handoff_normalizes_rate_and_channel_boundaries() {
+        let dir = TempDir::new("gapless-format");
+        let a = write_dc_wav(&dir, "a.wav", 22_050, 2_000, 0.2);
+        let b = write_dc_wav_channels(&dir, "b.wav", 44_100, 2, 2_000, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 2);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(60), QueueEntryId::new(61));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        // 2000 source frames at 22.05 kHz become 4000 output frames;
+        // the stereo successor contributes 2000 mono output frames.
+        wait_for_pushed_frames(&engine, &control, 6_000);
+        control.clear_captured();
+        control.drain_frames(4_001);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        let captured = control.captured();
+        assert_eq!(captured.len(), 4_001 * 2);
+        assert!(
+            captured[..4_000 * 2]
+                .iter()
+                .all(|s| (*s - 0.2).abs() < 0.01),
+            "rate-converted mono first source must be duplicated to stereo"
+        );
+        assert!(
+            captured[4_000 * 2..]
+                .iter()
+                .all(|s| (*s - 0.8).abs() < 0.01),
+            "stereo successor must begin at the immediately following frame"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned {
+                    to_id,
+                    boundary_frame: 4_000,
+                    ..
+                } if *to_id == id_b
+            )),
+            "transition boundary must use output frames: {events:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn stop_during_preload_releases_the_successor_without_a_transition() {
+        let dir = TempDir::new("gapless-stop-preload");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_000, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_000, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(70), QueueEntryId::new(71));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.stop();
+        let events = collect_events_until(&engine, |event| matches!(event, EngineEvent::Stopped));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Stopped))
+        );
+
+        engine.play();
+        let events =
+            collect_events_until(&engine, |event| matches!(event, EngineEvent::Error { .. }));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Error {
+                    error: EngineError::NoTrackLoaded,
+                    ..
+                }
+            )),
+            "stop must unload and release the prepared decoder: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. }))
+        );
+        let _ = control;
+        engine.shutdown();
+    }
+
+    #[test]
+    fn explicit_load_before_the_boundary_discards_the_old_handoff() {
+        let dir = TempDir::new("gapless-skip-preload");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 2_000, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1_000, 0.5);
+        let c = write_dc_wav(&dir, "c.wav", 44_100, 1_500, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b, id_c) = (TrackId::new(1), TrackId::new(2), TrackId::new(3));
+        let (entry_a, entry_b, entry_c) = (
+            QueueEntryId::new(80),
+            QueueEntryId::new(81),
+            QueueEntryId::new(82),
+        );
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        // A and B are fully queued and the handoff is installed, but no
+        // device frame has crossed the boundary yet.
+        wait_for_pushed_frames(&engine, &control, 3_000);
+
+        engine.load_entry(id_c, entry_c, c);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_c),
+        );
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 1_500);
+        control.clear_captured();
+        control.drain_frames(1_500);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackEnded { entry, id, .. }
+                    if *entry == entry_c && *id == id_c
+            )),
+            "C must play to its own end: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. })),
+            "the obsolete A-to-B handoff must be discarded: {events:?}"
+        );
+        assert!(
+            control.captured().iter().all(|s| (*s - 0.9).abs() < 0.01),
+            "only C samples may reach the device"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn seek_after_installing_a_handoff_rebuilds_the_boundary_from_the_seek() {
+        let dir = TempDir::new("gapless-seek");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 4_000, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 2_000, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(90), QueueEntryId::new(91));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b.clone());
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 6_000);
+
+        let _ = engine.seek(Duration::from_millis(50));
+        engine.preload_entry(id_b, entry_b, b.clone());
+        // Preloaded proves the seek command was processed first.
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        // 2205 source frames are skipped; the remaining 1795 A frames
+        // precede B's 2000 output frames.
+        wait_for_pushed_frames(&engine, &control, 3_795);
+        control.clear_captured();
+        control.drain_frames(3_795);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned {
+                    boundary_frame: 1_795,
+                    to_entry,
+                    ..
+                } if *to_entry == entry_b
+            )),
+            "the old boundary must not survive a seek: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                boundary_frame: 4_000,
+                ..
+            }
+        )));
+        let captured = control.captured();
+        assert_eq!(captured.len(), 3_795);
+        assert!(captured[..1_795].iter().all(|s| (*s - 0.2).abs() < 0.01));
+        assert!(captured[1_795..].iter().all(|s| (*s - 0.8).abs() < 0.01));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn one_frame_successor_is_contiguous_and_then_ends_once() {
+        let dir = TempDir::new("gapless-one-frame");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 500, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 1, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(120), QueueEntryId::new(121));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 501);
+        control.clear_captured();
+        control.drain_frames(501);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 500,
+                ..
+            } if *to_id == id_b
+        )));
+        let captured = control.captured();
+        assert_eq!(captured.len(), 501);
+        assert!((*captured.last().expect("one successor frame") - 0.8).abs() < 0.01);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackEnded { entry, id, .. }
+                    if *entry == entry_b && *id == id_b
+            )),
+            "the one-frame successor must end exactly once: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackEnded { id, .. } if *id == id_a
+        )));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn truncated_prepared_successor_fails_without_a_fake_transition() {
+        let dir = TempDir::new("gapless-truncated");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 1_000, 0.2);
+        let full = write_dc_wav(&dir, "b-full.wav", 44_100, 2_000, 0.8);
+        let truncated = dir.0.join("b.wav");
+        let mut bytes = fs::read(&full).expect("read full wav");
+        bytes.truncate(bytes.len() - 100);
+        fs::write(&truncated, bytes).expect("write truncated wav");
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(130), QueueEntryId::new(131));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, truncated);
+        let preloaded = collect_events_until(&engine, |event| {
+            matches!(
+                event,
+                EngineEvent::Preloaded { .. } | EngineEvent::PreloadFailed { .. }
+            )
+        });
+        assert!(
+            matches!(preloaded.last(), Some(EngineEvent::Preloaded { id, .. }) if *id == id_b),
+            "the truncated file must open so the failure happens mid-stream: {preloaded:?}"
+        );
+        engine.play();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Error { .. })
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EngineEvent::Error { id: Some(id), .. } if *id == id_b
+            )),
+            "the successor's decode failure must name B: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. })),
+            "a failed successor must not produce a fake transition: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EngineEvent::TrackEnded { id, .. } if *id == id_a
+            )),
+            "a failed successor must not report a clean A end"
+        );
         engine.shutdown();
     }
 

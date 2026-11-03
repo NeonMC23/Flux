@@ -108,9 +108,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   stable shuffle cycle that does not mutate playlist order. Previous restarts
   the current track after three seconds and otherwise moves backward. Queue
   order, current entry, mode, shuffle flag and position persist for canonical
-  libraries and restore paused. The engine prepares the next queue entry in the
-  background, but transitions still occur after the current source drains and
-  are not gapless. The
+  libraries and restore paused. The engine preloads the next queue entry and
+  performs the natural decoder handoff inside the audio pipeline at the exact
+  source-frame boundary, without restarting the output stream. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
   then removes old files through journal cleanup. The same editor supports
@@ -292,7 +292,7 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Rating UI, gapless playback, crossfade, EQ,
+Rating UI, crossfade, EQ,
 frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
 imports are intentionally rejected in canonical mode. Rating storage APIs exist

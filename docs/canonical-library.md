@@ -296,37 +296,82 @@ Play. Queue files without the optional playback fields remain readable with
 defaults. Saves remain atomic and malformed files are preserved. Non-canonical
 legacy/portable backends retain their existing queue workflow.
 
-### Audio engine and next-track preparation
+### Audio engine and gapless handoff
 
 The audio crate keeps policy and mechanism separate. [`Controller`] decides
 which stable `QueueEntryId` should play; `flux-audio::engine` owns decoding,
 format conversion, the bounded sample ring and device output. Decoding and file
 I/O run on one worker thread. The CPAL callback only pops from a lock-free SPSC
 ring, emits silence on underrun, and publishes the oscilloscope tap; it performs
-no file I/O, locking or allocation. The output stream stays open across normal
-loads, but each load/stop still bumps a generation counter that makes the
-callback flush the previous generation, so the stream is continuous while the
-track content is not sample-contiguous.
+no file I/O, locking or allocation. The output stream stays open across loads
+and across natural handoffs.
 
-The Controller now prepares the next queue entry through
-`EngineHandle::preload`:
+The worker tracks: the audible/current source; at most one prepared decoder; and
+— once the current decoder reaches EOF — one incoming source whose decoder has
+already been installed in the ring but whose queue entry becomes current only
+at the output boundary. Both current and prepared sources carry `TrackId`,
+`QueueEntryId`, path and decoded stream facts. A prepared decoder is consumed
+only when the later `Load` or natural handoff still matches both identity and
+path. Duplicate tracks therefore remain distinct queue entries.
 
-- Normal playback prepares the following queue entry;
-- Repeat All prepares the first entry after the last;
-- Repeat One prepares a fresh decoder for the current entry;
-- Shuffle and Shuffle + Repeat All use the existing seeded queue-entry
-  traversal, preserving duplicate-track identity;
-- a changed queue or playback mode replaces or cancels the obsolete preload,
-  and an unchanged target is not reopened.
+For a natural transition:
 
-The worker holds at most one active decoder and one prepared decoder. A
-matching load consumes the prepared decoder; a mismatched or cancelled load
-drops it deterministically. Preload failures are reported as
-`EngineEvent::PreloadFailed` and never interrupt current playback. This
-preparation removes decoder-open work from the later transition and is the
-foundation for a future continuous pipeline, but it is **not** gapless: the
-application still loads the next entry only after `TrackEnded` has drained the
-ring.
+1. The active decoder reaches EOF and its converter tail is pushed.
+2. The prepared decoder is installed into the same generation.
+3. Its frames are appended directly after the old source's final output frame.
+4. The worker records the boundary as the number of output frames pushed for
+   the generation.
+5. Once the callback reports that the device consumed up to that boundary, the
+   worker promotes the incoming source, resets source-relative position to zero,
+   and emits exactly one `EngineEvent::Transitioned` with both queue entries,
+   track IDs, generation, output boundary and new stream facts.
+6. The Controller updates the queue's current entry, engine ledger, history
+   boundary and UI state. It does not issue another load for that transition.
+
+Load, seek, stop and restart each bump the output generation and make the
+callback flush stale buffered samples. A natural handoff deliberately does not
+bump it: the old tail and new head share one output sequence, so seek/stop/
+replacement invalidate audio explicitly while adjacent tracks remain
+sample-contiguous. The callback still rejects samples from older generations.
+
+The Controller preloads the intended successor for Normal, Repeat One, Repeat
+All, Shuffle and Shuffle + Repeat All. A queue change or mode change replaces or
+cancels the obsolete preparation; an unchanged target is not reopened. If the
+successor was already installed in the ring but has not yet reached the output
+boundary, replacement/cancellation flushes that unpromoted generation and
+reopens the audible current source at its reported position before preparing
+the newly authorized entry. This invalidation path is deliberately not
+advertised as gapless. The session, current entry and `to_entry` are checked
+before the Controller adopts a transition event, so a stale event from an
+earlier user action cannot overwrite the current model. If a queue mutation
+wins a boundary race after the event, the Controller stops the pipeline and
+reconciles to the authoritative current entry rather than silently keeping the
+unauthorized successor.
+
+Playback position remains source-relative: the engine subtracts the active
+source's output-frame start from consumed frames. Preparation and buffered
+decode never advance visible position. Pause freezes consumption; seeking
+targets the current audible source and invalidates an unpromoted handoff.
+Meaningful-play history is keyed by queue entry and is reset only when the
+Controller accepts a transition, so preloading creates no play and duplicate
+tracks count as distinct occurrences.
+
+If no prepared successor exists when EOF is reached, the old path remains:
+`TrackEnded` fires only after the ring drains, then the Controller advances and
+performs an explicit load. That fallback may contain silence and is not
+presented as gapless. Preload failure never interrupts the active source; the
+actual load reports the decode/IO error when reached.
+
+Format changes are handled by the existing `FormatConverter` (sample-rate
+conversion, mono downmix and channel mapping), so the successor can have a
+different rate or channel count without changing the output configuration or
+device stream.
+
+The prepared window is one entry. The Controller can authorize the successor
+after it accepts the preceding transition, so an extremely short successor may
+end before the following preload arrives and falls back to `TrackEnded`. Real
+hardware gapless behavior has not been measured; deterministic frame continuity
+is verified with synthetic sources and the null backend.
 
 [`Controller`]: ../crates/flux-app/src/lib.rs
 
@@ -913,14 +958,16 @@ cleanup.
     objects/boundaries are not implemented; the aggregate `history.flux`
     cannot reconstruct them without fabricating chronology. Recent/Most Played
     remain aggregate views.
-24. Gapless playback and crossfade are deferred. The engine now retains one
-    prepared next decoder and a subsequent matching load consumes it, but the
-    transition is still driven by the application after the ring has drained;
-    every load starts a new generation and flushes the old samples. There is no
-    sample-boundary auto-advance, mixed output graph or testable frame-continuity
-    path. Flux does not simulate either feature by shortening UI timers or
-    issuing GUI volume automation. Queue persistence, shuffle modes and
-    next-track preparation work without gapless assumptions.
+24. Natural gapless playback is implemented inside the engine: a prepared
+    queue entry is handed off in the same output generation at the source-frame
+    boundary, and the Controller follows a single authoritative transition
+    event. Crossfade remains deferred because there is still no dual-source
+    mixing graph or gain-envelope transition policy. Flux does not simulate
+    crossfade with UI timers or volume automation. Gapless has been verified
+    with deterministic synthetic sources and an instrumented null backend, not
+    by measuring real hardware. One prepared successor is supported; a chain
+    depends on the Controller preloading the following entry after each accepted
+    transition.
 25. Multi-entry queue removal and a dedicated queue clear action are not exposed
     in the GUI; individual removal/reorder and queue population from track/
     playlist actions remain available.

@@ -12,7 +12,7 @@
 //!   device output through CPAL. When the feature is off, no code in
 //!   this crate can produce sound, and nothing claims otherwise.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::EngineError;
@@ -77,6 +77,7 @@ struct NullShared {
     fill: Mutex<Option<Box<dyn FillCallback>>>,
     captured: Mutex<Vec<f32>>,
     running: AtomicBool,
+    starts: AtomicU32,
 }
 
 /// A device-free [`OutputBackend`] driven manually through
@@ -106,6 +107,7 @@ impl NullOutput {
             fill: Mutex::new(None),
             captured: Mutex::new(Vec::new()),
             running: AtomicBool::new(false),
+            starts: AtomicU32::new(0),
         });
         (
             Self {
@@ -131,6 +133,7 @@ impl OutputBackend for NullOutput {
         _on_error: Box<dyn FnMut(String) + Send>,
     ) -> Result<(), EngineError> {
         *self.shared.fill.lock().expect("null output mutex") = Some(fill);
+        self.shared.starts.fetch_add(1, Ordering::Relaxed);
         self.shared.running.store(true, Ordering::Release);
         Ok(())
     }
@@ -145,6 +148,13 @@ impl NullControl {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Acquire)
+    }
+
+    /// Number of times the backend stream has been started. Natural
+    /// track handoffs must not increase this.
+    #[must_use]
+    pub fn start_count(&self) -> u32 {
+        self.shared.starts.load(Ordering::Acquire)
     }
 
     /// Simulates the device consuming exactly `frames` frames,

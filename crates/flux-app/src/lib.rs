@@ -1044,6 +1044,9 @@ pub struct Controller {
     /// load. Not a selection — `Player` owns that; this only decides
     /// "resume vs. load" when syncing.
     engine_loaded: Option<TrackId>,
+    /// Stable queue entry of `engine_loaded`. TrackId alone cannot
+    /// distinguish duplicate entries for the same track.
+    engine_entry: Option<QueueEntryId>,
     /// The load session of `engine_loaded`. Every explicit load gets a
     /// new monotonic session from the engine, so delayed events from an
     /// older attempt (even for the same track) cannot affect the
@@ -1420,6 +1423,7 @@ impl Controller {
             engine,
             audio,
             engine_loaded: None,
+            engine_entry: None,
             engine_session: None,
             stream_info: None,
             volume: 1.0,
@@ -2325,16 +2329,24 @@ impl Controller {
         }
 
         let target = position.min(duration);
-        let had_loaded_track = self.engine_loaded == Some(id);
+        let current_entry = self.current_queue_entry_id();
+        let had_loaded_track = self.engine_loaded == Some(id) && self.engine_entry == current_entry;
         if !had_loaded_track && let Err(err) = self.load_into_engine(id, false) {
             self.report_error(err.clone());
             return Err(err);
+        }
+        // Seeking invalidates any already-installed incoming decoder,
+        // so forget the old preload request and re-authorize the next
+        // entry after the seek command.
+        if self.preloaded_entry.take().is_some() {
+            self.engine.cancel_preload();
         }
         let session = self.engine.seek(target);
         self.engine_session = Some(session);
         if self.player.state() == PlaybackState::Playing && !had_loaded_track {
             self.engine.play();
         }
+        self.preload_next_queue_entry();
         self.persist_queue();
         Ok(target)
     }
@@ -2823,6 +2835,7 @@ impl Controller {
         self.player.stop();
         self.engine.stop();
         self.engine_loaded = None;
+        self.engine_entry = None;
         self.engine_session = None;
         self.stream_info = None;
 
@@ -3479,6 +3492,7 @@ impl Controller {
             self.player.stop();
             self.engine.stop();
             self.engine_loaded = None;
+            self.engine_entry = None;
             self.engine_session = None;
             self.stream_info = None;
         }
@@ -4268,6 +4282,7 @@ impl Controller {
             self.player.stop();
             self.engine.stop();
             self.engine_loaded = None;
+            self.engine_entry = None;
             self.engine_session = None;
             self.stream_info = None;
             self.outbox.push(ControllerEvent::PlaybackChanged);
@@ -4970,8 +4985,16 @@ impl Controller {
     /// inject controlled event ordering without sleeping.
     fn handle_engine_event(&mut self, event: EngineEvent, events: &mut Vec<ControllerEvent>) {
         match event {
-            EngineEvent::Loaded { session, id, info } => {
-                if self.engine_session == Some(session) && self.engine_loaded == Some(id) {
+            EngineEvent::Loaded {
+                session,
+                id,
+                entry,
+                info,
+            } => {
+                if self.engine_session == Some(session)
+                    && self.engine_loaded == Some(id)
+                    && self.engine_entry == Some(entry)
+                {
                     self.stream_info = Some(info);
                     events.push(ControllerEvent::PlaybackChanged);
                 }
@@ -4983,16 +5006,73 @@ impl Controller {
                 }
             }
             EngineEvent::Stopped => events.push(ControllerEvent::PlaybackChanged),
-            EngineEvent::TrackEnded { session, id } => {
+            EngineEvent::Transitioned {
+                session,
+                generation: _,
+                from_id,
+                from_entry,
+                to_id,
+                to_entry,
+                boundary_frame: _,
+                info,
+            } => {
+                if self.engine_session != Some(session) {
+                    return;
+                }
+                let model_matches = self.player.current_track() == Some(from_id)
+                    && self.current_queue_entry_id() == Some(from_entry)
+                    && self.engine_loaded == Some(from_id)
+                    && self.engine_entry == Some(from_entry);
+                let authorized = self.preloaded_entry == Some((to_entry, to_id));
+                let target_valid = self
+                    .player
+                    .queue()
+                    .entry(to_entry)
+                    .is_some_and(|entry| entry.track() == to_id);
+                if !model_matches || !authorized || !target_valid {
+                    // The engine reached a boundary before this
+                    // controller saw a newer queue action. Do not let a
+                    // stale handoff replace the authoritative model:
+                    // stop the pipeline and reload the model's current
+                    // entry (if any) from a clean generation.
+                    self.engine.stop();
+                    self.engine_loaded = None;
+                    self.engine_entry = None;
+                    self.engine_session = None;
+                    self.stream_info = None;
+                    self.preloaded_entry = None;
+                    self.sync_engine(true);
+                    self.report_error(
+                        "The playback queue changed during a track transition; \
+                         playback was reconciled to the current queue entry."
+                            .to_owned(),
+                    );
+                    events.push(ControllerEvent::PlaybackChanged);
+                    return;
+                }
+
+                // The engine completed the natural handoff. It remains
+                // the same load session and generation; only source
+                // identity and source-relative position reset here.
+                let _ = self.player.queue_mut().set_current_entry(to_entry);
+                self.engine_loaded = Some(to_id);
+                self.engine_entry = Some(to_entry);
+                self.stream_info = Some(info);
+                self.preloaded_entry = None;
+                self.after_queue_change();
+                events.push(ControllerEvent::PlaybackChanged);
+            }
+            EngineEvent::TrackEnded { session, entry, id } => {
                 if self.engine_session == Some(session)
                     && self.engine_loaded == Some(id)
+                    && self.engine_entry == Some(entry)
                     && self.player.current_track() == Some(id)
+                    && self.current_queue_entry_id() == Some(entry)
                     && self.player.state() == PlaybackState::Playing
                 {
-                    // Advance (or stop at the end), then reconcile the
-                    // engine to the model. At the end of the queue this
-                    // clears the sync ledger so a later Play performs a
-                    // fresh load instead of restarting an old session.
+                    // Fallback path: no prepared successor existed at
+                    // end-of-stream, so the ring drained and the next
+                    // entry now requires an explicit load.
                     let before = self.current_queue_entry_id();
                     if self.shuffle {
                         if self.advance_shuffle_on_end().is_none() {
@@ -5027,8 +5107,10 @@ impl Controller {
                 self.player.stop();
                 self.engine.stop();
                 self.engine_loaded = None;
+                self.engine_entry = None;
                 self.engine_session = None;
                 self.stream_info = None;
+                self.preloaded_entry = None;
                 self.report_error(message);
                 events.push(ControllerEvent::PlaybackChanged);
             }
@@ -5118,16 +5200,25 @@ impl Controller {
                 let Some(id) = self.player.current_track() else {
                     self.engine.stop();
                     self.engine_loaded = None;
+                    self.engine_entry = None;
                     return;
                 };
-                if self.engine_loaded == Some(id) && !force_reload {
+                if self.engine_loaded == Some(id)
+                    && self.engine_entry == self.current_queue_entry_id()
+                    && !force_reload
+                {
                     self.engine.play();
                 } else if let Err(message) = self.load_into_engine(id, true) {
                     self.fail_playback(message);
                 }
             }
             PlaybackState::Paused => match self.player.current_track() {
-                Some(id) if self.engine_loaded == Some(id) => self.engine.pause(),
+                Some(id)
+                    if self.engine_loaded == Some(id)
+                        && self.engine_entry == self.current_queue_entry_id() =>
+                {
+                    self.engine.pause()
+                }
                 Some(id) => {
                     if let Err(message) = self.load_into_engine(id, false) {
                         self.fail_playback(message);
@@ -5141,6 +5232,7 @@ impl Controller {
             PlaybackState::Stopped => {
                 self.engine.stop();
                 self.engine_loaded = None;
+                self.engine_entry = None;
                 self.engine_session = None;
                 self.stream_info = None;
             }
@@ -5192,7 +5284,7 @@ impl Controller {
             return;
         };
         let path = track.source().path().to_path_buf();
-        self.engine.preload(next.track(), path);
+        self.engine.preload_entry(next.track(), next.id(), path);
         self.preloaded_entry = Some((next.id(), next.track()));
     }
 
@@ -5215,8 +5307,17 @@ impl Controller {
                  Opus, and M4A/MP4 (AAC) files. The file stays in the library, indexed."
             ));
         }
-        let session = self.engine.load(id, path);
+        let Some(entry) = self.current_queue_entry_id() else {
+            return Err("That track is not in the playback queue.".to_owned());
+        };
+        // A load consumes a matching prepared decoder or drops a
+        // mismatched one. Either way the controller's old preload
+        // ledger is stale, including when the old target happened to
+        // equal the following entry after this load.
+        self.preloaded_entry = None;
+        let session = self.engine.load_entry(id, entry, path);
         self.engine_loaded = Some(id);
+        self.engine_entry = Some(entry);
         self.engine_session = Some(session);
         self.stream_info = None;
         if autoplay {
@@ -5231,8 +5332,10 @@ impl Controller {
         self.player.stop();
         self.engine.stop();
         self.engine_loaded = None;
+        self.engine_entry = None;
         self.engine_session = None;
         self.stream_info = None;
+        self.preloaded_entry = None;
         self.report_error(message);
     }
 
@@ -6347,7 +6450,7 @@ mod tests {
         // A second folder whose scan will complete during playback.
         let other = dir.path().join("other");
         fs::create_dir_all(&other).expect("other dir");
-        write_dc_wav(&other, "extra.wav", 4_410, 0.2);
+        let extra_path = write_dc_wav(&other, "extra.wav", 4_410, 0.2);
 
         let (mut controller, control) = boot(&dir);
         scanned(&mut controller, &control, root);
@@ -6380,17 +6483,23 @@ mod tests {
         });
         // A scan completing mid-playback must not disturb it.
         controller.begin_scan(other);
-        // Position is derived from delivered frames; the identity
-        // conversion emits exactly the input count, so the 2 s track
-        // ends with position exactly 2 s and everything captured.
+        // The scan adds the short extra track to the end of the queue.
+        // The engine must hand off to it at the exact boundary, without
+        // the application reloading or flushing the tone.
         drive(&mut controller, &control, |c, _| {
-            !c.is_scanning() && c.position() >= Duration::from_secs(2)
+            c.current_track()
+                .is_some_and(|track| track.source().path() == extra_path)
         });
-        // Collect a little post-track device time (must be silence).
         for _ in 0..4 {
             control.drain_frames(512);
             controller.poll();
         }
+        assert!(
+            controller
+                .current_track()
+                .is_some_and(|track| track.source().path() == extra_path),
+            "the controller must follow the engine's natural transition"
+        );
 
         let captured = control.captured();
         let start = captured
@@ -6410,12 +6519,16 @@ mod tests {
             reference.as_slice(),
             "delivered samples diverge from direct decode"
         );
+        let following = &captured[start + reference.len()..];
         assert!(
-            captured[start + reference.len()..]
-                .iter()
-                .all(|s| *s == 0.0),
-            "only silence may follow the track"
+            following.len() >= 1_024,
+            "capture holds too little post-boundary audio"
         );
+        assert!(
+            following[..1_024].iter().all(|s| (*s - 0.2).abs() < 0.02),
+            "the next queued track must begin at the exact tone boundary"
+        );
+        assert_eq!(control.start_count(), 1, "the output stream was restarted");
         controller.shutdown();
     }
 
@@ -6861,7 +6974,11 @@ mod tests {
         // Model a current Playing session on track B without starting
         // the real worker; event delivery is then fully controlled.
         controller.player.play_track(b).expect("select b");
+        let entry_b = controller
+            .current_queue_entry_id()
+            .expect("b has a queue entry");
         controller.engine_loaded = Some(b);
+        controller.engine_entry = Some(entry_b);
         controller.engine_session = Some(77);
 
         let mut events = Vec::new();
@@ -6925,7 +7042,11 @@ mod tests {
         scanned(&mut controller, &control, fx.root.clone());
         let a = id_of(&controller, &fx.a);
         controller.player.play_track(a).expect("select a");
+        let entry_a = controller
+            .current_queue_entry_id()
+            .expect("a has a queue entry");
         controller.engine_loaded = Some(a);
+        controller.engine_entry = Some(entry_a);
         controller.engine_session = Some(5);
 
         let mut events = Vec::new();
@@ -6950,6 +7071,80 @@ mod tests {
     }
 
     #[test]
+    fn stale_or_unauthorized_transition_events_cannot_replace_the_queue_model() {
+        let dir = TempDir::new("stale-transition");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        let b = id_of(&controller, &root.join("b.wav"));
+        controller.play_track(a);
+        let entry_a = controller.current_queue_entry_id().expect("a current");
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        let session = controller.engine_session.expect("session");
+        controller.preloaded_entry = Some((entry_b, b));
+        let info = flux_audio::decode::StreamInfo {
+            sample_rate: 44_100,
+            channels: 1,
+            duration: None,
+        };
+
+        // Older session: explicit user action already superseded it.
+        let mut events = Vec::new();
+        controller.handle_engine_event(
+            EngineEvent::Transitioned {
+                session: session.wrapping_add(1),
+                generation: 99,
+                from_id: a,
+                from_entry: entry_a,
+                to_id: b,
+                to_entry: entry_b,
+                boundary_frame: 1_000,
+                info,
+            },
+            &mut events,
+        );
+        assert!(events.is_empty());
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_a));
+        assert_eq!(controller.engine_session, Some(session));
+        assert!(controller.last_error().is_none());
+
+        // Current session but no longer the authorized successor: queue
+        // mutation won the race. The controller must not adopt B.
+        controller.preloaded_entry = Some((entry_a, a));
+        controller.handle_engine_event(
+            EngineEvent::Transitioned {
+                session,
+                generation: 99,
+                from_id: a,
+                from_entry: entry_a,
+                to_id: b,
+                to_entry: entry_b,
+                boundary_frame: 1_000,
+                info,
+            },
+            &mut events,
+        );
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_a));
+        assert_eq!(controller.current_id(), Some(a));
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|message| message.contains("queue changed")),
+            "{:?}",
+            controller.last_error()
+        );
+        assert!(events.contains(&ControllerEvent::PlaybackChanged));
+        assert_ne!(controller.engine_session, Some(session));
+        controller.shutdown();
+    }
+
+    #[test]
     fn stale_track_end_does_not_advance_but_current_end_does() {
         let dir = TempDir::new("stale-end");
         let root = two_track_dir(&dir, "music");
@@ -6959,15 +7154,33 @@ mod tests {
         let a = TrackId::new(ids[0]);
         let b = TrackId::new(ids[1]);
         controller.player.play_track(a).expect("select a");
+        let entry_a = controller
+            .current_queue_entry_id()
+            .expect("a has a queue entry");
         controller.engine_loaded = Some(a);
+        controller.engine_entry = Some(entry_a);
         controller.engine_session = Some(10);
 
         let mut events = Vec::new();
-        controller.handle_engine_event(EngineEvent::TrackEnded { session: 9, id: a }, &mut events);
+        controller.handle_engine_event(
+            EngineEvent::TrackEnded {
+                session: 9,
+                entry: entry_a,
+                id: a,
+            },
+            &mut events,
+        );
         assert_eq!(controller.current_id(), Some(a));
         assert_eq!(controller.player_state(), PlaybackState::Playing);
 
-        controller.handle_engine_event(EngineEvent::TrackEnded { session: 10, id: a }, &mut events);
+        controller.handle_engine_event(
+            EngineEvent::TrackEnded {
+                session: 10,
+                entry: entry_a,
+                id: a,
+            },
+            &mut events,
+        );
         assert_eq!(controller.current_id(), Some(b));
         assert_eq!(controller.player_state(), PlaybackState::Playing);
         controller.shutdown();
@@ -7117,6 +7330,139 @@ mod tests {
     }
 
     #[test]
+    fn natural_transition_updates_the_queue_without_reloading_or_recording_a_short_play() {
+        let dir = TempDir::new("gapless-controller");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        let b = id_of(&controller, &root.join("b.wav"));
+
+        controller.play_track(a);
+        let entry_a = controller.current_queue_entry_id().expect("a is current");
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        let session = controller.engine_session.expect("load session");
+
+        let events = drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id() == Some(entry_b)
+        });
+        assert!(
+            events.contains(&ControllerEvent::PlaybackChanged),
+            "the transition must be visible to front-ends: {events:?}"
+        );
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_b));
+        assert_eq!(controller.engine_loaded, Some(b));
+        assert_eq!(controller.engine_entry, Some(entry_b));
+        assert_eq!(
+            controller.engine_session,
+            Some(session),
+            "a natural handoff must not create a new load session"
+        );
+        assert_eq!(
+            controller.preloaded_entry, None,
+            "the consumed successor must not remain advertised"
+        );
+        assert!(
+            controller.position() < Duration::from_secs(1),
+            "position must reset relative to the new source"
+        );
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            0,
+            "a short transition must not manufacture a meaningful play"
+        );
+
+        // Let the second short track end; it still must not cross the
+        // meaningful-play threshold.
+        drive(&mut controller, &control, |c, _| {
+            c.player_state() == PlaybackState::Stopped
+        });
+        assert_eq!(controller.playback_history().total_plays(), 0);
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_b));
+        assert_ne!(entry_a, entry_b);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn gapless_handoff_distinguishes_duplicate_entries_for_the_same_track() {
+        let dir = TempDir::new("gapless-controller-duplicate");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 11_025, 0.4);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+
+        controller.play_track(a);
+        let first = controller.current_queue_entry_id().expect("first entry");
+        let second = controller.enqueue_track(a).expect("duplicate entry");
+        assert_ne!(first, second);
+        let session = controller.engine_session.expect("load session");
+
+        let events = drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id() == Some(second)
+        });
+        assert!(
+            events.contains(&ControllerEvent::PlaybackChanged),
+            "{events:?}"
+        );
+        assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(controller.current_queue_entry_id(), Some(second));
+        assert_eq!(controller.engine_entry, Some(second));
+        assert_eq!(controller.engine_session, Some(session));
+        assert_eq!(controller.playback_history().total_plays(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn explicit_skip_keeps_the_following_natural_transition_gapless() {
+        let dir = TempDir::new("gapless-after-skip");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        write_dc_wav(&root, "a.wav", 11_025, 0.3);
+        let b_path = write_dc_wav(&root, "b.wav", 11_025, 0.5);
+        let c_path = write_dc_wav(&root, "c.wav", 11_025, 0.7);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        let b = id_of(&controller, &b_path);
+        let c_track = id_of(&controller, &c_path);
+
+        controller.play_track(a);
+        // Let the first preload settle, then skip explicitly to B.
+        drive(&mut controller, &control, |c, _| {
+            c.preloaded_entry.is_some()
+        });
+        controller.next();
+        let session_b = controller.engine_session.expect("B load session");
+        drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id()
+                == c.queue_entries()
+                    .iter()
+                    .find(|entry| entry.track() == b)
+                    .map(|entry| entry.id())
+        });
+        // The explicit load of B must leave C prepared for B's natural
+        // end. Otherwise C would arrive through a fresh load session.
+        drive(&mut controller, &control, |c, _| {
+            c.current_id() == Some(c_track)
+        });
+        assert_eq!(controller.current_id(), Some(c_track));
+        assert_eq!(
+            controller.engine_session,
+            Some(session_b),
+            "B-to-C must hand off without a new load session"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn repeat_one_replays_and_refresh_without_roots_is_a_status() {
         let dir = TempDir::new("repeat");
         let fx = fixtures(&dir);
@@ -7135,6 +7481,7 @@ mod tests {
         let a = id_of(&controller, &fx.a);
         controller.set_repeat_mode(RepeatMode::One);
         controller.play_track(a);
+        let session = controller.engine_session.expect("repeat-one session");
         // Two full plays of A (11_025 frames each) must pass through.
         drive(&mut controller, &control, |_, _| {
             control
@@ -7146,6 +7493,11 @@ mod tests {
         });
         assert_eq!(controller.player_state(), PlaybackState::Playing);
         assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(
+            controller.engine_session,
+            Some(session),
+            "Repeat One must replay through the gapless engine handoff"
+        );
         controller.shutdown();
     }
 
