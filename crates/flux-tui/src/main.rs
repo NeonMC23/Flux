@@ -853,7 +853,7 @@ impl Tui {
                              · / search · R repeat · O open · C create · M migrate \
                              · D album · E albums · T transfer/delete (GUI) \
                              · move/replace (GUI) · global search/filters/batch (GUI) \
-                             · B index · U fix · q quit"
+                             · playlists (GUI) · B index · U fix · q quit"
                 .to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
