@@ -226,6 +226,30 @@ pub fn pick_image_files_in(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>,
     }
 }
 
+/// Native lyrics-file picker for `.lrc` and `.txt` UTF-8 files.
+pub fn pick_lyrics_files_in(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        const FILTER: &str = "*.lrc *.txt";
+        pick_linux_files_filtered(start, "Import lyrics", "Lyrics files", FILTER, false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = start;
+        pick_macos_text()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = start;
+        pick_windows_text()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = start;
+        Err("native lyrics dialogs are not implemented on this platform".to_owned())
+    }
+}
+
 /// Native folder picker with an optional starting directory.
 pub fn pick_folder_in(start: Option<&Path>) -> Result<Option<PathBuf>, String> {
     #[cfg(target_os = "linux")]
@@ -464,6 +488,60 @@ end try"#;
         .map(PathBuf::from)
         .collect::<Vec<_>>();
     Ok((!paths.is_empty()).then_some(paths))
+}
+
+#[cfg(target_os = "macos")]
+fn pick_macos_text() -> Result<Option<Vec<PathBuf>>, String> {
+    let script = r#"try
+set chosen to choose file with prompt "Import lyrics" of type {"public.text"}
+return POSIX path of chosen
+on error number -128
+return ""
+end try"#;
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|err| format!("could not start the native lyrics dialog: {err}"))?;
+    if !output.status.success() {
+        return Err(dialog_error(&output.stderr, output.status.code()));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!value.is_empty()).then(|| vec![PathBuf::from(value)]))
+}
+
+#[cfg(target_os = "windows")]
+fn pick_windows_text() -> Result<Option<Vec<PathBuf>>, String> {
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Multiselect = $false
+$d.Title = 'Import lyrics'
+$d.Filter = 'Lyrics files|*.lrc;*.txt|All files|*.*'
+if ($d.ShowDialog() -eq 'OK') { $d.FileName }"#;
+    let output = match std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-STA")
+        .arg("-Command")
+        .arg(script)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::process::Command::new("pwsh")
+                .arg("-NoProfile")
+                .arg("-STA")
+                .arg("-Command")
+                .arg(script)
+                .output()
+                .map_err(|err| format!("could not start the native lyrics dialog: {err}"))?
+        }
+        Err(err) => return Err(format!("could not start the native lyrics dialog: {err}")),
+    };
+    if !output.status.success() {
+        return Err(dialog_error(&output.stderr, output.status.code()));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!value.is_empty()).then(|| vec![PathBuf::from(value)]))
 }
 
 #[cfg(target_os = "windows")]

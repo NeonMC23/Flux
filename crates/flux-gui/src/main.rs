@@ -21,10 +21,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use flux_app::{
     AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
     Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan,
-    ImportProgress, ImportRequest, ImportStage, ImportStorage, PlaylistId, PreparedImport,
-    ReconcileReport, RelPath, ReleaseType, StorageMode, TrackAudioReplacementPlan,
-    TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration,
-    is_track_playable, prepare_import_files, prepare_import_plan,
+    ImportProgress, ImportRequest, ImportStage, ImportStorage, LyricLine, LyricsDocument,
+    LyricsKind, PlaylistId, PreparedImport, ReconcileReport, RelPath, ReleaseType, StorageMode,
+    TrackAudioReplacementPlan, TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan,
+    WAVEFORM_WINDOW, format_duration, is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
     APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
@@ -852,6 +852,28 @@ fn browser_up(browser: &mut FileBrowser) {
     }
 }
 
+fn parse_editor_timestamp(value: &str) -> Result<Option<u64>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let document =
+        LyricsDocument::parse(&format!("[{value}]x")).map_err(|error| error.to_string())?;
+    document
+        .lines
+        .first()
+        .and_then(|line| line.timestamp_ms)
+        .map(Some)
+        .ok_or_else(|| "timestamp must use mm:ss.xxx".to_owned())
+}
+
+fn format_timestamp_ms(timestamp_ms: u64) -> String {
+    let minutes = timestamp_ms / 60_000;
+    let seconds = (timestamp_ms / 1000) % 60;
+    let millis = timestamp_ms % 1000;
+    format!("{minutes:02}:{seconds:02}.{millis:03}")
+}
+
 fn human_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
@@ -1190,7 +1212,7 @@ fn group_key(view: LibraryView, track: &Track) -> Option<String> {
         LibraryView::Artists => Some(artist_group_key(None, track)),
         LibraryView::Albums => Some(album_group_key(None, track)),
         LibraryView::Folders => Some(display_folder(track)),
-        LibraryView::Playlists => None,
+        LibraryView::Playlists | LibraryView::Lyrics => None,
     }
 }
 
@@ -1202,7 +1224,7 @@ fn group_title(view: LibraryView, key: &str) -> String {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| key.to_owned()),
         LibraryView::Albums => album_key_parts(key).0.to_owned(),
-        LibraryView::Tracks | LibraryView::Playlists => key.to_owned(),
+        LibraryView::Tracks | LibraryView::Playlists | LibraryView::Lyrics => key.to_owned(),
     }
 }
 
@@ -1215,6 +1237,7 @@ enum LibraryView {
     Albums,
     Folders,
     Playlists,
+    Lyrics,
 }
 
 impl LibraryView {
@@ -1225,6 +1248,7 @@ impl LibraryView {
             Self::Albums => "Albums",
             Self::Folders => "Folders",
             Self::Playlists => "Playlists",
+            Self::Lyrics => "Lyrics",
         }
     }
 
@@ -1234,6 +1258,7 @@ impl LibraryView {
             Self::Albums => "No albums yet",
             Self::Folders => "No folders yet",
             Self::Playlists => "No playlists yet",
+            Self::Lyrics => "No lyrics yet",
         }
     }
 }
@@ -1355,6 +1380,54 @@ struct BatchReview {
     expected_playlist_track_ids: Option<Vec<TrackId>>,
     new_playlist_name: String,
     track_ids: Vec<TrackId>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LyricsMode {
+    #[default]
+    Read,
+    Edit,
+    Karaoke,
+}
+
+#[derive(Debug, Clone)]
+struct LyricsEditLine {
+    text: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Clone)]
+struct LyricsEditorState {
+    track_id: TrackId,
+    expected_text: Option<String>,
+    metadata: Vec<(String, String)>,
+    lines: Vec<LyricsEditLine>,
+    original_synced: bool,
+    allow_plain_conversion: bool,
+    dirty: bool,
+    discard_confirm: bool,
+    remove_confirm: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LyricsImportPreview {
+    track_id: TrackId,
+    path: PathBuf,
+    raw: String,
+    document: LyricsDocument,
+    expected_text: Option<String>,
+    error: Option<String>,
+    overwrite_confirm: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LyricsCacheEntry {
+    path: PathBuf,
+    modified_ns: u128,
+    len: u64,
+    document: Option<LyricsDocument>,
     error: Option<String>,
 }
 
@@ -1619,6 +1692,16 @@ struct FluxReady {
     playlist_remove_confirm: bool,
     playlist_drag: Option<PlaylistDrag>,
     playlist_error: Option<String>,
+    selected_lyrics: Option<TrackId>,
+    lyrics_mode: LyricsMode,
+    lyrics_follow_current: bool,
+    lyrics_filter: String,
+    lyrics_editor: Option<LyricsEditorState>,
+    lyrics_import: Option<LyricsImportPreview>,
+    lyrics_export_path: String,
+    lyrics_export_pending: Option<(PathBuf, String)>,
+    lyrics_error: Option<String>,
+    lyrics_cache: RefCell<BTreeMap<TrackId, LyricsCacheEntry>>,
     lib_input: String,
     track_editor: Option<TrackEditor>,
     import_manager: Option<ImportManager>,
@@ -1826,6 +1909,31 @@ enum Message {
     PlaylistDragStart(usize),
     PlaylistDragHover(usize),
     PlaylistDragLeave,
+    LyricsSelect(TrackId),
+    LyricsBack,
+    LyricsOpenCurrent,
+    LyricsFilterChanged(String),
+    LyricsModeChanged(LyricsMode),
+    LyricsEditOpen,
+    LyricsEditorTextChanged(usize, String),
+    LyricsEditorTimestampChanged(usize, String),
+    LyricsEditorAddLine,
+    LyricsEditorRemoveLine(usize),
+    LyricsEditorMoveLine(usize, isize),
+    LyricsEditorSetCurrentTime(usize),
+    LyricsEditorNudge(usize, i64),
+    LyricsEditorClearTimestamp(usize),
+    LyricsEditorSave,
+    LyricsEditorCancel,
+    LyricsEditorRemove,
+    LyricsImportOpen,
+    LyricsImportPicked(Result<Option<Vec<PathBuf>>, String>),
+    LyricsImportConfirm,
+    LyricsImportCancel,
+    LyricsExportPathChanged(String),
+    LyricsExport(String),
+    LyricsOpenAlbum(AlbumId),
+    LyricsOpenArtist(ArtistId),
     SelectView(LibraryView),
     SelectGroup(Option<String>),
     ToggleSetup,
@@ -1887,6 +1995,16 @@ impl FluxReady {
             playlist_remove_confirm: false,
             playlist_drag: None,
             playlist_error: None,
+            selected_lyrics: None,
+            lyrics_mode: LyricsMode::Read,
+            lyrics_follow_current: false,
+            lyrics_filter: String::new(),
+            lyrics_editor: None,
+            lyrics_import: None,
+            lyrics_export_path: String::new(),
+            lyrics_export_pending: None,
+            lyrics_error: None,
+            lyrics_cache: RefCell::new(BTreeMap::new()),
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
@@ -1953,6 +2071,12 @@ impl FluxReady {
         self.queue_drag = None;
         self.seek_preview = None;
         self.track_editor = None;
+        self.selected_lyrics = None;
+        self.lyrics_mode = LyricsMode::Read;
+        self.lyrics_follow_current = false;
+        self.lyrics_editor = None;
+        self.lyrics_import = None;
+        self.lyrics_cache.borrow_mut().clear();
         self.artist_selected = None;
         self.artist_name_input.clear();
         self.artist_rename_input.clear();
@@ -1974,6 +2098,14 @@ impl FluxReady {
             self.last_queue_current = current;
             self.seek_preview = None;
             self.focus_queue_current();
+            if self.lyrics_follow_current {
+                self.selected_lyrics = self.controller.current_id();
+                if self.lyrics_mode == LyricsMode::Edit {
+                    self.lyrics_mode = LyricsMode::Read;
+                    self.lyrics_editor = None;
+                }
+                self.lyrics_import = None;
+            }
         }
     }
 
@@ -2993,11 +3125,26 @@ impl FluxReady {
     }
 
     fn select_view(&mut self, view: LibraryView) {
+        if let Some(editor) = self.lyrics_editor.as_mut()
+            && editor.dirty
+            && !editor.discard_confirm
+        {
+            editor.discard_confirm = true;
+            editor.error = Some(
+                "Unsaved lyrics changes will be discarded. Choose the destination again to leave the editor."
+                    .to_owned(),
+            );
+            return;
+        }
         self.view = view;
         self.selected_group = None;
         self.selected_playlist = None;
         self.playlist_entry_selection.clear();
         self.playlist_drag = None;
+        self.selected_lyrics = None;
+        self.lyrics_follow_current = false;
+        self.lyrics_editor = None;
+        self.lyrics_import = None;
         self.search.clear();
         self.page = 0;
         self.show_setup = false;
@@ -4165,6 +4312,8 @@ impl FluxReady {
                 if let Some(album) = self.controller.album(id) {
                     self.view = LibraryView::Albums;
                     self.selected_playlist = None;
+                    self.selected_lyrics = None;
+                    self.lyrics_follow_current = false;
                     self.selected_group = Some(album_key_for_title(id, &album.title));
                     self.search.clear();
                     self.selected_tracks.clear();
@@ -4184,6 +4333,8 @@ impl FluxReady {
                         .unwrap_or(0);
                     self.view = LibraryView::Tracks;
                     self.selected_playlist = None;
+                    self.selected_lyrics = None;
+                    self.lyrics_follow_current = false;
                     self.selected_group = None;
                     self.search.clear();
                     self.focused_track = Some(id);
@@ -4636,6 +4787,238 @@ impl FluxReady {
                     drag.moved = true;
                 }
             }
+            Message::LyricsSelect(id) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && editor.dirty
+                    && !editor.discard_confirm
+                {
+                    editor.discard_confirm = true;
+                    editor.error = Some(
+                        "Save or cancel the current lyrics edit before opening another track."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                if self.controller.track(id).is_some() {
+                    self.view = LibraryView::Lyrics;
+                    self.selected_lyrics = Some(id);
+                    self.selected_playlist = None;
+                    self.lyrics_mode = LyricsMode::Read;
+                    self.lyrics_follow_current = false;
+                    self.lyrics_editor = None;
+                    self.lyrics_import = None;
+                    self.lyrics_error = None;
+                    self.lyrics_export_pending = None;
+                    self.selected_group = None;
+                    self.search.clear();
+                    self.show_setup = false;
+                    self.page = 0;
+                }
+            }
+            Message::LyricsBack => {
+                self.selected_lyrics = None;
+                self.lyrics_mode = LyricsMode::Read;
+                self.lyrics_follow_current = false;
+                self.lyrics_editor = None;
+                self.lyrics_import = None;
+                self.lyrics_error = None;
+                self.lyrics_export_pending = None;
+            }
+            Message::LyricsOpenCurrent => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && editor.dirty
+                    && !editor.discard_confirm
+                {
+                    editor.discard_confirm = true;
+                    editor.error = Some(
+                        "Save or cancel the current lyrics edit before following playback."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                if let Some(id) = self.controller.current_id() {
+                    self.view = LibraryView::Lyrics;
+                    self.selected_lyrics = Some(id);
+                    self.lyrics_mode = LyricsMode::Read;
+                    self.lyrics_follow_current = true;
+                    self.lyrics_editor = None;
+                    self.lyrics_import = None;
+                    self.lyrics_error = None;
+                } else {
+                    self.lifecycle_msg = Some("Nothing is playing.".to_owned());
+                }
+            }
+            Message::LyricsFilterChanged(value) => {
+                self.lyrics_filter = value;
+                self.page = 0;
+            }
+            Message::LyricsModeChanged(mode) => {
+                if mode == LyricsMode::Edit {
+                    self.open_lyrics_editor();
+                } else {
+                    self.lyrics_mode = mode;
+                    self.lyrics_follow_current = mode == LyricsMode::Karaoke
+                        && self
+                            .selected_lyrics
+                            .is_some_and(|id| self.controller.current_id() == Some(id));
+                }
+            }
+            Message::LyricsEditOpen => self.open_lyrics_editor(),
+            Message::LyricsEditorTextChanged(index, value) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && let Some(line) = editor.lines.get_mut(index)
+                {
+                    line.text = value;
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
+                    editor.error = None;
+                }
+            }
+            Message::LyricsEditorTimestampChanged(index, value) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && let Some(line) = editor.lines.get_mut(index)
+                {
+                    line.timestamp = value;
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
+                    editor.allow_plain_conversion = false;
+                    editor.error = None;
+                }
+            }
+            Message::LyricsEditorAddLine => {
+                if let Some(editor) = self.lyrics_editor.as_mut() {
+                    editor.lines.push(LyricsEditLine {
+                        text: String::new(),
+                        timestamp: String::new(),
+                    });
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
+                }
+            }
+            Message::LyricsEditorRemoveLine(index) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && index < editor.lines.len()
+                {
+                    editor.lines.remove(index);
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
+                }
+            }
+            Message::LyricsEditorMoveLine(index, delta) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && index < editor.lines.len()
+                {
+                    let target = index as isize + delta;
+                    if target >= 0 && (target as usize) < editor.lines.len() {
+                        editor.lines.swap(index, target as usize);
+                        editor.dirty = true;
+                        editor.discard_confirm = false;
+                    }
+                }
+            }
+            Message::LyricsEditorSetCurrentTime(index) => {
+                let Some(editor) = self.lyrics_editor.as_mut() else {
+                    return Task::none();
+                };
+                if self.controller.current_id() != Some(editor.track_id) {
+                    editor.error = Some(
+                        "Play this track before assigning the current playback position."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                if let Some(line) = editor.lines.get_mut(index) {
+                    line.timestamp =
+                        format_timestamp_ms(self.controller.position().as_millis() as u64);
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
+                    editor.allow_plain_conversion = false;
+                    editor.error = None;
+                }
+            }
+            Message::LyricsEditorNudge(index, delta) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && let Some(line) = editor.lines.get_mut(index)
+                {
+                    let current = parse_editor_timestamp(&line.timestamp)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    let adjusted = (i128::from(current) + i128::from(delta))
+                        .clamp(0, i128::from(u64::MAX)) as u64;
+                    line.timestamp = format_timestamp_ms(adjusted);
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
+                    editor.allow_plain_conversion = false;
+                    editor.error = None;
+                }
+            }
+            Message::LyricsEditorClearTimestamp(index) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && let Some(line) = editor.lines.get_mut(index)
+                {
+                    line.timestamp.clear();
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
+                    editor.allow_plain_conversion = false;
+                    editor.error = None;
+                }
+            }
+            Message::LyricsEditorSave => self.save_lyrics_editor(),
+            Message::LyricsEditorCancel => self.cancel_lyrics_editor(),
+            Message::LyricsEditorRemove => self.remove_lyrics_from_editor(),
+            Message::LyricsImportOpen => return self.begin_lyrics_import(),
+            Message::LyricsImportPicked(result) => match result {
+                Ok(Some(paths)) => {
+                    if let Some(path) = paths.first() {
+                        match std::fs::read_to_string(path) {
+                            Ok(raw) => {
+                                let expected = self
+                                    .selected_lyrics
+                                    .and_then(|id| self.controller.track_lyrics(id));
+                                self.set_lyrics_import_preview(path.clone(), raw, expected);
+                            }
+                            Err(error) => {
+                                self.lyrics_error =
+                                    Some(format!("Could not read lyrics file: {error}"));
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.lyrics_error = Some(error),
+            },
+            Message::LyricsImportConfirm => self.confirm_lyrics_import(),
+            Message::LyricsImportCancel => self.lyrics_import = None,
+            Message::LyricsExportPathChanged(value) => {
+                self.lyrics_export_path = value;
+                self.lyrics_export_pending = None;
+            }
+            Message::LyricsExport(format) => self.export_lyrics(&format),
+            Message::LyricsOpenAlbum(album_id) => {
+                if let Some(album) = self.controller.album(album_id) {
+                    self.view = LibraryView::Albums;
+                    self.selected_playlist = None;
+                    self.selected_lyrics = None;
+                    self.lyrics_follow_current = false;
+                    self.selected_group = Some(album_key_for_title(album_id, &album.title));
+                    self.search.clear();
+                    self.sync_album_editor();
+                }
+            }
+            Message::LyricsOpenArtist(artist_id) => {
+                if let Some(artist) = self.controller.artist(artist_id) {
+                    self.view = LibraryView::Artists;
+                    self.selected_playlist = None;
+                    self.selected_lyrics = None;
+                    self.lyrics_follow_current = false;
+                    self.selected_group = Some(format!(
+                        "{}{ARTIST_KEY_SEPARATOR}{artist_id}",
+                        artist.name()
+                    ));
+                    self.search.clear();
+                }
+            }
             Message::SelectView(view) => {
                 self.selected_tracks.clear();
                 self.focused_track = None;
@@ -4647,6 +5030,8 @@ impl FluxReady {
                 }
                 self.selected_group = group;
                 self.selected_playlist = None;
+                self.selected_lyrics = None;
+                self.lyrics_follow_current = false;
                 self.selected_tracks.clear();
                 self.focused_track = None;
                 self.sync_album_editor();
@@ -4831,9 +5216,14 @@ impl FluxReady {
                     Key::Character("3") => self.select_view(LibraryView::Albums),
                     Key::Character("4") => self.select_view(LibraryView::Folders),
                     Key::Character("5") => self.select_view(LibraryView::Playlists),
+                    Key::Character("6") => self.select_view(LibraryView::Lyrics),
                     Key::Character("l") => self.toggle_setup(),
                     Key::Named(Named::Escape) => {
                         if self.track_editor.take().is_some() {
+                            return Task::none();
+                        }
+                        if self.lyrics_editor.is_some() {
+                            self.cancel_lyrics_editor();
                             return Task::none();
                         }
                         self.cancel_queue_drag();
@@ -4918,7 +5308,11 @@ impl FluxReady {
         }
 
         let base: Element<'_, Message> = body.into();
-        let body: Element<'_, Message> = if self.playlist_create_open {
+        let body: Element<'_, Message> = if self.lyrics_import.is_some() {
+            stack([base, self.lyrics_import_overlay()])
+                .height(Length::Fill)
+                .into()
+        } else if self.playlist_create_open {
             stack([base, self.playlist_create_overlay()])
                 .height(Length::Fill)
                 .into()
@@ -7083,7 +7477,7 @@ impl FluxReady {
         .into()
     }
 
-    fn nav_counts(&self) -> (usize, usize, usize, usize, usize) {
+    fn nav_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
         let mut artists: HashSet<String> = HashSet::new();
         let mut albums: HashSet<Option<&str>> = HashSet::new();
         let mut folders: HashSet<Option<&Path>> = HashSet::new();
@@ -7105,6 +7499,11 @@ impl FluxReady {
             albums.len(),
             folders.len(),
             self.controller.playlists().len(),
+            self.controller
+                .tracks()
+                .iter()
+                .filter(|(id, _)| self.controller.track_has_lyrics(*id))
+                .count(),
         )
     }
 
@@ -7135,6 +7534,7 @@ impl FluxReady {
             LibraryView::Albums,
             LibraryView::Folders,
             LibraryView::Playlists,
+            LibraryView::Lyrics,
         ] {
             nav = nav.push(
                 button(
@@ -7148,6 +7548,7 @@ impl FluxReady {
                                 LibraryView::Albums => counts.2,
                                 LibraryView::Folders => counts.3,
                                 LibraryView::Playlists => counts.4,
+                                LibraryView::Lyrics => counts.5,
                             }
                             .to_string()
                         )
@@ -7254,6 +7655,21 @@ impl FluxReady {
                 "Search results".to_owned(),
                 "Artists, albums and tracks from the canonical catalogue.".to_owned(),
             )
+        } else if let Some(track_id) = self.selected_lyrics {
+            let title = self
+                .controller
+                .track(track_id)
+                .map(|track| track.title().to_owned())
+                .unwrap_or_else(|| "Lyrics".to_owned());
+            (
+                title,
+                format!("Lyrics for track {track_id} · managed canonical text"),
+            )
+        } else if self.view == LibraryView::Lyrics {
+            (
+                "Lyrics".to_owned(),
+                "Tracks with managed plain-text or synchronized lyrics.".to_owned(),
+            )
         } else if let Some(playlist_id) = self.selected_playlist {
             (
                 self.controller
@@ -7345,6 +7761,14 @@ impl FluxReady {
                 );
             }
         }
+        if self.controller.current_id().is_some() && self.track_editor.is_none() {
+            bar = bar.push(
+                button(text("Lyrics").size(11))
+                    .style(nav_style(self.view == LibraryView::Lyrics))
+                    .padding([6, 10])
+                    .on_press(Message::LyricsOpenCurrent),
+            );
+        }
         if self.window_width >= 1_080.0 && self.track_editor.is_none() {
             bar = bar.push(
                 button(text("Queue").size(11))
@@ -7406,6 +7830,12 @@ impl FluxReady {
         }
         if !self.search.trim().is_empty() {
             return self.search_results_view();
+        }
+        if self.view == LibraryView::Lyrics {
+            return self.selected_lyrics.map_or_else(
+                || self.lyrics_library_view(),
+                |id| self.lyrics_detail_view_for_mode(id),
+            );
         }
         if self.view == LibraryView::Playlists {
             return self.selected_playlist.map_or_else(
@@ -8888,6 +9318,1148 @@ impl FluxReady {
                 .padding(18)
                 .width(Length::Fill)
                 .max_width(520.0)
+                .style(import_panel_style),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center(Length::Fill)
+        .style(modal_backdrop_style)
+        .into()
+    }
+
+    fn open_lyrics_editor(&mut self) {
+        let Some(id) = self.selected_lyrics else {
+            self.lyrics_error = Some("Select a track first.".to_owned());
+            return;
+        };
+        let Some(_) = self.controller.track(id) else {
+            self.lyrics_error = Some("The lyrics track is no longer in the library.".to_owned());
+            return;
+        };
+        let expected_text = self.controller.track_lyrics(id);
+        let document = match expected_text.as_deref() {
+            Some(raw) => match LyricsDocument::parse(raw) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.lyrics_error = Some(format!(
+                        "Existing lyrics are not valid LRC/TXT: {error}. Import valid lyrics or remove them before editing."
+                    ));
+                    return;
+                }
+            },
+            None => LyricsDocument::default(),
+        };
+        let original_synced = document.kind() == LyricsKind::Synced;
+        let mut lines = document
+            .lines
+            .into_iter()
+            .map(|line| LyricsEditLine {
+                text: line.text,
+                timestamp: line
+                    .timestamp_ms
+                    .map(format_timestamp_ms)
+                    .unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(LyricsEditLine {
+                text: String::new(),
+                timestamp: String::new(),
+            });
+        }
+        self.lyrics_editor = Some(LyricsEditorState {
+            track_id: id,
+            expected_text,
+            metadata: document.metadata,
+            lines,
+            original_synced,
+            allow_plain_conversion: false,
+            dirty: false,
+            discard_confirm: false,
+            remove_confirm: false,
+            error: None,
+        });
+        self.lyrics_mode = LyricsMode::Edit;
+        self.lyrics_follow_current = false;
+        self.lyrics_error = None;
+    }
+
+    fn save_lyrics_editor(&mut self) {
+        let Some(editor) = self.lyrics_editor.as_ref().cloned() else {
+            return;
+        };
+        let mut lines = Vec::with_capacity(editor.lines.len());
+        let mut last_timestamp = None;
+        for (index, edit_line) in editor.lines.iter().enumerate() {
+            let timestamp = match parse_editor_timestamp(&edit_line.timestamp) {
+                Ok(timestamp) => timestamp,
+                Err(error) => {
+                    if let Some(editor) = self.lyrics_editor.as_mut() {
+                        editor.error = Some(format!("Line {}: {error}", index + 1));
+                    }
+                    return;
+                }
+            };
+            if let Some(timestamp) = timestamp {
+                if last_timestamp.is_some_and(|previous| timestamp < previous) {
+                    if let Some(editor) = self.lyrics_editor.as_mut() {
+                        editor.error = Some(format!(
+                            "Line {} is earlier than the preceding timestamp. Reorder the line or adjust its timestamp.",
+                            index + 1
+                        ));
+                    }
+                    return;
+                }
+                last_timestamp = Some(timestamp);
+            }
+            lines.push(LyricLine {
+                text: edit_line.text.clone(),
+                timestamp_ms: timestamp,
+            });
+        }
+        let synced = lines.iter().any(|line| line.timestamp_ms.is_some());
+        if editor.original_synced && !synced && !editor.allow_plain_conversion {
+            if let Some(editor) = self.lyrics_editor.as_mut() {
+                editor.allow_plain_conversion = true;
+                editor.error = Some(
+                    "Every timestamp is gone. Save again to explicitly convert this synchronized document to plain text."
+                        .to_owned(),
+                );
+            }
+            return;
+        }
+        let document = LyricsDocument {
+            metadata: editor.metadata.clone(),
+            lines,
+        };
+        let serialized = if synced || !document.metadata.is_empty() {
+            document.to_lrc()
+        } else {
+            document.to_plain_text()
+        };
+        match self.controller.save_lyrics_checked(
+            editor.track_id,
+            editor.expected_text.as_deref(),
+            Some(&serialized),
+        ) {
+            Ok(()) => {
+                self.invalidate_lyrics_cache(editor.track_id);
+                self.lyrics_editor = None;
+                self.lyrics_mode = LyricsMode::Read;
+                self.lyrics_error = None;
+                self.lifecycle_msg = Some(format!("Saved lyrics for track {}.", editor.track_id));
+            }
+            Err(error) => {
+                if let Some(editor) = self.lyrics_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn cancel_lyrics_editor(&mut self) {
+        let Some(editor) = self.lyrics_editor.as_mut() else {
+            self.lyrics_mode = LyricsMode::Read;
+            return;
+        };
+        if editor.dirty && !editor.discard_confirm {
+            editor.discard_confirm = true;
+            editor.error = Some(
+                "Unsaved lyrics changes will be discarded. Press Cancel again to discard them."
+                    .to_owned(),
+            );
+            return;
+        }
+        self.lyrics_editor = None;
+        self.lyrics_mode = LyricsMode::Read;
+    }
+
+    fn remove_lyrics_from_editor(&mut self) {
+        let Some(editor) = self.lyrics_editor.as_mut() else {
+            return;
+        };
+        if !editor.remove_confirm {
+            editor.remove_confirm = true;
+            editor.error = Some(
+                "Press “Confirm remove lyrics” again to delete only the managed lyrics file."
+                    .to_owned(),
+            );
+            return;
+        }
+        let editor = editor.clone();
+        match self.controller.save_lyrics_checked(
+            editor.track_id,
+            editor.expected_text.as_deref(),
+            None,
+        ) {
+            Ok(()) => {
+                self.invalidate_lyrics_cache(editor.track_id);
+                self.lyrics_editor = None;
+                self.lyrics_mode = LyricsMode::Read;
+                self.lyrics_error = None;
+                self.lifecycle_msg = Some(format!(
+                    "Removed lyrics for track {}; the track and audio were not changed.",
+                    editor.track_id
+                ));
+            }
+            Err(error) => {
+                if let Some(editor) = self.lyrics_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn begin_lyrics_import(&mut self) -> Task<Message> {
+        let Some(id) = self.selected_lyrics else {
+            self.lyrics_error = Some("Select a track before importing lyrics.".to_owned());
+            return Task::none();
+        };
+        let start = self
+            .controller
+            .track_lyrics_path(id)
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| self.controller.canonical_root().map(Path::to_path_buf));
+        Task::perform(
+            async move { flux_platform::pick_lyrics_files_in(start.as_deref()) },
+            Message::LyricsImportPicked,
+        )
+    }
+
+    fn set_lyrics_import_preview(
+        &mut self,
+        path: PathBuf,
+        raw: String,
+        expected_text: Option<String>,
+    ) {
+        let (document, error) = match LyricsDocument::parse(&raw) {
+            Ok(document) => (document, None),
+            Err(error) => (LyricsDocument::default(), Some(error.to_string())),
+        };
+        let Some(id) = self.selected_lyrics else {
+            self.lyrics_error = Some("Select a track before importing lyrics.".to_owned());
+            return;
+        };
+        self.lyrics_import = Some(LyricsImportPreview {
+            track_id: id,
+            path,
+            raw,
+            document,
+            expected_text,
+            error,
+            overwrite_confirm: false,
+        });
+    }
+
+    fn confirm_lyrics_import(&mut self) {
+        let Some(mut preview) = self.lyrics_import.take() else {
+            return;
+        };
+        if preview.error.is_some() {
+            self.lyrics_import = Some(preview);
+            return;
+        }
+        if preview.expected_text.is_some() && !preview.overwrite_confirm {
+            preview.overwrite_confirm = true;
+            self.lyrics_import = Some(preview);
+            return;
+        }
+        match self.controller.save_lyrics_checked(
+            preview.track_id,
+            preview.expected_text.as_deref(),
+            Some(&preview.raw),
+        ) {
+            Ok(()) => {
+                self.invalidate_lyrics_cache(preview.track_id);
+                self.selected_lyrics = Some(preview.track_id);
+                self.lyrics_mode = LyricsMode::Read;
+                self.lyrics_import = None;
+                self.lyrics_error = None;
+                self.lifecycle_msg = Some(format!(
+                    "Imported lyrics for track {} from {}.",
+                    preview.track_id,
+                    preview.path.display()
+                ));
+            }
+            Err(error) => {
+                preview.error = Some(error);
+                self.lyrics_import = Some(preview);
+            }
+        }
+    }
+
+    fn export_lyrics(&mut self, format: &str) {
+        let Some(id) = self.selected_lyrics else {
+            self.lyrics_error = Some("Select a track before exporting lyrics.".to_owned());
+            return;
+        };
+        let Some(raw) = self.controller.track_lyrics(id) else {
+            self.lyrics_error = Some("This track has no managed lyrics to export.".to_owned());
+            return;
+        };
+        let document = match LyricsDocument::parse(&raw) {
+            Ok(document) => document,
+            Err(error) => {
+                self.lyrics_error = Some(format!("Lyrics cannot be exported: {error}"));
+                return;
+            }
+        };
+        let expected_extension = if format == "lrc" { "lrc" } else { "txt" };
+        let mut path = PathBuf::from(self.lyrics_export_path.trim());
+        if self.lyrics_export_path.trim().is_empty() {
+            self.lyrics_error = Some("Enter an export destination path.".to_owned());
+            return;
+        }
+        match path.extension().and_then(|extension| extension.to_str()) {
+            None => {
+                path.set_extension(expected_extension);
+            }
+            Some(extension) if extension.eq_ignore_ascii_case(expected_extension) => {}
+            Some(_) => {
+                self.lyrics_error = Some(format!(
+                    "Export .{format} requires a .{expected_extension} destination."
+                ));
+                return;
+            }
+        }
+        let pending =
+            self.lyrics_export_pending
+                .as_ref()
+                .is_some_and(|(pending_path, pending_format)| {
+                    pending_path == &path && pending_format == format
+                });
+        if path.exists() && !pending {
+            self.lyrics_export_pending = Some((path.clone(), format.to_owned()));
+            self.lyrics_error = Some(
+                "The destination exists. Click the same export action again to overwrite it."
+                    .to_owned(),
+            );
+            return;
+        }
+        let content = if format == "lrc" {
+            document.to_lrc()
+        } else {
+            document.to_plain_text()
+        };
+        match std::fs::write(&path, content.as_bytes()) {
+            Ok(()) => {
+                self.lyrics_export_pending = None;
+                self.lyrics_error = None;
+                self.lifecycle_msg = Some(format!("Exported lyrics to {}.", path.display()));
+            }
+            Err(error) => self.lyrics_error = Some(format!("Could not export lyrics: {error}")),
+        }
+    }
+
+    fn lyrics_cache_entry(&self, id: TrackId) -> Option<LyricsCacheEntry> {
+        let path = self.controller.track_lyrics_path(id)?;
+        let metadata = std::fs::metadata(&path).ok();
+        let modified_ns = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        let len = metadata.map_or(0, |metadata| metadata.len());
+        {
+            let cache = self.lyrics_cache.borrow();
+            if let Some(entry) = cache.get(&id)
+                && entry.path == path
+                && entry.modified_ns == modified_ns
+                && entry.len == len
+            {
+                return Some(entry.clone());
+            }
+        }
+        let (document, error) = match std::fs::read_to_string(&path) {
+            Ok(raw) => match LyricsDocument::parse(&raw) {
+                Ok(document) => (Some(document), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            Err(error) => (None, Some(format!("lyrics file cannot be read: {error}"))),
+        };
+        let entry = LyricsCacheEntry {
+            path,
+            modified_ns,
+            len,
+            document,
+            error,
+        };
+        self.lyrics_cache.borrow_mut().insert(id, entry.clone());
+        Some(entry)
+    }
+
+    fn invalidate_lyrics_cache(&self, id: TrackId) {
+        self.lyrics_cache.borrow_mut().remove(&id);
+    }
+
+    #[cfg(test)]
+    fn lyrics_kind_for(&self, id: TrackId) -> LyricsKind {
+        self.lyrics_cache_entry(id)
+            .and_then(|entry| entry.document)
+            .map_or(LyricsKind::Plain, |document| document.kind())
+    }
+
+    fn filtered_lyrics_tracks(&self) -> Vec<(TrackId, &Track)> {
+        let needle = self.lyrics_filter.trim().to_lowercase();
+        self.controller
+            .tracks()
+            .iter()
+            .filter(|(id, track)| {
+                self.controller.track_has_lyrics(*id)
+                    && (needle.is_empty()
+                        || track.title().to_lowercase().contains(&needle)
+                        || track
+                            .artist()
+                            .is_some_and(|artist| artist.to_lowercase().contains(&needle))
+                        || track
+                            .album()
+                            .is_some_and(|album| album.to_lowercase().contains(&needle)))
+            })
+            .map(|(id, track)| (*id, track))
+            .collect()
+    }
+
+    fn lyrics_library_view(&self) -> Element<'_, Message> {
+        let rows = self.filtered_lyrics_tracks();
+        let total = rows.len();
+        let mut body = column![
+            row![
+                column![
+                    text("Lyrics").size(22).color(TEXT),
+                    text(format!("{total} track(s) with managed lyrics"))
+                        .size(10)
+                        .color(MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                button(text("Open current lyrics").size(10))
+                    .style(accent_button_style)
+                    .padding([7, 10])
+                    .on_press_maybe(
+                        self.controller
+                            .current_id()
+                            .map(|_| Message::LyricsOpenCurrent)
+                    ),
+            ]
+            .align_y(Alignment::Center),
+            text_input(
+                "Filter lyrics by title, artist or album…",
+                &self.lyrics_filter
+            )
+            .on_input(Message::LyricsFilterChanged)
+            .style(input_style)
+            .width(Length::Fill),
+        ]
+        .spacing(9);
+        if let Some(error) = &self.lyrics_error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        if rows.is_empty() {
+            body = body.push(
+                container(
+                    column![
+                        text(if self.lyrics_filter.trim().is_empty() {
+                            "No tracks have lyrics yet."
+                        } else {
+                            "No lyrics tracks match this filter."
+                        })
+                        .size(16)
+                        .color(TEXT),
+                        text("Open a track and use Edit or Import lyrics to create managed plain-text or synchronized lyrics.")
+                            .size(10)
+                            .color(MUTED),
+                        button(text("Browse tracks").size(11))
+                            .style(accent_button_style)
+                            .padding([7, 11])
+                            .on_press(Message::SelectView(LibraryView::Tracks)),
+                    ]
+                    .spacing(8)
+                    .align_x(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center(Length::Fill)
+                .style(card_style),
+            );
+            return body.into();
+        }
+        let pages = total.div_ceil(TRACK_PAGE_SIZE).max(1);
+        let page = self.page.min(pages - 1);
+        let start = page * TRACK_PAGE_SIZE;
+        let end = (start + TRACK_PAGE_SIZE).min(total);
+        let current = self.controller.current_id();
+        let mut list = column![].spacing(4);
+        for (id, track) in &rows[start..end] {
+            let entry = self.lyrics_cache_entry(*id);
+            let kind = entry
+                .as_ref()
+                .and_then(|entry| entry.document.as_ref())
+                .map_or(LyricsKind::Plain, LyricsDocument::kind);
+            let invalid = entry.as_ref().and_then(|entry| entry.error.as_ref());
+            let preview = entry
+                .as_ref()
+                .and_then(|entry| entry.document.as_ref())
+                .and_then(|document| {
+                    document
+                        .lines
+                        .iter()
+                        .map(|line| line.text.trim())
+                        .find(|line| !line.is_empty())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "No readable text preview".to_owned());
+            list = list.push(
+                button(
+                    row![
+                        container(text("♪").size(16).color(ACCENT))
+                            .width(38)
+                            .height(38)
+                            .center(38)
+                            .style(artwork_style(artwork_color(track.title()))),
+                        column![
+                            row![
+                                text(track.title().to_owned())
+                                    .size(13)
+                                    .color(if current == Some(*id) { ACCENT } else { TEXT }),
+                                if current == Some(*id) {
+                                    Element::from(text("▶ playing").size(9).color(ACCENT))
+                                } else {
+                                    Element::from(iced::widget::Space::new().width(0))
+                                },
+                            ]
+                            .spacing(7),
+                            text(format!(
+                                "{} · {} · {}",
+                                display_artist(track),
+                                display_album(track),
+                                match kind {
+                                    LyricsKind::Synced => "Synchronized",
+                                    LyricsKind::Plain => "Plain text",
+                                }
+                            ))
+                            .size(9)
+                            .color(MUTED),
+                            text(preview).size(9).color(MUTED),
+                        ]
+                        .spacing(1)
+                        .width(Length::Fill),
+                        text(if invalid.is_some() {
+                            "INVALID"
+                        } else {
+                            match kind {
+                                LyricsKind::Synced => "SYNC",
+                                LyricsKind::Plain => "TEXT",
+                            }
+                        })
+                        .size(8)
+                        .color(if invalid.is_some() {
+                            DANGER
+                        } else if kind == LyricsKind::Synced {
+                            ACCENT
+                        } else {
+                            MUTED
+                        }),
+                        text("›").size(18).color(MUTED),
+                    ]
+                    .spacing(9)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding(7)
+                .style(group_style)
+                .on_press(Message::LyricsSelect(*id)),
+            );
+        }
+        body = body.push(scrollable(list).height(Length::Fill));
+        body = body.push(pagination_footer(page, pages, start, end, total));
+        body.height(Length::Fill).into()
+    }
+
+    fn lyrics_detail_view_for_mode(&self, id: TrackId) -> Element<'_, Message> {
+        match self.lyrics_mode {
+            LyricsMode::Read => self.lyrics_read_view(id),
+            LyricsMode::Edit => self.lyrics_editor_view(),
+            LyricsMode::Karaoke => self.lyrics_karaoke_view(id),
+        }
+    }
+
+    fn lyrics_read_view(&self, id: TrackId) -> Element<'_, Message> {
+        let Some(track) = self.controller.track(id) else {
+            return text("The lyrics track is no longer in the library.")
+                .size(13)
+                .color(MUTED)
+                .into();
+        };
+        let entry = self.lyrics_cache_entry(id);
+        let document = entry.as_ref().and_then(|entry| entry.document.clone());
+        let status = document
+            .as_ref()
+            .map_or(LyricsKind::Plain, LyricsDocument::kind);
+        let current_track = self.controller.current_id() == Some(id);
+        let position_ms = if current_track {
+            self.seek_preview
+                .map(|seconds| (f64::from(seconds) * 1000.0) as u64)
+                .unwrap_or_else(|| self.controller.position().as_millis() as u64)
+        } else {
+            0
+        };
+        let album = self.controller.track_album_id(id);
+        let owner = self.controller.track_artist_id(id);
+        let mut header = row![
+            button(text("‹ Back").size(11))
+                .style(ghost_style)
+                .padding([6, 9])
+                .on_press(Message::LyricsBack),
+            column![
+                text(track.title().to_owned()).size(22).color(TEXT),
+                text(format!(
+                    "{} · {}",
+                    display_artist(track),
+                    display_album(track)
+                ))
+                .size(10)
+                .color(MUTED),
+                text(match status {
+                    LyricsKind::Synced => "Synchronized lyrics",
+                    LyricsKind::Plain => "Plain-text lyrics",
+                })
+                .size(9)
+                .color(if status == LyricsKind::Synced {
+                    ACCENT
+                } else {
+                    MUTED
+                }),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            button(text("Play").size(10))
+                .style(accent_button_style)
+                .padding([7, 10])
+                .on_press(Message::PlayTrack(id)),
+            button(text("Edit").size(10))
+                .style(ghost_style)
+                .padding([7, 10])
+                .on_press(Message::LyricsEditOpen),
+            button(text("Import…").size(10))
+                .style(ghost_style)
+                .padding([7, 10])
+                .on_press(Message::LyricsImportOpen),
+            button(text("Karaoke").size(10))
+                .style(ghost_style)
+                .padding([7, 10])
+                .on_press(Message::LyricsModeChanged(LyricsMode::Karaoke)),
+        ]
+        .spacing(7)
+        .align_y(Alignment::Center);
+        if let Some(album_id) = album {
+            header = header.push(
+                button(text("Album").size(9))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::LyricsOpenAlbum(album_id)),
+            );
+        }
+        if let Some(artist_id) = owner {
+            header = header.push(
+                button(text("Artist").size(9))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::LyricsOpenArtist(artist_id)),
+            );
+        }
+        header = header.push(
+            button(text("Track").size(9))
+                .style(ghost_style)
+                .padding([5, 8])
+                .on_press(Message::SearchNavigateTrack(id)),
+        );
+        let mut body = column![header].spacing(10);
+        if let Some(error) = &self.lyrics_error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        if let Some(error) = entry.as_ref().and_then(|entry| entry.error.as_ref()) {
+            body = body.push(
+                text(format!("Lyrics cannot be parsed: {error}"))
+                    .size(10)
+                    .color(DANGER),
+            );
+        }
+        if let Some(document) = &document {
+            if !document.metadata.is_empty() {
+                body = body.push(
+                    text(format!(
+                        "{} LRC metadata tag(s) preserved; they never override canonical track metadata.",
+                        document.metadata.len()
+                    ))
+                    .size(9)
+                    .color(MUTED),
+                );
+            }
+            if status == LyricsKind::Synced {
+                let events = document.sync_events();
+                let current_event = current_track
+                    .then(|| document.current_event_index(position_ms))
+                    .flatten();
+                let mut lines = column![].spacing(3);
+                for (index, event) in events.iter().enumerate() {
+                    let color = if current_event == Some(index) {
+                        ACCENT
+                    } else if current_event.is_some_and(|current| index < current) {
+                        MUTED
+                    } else {
+                        TEXT
+                    };
+                    lines = lines.push(
+                        row![
+                            text(format_timestamp_ms(event.time_ms))
+                                .size(9)
+                                .color(MUTED)
+                                .width(Length::Fixed(64.0)),
+                            text(event.text.clone())
+                                .size(if current_event == Some(index) { 15 } else { 12 })
+                                .color(color),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    );
+                }
+                let untimed = document
+                    .lines
+                    .iter()
+                    .filter(|line| line.timestamp_ms.is_none())
+                    .collect::<Vec<_>>();
+                if !untimed.is_empty() {
+                    lines = lines.push(text("UNTIMED").size(8).color(MUTED));
+                    for line in untimed {
+                        lines = lines.push(text(line.text.clone()).size(11).color(TEXT));
+                    }
+                }
+                body = body.push(scrollable(lines).height(Length::Fill));
+            } else {
+                let lines = document
+                    .lines
+                    .iter()
+                    .map(|line| Element::from(text(line.text.clone()).size(12).color(TEXT)))
+                    .collect::<Vec<_>>();
+                body = body.push(scrollable(column![].extend(lines)).height(Length::Fill));
+            }
+            body = body.push(
+                text("Playback highlighting uses the actual player position; seek, pause, resume and track changes update it without changing the canonical text.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        } else {
+            body = body.push(
+                container(
+                    column![
+                        text("No managed lyrics for this track.").size(16).color(TEXT),
+                        text("Create plain or synchronized lyrics manually, or import an LRC/TXT file. Existing lyrics are preserved until an explicit save.")
+                            .size(10)
+                            .color(MUTED),
+                        row![
+                            button(text("Create lyrics").size(11))
+                                .style(accent_button_style)
+                                .padding([7, 10])
+                                .on_press(Message::LyricsEditOpen),
+                            button(text("Import lyrics…").size(10))
+                                .style(ghost_style)
+                                .padding([7, 10])
+                                .on_press(Message::LyricsImportOpen),
+                        ]
+                        .spacing(7),
+                    ]
+                    .spacing(7),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(card_style),
+            );
+        }
+        body = body.push(
+            container(
+                column![
+                    text("EXPORT").size(9).color(ACCENT),
+                    row![
+                        text_input("Destination path (.lrc or .txt)…", &self.lyrics_export_path)
+                            .on_input(Message::LyricsExportPathChanged)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text(if self.lyrics_export_pending.as_ref().is_some_and(|(_, format)| format == "lrc") { "Confirm overwrite .lrc" } else { "Export .lrc" }).size(10))
+                            .style(ghost_style)
+                            .padding([6, 8])
+                            .on_press_maybe(document.is_some().then_some(Message::LyricsExport("lrc".to_owned()))),
+                        button(text(if self.lyrics_export_pending.as_ref().is_some_and(|(_, format)| format == "txt") { "Confirm overwrite .txt" } else { "Export .txt" }).size(10))
+                            .style(ghost_style)
+                            .padding([6, 8])
+                            .on_press_maybe(document.is_some().then_some(Message::LyricsExport("txt".to_owned()))),
+                    ]
+                    .spacing(6),
+                    text("Export is UTF-8 and never writes into audio files. Existing destination files require a second explicit confirmation.")
+                        .size(9)
+                        .color(MUTED),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .style(card_style),
+        );
+        body.height(Length::Fill).into()
+    }
+
+    fn lyrics_editor_view(&self) -> Element<'_, Message> {
+        let Some(editor) = self.lyrics_editor.as_ref() else {
+            return text("No lyrics editor is open.")
+                .size(13)
+                .color(MUTED)
+                .into();
+        };
+        let track_title = self
+            .controller
+            .track(editor.track_id)
+            .map(|track| track.title().to_owned())
+            .unwrap_or_else(|| format!("Track {}", editor.track_id));
+        let current_playback = self.controller.current_id() == Some(editor.track_id);
+        let mut body = column![
+            row![
+                button(text("‹ Cancel").size(10))
+                    .style(ghost_style)
+                    .padding([6, 8])
+                    .on_press(Message::LyricsEditorCancel),
+                column![
+                    text(format!("Edit lyrics · {track_title}")).size(20).color(TEXT),
+                    text(if editor.dirty { "Unsaved changes" } else { "No unsaved changes" })
+                        .size(9)
+                        .color(if editor.dirty { ACCENT } else { MUTED }),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                button(text("Save lyrics").size(11))
+                    .style(accent_button_style)
+                    .padding([7, 11])
+                    .on_press(Message::LyricsEditorSave),
+                button(
+                    text(if editor.remove_confirm {
+                        "Confirm remove lyrics"
+                    } else {
+                        "Remove lyrics"
+                    })
+                    .size(10),
+                )
+                .style(danger_button_style)
+                .padding([7, 10])
+                .on_press(Message::LyricsEditorRemove),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+            text("Edit text and timestamps. Leave a timestamp empty for an untimed line. Timestamps use mm:ss.xxx and must be non-decreasing in line order.")
+                .size(9)
+                .color(MUTED),
+        ]
+        .spacing(8);
+        if let Some(error) = &editor.error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        let mut rows = column![].spacing(3);
+        for (index, line) in editor.lines.iter().enumerate() {
+            let mut actions = row![
+                text(format!("{}", index + 1))
+                    .size(9)
+                    .color(MUTED)
+                    .width(Length::Fixed(24.0)),
+                text_input("Lyric line…", &line.text)
+                    .on_input(move |value| Message::LyricsEditorTextChanged(index, value))
+                    .style(input_style)
+                    .width(Length::FillPortion(5)),
+                text_input("mm:ss.xxx", &line.timestamp)
+                    .on_input(move |value| Message::LyricsEditorTimestampChanged(index, value))
+                    .style(input_style)
+                    .width(Length::Fixed(112.0)),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center);
+            actions = actions.push(
+                button(text("Now").size(9))
+                    .style(ghost_style)
+                    .padding([4, 6])
+                    .on_press_maybe(
+                        current_playback.then_some(Message::LyricsEditorSetCurrentTime(index)),
+                    ),
+            );
+            for (label, delta) in [
+                ("-1s", -1000i64),
+                ("-100", -100),
+                ("+100", 100),
+                ("+1s", 1000),
+            ] {
+                actions = actions.push(
+                    button(text(label).size(8))
+                        .style(ghost_style)
+                        .padding([4, 5])
+                        .on_press(Message::LyricsEditorNudge(index, delta)),
+                );
+            }
+            actions = actions.push(
+                button(text("Clear").size(8))
+                    .style(ghost_style)
+                    .padding([4, 5])
+                    .on_press(Message::LyricsEditorClearTimestamp(index)),
+            );
+            actions = actions.push(
+                button(text("↑").size(9))
+                    .style(ghost_style)
+                    .padding([4, 5])
+                    .on_press_maybe(
+                        (index > 0).then_some(Message::LyricsEditorMoveLine(index, -1)),
+                    ),
+            );
+            actions = actions.push(
+                button(text("↓").size(9))
+                    .style(ghost_style)
+                    .padding([4, 5])
+                    .on_press_maybe(
+                        (index + 1 < editor.lines.len())
+                            .then_some(Message::LyricsEditorMoveLine(index, 1)),
+                    ),
+            );
+            actions = actions.push(
+                button(text("×").size(9))
+                    .style(danger_button_style)
+                    .padding([4, 5])
+                    .on_press(Message::LyricsEditorRemoveLine(index)),
+            );
+            rows = rows.push(actions);
+        }
+        body = body.push(scrollable(rows).height(Length::Fill));
+        body = body.push(
+            row![
+                button(text("Add line").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::LyricsEditorAddLine),
+                text(if editor.original_synced {
+                    "Removing every timestamp requires an explicit second Save to convert to plain text."
+                } else {
+                    "Any saved timestamp converts this document to synchronized LRC."
+                })
+                .size(9)
+                .color(MUTED),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        body.height(Length::Fill).into()
+    }
+
+    fn lyrics_karaoke_view(&self, id: TrackId) -> Element<'_, Message> {
+        let Some(track) = self.controller.track(id) else {
+            return text("The karaoke track is no longer in the library.")
+                .size(13)
+                .color(MUTED)
+                .into();
+        };
+        let entry = self.lyrics_cache_entry(id);
+        let document = entry.as_ref().and_then(|entry| entry.document.clone());
+        let current_track = self.controller.current_id() == Some(id);
+        let position_ms = if current_track {
+            self.seek_preview
+                .map(|seconds| (f64::from(seconds) * 1000.0) as u64)
+                .unwrap_or_else(|| self.controller.position().as_millis() as u64)
+        } else {
+            0
+        };
+        let mut body = column![
+            row![
+                button(text("‹ Back").size(11))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::LyricsModeChanged(LyricsMode::Read)),
+                column![
+                    text(track.title().to_owned()).size(20).color(TEXT),
+                    text(format!(
+                        "{} · {}",
+                        display_artist(track),
+                        display_album(track)
+                    ))
+                    .size(10)
+                    .color(MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                button(text("Play").size(10))
+                    .style(accent_button_style)
+                    .padding([7, 10])
+                    .on_press(Message::PlayTrack(id)),
+                button(text("Edit").size(10))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press(Message::LyricsEditOpen),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10);
+        if let Some(document) = &document {
+            let events = document.sync_events();
+            if events.is_empty() {
+                body = body.push(
+                    text("This is plain-text lyrics; karaoke needs synchronized timestamps.")
+                        .size(12)
+                        .color(MUTED),
+                );
+                let lines = document
+                    .lines
+                    .iter()
+                    .map(|line| Element::from(text(line.text.clone()).size(13).color(TEXT)))
+                    .collect::<Vec<_>>();
+                body = body.push(scrollable(column![].extend(lines)).height(Length::Fill));
+            } else {
+                let current_event = current_track
+                    .then(|| document.current_event_index(position_ms))
+                    .flatten();
+                let current_line = current_event
+                    .and_then(|index| events.get(index))
+                    .map(|event| event.text.clone())
+                    .unwrap_or_else(|| {
+                        if current_track {
+                            "Waiting for the first line…".to_owned()
+                        } else {
+                            "Play this track to follow karaoke.".to_owned()
+                        }
+                    });
+                body = body.push(
+                    container(
+                        text(current_line)
+                            .size(30)
+                            .color(ACCENT)
+                            .width(Length::Fill),
+                    )
+                    .padding([18, 12])
+                    .width(Length::Fill)
+                    .style(card_style),
+                );
+                if let Some(current) = current_event {
+                    if let Some(previous) =
+                        current.checked_sub(1).and_then(|index| events.get(index))
+                    {
+                        body = body.push(text(previous.text.clone()).size(12).color(MUTED));
+                    }
+                    let upcoming = events
+                        .iter()
+                        .skip(current + 1)
+                        .take(4)
+                        .map(|event| Element::from(text(event.text.clone()).size(14).color(TEXT)))
+                        .collect::<Vec<_>>();
+                    body = body.push(column![].extend(upcoming).spacing(5));
+                } else {
+                    let upcoming = events
+                        .iter()
+                        .take(4)
+                        .map(|event| Element::from(text(event.text.clone()).size(14).color(TEXT)))
+                        .collect::<Vec<_>>();
+                    body = body.push(column![].extend(upcoming).spacing(5));
+                }
+                body = body.push(
+                    text("Karaoke follows the actual playback clock. Pausing, seeking and track changes do not alter the canonical lyrics.")
+                        .size(9)
+                        .color(MUTED),
+                );
+            }
+        } else {
+            body = body.push(
+                text("No managed lyrics for this track.")
+                    .size(13)
+                    .color(MUTED),
+            );
+        }
+        body.height(Length::Fill).into()
+    }
+
+    fn lyrics_import_overlay(&self) -> Element<'_, Message> {
+        let Some(preview) = self.lyrics_import.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let mut body = column![
+            text("Preview imported lyrics").size(22).color(TEXT),
+            text(format!(
+                "Track {} · {}",
+                preview.track_id,
+                preview.path.display()
+            ))
+            .size(10)
+            .color(MUTED),
+            text(format!(
+                "Detected: {} · {} line(s)",
+                match preview.document.kind() {
+                    LyricsKind::Synced => "synchronized LRC",
+                    LyricsKind::Plain => "plain text",
+                },
+                preview.document.lines.len()
+            ))
+            .size(10)
+            .color(ACCENT),
+        ]
+        .spacing(8);
+        if preview.expected_text.is_some() {
+            body = body.push(
+                text("This track already has lyrics. Saving requires a second explicit confirmation and will not happen automatically.")
+                    .size(9)
+                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+            );
+        }
+        if let Some(error) = &preview.error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        let preview_lines = preview
+            .document
+            .lines
+            .iter()
+            .take(12)
+            .map(|line| {
+                let timestamp = line
+                    .timestamp_ms
+                    .map(format_timestamp_ms)
+                    .unwrap_or_else(|| "--:--.---".to_owned());
+                Element::from(
+                    text(format!("{timestamp}  {}", line.text))
+                        .size(10)
+                        .color(MUTED),
+                )
+            })
+            .collect::<Vec<_>>();
+        body = body.push(scrollable(column![].extend(preview_lines)).height(Length::Fixed(260.0)));
+        body = body.push(
+            row![
+                button(
+                    text(
+                        if preview.expected_text.is_some() && !preview.overwrite_confirm {
+                            "Confirm overwrite existing lyrics"
+                        } else {
+                            "Save imported lyrics"
+                        }
+                    )
+                    .size(11),
+                )
+                .style(accent_button_style)
+                .padding([7, 12])
+                .on_press_maybe(
+                    preview
+                        .error
+                        .is_none()
+                        .then_some(Message::LyricsImportConfirm)
+                ),
+                button(text("Cancel").size(10))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press(Message::LyricsImportCancel),
+            ]
+            .spacing(8),
+        );
+        container(
+            container(body)
+                .padding(18)
+                .width(Length::Fill)
+                .max_width(720.0)
+                .max_height(560.0)
                 .style(import_panel_style),
         )
         .width(Length::Fill)
@@ -10478,6 +12050,16 @@ mod tests {
             playlist_remove_confirm: false,
             playlist_drag: None,
             playlist_error: None,
+            selected_lyrics: None,
+            lyrics_mode: LyricsMode::Read,
+            lyrics_follow_current: false,
+            lyrics_filter: String::new(),
+            lyrics_editor: None,
+            lyrics_import: None,
+            lyrics_export_path: String::new(),
+            lyrics_export_pending: None,
+            lyrics_error: None,
+            lyrics_cache: RefCell::new(BTreeMap::new()),
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
@@ -12844,6 +14426,331 @@ mod tests {
         assert_eq!(gui.controller.queue_len(), 3);
         let current = gui.controller.current_queue_entry_id().expect("current");
         assert_eq!(gui.controller.queue_entry_index(current), Some(0));
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn lyrics_library_classifies_and_filters_plain_and_synced_tracks() {
+        let dir = TempDir::new("gui-lyrics-library");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let plain = import_named_track(
+            &mut gui,
+            &dir,
+            "Plain Track",
+            "Lyrics Artist",
+            "Lyrics Album",
+            ReleaseType::Album,
+            1,
+        );
+        let synced = import_named_track(
+            &mut gui,
+            &dir,
+            "Sync Track",
+            "Lyrics Artist",
+            "Lyrics Album",
+            ReleaseType::Album,
+            2,
+        );
+        gui.controller
+            .set_lyrics(plain, Some("Café 世界\nsecond line"))
+            .expect("plain lyrics");
+        gui.controller
+            .set_lyrics(synced, Some("[00:01.000]first\n[00:02.500]second"))
+            .expect("synced lyrics");
+        send(&mut gui, Message::SelectView(LibraryView::Lyrics));
+        assert_eq!(gui.lyrics_kind_for(plain), LyricsKind::Plain);
+        assert_eq!(gui.lyrics_kind_for(synced), LyricsKind::Synced);
+        assert_eq!(gui.filtered_lyrics_tracks().len(), 2);
+        send(&mut gui, Message::LyricsFilterChanged("plain".to_owned()));
+        assert_eq!(
+            gui.filtered_lyrics_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![plain]
+        );
+        send(&mut gui, Message::LyricsSelect(synced));
+        assert_eq!(gui.view, LibraryView::Lyrics);
+        assert_eq!(gui.selected_lyrics, Some(synced));
+        assert_eq!(gui.lyrics_mode, LyricsMode::Read);
+        assert!(
+            gui.lyrics_cache_entry(synced)
+                .and_then(|entry| entry.document)
+                .is_some_and(|document| document.kind() == LyricsKind::Synced)
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn lyrics_editor_preserves_unicode_blank_lines_and_rejects_stale_or_cancelled_edits() {
+        let dir = TempDir::new("gui-lyrics-editor");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Edit Track",
+            "Lyrics Artist",
+            "Lyrics Album",
+            ReleaseType::Album,
+            1,
+        );
+        send(&mut gui, Message::LyricsSelect(id));
+        send(&mut gui, Message::LyricsEditOpen);
+        send(
+            &mut gui,
+            Message::LyricsEditorTextChanged(0, "Café 世界".to_owned()),
+        );
+        send(&mut gui, Message::LyricsEditorAddLine);
+        send(&mut gui, Message::LyricsEditorAddLine);
+        send(
+            &mut gui,
+            Message::LyricsEditorTextChanged(2, "second".to_owned()),
+        );
+        send(&mut gui, Message::LyricsEditorSave);
+        assert!(gui.lyrics_editor.is_none());
+        assert_eq!(
+            gui.controller.track_lyrics(id).as_deref(),
+            Some("Café 世界\n\nsecond\n")
+        );
+        assert_eq!(gui.lyrics_kind_for(id), LyricsKind::Plain);
+
+        // Unsaved cancellation requires a second explicit action.
+        send(&mut gui, Message::LyricsEditOpen);
+        send(
+            &mut gui,
+            Message::LyricsEditorTextChanged(0, "discard me".to_owned()),
+        );
+        send(&mut gui, Message::LyricsEditorCancel);
+        assert!(gui.lyrics_editor.is_some());
+        send(&mut gui, Message::LyricsEditorCancel);
+        assert!(gui.lyrics_editor.is_none());
+        assert_eq!(
+            gui.controller.track_lyrics(id).as_deref(),
+            Some("Café 世界\n\nsecond\n")
+        );
+
+        // A stale edit cannot overwrite lyrics changed elsewhere.
+        send(&mut gui, Message::LyricsEditOpen);
+        gui.controller
+            .set_lyrics(id, Some("newer external lyrics"))
+            .expect("external edit");
+        send(
+            &mut gui,
+            Message::LyricsEditorTextChanged(0, "stale edit".to_owned()),
+        );
+        send(&mut gui, Message::LyricsEditorSave);
+        assert!(gui.lyrics_editor.is_some());
+        assert!(
+            gui.lyrics_editor
+                .as_ref()
+                .and_then(|editor| editor.error.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            gui.controller.track_lyrics(id).as_deref(),
+            Some("newer external lyrics")
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn lyrics_timestamp_editor_synced_conversion_and_follow_current() {
+        let dir = TempDir::new("gui-lyrics-sync");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let first = import_named_track(
+            &mut gui,
+            &dir,
+            "First",
+            "Lyrics Artist",
+            "Lyrics Album",
+            ReleaseType::Album,
+            1,
+        );
+        let second = import_named_track(
+            &mut gui,
+            &dir,
+            "Second",
+            "Lyrics Artist",
+            "Lyrics Album",
+            ReleaseType::Album,
+            2,
+        );
+        gui.controller
+            .set_lyrics(first, Some("[00:01.000]one\n[00:02.000]two"))
+            .expect("synced");
+        gui.controller
+            .set_lyrics(second, Some("[00:01.000]other"))
+            .expect("other synced");
+        send(&mut gui, Message::LyricsSelect(first));
+        gui.controller.play_track(first);
+        send(&mut gui, Message::LyricsOpenCurrent);
+        send(&mut gui, Message::LyricsEditOpen);
+        send(&mut gui, Message::LyricsEditorSetCurrentTime(0));
+        send(
+            &mut gui,
+            Message::LyricsEditorTextChanged(0, "one edited".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::LyricsEditorTimestampChanged(1, "00:02.000".to_owned()),
+        );
+        send(&mut gui, Message::LyricsEditorSave);
+        let raw = gui.controller.track_lyrics(first).expect("saved");
+        assert!(LyricsDocument::parse(&raw).expect("parse").kind() == LyricsKind::Synced);
+        assert!(raw.contains("one edited"));
+        assert_eq!(gui.lyrics_kind_for(first), LyricsKind::Synced);
+
+        gui.controller
+            .set_lyrics(first, Some("[00:01.000]only"))
+            .expect("reset synced");
+        send(&mut gui, Message::LyricsEditOpen);
+        send(&mut gui, Message::LyricsEditorClearTimestamp(0));
+        send(&mut gui, Message::LyricsEditorSave);
+        assert!(
+            gui.lyrics_editor.is_some(),
+            "plain conversion needs confirmation"
+        );
+        send(&mut gui, Message::LyricsEditorSave);
+        assert!(gui.lyrics_editor.is_none());
+        assert_eq!(gui.lyrics_kind_for(first), LyricsKind::Plain);
+        assert_eq!(
+            gui.controller.track_lyrics(first).as_deref(),
+            Some("only\n")
+        );
+
+        // Player lyrics follow explicit track changes while in follow mode.
+        gui.controller.play_track(first);
+        send(&mut gui, Message::LyricsOpenCurrent);
+        gui.controller.play_track(second);
+        send(&mut gui, Message::Tick);
+        assert_eq!(gui.selected_lyrics, Some(second));
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn lyrics_import_export_preview_and_overwrite_confirmation() {
+        let dir = TempDir::new("gui-lyrics-io");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "IO Track",
+            "Lyrics Artist",
+            "Lyrics Album",
+            ReleaseType::Album,
+            1,
+        );
+        send(&mut gui, Message::LyricsSelect(id));
+        let import_path = dir.path().join("import.lrc");
+        std::fs::write(&import_path, "[00:01.000]Café\n[00:02.000]second\n").expect("import file");
+        send(
+            &mut gui,
+            Message::LyricsImportPicked(Ok(Some(vec![import_path.clone()]))),
+        );
+        assert!(gui.lyrics_import.is_some());
+        assert!(
+            gui.controller.track_lyrics(id).is_none(),
+            "preview does not save"
+        );
+        send(&mut gui, Message::LyricsImportConfirm);
+        assert_eq!(
+            gui.lyrics_kind_for(id),
+            LyricsKind::Synced,
+            "import saved canonical LRC"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&import_path).expect("source preserved"),
+            "[00:01.000]Café\n[00:02.000]second\n"
+        );
+
+        let export_path = dir.path().join("export.lrc");
+        send(
+            &mut gui,
+            Message::LyricsExportPathChanged(export_path.display().to_string()),
+        );
+        send(&mut gui, Message::LyricsExport("lrc".to_owned()));
+        assert!(export_path.is_file());
+        assert!(
+            std::fs::read_to_string(&export_path)
+                .expect("export")
+                .contains("[00:01.000]Café")
+        );
+        std::fs::write(&export_path, "keep me").expect("existing destination");
+        send(&mut gui, Message::LyricsExport("lrc".to_owned()));
+        assert_eq!(
+            std::fs::read_to_string(&export_path).expect("existing"),
+            "keep me",
+            "first export click must not overwrite"
+        );
+        send(&mut gui, Message::LyricsExport("lrc".to_owned()));
+        assert!(
+            std::fs::read_to_string(&export_path)
+                .expect("overwrite")
+                .contains("Café")
+        );
+
+        // Existing lyrics require an explicit second import confirmation.
+        let second_import = dir.path().join("second.txt");
+        std::fs::write(&second_import, "new plain").expect("second import");
+        send(
+            &mut gui,
+            Message::LyricsImportPicked(Ok(Some(vec![second_import]))),
+        );
+        send(&mut gui, Message::LyricsImportConfirm);
+        assert!(gui.lyrics_import.is_some());
+        assert_eq!(gui.lyrics_kind_for(id), LyricsKind::Synced);
+        send(&mut gui, Message::LyricsImportConfirm);
+        assert!(gui.lyrics_import.is_none());
+        assert_eq!(gui.lyrics_kind_for(id), LyricsKind::Plain);
+
+        let invalid = dir.path().join("invalid.lrc");
+        std::fs::write(&invalid, "[00:99.00]bad").expect("invalid");
+        send(
+            &mut gui,
+            Message::LyricsImportPicked(Ok(Some(vec![invalid]))),
+        );
+        assert!(
+            gui.lyrics_import
+                .as_ref()
+                .and_then(|preview| preview.error.as_ref())
+                .is_some()
+        );
+        send(&mut gui, Message::LyricsImportConfirm);
+        assert!(gui.lyrics_import.is_some());
+        send(&mut gui, Message::LyricsImportCancel);
+        assert!(gui.lyrics_import.is_none());
+        assert_eq!(
+            gui.controller.track_lyrics(id).as_deref(),
+            Some("new plain")
+        );
         gui.controller.shutdown();
     }
 }
