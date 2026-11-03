@@ -886,8 +886,9 @@ impl Tui {
             },
         };
         let mut header = format!(
-            "Flux {MILESTONE} — terminal player   [{library_label}]   [queue {}]",
-            self.controller.queue_len()
+            "Flux {MILESTONE} — terminal player   [{library_label}]   [queue {}]   [mode {}]",
+            self.controller.queue_len(),
+            self.controller.playback_mode().label()
         );
         if self.controller.portable_recovery().is_some() {
             header.push_str("   [recovered — read-only, A acknowledges]");
@@ -1002,7 +1003,7 @@ impl Tui {
                              · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
                              · i/I quick copy-import · e edit track · y lyrics · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
-                             · / search · F favorites · H stats · R repeat · O open · C create · M migrate \
+                             · / search · F favorites · H stats · R mode · O open · C create · M migrate \
                              · D album · E albums · T transfer/delete (GUI) \
                              · move/replace (GUI) · global search/filters/batch (GUI) \
                              · playlists (GUI) · B index · U fix · q quit"
