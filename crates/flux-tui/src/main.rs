@@ -147,6 +147,8 @@ struct Tui {
     input: String,
     /// The active library filter (empty = everything).
     search: String,
+    /// Show only favorite tracks.
+    favorites_only: bool,
     /// Legacy index file chosen at migration step 1.
     migrate_source: PathBuf,
     /// Planned-but-unconfirmed migration (nothing written yet).
@@ -175,6 +177,13 @@ impl Tui {
         self.controller
             .search(&self.search)
             .into_iter()
+            .filter(|(id, _)| {
+                !self.favorites_only
+                    || self
+                        .controller
+                        .rating(*id)
+                        .is_some_and(|rating| rating.favorite)
+            })
             .map(|(id, _)| id)
             .collect()
     }
@@ -377,6 +386,53 @@ impl Tui {
                             .join("; ")
                     )
                 });
+            }
+            KeyCode::Char('F') => {
+                self.favorites_only = !self.favorites_only;
+                self.cursor = 0;
+                self.offset = 0;
+                self.lifecycle_msg = Some(if self.favorites_only {
+                    "Showing favorites only (F toggles).".to_owned()
+                } else {
+                    "Showing all tracks (F toggles favorites).".to_owned()
+                });
+            }
+            KeyCode::Char('H') => {
+                let history = self.controller.playback_history();
+                if history.is_empty() {
+                    self.lifecycle_msg = Some(
+                        "No meaningful playback history yet; history starts when this feature is used."
+                            .to_owned(),
+                    );
+                } else {
+                    let mut entries = history.entries().collect::<Vec<_>>();
+                    entries.sort_by(|(left_id, left), (right_id, right)| {
+                        right
+                            .play_count
+                            .cmp(&left.play_count)
+                            .then_with(|| right.last_played_unix_ms.cmp(&left.last_played_unix_ms))
+                            .then_with(|| left_id.cmp(right_id))
+                    });
+                    let summary = entries
+                        .into_iter()
+                        .take(5)
+                        .map(|(id, entry)| {
+                            format!(
+                                "{}={}",
+                                self.controller
+                                    .track(id)
+                                    .map(display_title)
+                                    .unwrap_or_else(|| format!("Track {id}")),
+                                entry.play_count
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    self.lifecycle_msg = Some(format!(
+                        "Most played: {summary}. Total meaningful plays: {}.",
+                        history.total_plays()
+                    ));
+                }
             }
             KeyCode::Char('L') => self.relink_first_unique(),
             KeyCode::Char('r') => self.controller.refresh(),
@@ -946,7 +1002,7 @@ impl Tui {
                              · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
                              · i/I quick copy-import · e edit track · y lyrics · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
-                             · / search · R repeat · O open · C create · M migrate \
+                             · / search · F favorites · H stats · R repeat · O open · C create · M migrate \
                              · D album · E albums · T transfer/delete (GUI) \
                              · move/replace (GUI) · global search/filters/batch (GUI) \
                              · playlists (GUI) · B index · U fix · q quit"
@@ -1244,6 +1300,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         mode: Mode::Normal,
         input: String::new(),
         search: String::new(),
+        favorites_only: false,
         migrate_source: PathBuf::new(),
         lyrics_lines: Vec::new(),
         lyrics_scroll: 0,
@@ -1311,6 +1368,7 @@ mod tests {
             mode: Mode::Normal,
             input: String::new(),
             search: String::new(),
+            favorites_only: false,
             migrate_source: std::path::PathBuf::new(),
             lyrics_lines: Vec::new(),
             lyrics_scroll: 0,
@@ -1456,6 +1514,14 @@ mod tests {
         key(&mut tui, KeyCode::Down);
         key(&mut tui, KeyCode::Esc);
         assert_eq!(tui.mode, Mode::Normal);
+        tui.controller.set_favorites(&[id], true).expect("favorite");
+        key(&mut tui, KeyCode::Char('F'));
+        assert_eq!(tui.rows().len(), 1, "favorites-only filter");
+        key(&mut tui, KeyCode::Char('F'));
+        key(&mut tui, KeyCode::Char('H'));
+        assert!(tui.lifecycle_msg.as_deref().is_some_and(
+            |message| message.contains("Most played") || message.contains("No meaningful")
+        ));
 
         let outside = dir.path().join("Other Artist/Album/outside.wav");
         std::fs::create_dir_all(outside.parent().expect("parent")).expect("outside dir");
