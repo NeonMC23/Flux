@@ -22,13 +22,12 @@ use flux_app::{
     AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
     Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan,
     ImportProgress, ImportRequest, ImportStage, ImportStorage, LyricLine, LyricsDocument,
-    LyricsKind, PlaylistId, PreparedImport, ReconcileReport, RelPath, ReleaseType, StorageMode,
-    TrackAudioReplacementPlan, TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan,
-    WAVEFORM_WINDOW, format_duration, is_track_playable, prepare_import_files, prepare_import_plan,
+    LyricsKind, PlaybackMode, PlaylistId, PreparedImport, ReconcileReport, RelPath, ReleaseType,
+    StorageMode, TrackAudioReplacementPlan, TrackMetadataEdit, TrackMetadataUpdatePlan,
+    TrackMovePlan, WAVEFORM_WINDOW, format_duration, is_track_playable, prepare_import_files,
+    prepare_import_plan,
 };
-use flux_core::{
-    APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
-};
+use flux_core::{APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, Track, TrackId};
 use iced::ContentFit;
 use iced::advanced::Widget;
 use iced::advanced::layout::{self, Layout};
@@ -12229,7 +12228,7 @@ impl FluxReady {
             ),
             transport_button(">|", "Next", false, skip_enabled, Message::Next),
             transport_button("■", "Stop", false, stop_enabled, Message::Stop),
-            repeat_button(self.controller.repeat_mode()),
+            repeat_button(self.controller.playback_mode()),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -12781,11 +12780,13 @@ fn transport_button<'a>(
     .into()
 }
 
-fn repeat_button<'a>(mode: RepeatMode) -> Element<'a, Message> {
-    let icon = if mode == RepeatMode::One {
-        "↻1"
-    } else {
-        "↻"
+fn repeat_button<'a>(mode: PlaybackMode) -> Element<'a, Message> {
+    let icon = match mode {
+        PlaybackMode::Normal => "↻",
+        PlaybackMode::RepeatOne => "↻1",
+        PlaybackMode::RepeatAll => "↻A",
+        PlaybackMode::Shuffle => "⤨",
+        PlaybackMode::ShuffleAll => "⤨A",
     };
     let content = container(text(icon).size(12))
         .width(Length::Fill)
@@ -12796,26 +12797,22 @@ fn repeat_button<'a>(mode: RepeatMode) -> Element<'a, Message> {
         .width(Length::Fixed(32.0))
         .height(Length::Fixed(32.0))
         .padding(0)
-        .style(nav_style(mode != RepeatMode::Off))
+        .style(nav_style(mode != PlaybackMode::Normal))
         .on_press(Message::CycleRepeat);
     tooltip(
         button,
-        container(text(repeat_label(mode)).size(10).color(TEXT))
-            .padding([4, 7])
-            .style(tooltip_style),
+        container(
+            text(format!("Playback mode: {}", mode.label()))
+                .size(10)
+                .color(TEXT),
+        )
+        .padding([4, 7])
+        .style(tooltip_style),
         tooltip::Position::Top,
     )
     .gap(6)
     .delay(Duration::from_millis(350))
     .into()
-}
-
-fn repeat_label(mode: RepeatMode) -> &'static str {
-    match mode {
-        RepeatMode::Off => "Repeat: off",
-        RepeatMode::All => "Repeat: all",
-        RepeatMode::One => "Repeat: one",
-    }
 }
 
 fn migration_plan_summary(plan: &CanonicalMigrationPlan) -> String {
