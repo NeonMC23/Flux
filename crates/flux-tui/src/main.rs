@@ -132,6 +132,8 @@ enum Mode {
     /// A migration finished: `a` opens the result, anything else
     /// keeps the current library.
     MigratedDone,
+    /// Read-only managed lyrics for the selected track (`y`).
+    LyricsView,
 }
 
 struct Tui {
@@ -157,6 +159,12 @@ struct Tui {
     import_copy: bool,
     /// Last reconciliation, used by the explicit `L` unique-relink action.
     last_reconcile: Option<ReconcileReport>,
+    /// Read-only lyrics lines for the selected track.
+    lyrics_lines: Vec<String>,
+    /// First visible lyrics line.
+    lyrics_scroll: usize,
+    /// Human-readable lyrics title/status.
+    lyrics_title: String,
 }
 
 impl Tui {
@@ -191,6 +199,17 @@ impl Tui {
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        if self.mode == Mode::LyricsView {
+            match key.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Up => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1),
+                KeyCode::Down => self.lyrics_scroll = self.lyrics_scroll.saturating_add(1),
+                KeyCode::PageUp => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.lyrics_scroll = self.lyrics_scroll.saturating_add(10),
+                _ => {}
+            }
+            return false;
+        }
         if self.mode != Mode::Normal {
             return self.handle_input_key(key, ctrl_c);
         }
@@ -282,6 +301,58 @@ impl Tui {
                 } else {
                     self.lifecycle_msg = Some("Select a track to edit.".to_owned());
                 }
+            }
+            KeyCode::Char('y') => {
+                let id = self
+                    .rows()
+                    .get(self.cursor)
+                    .copied()
+                    .or_else(|| self.controller.current_id());
+                let Some(id) = id else {
+                    self.lifecycle_msg = Some("Select a track to inspect lyrics.".to_owned());
+                    return false;
+                };
+                let Some(raw) = self.controller.track_lyrics(id) else {
+                    self.lifecycle_msg = Some(format!("Track {id} has no managed lyrics."));
+                    return false;
+                };
+                let document = match flux_app::LyricsDocument::parse(&raw) {
+                    Ok(document) => document,
+                    Err(error) => {
+                        self.lifecycle_msg = Some(format!("Lyrics cannot be parsed: {error}"));
+                        return false;
+                    }
+                };
+                self.lyrics_title = self
+                    .controller
+                    .track(id)
+                    .map(|track| {
+                        format!(
+                            "Lyrics · {} · {} · {}",
+                            display_title(track),
+                            credit_display(&self.controller, id),
+                            match document.kind() {
+                                flux_app::LyricsKind::Synced => "synchronized",
+                                flux_app::LyricsKind::Plain => "plain text",
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| format!("Lyrics for track {id}"));
+                self.lyrics_lines = document
+                    .lines
+                    .iter()
+                    .map(|line| match line.timestamp_ms {
+                        Some(timestamp) => {
+                            format!("{}  {}", format_lyrics_timestamp(timestamp), line.text)
+                        }
+                        None => line.text.clone(),
+                    })
+                    .collect();
+                if self.lyrics_lines.is_empty() {
+                    self.lyrics_lines.push("(empty lyrics file)".to_owned());
+                }
+                self.lyrics_scroll = 0;
+                self.mode = Mode::LyricsView;
             }
             KeyCode::Char('P') => {
                 self.mode = Mode::ArtistCreateInput;
@@ -615,7 +686,8 @@ impl Tui {
                             }
                         }
                     }
-                    Mode::Normal | Mode::MigrateConfirm | Mode::MigratedDone => {}
+                    Mode::Normal | Mode::MigrateConfirm | Mode::MigratedDone | Mode::LyricsView => {
+                    }
                 }
                 self.mode = next;
             }
@@ -790,6 +862,30 @@ impl Tui {
             self.line(out, 2, "", width, false)?;
         }
 
+        if self.mode == Mode::LyricsView {
+            self.line(out, list_top as u16, &self.lyrics_title, width, true)?;
+            let available = height.saturating_sub(list_top + 4).max(1);
+            let max_scroll = self.lyrics_lines.len().saturating_sub(available);
+            self.lyrics_scroll = self.lyrics_scroll.min(max_scroll);
+            for (row, line) in self
+                .lyrics_lines
+                .iter()
+                .skip(self.lyrics_scroll)
+                .take(available)
+                .enumerate()
+            {
+                self.line(out, (list_top + 1 + row) as u16, line, width, false)?;
+            }
+            let help = format!(
+                "Lyrics read-only — ↑/↓ scroll · PgUp/PgDn · Esc back · {}-{} of {}",
+                self.lyrics_scroll + 1,
+                (self.lyrics_scroll + available).min(self.lyrics_lines.len()),
+                self.lyrics_lines.len()
+            );
+            self.line(out, (height - 1) as u16, &help, width, false)?;
+            return Ok(());
+        }
+
         // Track list.
         if rows.is_empty() {
             let msg = if self.controller.tracks().is_empty() {
@@ -848,7 +944,7 @@ impl Tui {
         let help = match self.mode {
             Mode::Normal => "Enter play · Space pause · s stop · n/p skip · a add · x next \
                              · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
-                             · i/I quick copy-import · e edit track · V artists \
+                             · i/I quick copy-import · e edit track · y lyrics · V artists \
                              · P new artist · Y rename artist · L relink · X reconcile \
                              · / search · R repeat · O open · C create · M migrate \
                              · D album · E albums · T transfer/delete (GUI) \
@@ -899,6 +995,7 @@ impl Tui {
                 "Migration done — a opens the migrated library, Esc keeps the current one."
                     .to_owned()
             }
+            Mode::LyricsView => "Lyrics read-only — ↑/↓ scroll, Esc back.".to_owned(),
         };
         self.line(out, (height - 1) as u16, &help, width, false)?;
 
@@ -1105,6 +1202,13 @@ fn display_title(track: &Track) -> String {
     }
 }
 
+fn format_lyrics_timestamp(timestamp_ms: u64) -> String {
+    let minutes = timestamp_ms / 60_000;
+    let seconds = (timestamp_ms / 1000) % 60;
+    let millis = timestamp_ms % 1000;
+    format!("{minutes:02}:{seconds:02}.{millis:03}")
+}
+
 /// Left text plus right-aligned `right`, space-padded to `width`.
 /// Degenerate widths (a 0-column pty, `right` wider than the line)
 /// degrade to just the truncated left text instead of panicking.
@@ -1141,6 +1245,9 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         input: String::new(),
         search: String::new(),
         migrate_source: PathBuf::new(),
+        lyrics_lines: Vec::new(),
+        lyrics_scroll: 0,
+        lyrics_title: String::new(),
         pending_plan: None,
         migrated_dest: None,
         lifecycle_msg: None,
@@ -1205,6 +1312,9 @@ mod tests {
             input: String::new(),
             search: String::new(),
             migrate_source: std::path::PathBuf::new(),
+            lyrics_lines: Vec::new(),
+            lyrics_scroll: 0,
+            lyrics_title: String::new(),
             pending_plan: None,
             migrated_dest: None,
             lifecycle_msg: None,
@@ -1332,6 +1442,20 @@ mod tests {
             tui.controller.track(id).and_then(Track::artist),
             Some("Renamed Tui Artist")
         );
+
+        tui.controller
+            .set_lyrics(id, Some("[00:01.000]Tui lyric\nplain tail"))
+            .expect("lyrics");
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.mode, Mode::LyricsView);
+        assert!(
+            tui.lyrics_lines
+                .iter()
+                .any(|line| line.contains("Tui lyric"))
+        );
+        key(&mut tui, KeyCode::Down);
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
 
         let outside = dir.path().join("Other Artist/Album/outside.wav");
         std::fs::create_dir_all(outside.parent().expect("parent")).expect("outside dir");
