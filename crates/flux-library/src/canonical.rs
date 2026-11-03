@@ -349,6 +349,8 @@ pub struct CanonicalTrack {
     pub lyrics: Option<String>,
     /// Optional content fingerprint.
     pub fingerprint: Option<ContentFingerprint>,
+    /// Canonical creation/import time; zero means unknown/legacy.
+    pub created_unix_ms: u64,
 }
 
 /// One canonical playlist.
@@ -640,6 +642,9 @@ struct TrackEntityDto {
     lyrics: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fingerprint: Option<ContentFingerprint>,
+    /// Canonical creation/import time; zero means this predates the field.
+    #[serde(default)]
+    created_unix_ms: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlaylistEntityDto {
@@ -1418,6 +1423,7 @@ impl CanonicalLibrary {
                     duration_ms: dto.duration_ms,
                     lyrics: dto.lyrics,
                     fingerprint: dto.fingerprint,
+                    created_unix_ms: dto.created_unix_ms,
                 },
             );
         }
@@ -3068,6 +3074,7 @@ impl CanonicalLibrary {
                 duration_ms: request.duration_ms,
                 lyrics: None,
                 fingerprint: Some(fingerprint),
+                created_unix_ms: crate::portable::now_unix_ms(),
             };
             push_file_write(&mut writes, &record, &dto)?;
             writes.push(PendingWrite {
@@ -3135,6 +3142,7 @@ impl CanonicalLibrary {
                 duration_ms: update.duration_ms,
                 lyrics: track.lyrics,
                 fingerprint: track.fingerprint,
+                created_unix_ms: track.created_unix_ms,
             };
             push_file_write(&mut writes, &record, &dto)?;
         }
@@ -3281,6 +3289,7 @@ impl CanonicalLibrary {
                 duration_ms: imported.duration_ms,
                 lyrics: None,
                 fingerprint: Some(fingerprint),
+                created_unix_ms: crate::portable::now_unix_ms(),
             };
             push_file_write(&mut writes, &record, &dto)?;
             writes.push(PendingWrite {
@@ -3489,6 +3498,7 @@ impl CanonicalLibrary {
             duration_ms: imported.duration_ms,
             lyrics: None,
             fingerprint: Some(fingerprint),
+            created_unix_ms: crate::portable::now_unix_ms(),
         };
         push_entity_write(&mut writes, &album_rel_path, "album.flux", &album_dto)?;
         push_file_write(&mut writes, &record_rel, &track_dto)?;
@@ -3626,6 +3636,7 @@ impl CanonicalLibrary {
             duration_ms: track.duration_ms,
             lyrics: track.lyrics,
             fingerprint: track.fingerprint,
+            created_unix_ms: track.created_unix_ms,
         };
         let mut writes = Vec::new();
         push_file_write(&mut writes, &record_rel, &track_dto)?;
@@ -3864,6 +3875,7 @@ impl CanonicalLibrary {
             duration_ms: track.duration_ms,
             lyrics: track.lyrics.clone(),
             fingerprint: Some(plan.fingerprint),
+            created_unix_ms: track.created_unix_ms,
         };
         let from_dto = AlbumEntityDto {
             schema_version: CANONICAL_SCHEMA_VERSION,
@@ -4098,6 +4110,7 @@ impl CanonicalLibrary {
             duration_ms: track.duration_ms,
             lyrics: track.lyrics.clone(),
             fingerprint: Some(plan.source_fingerprint),
+            created_unix_ms: track.created_unix_ms,
         };
         let mut writes = Vec::new();
         push_file_write(&mut writes, &plan.record_path, &track_dto)?;
@@ -4180,6 +4193,7 @@ impl CanonicalLibrary {
             duration_ms,
             lyrics: track.lyrics,
             fingerprint: track.fingerprint,
+            created_unix_ms: track.created_unix_ms,
         };
         let mut writes = Vec::new();
         push_file_write(&mut writes, &rel, &dto)?;
@@ -4292,6 +4306,7 @@ impl CanonicalLibrary {
             duration_ms: track.duration_ms,
             lyrics: lyrics_name.clone(),
             fingerprint: track.fingerprint,
+            created_unix_ms: track.created_unix_ms,
         };
         let mut writes = Vec::new();
         push_file_write(&mut writes, &record_rel, &dto)?;
@@ -5083,6 +5098,7 @@ impl CanonicalLibrary {
                 duration_ms: track.duration_ms,
                 lyrics,
                 fingerprint: track.fingerprint.or(Some(fingerprint)),
+                created_unix_ms: track.created_unix_ms,
             };
             push_file_write(&mut writes, &record_rel, &dto)?;
             if let (Some(text), Some(name)) = (&item.lyrics_text, &dto.lyrics) {
@@ -5639,6 +5655,7 @@ impl CanonicalLibrary {
             duration_ms: track.duration_ms,
             lyrics: track.lyrics,
             fingerprint: plan.expected_fingerprint,
+            created_unix_ms: track.created_unix_ms,
         };
         let mut catalog = self.catalog.clone();
         catalog.next_album_id = catalog.next_album_id.max(plan.destination_album.get() + 1);
@@ -6733,6 +6750,7 @@ impl CanonicalLibrary {
                         duration_ms: current.duration_ms,
                         lyrics,
                         fingerprint: current.fingerprint,
+                        created_unix_ms: current.created_unix_ms,
                     };
                     let mut updated = current.clone();
                     updated.owner_artist_id = *new_owner;
@@ -6848,6 +6866,7 @@ impl CanonicalLibrary {
                 duration_ms: updated.duration_ms,
                 lyrics: updated.lyrics,
                 fingerprint: updated.fingerprint,
+                created_unix_ms: updated.created_unix_ms,
             };
             push_file_write(&mut writes, &record_path, &dto)?;
             credits_removed += 1;
@@ -9314,6 +9333,7 @@ impl CanonicalLibrary {
                 duration_ms: track.duration_ms,
                 lyrics,
                 fingerprint: track.fingerprint,
+                created_unix_ms: track.created_unix_ms,
             };
             push_file_write(&mut writes, &new_record, &track_dto)?;
             writes.push(PendingWrite {

@@ -81,7 +81,8 @@ use flux_library::portable::{
     sync_library_to_portable_store,
 };
 use flux_library::{
-    Library, LibraryLock, LibraryLockError, PortableSyncReport, QueueStore, ScanReport,
+    Library, LibraryLock, LibraryLockError, PlaybackHistory, PlaybackHistoryStore,
+    PortableSyncReport, QueueStore, ScanReport,
 };
 
 pub mod import;
@@ -634,6 +635,8 @@ pub enum ControllerEvent {
     QueueChanged,
     /// Playback state, selection, or stream info changed.
     PlaybackChanged,
+    /// Derived local playback history changed.
+    HistoryChanged,
     /// An informational message for the user.
     Status(String),
     /// A user-facing error. Playback state has already been made
@@ -1032,6 +1035,16 @@ pub struct Controller {
     /// receive newly scanned tracks. Cleared permanently by structural
     /// queue edits.
     queue_auto_library: bool,
+    /// Derived, persistent meaningful-play history for canonical libraries.
+    playback_history: PlaybackHistory,
+    /// Optional atomic history store for the active canonical library.
+    history_store: Option<PlaybackHistoryStore>,
+    /// Malformed history is preserved and not overwritten this session.
+    history_write_protected: bool,
+    /// Increments when history changes so derived GUI summaries can invalidate.
+    history_generation: u64,
+    /// Session-local meaningful-play accumulator.
+    play_session: Option<PlaySession>,
     /// Exclusive OS ownership of the active library's catalogue. Held
     /// for the controller's lifetime and cloned into any scan worker so
     /// a dying UI cannot release the lock while background code writes.
@@ -1073,6 +1086,46 @@ struct LibrarySeed {
     queue_store: Option<QueueStore>,
     queue_write_protected: bool,
     queue_auto_library: bool,
+    playback_history: PlaybackHistory,
+    history_store: Option<PlaybackHistoryStore>,
+    history_write_protected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PlaySession {
+    entry: QueueEntryId,
+    listened_ms: u64,
+    last_position_ms: u64,
+    recorded: bool,
+}
+
+fn meaningful_play_threshold(duration_ms: Option<u64>) -> u64 {
+    duration_ms
+        .map(|duration| (duration / 2).clamp(5_000, 30_000))
+        .unwrap_or(30_000)
+}
+
+fn accumulate_play_session(
+    session: &mut PlaySession,
+    position_ms: u64,
+    playing: bool,
+    threshold_ms: u64,
+) -> bool {
+    if !playing {
+        session.last_position_ms = position_ms;
+        return false;
+    }
+    let delta = position_ms.saturating_sub(session.last_position_ms);
+    if delta > 0 && delta <= 2_000 {
+        session.listened_ms = session.listened_ms.saturating_add(delta);
+    }
+    session.last_position_ms = position_ms;
+    if !session.recorded && session.listened_ms >= threshold_ms {
+        session.recorded = true;
+        true
+    } else {
+        false
+    }
 }
 
 impl Controller {
@@ -1143,6 +1196,9 @@ impl Controller {
                 queue_store,
                 queue_write_protected,
                 queue_auto_library,
+                playback_history: PlaybackHistory::default(),
+                history_store: None,
+                history_write_protected: false,
             },
         );
         controller.legacy_index_write_protected = write_protected;
@@ -1202,6 +1258,9 @@ impl Controller {
                 queue_store,
                 queue_write_protected,
                 queue_auto_library,
+                playback_history: PlaybackHistory::default(),
+                history_store: None,
+                history_write_protected: false,
             },
         );
         if skipped > 0 {
@@ -1229,6 +1288,9 @@ impl Controller {
         let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
             load_queue(queue_store.as_ref(), &library);
+        let history_store = Some(PlaybackHistoryStore::new(canonical_history_path(&root)));
+        let (playback_history, history_write_protected, history_error) =
+            load_history(history_store.as_ref());
         let mut controller = Self::assemble(
             engine,
             audio,
@@ -1244,9 +1306,15 @@ impl Controller {
                 queue_store,
                 queue_write_protected,
                 queue_auto_library,
+                playback_history,
+                history_store,
+                history_write_protected,
             },
         );
         if let Some(error) = queue_error {
+            controller.report_error(error);
+        }
+        if let Some(error) = history_error {
             controller.report_error(error);
         }
         controller.report_status(format!("Opened canonical library at {}.", root.display()));
@@ -1297,6 +1365,9 @@ impl Controller {
             queue_store,
             queue_write_protected,
             queue_auto_library,
+            playback_history,
+            history_store,
+            history_write_protected,
         } = seed;
         let mut player = Player::new();
         *player.queue_mut() = queue;
@@ -1314,6 +1385,11 @@ impl Controller {
             queue_store,
             queue_write_protected,
             queue_auto_library,
+            playback_history,
+            history_store,
+            history_write_protected,
+            history_generation: 0,
+            play_session: None,
             library_lock,
             legacy_index_write_protected: false,
             portable_store,
@@ -1991,6 +2067,78 @@ impl Controller {
             .is_some_and(|track| track.lyrics.is_some())
     }
 
+    /// Canonical creation/import time in Unix milliseconds. Zero means the
+    /// track predates reliable canonical creation timestamps.
+    #[must_use]
+    pub fn track_created_unix_ms(&self, id: TrackId) -> Option<u64> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.track(id))
+            .map(|track| track.created_unix_ms)
+    }
+
+    /// Aggregated meaningful-play count for a canonical track.
+    #[must_use]
+    pub fn track_play_count(&self, id: TrackId) -> u64 {
+        self.playback_history
+            .entry(id)
+            .map_or(0, |entry| entry.play_count)
+    }
+
+    /// Last meaningful-play time in Unix milliseconds, when recorded.
+    #[must_use]
+    pub fn track_last_played_unix_ms(&self, id: TrackId) -> Option<u64> {
+        self.playback_history
+            .entry(id)
+            .map(|entry| entry.last_played_unix_ms)
+    }
+
+    /// Sets a rating for selected tracks in one transaction, preserving each
+    /// track's favorite flag.
+    pub fn set_ratings_for_tracks(
+        &mut self,
+        ids: &[TrackId],
+        rating: Option<u8>,
+    ) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Err("Select at least one track.".to_owned());
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Ratings require a canonical library.".to_owned());
+        };
+        let updates = ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    rating,
+                    store.rating(*id).is_some_and(|current| current.favorite),
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .set_ratings(&updates)
+            .map_err(|err| format!("Could not update ratings: {err}"))?;
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Updated rating for {} track(s).", ids.len()));
+        Ok(ids.len())
+    }
+
+    /// Sets one rating while preserving the favorite flag.
+    pub fn set_track_rating(&mut self, id: TrackId, rating: Option<u8>) -> Result<(), String> {
+        self.set_ratings_for_tracks(&[id], rating).map(|_| ())
+    }
+
+    /// Toggles one favorite flag while preserving the rating.
+    pub fn toggle_track_favorite(&mut self, id: TrackId) -> Result<bool, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Favorites require a canonical library.".to_owned());
+        };
+        let favorite = store.rating(id).is_some_and(|rating| rating.favorite);
+        self.set_favorites(&[id], !favorite)?;
+        Ok(!favorite)
+    }
+
     /// Absolute managed lyrics path, when the track has managed lyrics.
     #[must_use]
     pub fn track_lyrics_path(&self, id: TrackId) -> Option<PathBuf> {
@@ -2328,6 +2476,9 @@ impl Controller {
         let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
             load_queue(queue_store.as_ref(), &library);
+        let history_store = Some(PlaybackHistoryStore::new(canonical_history_path(&root)));
+        let (playback_history, history_write_protected, history_error) =
+            load_history(history_store.as_ref());
         self.install_library(LibrarySeed {
             library,
             storage: StorageBackend::Canonical { root: root.clone() },
@@ -2340,12 +2491,18 @@ impl Controller {
             queue_store,
             queue_write_protected,
             queue_auto_library,
+            playback_history,
+            history_store,
+            history_write_protected,
         });
         self.report_status(format!(
             "Switched to the canonical library at {}.",
             root.display()
         ));
         if let Some(error) = queue_error {
+            self.report_error(error);
+        }
+        if let Some(error) = history_error {
             self.report_error(error);
         }
         Ok(())
@@ -2436,6 +2593,9 @@ impl Controller {
             queue_store,
             queue_write_protected,
             queue_auto_library,
+            playback_history: PlaybackHistory::default(),
+            history_store: None,
+            history_write_protected: false,
         });
         if skipped > 0 {
             self.report_status(skipped_unrepresentable_message(skipped));
@@ -2574,6 +2734,9 @@ impl Controller {
             queue_store,
             queue_write_protected,
             queue_auto_library,
+            playback_history: PlaybackHistory::default(),
+            history_store: None,
+            history_write_protected: false,
         });
         self.report_status(format!("Switched to the legacy library index{shown}."));
         if let Some(error) = queue_error {
@@ -2601,6 +2764,9 @@ impl Controller {
             queue_store,
             queue_write_protected,
             queue_auto_library,
+            playback_history,
+            history_store,
+            history_write_protected,
         } = seed;
         self.player.stop();
         self.engine.stop();
@@ -2620,6 +2786,11 @@ impl Controller {
         self.queue_store = queue_store;
         self.queue_write_protected = queue_write_protected;
         self.queue_auto_library = queue_auto_library;
+        self.playback_history = playback_history;
+        self.history_store = history_store;
+        self.history_write_protected = history_write_protected;
+        self.history_generation = self.history_generation.wrapping_add(1);
+        self.play_session = None;
         *self.player.queue_mut() = queue;
 
         self.outbox.push(ControllerEvent::LibraryChanged);
@@ -4381,6 +4552,88 @@ impl Controller {
     /// completion, and engine events (end-of-track advancement and
     /// playback errors are handled here). Never blocks; call it on a
     /// short timer from the UI event loop.
+    /// Aggregated local playback history for the active canonical library.
+    #[must_use]
+    pub fn playback_history(&self) -> &PlaybackHistory {
+        &self.playback_history
+    }
+
+    /// Increments whenever the derived history changes.
+    #[must_use]
+    pub fn history_generation(&self) -> u64 {
+        self.history_generation
+    }
+
+    fn persist_history(&mut self) {
+        if self.history_write_protected {
+            return;
+        }
+        let Some(store) = &self.history_store else {
+            return;
+        };
+        if let Err(error) = store.save(&self.playback_history) {
+            self.report_error(format!(
+                "Could not save playback history ({}): {error}. The in-memory history remains available.",
+                store.path().display()
+            ));
+        }
+    }
+
+    /// Updates the meaningful-play accumulator from the actual engine clock.
+    /// Seeking and pause/resume boundaries do not manufacture plays.
+    fn update_playback_history(&mut self) {
+        let Some(entry) = self.player.queue().current_entry() else {
+            self.play_session = None;
+            return;
+        };
+        let position_ms = self.engine.position().as_millis().min(u128::from(u64::MAX)) as u64;
+        let same_entry = self
+            .play_session
+            .as_ref()
+            .is_some_and(|session| session.entry == entry.id());
+        if !same_entry {
+            self.play_session = Some(PlaySession {
+                entry: entry.id(),
+                listened_ms: 0,
+                last_position_ms: position_ms,
+                recorded: false,
+            });
+            return;
+        }
+        if self.player.state() != PlaybackState::Playing {
+            if let Some(session) = self.play_session.as_mut() {
+                session.last_position_ms = position_ms;
+            }
+            return;
+        }
+        let track_id = entry.track();
+        let duration_ms = self
+            .track(track_id)
+            .and_then(Track::duration)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+        let threshold = meaningful_play_threshold(duration_ms);
+        let mut record = false;
+        if let Some(session) = self.play_session.as_mut() {
+            record = accumulate_play_session(
+                session,
+                position_ms,
+                self.player.state() == PlaybackState::Playing,
+                threshold,
+            );
+        }
+        if record {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    duration.as_millis().min(u128::from(u64::MAX)) as u64
+                });
+            self.playback_history.record(track_id, now);
+            self.history_generation = self.history_generation.wrapping_add(1);
+            self.persist_history();
+            self.outbox.push(ControllerEvent::HistoryChanged);
+        }
+    }
+
     pub fn poll(&mut self) -> Vec<ControllerEvent> {
         let mut events = std::mem::take(&mut self.outbox);
 
@@ -4462,6 +4715,7 @@ impl Controller {
             self.handle_engine_event(event, &mut events);
         }
 
+        self.update_playback_history();
         events.append(&mut self.outbox);
         events
     }
@@ -5337,6 +5591,28 @@ fn portable_queue_path(root: &Path) -> PathBuf {
 /// catalogue data, and never contains audio paths or metadata.
 fn canonical_queue_path(root: &Path) -> PathBuf {
     root.join("queue.flux")
+}
+
+fn canonical_history_path(root: &Path) -> PathBuf {
+    root.join("history.flux")
+}
+
+fn load_history(store: Option<&PlaybackHistoryStore>) -> (PlaybackHistory, bool, Option<String>) {
+    let Some(store) = store else {
+        return (PlaybackHistory::default(), false, None);
+    };
+    match store.load() {
+        Ok(Some(history)) => (history, false, None),
+        Ok(None) => (PlaybackHistory::default(), false, None),
+        Err(error) => (
+            PlaybackHistory::default(),
+            true,
+            Some(format!(
+                "Could not load playback history ({}): {error}. The file is preserved and history writes are disabled this session.",
+                store.path().display()
+            )),
+        ),
+    }
 }
 
 fn default_queue(library: &Library) -> Queue {
@@ -10149,5 +10425,123 @@ mod tests {
                 .is_none()
         );
         controller.shutdown();
+    }
+
+    #[test]
+    fn meaningful_play_threshold_and_session_accumulation_are_deterministic() {
+        assert_eq!(super::meaningful_play_threshold(Some(4_000)), 5_000);
+        assert_eq!(super::meaningful_play_threshold(Some(120_000)), 30_000);
+        assert_eq!(super::meaningful_play_threshold(None), 30_000);
+        let mut session = super::PlaySession {
+            entry: QueueEntryId::new(1),
+            listened_ms: 0,
+            last_position_ms: 0,
+            recorded: false,
+        };
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            1_000,
+            true,
+            5_000
+        ));
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            100_000,
+            true,
+            5_000
+        ));
+        assert_eq!(session.listened_ms, 1_000, "seek jump is not listening");
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            101_000,
+            true,
+            5_000
+        ));
+        assert_eq!(session.listened_ms, 2_000);
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            102_000,
+            false,
+            5_000
+        ));
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            104_000,
+            true,
+            5_000
+        ));
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            107_000,
+            true,
+            5_000
+        ));
+        assert!(super::accumulate_play_session(
+            &mut session,
+            108_000,
+            true,
+            2_000
+        ));
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            109_000,
+            true,
+            2_000
+        ));
+    }
+
+    #[test]
+    fn canonical_timestamps_and_history_persist_across_lifecycle_changes() {
+        let dir = TempDir::new("canonical-created-history");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        let created = controller.track_created_unix_ms(id);
+        assert!(created.is_some_and(|created| created > 0));
+        controller
+            .edit_track_metadata(
+                id,
+                TrackMetadataEdit {
+                    title: Some("Timestamp title".to_owned()),
+                    ..TrackMetadataEdit::default()
+                },
+            )
+            .expect("edit");
+        assert_eq!(controller.track_created_unix_ms(id), created);
+        let owner = controller.track_artist_id(id).expect("owner");
+        let destination = controller
+            .create_album(owner, "Timestamp destination", crate::ReleaseType::Album)
+            .expect("album");
+        let plan = controller
+            .plan_track_move(id, destination, 0)
+            .expect("move plan");
+        controller.execute_track_move(&plan).expect("move");
+        assert_eq!(controller.track_created_unix_ms(id), created);
+
+        let replacement = dir.path().join("timestamp-replacement.wav");
+        fs::write(&replacement, b"different-audio").expect("replacement");
+        let plan = controller
+            .plan_track_audio_replacement(id, &replacement)
+            .expect("replacement plan");
+        controller
+            .execute_track_audio_replacement(&plan)
+            .expect("replace");
+        assert_eq!(controller.track_created_unix_ms(id), created);
+        controller.shutdown();
+
+        let mut history = flux_library::PlaybackHistory::default();
+        history.record(id, 123_456);
+        history.record(id, 234_567);
+        flux_library::PlaybackHistoryStore::new(root.join("history.flux"))
+            .save(&history)
+            .expect("history save");
+        let (reopened, _control) = boot_canonical_at(&root);
+        assert_eq!(reopened.track_play_count(id), 2);
+        assert_eq!(reopened.track_last_played_unix_ms(id), Some(234_567));
+        assert_eq!(reopened.history_generation(), 0, "loaded history is stable");
+        reopened.shutdown();
     }
 }

@@ -58,6 +58,7 @@ pub mod canonical_migrate;
 mod fs_ops;
 pub mod library_lock;
 pub mod migrate;
+pub mod playback_history;
 pub mod portable;
 pub mod queue_store;
 pub mod scan;
@@ -67,6 +68,10 @@ pub use library_lock::{LibraryLock, LibraryLockError};
 pub use migrate::{
     ExclusionReason, IdGap, LegacyPath, MigrationDecision, MigrationError, MigrationPlan,
     MigrationReport, MigrationStage, PlannedRecord,
+};
+pub use playback_history::{
+    HISTORY_SCHEMA_VERSION, PlayHistoryEntry, PlaybackHistory, PlaybackHistoryError,
+    PlaybackHistoryStore,
 };
 pub use portable::{
     Artist, Availability, EffectiveMetadata, FileFingerprint, ImportedTrack, MetadataOverrides,
