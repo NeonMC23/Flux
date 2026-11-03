@@ -64,8 +64,10 @@ const SUCCESS: Color = Color::from_rgb8(0x7d, 0xe2, 0xb4);
 const TRACK_PAGE_SIZE: usize = 150;
 const GROUP_PAGE_SIZE: usize = 100;
 const SEARCH_RESULT_LIMIT: usize = 20;
+const PLAYLIST_PAGE_SIZE: usize = 150;
 const QUEUE_PAGE_SIZE: usize = 8;
 const QUEUE_ROW_HEIGHT: f32 = 38.0;
+const PLAYLIST_ROW_HEIGHT: f32 = 40.0;
 const WAVE_TICK: Duration = Duration::from_millis(16);
 const OSC_HEIGHT: f32 = 48.0;
 const OSC_RADIUS: f32 = 14.0;
@@ -977,6 +979,15 @@ fn artwork_color(seed: &str) -> Color {
     COLORS[hash as usize % COLORS.len()]
 }
 
+#[derive(Debug, Clone)]
+struct PlaylistDrag {
+    playlist_id: PlaylistId,
+    from: usize,
+    expected_track_ids: Vec<TrackId>,
+    target_gap: Option<usize>,
+    moved: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ArtworkKey {
     album_id: AlbumId,
@@ -1179,6 +1190,7 @@ fn group_key(view: LibraryView, track: &Track) -> Option<String> {
         LibraryView::Artists => Some(artist_group_key(None, track)),
         LibraryView::Albums => Some(album_group_key(None, track)),
         LibraryView::Folders => Some(display_folder(track)),
+        LibraryView::Playlists => None,
     }
 }
 
@@ -1190,7 +1202,7 @@ fn group_title(view: LibraryView, key: &str) -> String {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| key.to_owned()),
         LibraryView::Albums => album_key_parts(key).0.to_owned(),
-        LibraryView::Tracks => key.to_owned(),
+        LibraryView::Tracks | LibraryView::Playlists => key.to_owned(),
     }
 }
 
@@ -1202,6 +1214,7 @@ enum LibraryView {
     Artists,
     Albums,
     Folders,
+    Playlists,
 }
 
 impl LibraryView {
@@ -1211,6 +1224,7 @@ impl LibraryView {
             Self::Artists => "Artists",
             Self::Albums => "Albums",
             Self::Folders => "Folders",
+            Self::Playlists => "Playlists",
         }
     }
 
@@ -1219,6 +1233,7 @@ impl LibraryView {
             Self::Tracks | Self::Artists => "No artists yet",
             Self::Albums => "No albums yet",
             Self::Folders => "No folders yet",
+            Self::Playlists => "No playlists yet",
         }
     }
 }
@@ -1337,6 +1352,7 @@ impl std::fmt::Display for PlaylistChoice {
 struct BatchReview {
     playlist_id: Option<PlaylistId>,
     playlist_label: String,
+    expected_playlist_track_ids: Option<Vec<TrackId>>,
     new_playlist_name: String,
     track_ids: Vec<TrackId>,
     error: Option<String>,
@@ -1593,6 +1609,16 @@ struct FluxReady {
     filter_release: ReleaseFilter,
     sort_tracks: TrackSort,
     batch_review: Option<BatchReview>,
+    selected_playlist: Option<PlaylistId>,
+    playlist_entry_selection: Vec<usize>,
+    playlist_create_open: bool,
+    playlist_create_name: String,
+    playlist_name_input: String,
+    playlist_delete_confirm: bool,
+    playlist_clear_confirm: bool,
+    playlist_remove_confirm: bool,
+    playlist_drag: Option<PlaylistDrag>,
+    playlist_error: Option<String>,
     lib_input: String,
     track_editor: Option<TrackEditor>,
     import_manager: Option<ImportManager>,
@@ -1775,6 +1801,31 @@ enum Message {
     BatchReviewConfirm,
     BatchReviewCancel,
     BatchFavorites(bool),
+    PlaylistSelect(PlaylistId),
+    PlaylistBack,
+    PlaylistCreateOpen,
+    PlaylistCreateNameChanged(String),
+    PlaylistCreateConfirm,
+    PlaylistCreateCancel,
+    PlaylistRenameChanged(String),
+    PlaylistRenameSave,
+    PlaylistPlay,
+    PlaylistPlayEntry(usize),
+    PlaylistShuffle,
+    PlaylistEnqueue,
+    PlaylistEnqueueSelected,
+    PlaylistEnqueueEntry(usize),
+    PlaylistEntryToggle(usize),
+    PlaylistEntrySelectAll,
+    PlaylistEntryClearSelection,
+    PlaylistEntryRemove(usize),
+    PlaylistRemoveSelected,
+    PlaylistEntryMove(usize, isize),
+    PlaylistClear,
+    PlaylistDelete,
+    PlaylistDragStart(usize),
+    PlaylistDragHover(usize),
+    PlaylistDragLeave,
     SelectView(LibraryView),
     SelectGroup(Option<String>),
     ToggleSetup,
@@ -1826,6 +1877,16 @@ impl FluxReady {
             filter_release: ReleaseFilter::Any,
             sort_tracks: TrackSort::Default,
             batch_review: None,
+            selected_playlist: None,
+            playlist_entry_selection: Vec::new(),
+            playlist_create_open: false,
+            playlist_create_name: String::new(),
+            playlist_name_input: String::new(),
+            playlist_delete_confirm: false,
+            playlist_clear_confirm: false,
+            playlist_remove_confirm: false,
+            playlist_drag: None,
+            playlist_error: None,
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
@@ -1930,6 +1991,46 @@ impl FluxReady {
 
     fn cancel_queue_drag(&mut self) {
         self.queue_drag = None;
+    }
+
+    fn finish_playlist_drag(&mut self) {
+        let Some(drag) = self.playlist_drag.take() else {
+            return;
+        };
+        let Some(gap) = drag.target_gap else {
+            return;
+        };
+        if !drag.moved || self.selected_playlist != Some(drag.playlist_id) {
+            return;
+        }
+        let Some(playlist) = self.controller.playlist(drag.playlist_id) else {
+            self.playlist_error = Some("The playlist is no longer available.".to_owned());
+            return;
+        };
+        if playlist.track_ids != drag.expected_track_ids {
+            self.playlist_error =
+                Some("Playlist changed during the drag; reload and try again.".to_owned());
+            return;
+        }
+        if gap > playlist.track_ids.len() {
+            return;
+        }
+        let to = if gap > drag.from { gap - 1 } else { gap };
+        if to.min(playlist.track_ids.len().saturating_sub(1)) == drag.from {
+            return;
+        }
+        match self.controller.reorder_playlist_entry(
+            drag.playlist_id,
+            drag.from,
+            to.min(playlist.track_ids.len() - 1),
+            &drag.expected_track_ids,
+        ) {
+            Ok(()) => {
+                self.playlist_entry_selection.clear();
+                self.playlist_error = None;
+            }
+            Err(error) => self.playlist_error = Some(error),
+        }
     }
 
     fn finish_queue_drag(&mut self) {
@@ -2894,6 +2995,9 @@ impl FluxReady {
     fn select_view(&mut self, view: LibraryView) {
         self.view = view;
         self.selected_group = None;
+        self.selected_playlist = None;
+        self.playlist_entry_selection.clear();
+        self.playlist_drag = None;
         self.search.clear();
         self.page = 0;
         self.show_setup = false;
@@ -4060,6 +4164,7 @@ impl FluxReady {
             Message::SearchNavigateAlbum(id) => {
                 if let Some(album) = self.controller.album(id) {
                     self.view = LibraryView::Albums;
+                    self.selected_playlist = None;
                     self.selected_group = Some(album_key_for_title(id, &album.title));
                     self.search.clear();
                     self.selected_tracks.clear();
@@ -4078,6 +4183,7 @@ impl FluxReady {
                         .position(|(track_id, _)| *track_id == id)
                         .unwrap_or(0);
                     self.view = LibraryView::Tracks;
+                    self.selected_playlist = None;
                     self.selected_group = None;
                     self.search.clear();
                     self.focused_track = Some(id);
@@ -4152,6 +4258,7 @@ impl FluxReady {
                     self.batch_review = Some(BatchReview {
                         playlist_id: Some(playlist_id),
                         playlist_label: playlist.name,
+                        expected_playlist_track_ids: Some(playlist.track_ids),
                         new_playlist_name: String::new(),
                         track_ids: self.selected_tracks.clone(),
                         error: None,
@@ -4162,6 +4269,7 @@ impl FluxReady {
                 self.batch_review = Some(BatchReview {
                     playlist_id: None,
                     playlist_label: String::new(),
+                    expected_playlist_track_ids: None,
                     new_playlist_name: String::new(),
                     track_ids: self.selected_tracks.clone(),
                     error: None,
@@ -4188,6 +4296,346 @@ impl FluxReady {
                     Err(error) => self.lifecycle_msg = Some(error),
                 }
             }
+            Message::PlaylistSelect(id) => {
+                if self.controller.playlist(id).cloned().is_some() {
+                    self.view = LibraryView::Playlists;
+                    self.selected_playlist = Some(id);
+                    self.selected_group = None;
+                    self.search.clear();
+                    self.selected_tracks.clear();
+                    self.playlist_entry_selection.clear();
+                    self.playlist_delete_confirm = false;
+                    self.playlist_clear_confirm = false;
+                    self.playlist_remove_confirm = false;
+                    self.playlist_drag = None;
+                    self.playlist_error = None;
+                    self.show_setup = false;
+                    self.page = 0;
+                    if let Some(playlist) = self.controller.playlist(id).cloned() {
+                        self.playlist_name_input = playlist.name.clone();
+                    }
+                }
+            }
+            Message::PlaylistBack => {
+                self.selected_playlist = None;
+                self.playlist_entry_selection.clear();
+                self.playlist_drag = None;
+                self.playlist_create_open = false;
+                self.playlist_error = None;
+            }
+            Message::PlaylistCreateOpen => {
+                self.playlist_create_open = true;
+                self.playlist_create_name.clear();
+                self.playlist_error = None;
+            }
+            Message::PlaylistCreateNameChanged(value) => self.playlist_create_name = value,
+            Message::PlaylistCreateConfirm => {
+                let name = self.playlist_create_name.trim().to_owned();
+                if name.is_empty() {
+                    self.playlist_error = Some("Playlist name must not be empty.".to_owned());
+                    return Task::none();
+                }
+                match self.controller.create_playlist(&name) {
+                    Ok(id) => {
+                        self.playlist_create_open = false;
+                        self.playlist_create_name.clear();
+                        self.view = LibraryView::Playlists;
+                        self.selected_playlist = Some(id);
+                        self.playlist_name_input = name;
+                        self.playlist_error = None;
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistCreateCancel => self.playlist_create_open = false,
+            Message::PlaylistRenameChanged(value) => self.playlist_name_input = value,
+            Message::PlaylistRenameSave => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                let Some(playlist) = self.controller.playlist(id).cloned() else {
+                    self.playlist_error = Some("The playlist is no longer available.".to_owned());
+                    return Task::none();
+                };
+                let name = self.playlist_name_input.trim().to_owned();
+                if name.is_empty() {
+                    self.playlist_error = Some("Playlist name must not be empty.".to_owned());
+                    return Task::none();
+                }
+                match self.controller.rename_playlist(
+                    id,
+                    &name,
+                    &playlist.name,
+                    &playlist.track_ids,
+                ) {
+                    Ok(()) => {
+                        self.playlist_error = None;
+                        self.lifecycle_msg = Some(format!("Renamed playlist {id}."));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistPlay => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                match self.controller.play_playlist(id, 0) {
+                    Ok(()) => {
+                        self.follow_queue_current();
+                        self.lifecycle_msg = Some(format!("Playing playlist {id}."));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistPlayEntry(position) => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                match self.controller.play_playlist(id, position) {
+                    Ok(()) => {
+                        self.follow_queue_current();
+                        self.lifecycle_msg =
+                            Some(format!("Playing playlist entry {}.", position + 1));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistShuffle => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                match self.controller.play_playlist_shuffled(id) {
+                    Ok(()) => {
+                        self.follow_queue_current();
+                        self.lifecycle_msg = Some(format!(
+                            "Playing playlist {id} shuffled; canonical order unchanged."
+                        ));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistEnqueue => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                match self.controller.enqueue_playlist(id) {
+                    Ok(count) => {
+                        self.follow_queue_current();
+                        self.lifecycle_msg =
+                            Some(format!("Added {count} playlist entr(ies) to the queue."));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistEnqueueSelected => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                if self.playlist_entry_selection.is_empty() {
+                    self.playlist_error = Some("Select at least one playlist entry.".to_owned());
+                    return Task::none();
+                }
+                match self
+                    .controller
+                    .enqueue_playlist_entries(id, &self.playlist_entry_selection)
+                {
+                    Ok(count) => {
+                        self.follow_queue_current();
+                        self.lifecycle_msg =
+                            Some(format!("Added {count} selected entr(ies) to the queue."));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistEnqueueEntry(position) => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                match self.controller.enqueue_playlist_entries(id, &[position]) {
+                    Ok(_) => {
+                        self.follow_queue_current();
+                        self.lifecycle_msg = Some("Added playlist entry to the queue.".to_owned());
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistEntryToggle(position) => {
+                self.playlist_remove_confirm = false;
+                if let Some(index) = self
+                    .playlist_entry_selection
+                    .iter()
+                    .position(|selected| *selected == position)
+                {
+                    self.playlist_entry_selection.remove(index);
+                } else {
+                    self.playlist_entry_selection.push(position);
+                }
+            }
+            Message::PlaylistEntrySelectAll => {
+                if let Some(id) = self.selected_playlist
+                    && let Some(playlist) = self.controller.playlist(id).cloned()
+                {
+                    self.playlist_entry_selection = (0..playlist.track_ids.len()).collect();
+                    self.playlist_remove_confirm = false;
+                }
+            }
+            Message::PlaylistEntryClearSelection => {
+                self.playlist_entry_selection.clear();
+                self.playlist_remove_confirm = false;
+            }
+            Message::PlaylistEntryRemove(position) => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                let Some(playlist) = self.controller.playlist(id).cloned() else {
+                    self.playlist_error = Some("The playlist is no longer available.".to_owned());
+                    return Task::none();
+                };
+                match self
+                    .controller
+                    .remove_playlist_entries(id, &[position], &playlist.track_ids)
+                {
+                    Ok(_) => {
+                        self.playlist_entry_selection.clear();
+                        self.playlist_error = None;
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistRemoveSelected => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                if self.playlist_entry_selection.is_empty() {
+                    self.playlist_error = Some("Select at least one playlist entry.".to_owned());
+                    return Task::none();
+                }
+                if !self.playlist_remove_confirm {
+                    self.playlist_remove_confirm = true;
+                    return Task::none();
+                }
+                let Some(playlist) = self.controller.playlist(id).cloned() else {
+                    self.playlist_error = Some("The playlist is no longer available.".to_owned());
+                    return Task::none();
+                };
+                match self.controller.remove_playlist_entries(
+                    id,
+                    &self.playlist_entry_selection,
+                    &playlist.track_ids,
+                ) {
+                    Ok(count) => {
+                        self.playlist_entry_selection.clear();
+                        self.playlist_remove_confirm = false;
+                        self.playlist_error = None;
+                        self.lifecycle_msg = Some(format!("Removed {count} playlist entr(ies)."));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistEntryMove(position, delta) => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                let Some(playlist) = self.controller.playlist(id).cloned() else {
+                    self.playlist_error = Some("The playlist is no longer available.".to_owned());
+                    return Task::none();
+                };
+                let target = position as isize + delta;
+                if target < 0 || target as usize >= playlist.track_ids.len() {
+                    return Task::none();
+                }
+                match self.controller.reorder_playlist_entry(
+                    id,
+                    position,
+                    target as usize,
+                    &playlist.track_ids,
+                ) {
+                    Ok(()) => {
+                        self.playlist_entry_selection.clear();
+                        self.playlist_error = None;
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistClear => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                if !self.playlist_clear_confirm {
+                    self.playlist_clear_confirm = true;
+                    return Task::none();
+                }
+                let Some(playlist) = self.controller.playlist(id).cloned() else {
+                    self.playlist_error = Some("The playlist is no longer available.".to_owned());
+                    return Task::none();
+                };
+                match self.controller.clear_playlist(id, &playlist.track_ids) {
+                    Ok(()) => {
+                        self.playlist_clear_confirm = false;
+                        self.playlist_entry_selection.clear();
+                        self.playlist_error = None;
+                        self.lifecycle_msg =
+                            Some(format!("Cleared playlist {id}; tracks were not deleted."));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistDelete => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                if !self.playlist_delete_confirm {
+                    self.playlist_delete_confirm = true;
+                    return Task::none();
+                }
+                let Some(playlist) = self.controller.playlist(id).cloned() else {
+                    self.playlist_error = Some("The playlist is no longer available.".to_owned());
+                    return Task::none();
+                };
+                match self
+                    .controller
+                    .delete_playlist(id, &playlist.name, &playlist.track_ids)
+                {
+                    Ok(()) => {
+                        self.selected_playlist = None;
+                        self.playlist_entry_selection.clear();
+                        self.playlist_delete_confirm = false;
+                        self.playlist_error = None;
+                        self.lifecycle_msg =
+                            Some(format!("Deleted playlist {id}; no tracks were removed."));
+                    }
+                    Err(error) => self.playlist_error = Some(error),
+                }
+            }
+            Message::PlaylistDragStart(position) => {
+                let Some(id) = self.selected_playlist else {
+                    return Task::none();
+                };
+                let Some(playlist) = self.controller.playlist(id).cloned() else {
+                    return Task::none();
+                };
+                if position < playlist.track_ids.len() {
+                    self.playlist_drag = Some(PlaylistDrag {
+                        playlist_id: id,
+                        from: position,
+                        expected_track_ids: playlist.track_ids,
+                        target_gap: None,
+                        moved: false,
+                    });
+                }
+            }
+            Message::PlaylistDragHover(gap) => {
+                if let Some(drag) = self.playlist_drag.as_mut() {
+                    drag.target_gap = Some(gap);
+                    drag.moved = true;
+                }
+            }
+            Message::PlaylistDragLeave => {
+                if let Some(drag) = self.playlist_drag.as_mut() {
+                    drag.target_gap = None;
+                    drag.moved = true;
+                }
+            }
             Message::SelectView(view) => {
                 self.selected_tracks.clear();
                 self.focused_track = None;
@@ -4198,6 +4646,7 @@ impl FluxReady {
                     self.search.clear();
                 }
                 self.selected_group = group;
+                self.selected_playlist = None;
                 self.selected_tracks.clear();
                 self.focused_track = None;
                 self.sync_album_editor();
@@ -4209,8 +4658,20 @@ impl FluxReady {
                 self.cancel_queue_drag();
                 self.queue_visible = !self.queue_visible;
             }
-            Message::PagePrev => self.page = self.page.saturating_sub(1),
-            Message::PageNext => self.page = self.page.saturating_add(1),
+            Message::PagePrev => {
+                self.page = self.page.saturating_sub(1);
+                if self.selected_playlist.is_some() {
+                    self.playlist_entry_selection.clear();
+                    self.playlist_remove_confirm = false;
+                }
+            }
+            Message::PageNext => {
+                self.page = self.page.saturating_add(1);
+                if self.selected_playlist.is_some() {
+                    self.playlist_entry_selection.clear();
+                    self.playlist_remove_confirm = false;
+                }
+            }
             Message::QueuePagePrev => {
                 self.cancel_queue_drag();
                 self.queue_page = self.queue_page.saturating_sub(1);
@@ -4264,6 +4725,7 @@ impl FluxReady {
             }
             Message::QueueDragCancel => {
                 self.cancel_queue_drag();
+                self.playlist_drag = None;
                 self.commit_seek_preview();
             }
             Message::SeekPreview(value) => {
@@ -4276,6 +4738,7 @@ impl FluxReady {
             }
             Message::SeekCommit => self.commit_seek_preview(),
             Message::QueueDragRelease => {
+                self.finish_playlist_drag();
                 self.finish_queue_drag();
                 self.commit_seek_preview();
             }
@@ -4367,12 +4830,14 @@ impl FluxReady {
                     Key::Character("2") => self.select_view(LibraryView::Artists),
                     Key::Character("3") => self.select_view(LibraryView::Albums),
                     Key::Character("4") => self.select_view(LibraryView::Folders),
+                    Key::Character("5") => self.select_view(LibraryView::Playlists),
                     Key::Character("l") => self.toggle_setup(),
                     Key::Named(Named::Escape) => {
                         if self.track_editor.take().is_some() {
                             return Task::none();
                         }
                         self.cancel_queue_drag();
+                        self.playlist_drag = None;
                         self.search.clear();
                         self.selected_tracks.clear();
                         self.focused_track = None;
@@ -4453,7 +4918,11 @@ impl FluxReady {
         }
 
         let base: Element<'_, Message> = body.into();
-        let body: Element<'_, Message> = if self.batch_review.is_some() {
+        let body: Element<'_, Message> = if self.playlist_create_open {
+            stack([base, self.playlist_create_overlay()])
+                .height(Length::Fill)
+                .into()
+        } else if self.batch_review.is_some() {
             stack([base, self.batch_overlay()])
                 .height(Length::Fill)
                 .into()
@@ -6614,7 +7083,7 @@ impl FluxReady {
         .into()
     }
 
-    fn nav_counts(&self) -> (usize, usize, usize, usize) {
+    fn nav_counts(&self) -> (usize, usize, usize, usize, usize) {
         let mut artists: HashSet<String> = HashSet::new();
         let mut albums: HashSet<Option<&str>> = HashSet::new();
         let mut folders: HashSet<Option<&Path>> = HashSet::new();
@@ -6635,6 +7104,7 @@ impl FluxReady {
             artists.len(),
             albums.len(),
             folders.len(),
+            self.controller.playlists().len(),
         )
     }
 
@@ -6664,6 +7134,7 @@ impl FluxReady {
             LibraryView::Artists,
             LibraryView::Albums,
             LibraryView::Folders,
+            LibraryView::Playlists,
         ] {
             nav = nav.push(
                 button(
@@ -6676,6 +7147,7 @@ impl FluxReady {
                                 LibraryView::Artists => counts.1,
                                 LibraryView::Albums => counts.2,
                                 LibraryView::Folders => counts.3,
+                                LibraryView::Playlists => counts.4,
                             }
                             .to_string()
                         )
@@ -6781,6 +7253,28 @@ impl FluxReady {
             (
                 "Search results".to_owned(),
                 "Artists, albums and tracks from the canonical catalogue.".to_owned(),
+            )
+        } else if let Some(playlist_id) = self.selected_playlist {
+            (
+                self.controller
+                    .playlist(playlist_id)
+                    .map(|playlist| playlist.name.clone())
+                    .unwrap_or_else(|| "Playlist".to_owned()),
+                format!(
+                    "Playlist {playlist_id} · {count} entr(ies)",
+                    count = self
+                        .controller
+                        .playlist(playlist_id)
+                        .map_or(0, |playlist| playlist.track_ids.len())
+                ),
+            )
+        } else if self.view == LibraryView::Playlists {
+            (
+                "Playlists".to_owned(),
+                format!(
+                    "{} canonical playlist(s)",
+                    self.controller.playlists().len()
+                ),
             )
         } else if let Some(group) = &self.selected_group {
             let rows = self.filtered_tracks();
@@ -6912,6 +7406,12 @@ impl FluxReady {
         }
         if !self.search.trim().is_empty() {
             return self.search_results_view();
+        }
+        if self.view == LibraryView::Playlists {
+            return self.selected_playlist.map_or_else(
+                || self.playlist_list_view(),
+                |id| self.playlist_detail_view(id),
+            );
         }
         if self.controller.tracks().is_empty() {
             return self.empty_library();
@@ -7712,7 +8212,14 @@ impl FluxReady {
         }
         let result = if let Some(playlist_id) = review.playlist_id {
             self.controller
-                .add_tracks_to_playlist(playlist_id, &review.track_ids)
+                .add_tracks_to_playlist(
+                    playlist_id,
+                    &review.track_ids,
+                    review
+                        .expected_playlist_track_ids
+                        .as_deref()
+                        .unwrap_or_default(),
+                )
                 .map(|count| format!("Added {count} track(s) to {}.", review.playlist_label))
         } else {
             let name = review.new_playlist_name.trim();
@@ -7724,6 +8231,11 @@ impl FluxReady {
             self.controller
                 .create_playlist_from_tracks(name, &review.track_ids)
                 .map(|id| {
+                    self.view = LibraryView::Playlists;
+                    self.selected_playlist = Some(id);
+                    self.playlist_name_input = name.to_owned();
+                    self.selected_group = None;
+                    self.search.clear();
                     format!(
                         "Created playlist {id} with {} track(s).",
                         review.track_ids.len()
@@ -8034,6 +8546,355 @@ impl FluxReady {
             .color(MUTED),
         );
         scrollable(body).height(Length::Fill).into()
+    }
+
+    fn playlist_list_view(&self) -> Element<'_, Message> {
+        let playlists = self.controller.playlists();
+        let mut body = column![
+            row![
+                column![
+                    text("Playlists").size(22).color(TEXT),
+                    text(format!("{} canonical playlist(s)", playlists.len()))
+                        .size(10)
+                        .color(MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                button(text("New playlist").size(11))
+                    .style(accent_button_style)
+                    .padding([7, 11])
+                    .on_press(Message::PlaylistCreateOpen),
+            ]
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10);
+        if let Some(error) = &self.playlist_error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        if playlists.is_empty() {
+            body = body.push(
+                container(
+                    column![
+                        text("No playlists yet").size(18).color(TEXT),
+                        text("Create an empty playlist or select tracks from the library and use Create playlist… in the selection bar.")
+                            .size(11)
+                            .color(MUTED),
+                        button(text("Create playlist").size(11))
+                            .style(accent_button_style)
+                            .padding([7, 11])
+                            .on_press(Message::PlaylistCreateOpen),
+                    ]
+                    .spacing(8)
+                    .align_x(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center(Length::Fill)
+                .style(card_style),
+            );
+            return body.into();
+        }
+        let mut rows = column![].spacing(5);
+        for playlist in playlists {
+            let preview = playlist
+                .track_ids
+                .iter()
+                .take(3)
+                .filter_map(|id| self.controller.track(*id).map(Track::title))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let subtitle = if preview.is_empty() {
+                "Empty playlist".to_owned()
+            } else {
+                format!("{} track(s) · {preview}", playlist.track_ids.len())
+            };
+            rows = rows.push(
+                button(
+                    row![
+                        fallback_artwork(Some(&playlist.name), 38.0),
+                        column![
+                            text(playlist.name.clone()).size(14).color(TEXT),
+                            text(subtitle).size(10).color(MUTED),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        text("›").size(20).color(MUTED),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding(8)
+                .style(group_style)
+                .on_press(Message::PlaylistSelect(playlist.id)),
+            );
+        }
+        body = body.push(scrollable(rows).height(Length::Fill));
+        body.height(Length::Fill).into()
+    }
+
+    fn playlist_detail_view(&self, id: PlaylistId) -> Element<'_, Message> {
+        let Some(playlist) = self.controller.playlist(id).cloned() else {
+            return text("Playlist is no longer in the library.")
+                .size(13)
+                .color(MUTED)
+                .into();
+        };
+        let count = playlist.track_ids.len();
+        let selected_count = self.playlist_entry_selection.len();
+        let mut body = column![
+            row![
+                button(text("‹ Back").size(11))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::PlaylistBack),
+                column![
+                    text(playlist.name.clone()).size(22).color(TEXT),
+                    text(format!(
+                        "Playlist {} · {count} entr(ies) · stable TrackIds · duplicates preserved",
+                        playlist.id
+                    ))
+                    .size(10)
+                    .color(MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                button(text("Play").size(11))
+                    .style(accent_button_style)
+                    .padding([7, 10])
+                    .on_press_maybe((count > 0).then_some(Message::PlaylistPlay)),
+                button(text("Shuffle").size(10))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press_maybe((count > 0).then_some(Message::PlaylistShuffle)),
+                button(text("Add to queue").size(10))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press_maybe((count > 0).then_some(Message::PlaylistEnqueue)),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10);
+        if let Some(error) = &self.playlist_error {
+            body = body.push(text(error).size(10).color(DANGER));
+        }
+        body = body.push(
+            container(
+                column![
+                    text("PLAYLIST DETAILS").size(9).color(ACCENT),
+                    row![
+                        text_input("Playlist name…", &self.playlist_name_input)
+                            .on_input(Message::PlaylistRenameChanged)
+                            .on_submit(Message::PlaylistRenameSave)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text("Rename").size(10))
+                            .style(accent_button_style)
+                            .padding([6, 9])
+                            .on_press(Message::PlaylistRenameSave),
+                        button(
+                            text(if self.playlist_clear_confirm {
+                                "Confirm clear"
+                            } else {
+                                "Clear playlist"
+                            })
+                            .size(10),
+                        )
+                        .style(danger_button_style)
+                        .padding([6, 9])
+                        .on_press_maybe((count > 0).then_some(Message::PlaylistClear)),
+                        button(
+                            text(if self.playlist_delete_confirm {
+                                "Confirm delete playlist"
+                            } else {
+                                "Delete playlist"
+                            })
+                            .size(10),
+                        )
+                        .style(danger_button_style)
+                        .padding([6, 9])
+                        .on_press(Message::PlaylistDelete),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                    text("Renaming and clearing preserve the PlaylistId. Clearing never deletes canonical tracks.")
+                        .size(9)
+                        .color(MUTED),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .style(card_style),
+        );
+        if selected_count > 0 {
+            body = body.push(
+                container(
+                    row![
+                        text(format!("{selected_count} entr(ies) selected"))
+                            .size(10)
+                            .color(ACCENT),
+                        button(text("Select all").size(10))
+                            .style(ghost_style)
+                            .padding([5, 8])
+                            .on_press(Message::PlaylistEntrySelectAll),
+                        button(text("Clear selection").size(10))
+                            .style(ghost_style)
+                            .padding([5, 8])
+                            .on_press(Message::PlaylistEntryClearSelection),
+                        button(text("Add selected to queue").size(10))
+                            .style(ghost_style)
+                            .padding([5, 8])
+                            .on_press(Message::PlaylistEnqueueSelected),
+                        button(
+                            text(if self.playlist_remove_confirm {
+                                "Confirm remove selected"
+                            } else {
+                                "Remove selected"
+                            })
+                            .size(10),
+                        )
+                        .style(danger_button_style)
+                        .padding([5, 8])
+                        .on_press(Message::PlaylistRemoveSelected),
+                    ]
+                    .spacing(6)
+                    .wrap(),
+                )
+                .padding([7, 9])
+                .width(Length::Fill)
+                .style(card_style),
+            );
+        } else if count > 0 {
+            body = body.push(
+                row![
+                    text("Drag rows to reorder · select entries for batch actions")
+                        .size(9)
+                        .color(MUTED),
+                    iced::widget::Space::new().width(Length::Fill),
+                    button(text("Select all").size(10))
+                        .style(ghost_style)
+                        .padding([5, 8])
+                        .on_press(Message::PlaylistEntrySelectAll),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+
+        if count == 0 {
+            body = body.push(
+                container(
+                    column![
+                        text("This playlist is empty.").size(15).color(TEXT),
+                        text("Add tracks through the library selection bar, album detail, or global search. Playlist entries never duplicate audio files.")
+                            .size(10)
+                            .color(MUTED),
+                    ]
+                    .spacing(5),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(card_style),
+            );
+            return body.into();
+        }
+
+        let current = self.controller.current_id();
+        let dragged = self.playlist_drag.as_ref().map(|drag| drag.from);
+        let target_gap = self.playlist_drag.as_ref().and_then(|drag| drag.target_gap);
+        let pages = count.div_ceil(PLAYLIST_PAGE_SIZE).max(1);
+        let page = self.page.min(pages - 1);
+        let start = page * PLAYLIST_PAGE_SIZE;
+        let end = (start + PLAYLIST_PAGE_SIZE).min(count);
+        let track_lookup = self
+            .controller
+            .tracks()
+            .iter()
+            .map(|(id, track)| (*id, track))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut rows = column![].spacing(0);
+        for position in start..end {
+            let track_id = playlist.track_ids[position];
+            rows = rows.push(queue_gap_line(target_gap == Some(position)));
+            let Some(track) = track_lookup.get(&track_id).copied() else {
+                rows = rows.push(
+                    row![
+                        text(format!("{}", position + 1)).size(10).color(MUTED),
+                        text(format!("Missing track {track_id}"))
+                            .size(12)
+                            .color(DANGER),
+                        iced::widget::Space::new().width(Length::Fill),
+                        button(text("Remove entry").size(10))
+                            .style(danger_button_style)
+                            .padding([5, 8])
+                            .on_press(Message::PlaylistEntryRemove(position)),
+                    ]
+                    .spacing(8)
+                    .padding([6, 8]),
+                );
+                continue;
+            };
+            rows = rows.push(playlist_entry_row(
+                position,
+                track_id,
+                track,
+                current,
+                self.playlist_entry_selection.contains(&position),
+                dragged == Some(position),
+            ));
+        }
+        rows = rows.push(queue_gap_line(target_gap == Some(end)));
+        body = body.push(
+            mouse_area(scrollable(rows).height(Length::Fill)).on_exit(Message::PlaylistDragLeave),
+        );
+        body = body.push(pagination_footer(page, pages, start, end, count));
+        body.height(Length::Fill).into()
+    }
+
+    fn playlist_create_overlay(&self) -> Element<'_, Message> {
+        if !self.playlist_create_open {
+            return iced::widget::Space::new().into();
+        }
+        let mut content = column![
+            text("Create playlist").size(22).color(TEXT),
+            text("Creates an empty playlist with a stable PlaylistId. Add tracks from the library selection bar or playlist detail later.")
+                .size(10)
+                .color(MUTED),
+            text_input("Playlist name…", &self.playlist_create_name)
+                .on_input(Message::PlaylistCreateNameChanged)
+                .on_submit(Message::PlaylistCreateConfirm)
+                .style(input_style)
+                .width(Length::Fill),
+        ]
+        .spacing(8);
+        if let Some(error) = &self.playlist_error {
+            content = content.push(text(error).size(10).color(DANGER));
+        }
+        content = content.push(
+            row![
+                button(text("Create").size(12))
+                    .style(accent_button_style)
+                    .padding([8, 14])
+                    .on_press(Message::PlaylistCreateConfirm),
+                button(text("Cancel").size(11))
+                    .style(ghost_style)
+                    .padding([8, 12])
+                    .on_press(Message::PlaylistCreateCancel),
+            ]
+            .spacing(8),
+        );
+        container(
+            container(content)
+                .padding(18)
+                .width(Length::Fill)
+                .max_width(520.0)
+                .style(import_panel_style),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center(Length::Fill)
+        .style(modal_backdrop_style)
+        .into()
     }
 
     fn album_detail_view(&self, album_id: AlbumId) -> Element<'_, Message> {
@@ -9253,6 +10114,90 @@ fn track_row<'a>(
         .into()
 }
 
+fn playlist_entry_row<'a>(
+    position: usize,
+    track_id: TrackId,
+    track: &'a Track,
+    current: Option<TrackId>,
+    checked: bool,
+    dragging: bool,
+) -> Element<'a, Message> {
+    let is_current = current == Some(track_id);
+    let duration = track.duration().map(format_duration).unwrap_or_default();
+    let title_color = if is_current { ACCENT } else { TEXT };
+    let check = button(text(if checked { "✓" } else { "○" }).size(11))
+        .style(ghost_style)
+        .padding([4, 5])
+        .on_press(Message::PlaylistEntryToggle(position));
+    let play = button(text(if is_current { "▶" } else { "›" }).size(12))
+        .style(ghost_style)
+        .padding([4, 5])
+        .on_press(Message::PlaylistPlayEntry(position));
+    let queue = button(text("+").size(11))
+        .style(ghost_style)
+        .padding([4, 5])
+        .on_press(Message::PlaylistEnqueueEntry(position));
+    let up = button(text("↑").size(10))
+        .style(ghost_style)
+        .padding([4, 5])
+        .on_press_maybe((position > 0).then_some(Message::PlaylistEntryMove(position, -1)));
+    let down = button(text("↓").size(10))
+        .style(ghost_style)
+        .padding([4, 5])
+        .on_press(Message::PlaylistEntryMove(position, 1));
+    let remove = button(text("×").size(11))
+        .style(danger_button_style)
+        .padding([4, 5])
+        .on_press(Message::PlaylistEntryRemove(position));
+    let on_move = move |point: iced::Point| {
+        Message::PlaylistDragHover(if point.y < PLAYLIST_ROW_HEIGHT / 2.0 {
+            position
+        } else {
+            position + 1
+        })
+    };
+    mouse_area(
+        row![
+            text("≡").size(11).color(MUTED),
+            check,
+            text(format!("{}", position + 1))
+                .size(9)
+                .color(MUTED)
+                .width(Length::Fixed(24.0)),
+            play,
+            column![
+                text(track.title()).size(12).color(title_color),
+                text(display_artist(track)).size(9).color(MUTED),
+            ]
+            .spacing(1)
+            .width(Length::FillPortion(5)),
+            text(display_album(track))
+                .size(9)
+                .color(MUTED)
+                .width(Length::FillPortion(3)),
+            text(duration)
+                .size(9)
+                .color(MUTED)
+                .width(Length::Fixed(42.0)),
+            queue,
+            up,
+            down,
+            remove,
+        ]
+        .spacing(3)
+        .height(Length::Fixed(PLAYLIST_ROW_HEIGHT))
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::PlaylistDragStart(position))
+    .on_move(on_move)
+    .interaction(if dragging {
+        mouse::Interaction::Grabbing
+    } else {
+        mouse::Interaction::Grab
+    })
+    .into()
+}
+
 fn queue_row<'a>(
     entry: QueueEntry,
     index: usize,
@@ -9523,6 +10468,16 @@ mod tests {
             filter_release: ReleaseFilter::Any,
             sort_tracks: TrackSort::Default,
             batch_review: None,
+            selected_playlist: None,
+            playlist_entry_selection: Vec::new(),
+            playlist_create_open: false,
+            playlist_create_name: String::new(),
+            playlist_name_input: String::new(),
+            playlist_delete_confirm: false,
+            playlist_clear_confirm: false,
+            playlist_remove_confirm: false,
+            playlist_drag: None,
+            playlist_error: None,
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
@@ -11594,6 +12549,301 @@ mod tests {
         send(&mut gui, Message::BatchReviewCancel);
         assert_eq!(gui.controller.current_queue_entry_id(), queue_entry);
         assert_eq!(gui.controller.player_state(), playback_state);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn playlist_library_creates_renames_and_deletes_without_touching_tracks() {
+        let dir = TempDir::new("gui-playlist-library");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let track = import_named_track(
+            &mut gui,
+            &dir,
+            "One",
+            "Artist One",
+            "Album One",
+            ReleaseType::Album,
+            1,
+        );
+        let queue_entry = gui.controller.current_queue_entry_id();
+        let playback_state = gui.controller.player_state();
+
+        send(&mut gui, Message::PlaylistCreateOpen);
+        send(&mut gui, Message::PlaylistCreateConfirm);
+        assert!(gui.playlist_error.is_some(), "empty name is rejected");
+        assert_eq!(gui.controller.playlists().len(), 0);
+        send(
+            &mut gui,
+            Message::PlaylistCreateNameChanged("Mix".to_owned()),
+        );
+        send(&mut gui, Message::PlaylistCreateConfirm);
+        assert_eq!(gui.view, LibraryView::Playlists);
+        assert_eq!(gui.controller.playlists().len(), 1);
+        let playlist = gui.selected_playlist.expect("opened playlist");
+        assert!(
+            gui.controller
+                .playlist(playlist)
+                .is_some_and(|playlist| playlist.track_ids.is_empty())
+        );
+
+        send(
+            &mut gui,
+            Message::PlaylistRenameChanged("Renamed".to_owned()),
+        );
+        send(&mut gui, Message::PlaylistRenameSave);
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|playlist| playlist.name.as_str()),
+            Some("Renamed")
+        );
+        assert!(
+            gui.controller
+                .playlist(playlist)
+                .is_some_and(|playlist| playlist.track_ids.is_empty())
+        );
+
+        send(&mut gui, Message::PlaylistDelete);
+        assert!(gui.controller.playlist(playlist).is_some());
+        send(&mut gui, Message::PlaylistDelete);
+        assert!(gui.controller.playlist(playlist).is_none());
+        assert!(gui.controller.track(track).is_some(), "track is untouched");
+        assert_eq!(gui.controller.current_queue_entry_id(), queue_entry);
+        assert_eq!(gui.controller.player_state(), playback_state);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn playlist_entries_remove_reorder_clear_and_reject_stale_plans() {
+        let dir = TempDir::new("gui-playlist-entries");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let one = import_named_track(
+            &mut gui,
+            &dir,
+            "One",
+            "Artist One",
+            "Album One",
+            ReleaseType::Album,
+            1,
+        );
+        let two = import_named_track(
+            &mut gui,
+            &dir,
+            "Two",
+            "Artist Two",
+            "Album Two",
+            ReleaseType::Album,
+            2,
+        );
+        let playlist = gui.controller.create_playlist("Entries").expect("playlist");
+        gui.controller
+            .set_playlist(Some(playlist), "Entries", vec![one, two, two])
+            .expect("contents");
+        let queue_entry = gui.controller.current_queue_entry_id();
+        let playback_state = gui.controller.player_state();
+        send(&mut gui, Message::PlaylistSelect(playlist));
+        assert_eq!(gui.selected_playlist, Some(playlist));
+        assert_eq!(gui.view, LibraryView::Playlists);
+
+        send(&mut gui, Message::PlaylistEntryToggle(1));
+        send(&mut gui, Message::PlaylistEntryToggle(2));
+        send(&mut gui, Message::PlaylistRemoveSelected);
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(vec![one, two, two]),
+            "first click only asks for confirmation"
+        );
+        send(&mut gui, Message::PlaylistRemoveSelected);
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(vec![one]),
+            "duplicate entries are removed by position"
+        );
+        assert!(gui.controller.track(two).is_some());
+
+        gui.controller
+            .set_playlist(Some(playlist), "Entries", vec![one, two])
+            .expect("reset contents");
+        send(&mut gui, Message::PlaylistEntryMove(0, 1));
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(vec![two, one])
+        );
+        gui.controller
+            .set_playlist(Some(playlist), "Entries", vec![one, two])
+            .expect("reset contents");
+        send(&mut gui, Message::PlaylistDragStart(0));
+        send(&mut gui, Message::PlaylistDragHover(2));
+        send(&mut gui, Message::QueueDragRelease);
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(vec![two, one])
+        );
+
+        // A drag snapshot that no longer matches the playlist is rejected.
+        gui.controller
+            .set_playlist(Some(playlist), "Entries", vec![one, two])
+            .expect("reset contents");
+        send(&mut gui, Message::PlaylistDragStart(0));
+        gui.controller
+            .set_playlist(Some(playlist), "Entries", vec![two, one])
+            .expect("concurrent change");
+        send(&mut gui, Message::PlaylistDragHover(2));
+        send(&mut gui, Message::QueueDragRelease);
+        assert!(gui.playlist_error.is_some());
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(vec![two, one]),
+            "stale drag does not reorder"
+        );
+
+        send(&mut gui, Message::PlaylistClear);
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(vec![two, one])
+        );
+        send(&mut gui, Message::PlaylistClear);
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(Vec::new())
+        );
+        assert!(gui.controller.track(one).is_some());
+        assert!(gui.controller.track(two).is_some());
+        assert_eq!(gui.controller.current_queue_entry_id(), queue_entry);
+        assert_eq!(gui.controller.player_state(), playback_state);
+
+        let before = gui
+            .controller
+            .playlist(playlist)
+            .map(|p| p.track_ids.clone())
+            .unwrap();
+        assert!(
+            gui.controller
+                .remove_playlist_entries(playlist, &[0], &[TrackId::new(99_999)])
+                .is_err()
+        );
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(before)
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn playlist_playback_preserves_order_duplicates_and_queue_semantics() {
+        let dir = TempDir::new("gui-playlist-playback");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let one = import_named_track(
+            &mut gui,
+            &dir,
+            "One",
+            "Artist One",
+            "Album One",
+            ReleaseType::Album,
+            1,
+        );
+        let two = import_named_track(
+            &mut gui,
+            &dir,
+            "Two",
+            "Artist Two",
+            "Album Two",
+            ReleaseType::Album,
+            2,
+        );
+        let playlist = gui
+            .controller
+            .create_playlist("Playback")
+            .expect("playlist");
+        let canonical_order = vec![one, two, one];
+        gui.controller
+            .set_playlist(Some(playlist), "Playback", canonical_order.clone())
+            .expect("contents");
+        gui.controller.play_track(one);
+        send(&mut gui, Message::PlaylistSelect(playlist));
+
+        let before_len = gui.controller.queue_len();
+        let before_current = gui.controller.current_queue_entry_id();
+        send(&mut gui, Message::PlaylistEnqueue);
+        assert_eq!(gui.controller.queue_len(), before_len + 3);
+        assert_eq!(gui.controller.current_queue_entry_id(), before_current);
+        assert_eq!(
+            gui.controller.queue_entries()[before_len..]
+                .iter()
+                .map(|entry| entry.track())
+                .collect::<Vec<_>>(),
+            canonical_order
+        );
+
+        send(&mut gui, Message::PlaylistPlayEntry(2));
+        assert_eq!(gui.controller.queue_len(), 3);
+        let current = gui.controller.current_queue_entry_id().expect("current");
+        assert_eq!(gui.controller.queue_entry_index(current), Some(2));
+        assert_eq!(
+            gui.controller.current_track().map(|track| track.title()),
+            Some("One")
+        );
+        let current_before_edit = gui.controller.current_queue_entry_id();
+        send(&mut gui, Message::PlaylistEntryMove(0, 1));
+        assert_eq!(gui.controller.current_queue_entry_id(), current_before_edit);
+        let reordered_order = vec![two, one, one];
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(reordered_order.clone())
+        );
+
+        send(&mut gui, Message::PlaylistShuffle);
+        assert_eq!(
+            gui.controller
+                .playlist(playlist)
+                .map(|p| p.track_ids.clone()),
+            Some(reordered_order),
+            "shuffle never mutates canonical order"
+        );
+        assert_eq!(gui.controller.queue_len(), 3);
+        send(&mut gui, Message::PlaylistPlay);
+        assert_eq!(gui.controller.queue_len(), 3);
+        let current = gui.controller.current_queue_entry_id().expect("current");
+        assert_eq!(gui.controller.queue_entry_index(current), Some(0));
         gui.controller.shutdown();
     }
 }
