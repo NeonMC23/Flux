@@ -261,6 +261,53 @@ one-transaction reorder.
 The TUI does not expose playlist management; its help and documentation direct
 these operations to the GUI.
 
+### Discovery, ratings, history and dashboard
+
+Ratings/favorites remain canonical track data. Track rows expose a favorite
+toggle and deterministic rating cycle (none/1–5★); the batch bar applies
+favorites and ratings to selected stable TrackIds in one canonical ratings
+transaction. Existing unrelated rating/favorite values are preserved; invalid
+or stale selections reject without writes. Ratings remain track-only.
+
+Smart Collections are dynamic queries over canonical data plus local derived
+history, not editable playlists:
+
+- Favorites and Highly Rated (4–5★);
+- Recently Added using `TrackEntityDto.created_unix_ms`;
+- Recently Played and Most Played using local meaningful-play history;
+- Without Lyrics, Synchronized Lyrics and Without Artwork.
+
+Membership recomputes from current catalogue/rating/history state. Collection
+track lists reuse normal playback/queue/search/filter/selection actions. Album
+detail retains canonical album order. The dashboard shows track/artist/album
+totals, favorites/rated counts, lyrics/synchronized/artwork counts, recent and
+most-played previews, and highly-rated tracks, with direct collection links.
+Dashboard summaries are cached by catalogue generation plus history generation.
+
+New canonical imports persist `created_unix_ms` in `track.flux`. Existing or
+migrated records lacking a reliable timestamp keep zero and are excluded from
+Recently Added; filesystem modification time is not substituted. Creation time
+is preserved through metadata edits, moves, audio replacement and album transfer.
+
+Meaningful playback history is derived application state in a per-canonical-
+library `history.flux`, separate from the catalogue and audio tags. It stores an
+aggregated play count and last-played Unix milliseconds per stable TrackId using
+atomic replace; it is not a second catalogue. A play is counted once per queue
+entry after accumulated playing time reaches `clamp(duration/2, 5s, 30s)` (30s
+when duration is unknown). Pause/resume does not add time, seek jumps over two
+seconds are ignored as listening evidence, and restarting within the same queue
+entry does not create another play. No historical plays are fabricated. Malformed
+history is preserved and history writes are disabled for that session. History
+survives TrackId-preserving metadata edits, moves and audio replacement.
+
+Advanced sorting supports catalogue order, title, artist, album, track/disc,
+favorites, rating, play count, last played, date added and duration with an
+ascending/descending toggle and stable TrackId tie-breaks. Filters include
+favorites, lyrics, artwork, release type and minimum rating. Reset clears all
+filters/direction. Remove/clear actions never delete tracks. The TUI exposes
+read-only `F` favorites-only browsing and `H` most-played history summaries;
+Dashboard/Smart Collections/rating/batch editing are GUI-only.
+
 ### Lyrics
 
 Lyrics remain a single managed UTF-8 text file referenced by the existing
@@ -782,3 +829,14 @@ cleanup.
     lines are normalized on round-trip. Export uses a typed destination path,
     not a native save dialog. No remote lyrics lookup, tag extraction or TUI
     editing is implemented.
+20. Playback history and play counts are collected only after this feature is
+    introduced; pre-existing listening activity is not inferred. History is
+    derived state in `history.flux` and is separate from the canonical catalogue.
+21. Smart Collections are fixed built-ins; user-defined rule composition,
+    dashboard persistence/settings, TUI dashboards and advanced history export
+    are not implemented. Recently Added excludes legacy/migrated records with no
+    reliable canonical creation timestamp.
+22. Most Played exposes track rankings plus compact artist/album aggregates;
+    there are no separate artist/album statistics screens. History storage is
+    aggregated per TrackId, so individual play-event timestamps beyond the last
+    play are not retained.

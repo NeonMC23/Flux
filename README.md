@@ -50,7 +50,7 @@ selects or writes those backends.
 | `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, duplicate decisions, copy-only publication, artist/album/track edits, playlist management, lyrics parsing/editing/import/export APIs, playlists/ratings/lyrics persistence, and the canonical migration workflow. Both front-ends use this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, reviewed track move/audio replacement, decoded managed album artwork, dedicated playlist management/playback, lyrics library/editor/karaoke, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, reviewed track move/audio replacement, decoded managed album artwork, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart collections/rating controls, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
 | `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, copy-only quick import, folder import, track/artist edit keys, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
@@ -82,9 +82,16 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   duplicate decisions, and real progress/cancel. Click a track to play it; use
   the transport row for pause/stop/skip/repeat/volume. The search box performs
   a grouped, case-insensitive global search over canonical artists, albums and
-  tracks with direct navigation. Track views support favorites/lyrics/artwork/
-  release filters, deterministic sorting, and multi-selection by stable
-  TrackIds. Selection actions can set/unset favorites or create/append canonical
+  tracks with direct navigation. Track rows expose favorite and rating controls;
+  track views support favorites/lyrics/artwork/release/rating filters,
+  ascending/descending deterministic sorting by title/artist/album/track/rating/
+  date-added/duration/play-count/last-played, and multi-selection by stable
+  TrackIds. A Dashboard summarizes canonical counts plus locally recorded
+  listening history; Smart Collections provide Favorites, Highly Rated,
+  Recently Added, Recently Played, Most Played, Without Lyrics, Synchronized
+  Lyrics and Without Artwork views. Play counts/history begin only after this
+  feature is introduced and are stored separately from canonical metadata.
+  Selection actions can set/unset favorites or create/append canonical
   playlists after an explicit review. A dedicated Playlists section supports
   empty or selection-based creation, rename, detail browsing, duplicate-safe
   position selection, removal, drag/arrow reordering, clear/delete confirmation,
@@ -117,7 +124,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   edits the selected track as `title|album|track|disc|artist-id|credit-ids`, `P` creates
   an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. `y` opens read-only lyrics for the selected track.
+  migration workflow. `y` opens read-only lyrics, `F` toggles favorites-only
+  browsing, and `H` reports most-played/local history statistics.
   Global artist/album/track search, filters, multi-selection, playlist
   management, lyrics editing/import/export/karaoke and batch playlist/favorite
   actions require the GUI.
