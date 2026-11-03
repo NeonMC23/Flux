@@ -4311,7 +4311,21 @@ impl CanonicalLibrary {
                 expected: None,
             });
         }
-        self.commit_writes(None, writes)?;
+        let mut cleanup = Vec::new();
+        if lyrics.is_none()
+            && let Some(old) = &track.lyrics
+        {
+            cleanup.push(RelPath::from_utf8(&format!(
+                "{}/{}",
+                record_rel
+                    .display_lossy()
+                    .rsplit_once('/')
+                    .map_or("", |(dir, _)| dir),
+                old
+            ))?);
+        }
+        let catalog = self.catalog.clone();
+        self.commit_writes_with_cleanup(Some(catalog), writes, cleanup)?;
         self.reopen_after()?;
         Ok(())
     }
@@ -10856,6 +10870,49 @@ mod atomic_import_tests {
                     "{point:?}"
                 );
             }
+        }
+
+        #[test]
+        fn lyrics_replace_and_remove_are_transactional() {
+            for (point, committed) in [
+                (TransactionFailPoint::BeforeCatalogPublish, false),
+                (TransactionFailPoint::AfterCatalogPublish, true),
+            ] {
+                let mut fx = fixture(&format!("lifecycle-lyrics-{point:?}"));
+                let old_path = fx.library.track_lyrics_path(fx.middle).expect("old lyrics");
+                fx.library.set_transaction_failure(Some(TransactionFailure {
+                    point,
+                    interrupt: true,
+                    abort: false,
+                }));
+                assert!(
+                    fx.library
+                        .set_lyrics(fx.middle, Some("[00:01.000]new lyrics"))
+                        .is_err()
+                );
+                let root = fx.library.root.clone();
+                drop(fx.library);
+                let reopened = CanonicalLibrary::open(&root).expect("recover");
+                assert_eq!(
+                    lyrics(&reopened, fx.middle),
+                    Some(if committed {
+                        "[00:01.000]new lyrics".to_owned()
+                    } else {
+                        "line one".to_owned()
+                    }),
+                    "{point:?}"
+                );
+                assert!(old_path.exists(), "the managed lyrics resource remains");
+                drop(reopened);
+                assert!(CanonicalLibrary::open(&root).is_ok());
+            }
+
+            let mut fx = fixture("lifecycle-lyrics-remove");
+            let old_path = fx.library.track_lyrics_path(fx.middle).expect("lyrics");
+            fx.library.set_lyrics(fx.middle, None).expect("remove");
+            assert!(!old_path.exists());
+            assert!(fx.library.track_lyrics_path(fx.middle).is_none());
+            assert!(fx.library.track(fx.middle).is_some());
         }
 
         #[test]

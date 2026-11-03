@@ -85,6 +85,7 @@ use flux_library::{
 };
 
 pub mod import;
+pub mod lyrics;
 
 pub use import::{
     AppliedImportItem, CandidateStatus, ImportAlbumTarget, ImportApplyReport, ImportCandidate,
@@ -93,6 +94,7 @@ pub use import::{
     prepare_import_files, prepare_import_plan,
 };
 
+pub use crate::lyrics::{LyricLine, LyricsDocument, LyricsError, LyricsKind, SyncLyricLine};
 pub use flux_library::canonical::{
     AlbumId, AlbumTransferPlan, AlbumTransferReport, AlbumTransferTrack, ArtistDeletionAlbum,
     ArtistDeletionDecision, ArtistDeletionDestination, ArtistDeletionPlan, ArtistDeletionReport,
@@ -1955,6 +1957,21 @@ impl Controller {
         Ok(id)
     }
 
+    /// Saves lyrics only if the reviewed current text is still authoritative.
+    /// The write uses the existing canonical lyrics transaction.
+    pub fn save_lyrics_checked(
+        &mut self,
+        id: TrackId,
+        expected: Option<&str>,
+        lyrics: Option<&str>,
+    ) -> Result<(), String> {
+        let current = self.track_lyrics(id);
+        if current.as_deref() != expected {
+            return Err("Lyrics changed since review; reload the editor and try again.".to_owned());
+        }
+        self.set_lyrics(id, lyrics)
+    }
+
     /// Stores optional managed LRC text for a track.
     pub fn set_lyrics(&mut self, id: TrackId, lyrics: Option<&str>) -> Result<(), String> {
         let Some(store) = self.canonical_store.as_mut() else {
@@ -1972,6 +1989,14 @@ impl Controller {
             .as_ref()
             .and_then(|store| store.track(id))
             .is_some_and(|track| track.lyrics.is_some())
+    }
+
+    /// Absolute managed lyrics path, when the track has managed lyrics.
+    #[must_use]
+    pub fn track_lyrics_path(&self, id: TrackId) -> Option<PathBuf> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.track_lyrics_path(id))
     }
 
     /// Reads a canonical track's managed lyrics text, when present.
