@@ -19,8 +19,9 @@ drag-and-drop, duplicate decisions, editable metadata, copy-only staging,
 progress and cancellation. Existing playback, seeking, queue behavior and the
 real-time oscilloscope continue to use the same engine. Managed artwork is
 decoded and displayed in album and player views. Dedicated canonical playlist
-management is implemented; rating/lyrics UI remains incomplete and is called
-out below rather than presented as finished.
+management and an integrated lyrics library/editor/karaoke system are
+implemented; rating UI remains incomplete and is called out below rather than
+presented as finished.
 
 ## Canonical storage
 
@@ -46,10 +47,10 @@ selects or writes those backends.
 | `flux-core` | library | Backend-independent domain model: tracks, IDs, sources, the play queue with stable per-entry identities (duplicates allowed), repeat/playback states, and the shared error type. No UI, filesystem, database, audio-device, or network implementation. |
 | `flux-library` | library | Canonical self-contained library engine: stable artist/album/track/playlist IDs, relative managed paths, per-entity `.flux` metadata, transaction journal, copy verification, playlists/ratings/lyrics, and isolated migration from legacy/schema-v3 sources. The older in-memory scanner and portable store remain for compatibility tests and migration inventory. |
 | `flux-audio` | library | Playback, in two strictly separate layers: `Player`, the pure playback-control state machine and single authority for playback decisions; and a threaded engine that decodes WAV (hound), FLAC (claxon), MP3 (rmp3/minimp3), AAC in ADTS streams and MP4/M4A files (rusty_aac with the mp4 demuxer), and Ogg Vorbis and Opus (lewton and opus-pure over the ogg demuxer) on a worker thread and feeds an output backend (device-free `NullOutput`, or CPAL behind the non-default `cpal` feature) through a lock-free ring buffer. |
-| `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, duplicate decisions, copy-only publication, artist/album/track edits, playlist management, playlists/ratings/lyrics APIs, and the canonical migration workflow. Both front-ends use this one controller. |
+| `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, duplicate decisions, copy-only publication, artist/album/track edits, playlist management, lyrics parsing/editing/import/export APIs, playlists/ratings/lyrics persistence, and the canonical migration workflow. Both front-ends use this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, reviewed track move/audio replacement, decoded managed album artwork, dedicated playlist management/playback, native artwork/audio pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, reviewed track move/audio replacement, decoded managed album artwork, dedicated playlist management/playback, lyrics library/editor/karaoke, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
 | `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, copy-only quick import, folder import, track/artist edit keys, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
@@ -87,7 +88,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   playlists after an explicit review. A dedicated Playlists section supports
   empty or selection-based creation, rename, detail browsing, duplicate-safe
   position selection, removal, drag/arrow reordering, clear/delete confirmation,
-  play/shuffle/enqueue, and multi-entry queue actions. Artist and album views
+  play/shuffle/enqueue, and multi-entry queue actions.
+  A Lyrics section lists managed plain/synced lyrics, opens a reader with
+  playback highlighting, a line/timestamp editor, LRC/TXT import with preview,
+  UTF-8 export with overwrite confirmation, and a karaoke view. The player has a
+  Lyrics entry point and can follow current playback without changing audio.
+  Artist and album views
   group canonical stable identities. The queue panel supports drag reordering, keyboard moves,
   removal and direct entry playback; the seek bar moves the decoder. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
@@ -111,8 +117,11 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   edits the selected track as `title|album|track|disc|artist-id|credit-ids`, `P` creates
   an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. Global artist/album/track search, filters, multi-selection,
-  playlist management and batch playlist/favorite actions require the GUI.
+  migration workflow. `y` opens read-only lyrics for the selected track.
+  Global artist/album/track search, filters, multi-selection, playlist
+  management, lyrics editing/import/export/karaoke and batch playlist/favorite
+  actions require the GUI.
+
   Track moves and
   managed-audio replacement also require the GUI Track-editor review. `D` shows the selected track's album ownership; `E` lists
   every catalogue album, including empty albums, with owner, track count and
@@ -267,11 +276,11 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Rating/lyrics UI, gapless playback, crossfade, EQ,
+Rating UI, gapless playback, crossfade, EQ,
 frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
-imports are intentionally rejected in canonical mode. Rating and lyrics storage
-APIs exist but are not yet exposed as screens.
+imports are intentionally rejected in canonical mode. Rating storage APIs exist
+but are not yet exposed as a screen.
 Native dialogs and file-drop are implemented; cross-platform runtime
 verification remains limited to Linux/X11. Nothing here makes network
 requests, collects telemetry, or requires an account.

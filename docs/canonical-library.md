@@ -25,8 +25,9 @@ legacy retirement at the API level is not complete.
   queue data. Portable records are relative, but the legacy index and runtime
   queue are not guaranteed to be library-owned.
 - AlbumId, playlist, rating/favorite and managed-lyrics runtime types now exist
-  in the canonical engine. The GUI implements playlist management; dedicated
-  rating and lyrics screens are not implemented.
+  in the canonical engine. The GUI implements playlist management and a full
+  lyrics library/editor/karaoke workflow; a dedicated rating screen is not
+  implemented.
 - The GUI/TUI Import Manager is review-first and copy-only. Reference imports
   are rejected in canonical mode; the old portable import tests still cover
   their compatibility behavior.
@@ -259,6 +260,66 @@ one-transaction reorder.
 
 The TUI does not expose playlist management; its help and documentation direct
 these operations to the GUI.
+
+### Lyrics
+
+Lyrics remain a single managed UTF-8 text file referenced by the existing
+`TrackEntityDto.lyrics` filename inside the track directory. Both plain and
+synchronized lyrics use that managed `.lrc` filename; no schema migration or
+second lyrics store was added. Audio tags are never read or written. Replacing
+or moving audio preserves the managed lyrics file through the existing track
+lifecycle/album-transfer transactions.
+
+The app-level lyrics model parses and serializes:
+
+- plain text with preserved line order, blank lines, UTF-8 and non-Latin text;
+- LRC timestamps with 1–3 fractional digits, normalized to milliseconds;
+- multiple timestamps on one source line, expanded into deterministic events;
+- duplicate timestamps, retaining all text and ordering by source line;
+- untimed lines and empty lines;
+- standard/unknown metadata tags, preserved in source order and never used as
+  authoritative track metadata;
+- optional signed LRC `offset`, applied additively to timestamps for display
+  (negative effective times clamp to zero).
+
+Malformed timestamp syntax, out-of-range seconds/fractions and overflow are
+rejected rather than silently downgraded to plain text. Serialization emits
+millisecond precision (`[mm:ss.xxx]`), preserving line order and metadata.
+Multi-timestamp source lines are normalized to one event/line per timestamp;
+content and timing are preserved, but the original combined timestamp grouping
+is not. No fuzzy/online lyrics lookup exists.
+
+The GUI has a dedicated Lyrics library showing tracks with managed lyrics,
+plain/synced/invalid classification, a title/artist/album filter, empty states
+and navigation to Album, Artist and Track. The reader displays timed events with
+the current line highlighted from `Controller::position()` (the actual playback
+clock), not an independent timer. Scroll/paused/seeking/track changes update
+from the same position; a player Lyrics entry follows explicit current-track
+changes until the user opens another track/editor. Plain lyrics display without
+synchronization. Karaoke mode shows the current line, previous/upcoming lines
+and plain/absent fallbacks; shuffle/playback policy is unchanged.
+
+The line-oriented editor supports Unicode, blank lines, add/remove/move lines,
+manual `mm:ss.xxx` timestamps, assign-current-position, ±100 ms/±1 s nudges,
+clear timestamps, save/cancel and explicit remove. Timestamps must be
+non-decreasing in line order. Removing every timestamp from a previously synced
+document requires a second explicit Save before conversion to plain text.
+Unsaved changes require a second cancel/navigation action. Saving compares the
+reviewed raw text to the current managed lyrics and rejects a stale edit. Saves
+and removals use the canonical journal with `catalog.flux` as the commit point;
+replaced/removed lyrics files are journal cleanup and recovery yields complete
+old or complete new state. The track and its audio are never deleted.
+
+Import uses the native platform picker for `.lrc`/`.txt`, previews content and
+classification, rejects malformed input, preserves the source file and requires
+a second confirmation before replacing existing lyrics. Export writes UTF-8 LRC
+with timestamps or plain text without timestamps, requires `.lrc`/`.txt`
+extensions, does not touch audio, and requires a second action to overwrite an
+existing destination. Export path selection is a GUI path field, not a native
+save dialog. All operations are offline; no remote services are used.
+
+The TUI exposes read-only lyrics inspection with `y` (scrollable, Esc returns)
+but no editing/import/export/karaoke. Those remain GUI workflows.
 
 ### Album artwork
 
@@ -677,9 +738,9 @@ cleanup.
 5. Artwork selection has native PNG/JPEG/WebP pickers in addition to path entry.
    Decoding is bounded as documented above; animated formats and tag artwork
    are not supported.
-6. Ratings/favorites and lyrics have canonical Controller APIs and persistence
-   tests, but only favorites are currently exposed in a batch GUI action; no
-   dedicated rating/lyrics screen exists.
+6. Ratings/favorites have canonical Controller APIs and persistence tests, but
+   only favorites are exposed in a batch GUI action; no dedicated rating screen
+   exists. Lyrics have dedicated GUI and read-only TUI views.
 7. Automatic catalogue-backup rollback is not generation-consistent and is
    disabled; transaction-journal recovery is implemented and test-injected at
    every listed boundary. A recovery-required malformed journal requires manual
@@ -716,3 +777,8 @@ cleanup.
 18. Search is substring matching only, not fuzzy; results are capped at 20 per
     entity type. Track lists retain the existing page-based rendering rather than
     adding a new virtualization layer.
+19. Lyrics are line/event synchronized, not word-by-word. The editor is
+    line-oriented rather than a rich multiline text area. Multi-timestamp LRC
+    lines are normalized on round-trip. Export uses a typed destination path,
+    not a native save dialog. No remote lyrics lookup, tag extraction or TUI
+    editing is implemented.
