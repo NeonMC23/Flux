@@ -1212,7 +1212,13 @@ fn group_key(view: LibraryView, track: &Track) -> Option<String> {
         LibraryView::Artists => Some(artist_group_key(None, track)),
         LibraryView::Albums => Some(album_group_key(None, track)),
         LibraryView::Folders => Some(display_folder(track)),
-        LibraryView::Playlists | LibraryView::Lyrics => None,
+        LibraryView::Playlists
+        | LibraryView::Lyrics
+        | LibraryView::Dashboard
+        | LibraryView::Collections
+        | LibraryView::RecentlyAdded
+        | LibraryView::RecentlyPlayed
+        | LibraryView::MostPlayed => None,
     }
 }
 
@@ -1224,7 +1230,14 @@ fn group_title(view: LibraryView, key: &str) -> String {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| key.to_owned()),
         LibraryView::Albums => album_key_parts(key).0.to_owned(),
-        LibraryView::Tracks | LibraryView::Playlists | LibraryView::Lyrics => key.to_owned(),
+        LibraryView::Tracks
+        | LibraryView::Playlists
+        | LibraryView::Lyrics
+        | LibraryView::Dashboard
+        | LibraryView::Collections
+        | LibraryView::RecentlyAdded
+        | LibraryView::RecentlyPlayed
+        | LibraryView::MostPlayed => key.to_owned(),
     }
 }
 
@@ -1238,6 +1251,11 @@ enum LibraryView {
     Folders,
     Playlists,
     Lyrics,
+    Dashboard,
+    Collections,
+    RecentlyAdded,
+    RecentlyPlayed,
+    MostPlayed,
 }
 
 impl LibraryView {
@@ -1249,6 +1267,11 @@ impl LibraryView {
             Self::Folders => "Folders",
             Self::Playlists => "Playlists",
             Self::Lyrics => "Lyrics",
+            Self::Dashboard => "Dashboard",
+            Self::Collections => "Smart Collections",
+            Self::RecentlyAdded => "Recently Added",
+            Self::RecentlyPlayed => "Recently Played",
+            Self::MostPlayed => "Most Played",
         }
     }
 
@@ -1259,6 +1282,9 @@ impl LibraryView {
             Self::Folders => "No folders yet",
             Self::Playlists => "No playlists yet",
             Self::Lyrics => "No lyrics yet",
+            Self::Dashboard => "Library is empty",
+            Self::Collections => "No smart collections",
+            Self::RecentlyAdded | Self::RecentlyPlayed | Self::MostPlayed => "No tracks yet",
         }
     }
 }
@@ -1281,6 +1307,11 @@ enum TrackSort {
     Album,
     TrackNumber,
     Favorites,
+    Rating,
+    PlayCount,
+    LastPlayed,
+    DateAdded,
+    Duration,
 }
 
 impl std::fmt::Display for TrackSort {
@@ -1292,6 +1323,11 @@ impl std::fmt::Display for TrackSort {
             Self::Album => "Album",
             Self::TrackNumber => "Track / disc",
             Self::Favorites => "Favorites first",
+            Self::Rating => "Rating",
+            Self::PlayCount => "Play count",
+            Self::LastPlayed => "Last played",
+            Self::DateAdded => "Date added",
+            Self::Duration => "Duration",
         })
     }
 }
@@ -1359,6 +1395,114 @@ impl std::fmt::Display for ReleaseFilter {
             Self::Other => "Other",
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RatingFilter {
+    #[default]
+    Any,
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+}
+
+impl RatingFilter {
+    fn minimum(self) -> Option<u8> {
+        match self {
+            Self::Any => None,
+            Self::One => Some(1),
+            Self::Two => Some(2),
+            Self::Three => Some(3),
+            Self::Four => Some(4),
+            Self::Five => Some(5),
+        }
+    }
+}
+
+impl std::fmt::Display for RatingFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Any => "Any rating",
+            Self::One => "★ 1+",
+            Self::Two => "★ 2+",
+            Self::Three => "★ 3+",
+            Self::Four => "★ 4+",
+            Self::Five => "★ 5",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartCollection {
+    Favorites,
+    HighlyRated,
+    RecentlyAdded,
+    RecentlyPlayed,
+    MostPlayed,
+    NoLyrics,
+    SyncedLyrics,
+    NoArtwork,
+}
+
+impl SmartCollection {
+    const ALL: [Self; 8] = [
+        Self::Favorites,
+        Self::HighlyRated,
+        Self::RecentlyAdded,
+        Self::RecentlyPlayed,
+        Self::MostPlayed,
+        Self::NoLyrics,
+        Self::SyncedLyrics,
+        Self::NoArtwork,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Favorites => "Favorites",
+            Self::HighlyRated => "Highly rated",
+            Self::RecentlyAdded => "Recently added",
+            Self::RecentlyPlayed => "Recently played",
+            Self::MostPlayed => "Most played",
+            Self::NoLyrics => "Without lyrics",
+            Self::SyncedLyrics => "Synchronized lyrics",
+            Self::NoArtwork => "Without artwork",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Favorites => "Tracks marked as favorites.",
+            Self::HighlyRated => "Tracks rated 4★ or higher.",
+            Self::RecentlyAdded => "Tracks with a reliable canonical creation timestamp.",
+            Self::RecentlyPlayed => "Tracks with meaningful local playback history, newest first.",
+            Self::MostPlayed => {
+                "Historically most played tracks counted after the meaningful-play threshold."
+            }
+            Self::NoLyrics => "Tracks with no managed lyrics.",
+            Self::SyncedLyrics => "Tracks with synchronized LRC lyrics.",
+            Self::NoArtwork => "Tracks whose album has no managed cover.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashboardSummary {
+    generation: u64,
+    history_generation: u64,
+    total_tracks: usize,
+    total_artists: usize,
+    total_albums: usize,
+    favorites: usize,
+    rated: usize,
+    with_lyrics: usize,
+    synced_lyrics: usize,
+    with_artwork: usize,
+    recently_added: Vec<TrackId>,
+    recently_played: Vec<TrackId>,
+    most_played: Vec<TrackId>,
+    highly_rated: Vec<TrackId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1681,6 +1825,10 @@ struct FluxReady {
     filter_artwork: TriFilter,
     filter_release: ReleaseFilter,
     sort_tracks: TrackSort,
+    sort_descending: bool,
+    filter_rating: RatingFilter,
+    collection: Option<SmartCollection>,
+    dashboard_cache: RefCell<Option<DashboardSummary>>,
     batch_review: Option<BatchReview>,
     selected_playlist: Option<PlaylistId>,
     playlist_entry_selection: Vec<usize>,
@@ -1877,7 +2025,14 @@ enum Message {
     FilterArtworkCycle,
     FilterReleaseChanged(ReleaseFilter),
     SortTracksChanged(TrackSort),
+    SortDirectionToggled,
+    FilterRatingChanged(RatingFilter),
     ResetLibraryFilters,
+    CollectionSelect(SmartCollection),
+    CollectionBack,
+    TrackFavoriteToggle(TrackId),
+    TrackRatingSet(TrackId, Option<u8>),
+    BatchRating(Option<u8>),
     BatchPlaylistAdd(PlaylistId),
     BatchPlaylistCreateOpen,
     BatchPlaylistNameChanged(String),
@@ -1984,6 +2139,10 @@ impl FluxReady {
             filter_artwork: TriFilter::Any,
             filter_release: ReleaseFilter::Any,
             sort_tracks: TrackSort::Default,
+            sort_descending: false,
+            filter_rating: RatingFilter::Any,
+            collection: None,
+            dashboard_cache: RefCell::new(None),
             batch_review: None,
             selected_playlist: None,
             playlist_entry_selection: Vec::new(),
@@ -2088,6 +2247,7 @@ impl FluxReady {
         self.last_queue_current = current;
         self.artwork.clear();
         self.artwork_loading.clear();
+        *self.dashboard_cache.borrow_mut() = None;
         self.scope.reset();
         self.select_view(LibraryView::Tracks);
     }
@@ -3139,6 +3299,7 @@ impl FluxReady {
         self.view = view;
         self.selected_group = None;
         self.selected_playlist = None;
+        self.collection = None;
         self.playlist_entry_selection.clear();
         self.playlist_drag = None;
         self.selected_lyrics = None;
@@ -3651,6 +3812,7 @@ impl FluxReady {
                 }
                 match self.controller.set_album_cover(album, &path) {
                     Ok(()) => {
+                        *self.dashboard_cache.borrow_mut() = None;
                         self.album_cover_input.clear();
                         self.artwork.remove(&album);
                         self.sync_album_editor();
@@ -3673,6 +3835,7 @@ impl FluxReady {
                 }
                 match self.controller.remove_album_cover(album) {
                     Ok(()) => {
+                        *self.dashboard_cache.borrow_mut() = None;
                         self.artwork.remove(&album);
                         self.sync_album_editor();
                         self.lifecycle_msg = Some(format!("Removed cover for album {album}."));
@@ -4395,7 +4558,9 @@ impl FluxReady {
                 self.filter_lyrics = TriFilter::Any;
                 self.filter_artwork = TriFilter::Any;
                 self.filter_release = ReleaseFilter::Any;
+                self.filter_rating = RatingFilter::Any;
                 self.sort_tracks = TrackSort::Default;
+                self.sort_descending = false;
                 self.page = 0;
                 self.selected_tracks.clear();
             }
@@ -5019,6 +5184,63 @@ impl FluxReady {
                     self.search.clear();
                 }
             }
+            Message::SortDirectionToggled => {
+                self.sort_descending = !self.sort_descending;
+                self.page = 0;
+            }
+            Message::FilterRatingChanged(rating) => {
+                self.filter_rating = rating;
+                self.page = 0;
+                self.selected_tracks.clear();
+            }
+            Message::CollectionSelect(collection) => {
+                self.view = LibraryView::Collections;
+                self.collection = Some(collection);
+                self.selected_group = None;
+                self.selected_playlist = None;
+                self.selected_lyrics = None;
+                self.search.clear();
+                self.selected_tracks.clear();
+                self.page = 0;
+                self.show_setup = false;
+            }
+            Message::CollectionBack => {
+                self.collection = None;
+                self.page = 0;
+                self.selected_tracks.clear();
+            }
+            Message::TrackFavoriteToggle(id) => match self.controller.toggle_track_favorite(id) {
+                Ok(favorite) => {
+                    *self.dashboard_cache.borrow_mut() = None;
+                    self.lifecycle_msg = Some(format!(
+                        "Track {id} marked {}favorite.",
+                        if favorite { "" } else { "not " }
+                    ));
+                }
+                Err(error) => self.lifecycle_msg = Some(error),
+            },
+            Message::TrackRatingSet(id, rating) => {
+                match self.controller.set_track_rating(id, rating) {
+                    Ok(()) => {
+                        *self.dashboard_cache.borrow_mut() = None;
+                        self.lifecycle_msg = Some(format!(
+                            "Track {id} rating set to {}.",
+                            rating.map_or_else(|| "none".to_owned(), |rating| rating.to_string())
+                        ));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::BatchRating(rating) => {
+                let ids = self.selected_tracks.clone();
+                match self.controller.set_ratings_for_tracks(&ids, rating) {
+                    Ok(count) => {
+                        *self.dashboard_cache.borrow_mut() = None;
+                        self.lifecycle_msg = Some(format!("Updated rating for {count} track(s)."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
             Message::SelectView(view) => {
                 self.selected_tracks.clear();
                 self.focused_track = None;
@@ -5217,6 +5439,10 @@ impl FluxReady {
                     Key::Character("4") => self.select_view(LibraryView::Folders),
                     Key::Character("5") => self.select_view(LibraryView::Playlists),
                     Key::Character("6") => self.select_view(LibraryView::Lyrics),
+                    Key::Character("7") => self.select_view(LibraryView::Dashboard),
+                    Key::Character("8") => self.select_view(LibraryView::Collections),
+                    Key::Character("9") => self.select_view(LibraryView::RecentlyAdded),
+                    Key::Character("0") => self.select_view(LibraryView::RecentlyPlayed),
                     Key::Character("l") => self.toggle_setup(),
                     Key::Named(Named::Escape) => {
                         if self.track_editor.take().is_some() {
@@ -7535,6 +7761,11 @@ impl FluxReady {
             LibraryView::Folders,
             LibraryView::Playlists,
             LibraryView::Lyrics,
+            LibraryView::Dashboard,
+            LibraryView::Collections,
+            LibraryView::RecentlyAdded,
+            LibraryView::RecentlyPlayed,
+            LibraryView::MostPlayed,
         ] {
             nav = nav.push(
                 button(
@@ -7549,6 +7780,21 @@ impl FluxReady {
                                 LibraryView::Folders => counts.3,
                                 LibraryView::Playlists => counts.4,
                                 LibraryView::Lyrics => counts.5,
+                                LibraryView::Dashboard => self.controller.tracks().len(),
+                                LibraryView::Collections => SmartCollection::ALL.len(),
+                                LibraryView::RecentlyAdded => self
+                                    .controller
+                                    .tracks()
+                                    .iter()
+                                    .filter(|(id, _)| {
+                                        self.controller
+                                            .track_created_unix_ms(*id)
+                                            .is_some_and(|created| created > 0)
+                                    })
+                                    .count(),
+                                LibraryView::RecentlyPlayed | LibraryView::MostPlayed => {
+                                    self.controller.playback_history().len()
+                                }
                             }
                             .to_string()
                         )
@@ -7611,7 +7857,15 @@ impl FluxReady {
             && self.track_editor.is_none()
             && self.search.trim().is_empty()
             && !self.controller.tracks().is_empty()
-            && (self.view == LibraryView::Tracks || self.selected_group.is_some())
+            && (self.view == LibraryView::Tracks
+                || self.selected_group.is_some()
+                || self.collection.is_some()
+                || matches!(
+                    self.view,
+                    LibraryView::RecentlyAdded
+                        | LibraryView::RecentlyPlayed
+                        | LibraryView::MostPlayed
+                ))
         {
             content = content.push(self.library_controls());
         }
@@ -7654,6 +7908,36 @@ impl FluxReady {
             (
                 "Search results".to_owned(),
                 "Artists, albums and tracks from the canonical catalogue.".to_owned(),
+            )
+        } else if self.view == LibraryView::Dashboard {
+            (
+                "Dashboard".to_owned(),
+                "Canonical library summary and locally recorded listening statistics.".to_owned(),
+            )
+        } else if let Some(collection) = self.collection {
+            (
+                collection.label().to_owned(),
+                format!(
+                    "Smart collection · {} track(s) · {}",
+                    self.filtered_tracks().len(),
+                    collection.description()
+                ),
+            )
+        } else if self.view == LibraryView::Collections {
+            (
+                "Smart Collections".to_owned(),
+                "Dynamic catalogue queries; separate from manually ordered playlists.".to_owned(),
+            )
+        } else if matches!(
+            self.view,
+            LibraryView::RecentlyAdded | LibraryView::RecentlyPlayed | LibraryView::MostPlayed
+        ) {
+            (
+                self.view.label().to_owned(),
+                format!(
+                    "{} track(s) · deterministic ordering",
+                    self.filtered_tracks().len()
+                ),
             )
         } else if let Some(track_id) = self.selected_lyrics {
             let title = self
@@ -7733,6 +8017,13 @@ impl FluxReady {
                     .style(ghost_style)
                     .padding([6, 9])
                     .on_press(Message::SelectGroup(None)),
+            );
+        } else if self.collection.is_some() && self.view == LibraryView::Collections {
+            bar = bar.push(
+                button(text("‹ Collections").size(11))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::CollectionBack),
             );
         }
         bar = bar.push(
@@ -7831,6 +8122,12 @@ impl FluxReady {
         if !self.search.trim().is_empty() {
             return self.search_results_view();
         }
+        if self.view == LibraryView::Dashboard {
+            return self.dashboard_view();
+        }
+        if self.view == LibraryView::Collections && self.collection.is_none() {
+            return self.collections_view();
+        }
         if self.view == LibraryView::Lyrics {
             return self.selected_lyrics.map_or_else(
                 || self.lyrics_library_view(),
@@ -7847,7 +8144,20 @@ impl FluxReady {
             return self.empty_library();
         }
 
-        if self.view != LibraryView::Tracks && self.selected_group.is_none() {
+        if self.view == LibraryView::MostPlayed {
+            column![
+                self.most_played_breakdown(),
+                self.track_list(self.filtered_tracks()),
+            ]
+            .spacing(8)
+            .height(Length::Fill)
+            .into()
+        } else if matches!(
+            self.view,
+            LibraryView::RecentlyAdded | LibraryView::RecentlyPlayed | LibraryView::Collections
+        ) {
+            self.track_list(self.filtered_tracks())
+        } else if self.view != LibraryView::Tracks && self.selected_group.is_none() {
             self.group_list()
         } else {
             self.track_list(self.filtered_tracks())
@@ -8515,12 +8825,133 @@ impl FluxReady {
             || self.filter_lyrics != TriFilter::Any
             || self.filter_artwork != TriFilter::Any
             || self.filter_release != ReleaseFilter::Any
+            || self.filter_rating != RatingFilter::Any
             || self.sort_tracks != TrackSort::Default
+            || self.sort_descending
+    }
+
+    fn smart_collection_ids(&self, collection: SmartCollection) -> Vec<TrackId> {
+        match collection {
+            SmartCollection::Favorites => self
+                .controller
+                .tracks()
+                .iter()
+                .filter(|(id, _)| {
+                    self.controller
+                        .rating(*id)
+                        .is_some_and(|rating| rating.favorite)
+                })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            SmartCollection::HighlyRated => self
+                .controller
+                .tracks()
+                .iter()
+                .filter(|(id, _)| {
+                    self.controller
+                        .rating(*id)
+                        .and_then(|rating| rating.rating)
+                        .is_some_and(|rating| rating >= 4)
+                })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            SmartCollection::RecentlyAdded => {
+                let mut entries = self
+                    .controller
+                    .tracks()
+                    .iter()
+                    .filter_map(|(id, _)| {
+                        self.controller
+                            .track_created_unix_ms(*id)
+                            .filter(|created| *created > 0)
+                            .map(|created| (*id, created))
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left_id, left), (right_id, right)| {
+                    right.cmp(left).then_with(|| left_id.cmp(right_id))
+                });
+                entries.into_iter().map(|(id, _)| id).collect()
+            }
+            SmartCollection::RecentlyPlayed => {
+                let mut entries = self
+                    .controller
+                    .playback_history()
+                    .entries()
+                    .collect::<Vec<_>>();
+                entries.retain(|(id, _)| self.controller.track(*id).is_some());
+                entries.sort_by(|(left_id, left), (right_id, right)| {
+                    right
+                        .last_played_unix_ms
+                        .cmp(&left.last_played_unix_ms)
+                        .then_with(|| left_id.cmp(right_id))
+                });
+                entries.into_iter().map(|(id, _)| id).collect()
+            }
+            SmartCollection::MostPlayed => {
+                let mut entries = self
+                    .controller
+                    .playback_history()
+                    .entries()
+                    .collect::<Vec<_>>();
+                entries.retain(|(id, _)| self.controller.track(*id).is_some());
+                entries.sort_by(|(left_id, left), (right_id, right)| {
+                    right
+                        .play_count
+                        .cmp(&left.play_count)
+                        .then_with(|| right.last_played_unix_ms.cmp(&left.last_played_unix_ms))
+                        .then_with(|| left_id.cmp(right_id))
+                });
+                entries.into_iter().map(|(id, _)| id).collect()
+            }
+            SmartCollection::NoLyrics => self
+                .controller
+                .tracks()
+                .iter()
+                .filter(|(id, _)| !self.controller.track_has_lyrics(*id))
+                .map(|(id, _)| *id)
+                .collect(),
+            SmartCollection::SyncedLyrics => self
+                .controller
+                .tracks()
+                .iter()
+                .filter(|(id, _)| self.lyrics_kind_for(*id) == LyricsKind::Synced)
+                .map(|(id, _)| *id)
+                .collect(),
+            SmartCollection::NoArtwork => self
+                .controller
+                .tracks()
+                .iter()
+                .filter(|(id, _)| {
+                    self.controller
+                        .track_album_id(*id)
+                        .and_then(|album| self.controller.album(album))
+                        .is_none_or(|album| album.cover.is_none())
+                })
+                .map(|(id, _)| *id)
+                .collect(),
+        }
     }
 
     fn filtered_tracks(&self) -> Vec<(TrackId, &Track)> {
         let album_mode = self.selected_album_id();
-        let mut rows = if let Some(album_id) = album_mode {
+        let special_ids = match self.view {
+            LibraryView::Collections => self
+                .collection
+                .map(|collection| self.smart_collection_ids(collection)),
+            LibraryView::RecentlyAdded => {
+                Some(self.smart_collection_ids(SmartCollection::RecentlyAdded))
+            }
+            LibraryView::RecentlyPlayed => {
+                Some(self.smart_collection_ids(SmartCollection::RecentlyPlayed))
+            }
+            LibraryView::MostPlayed => Some(self.smart_collection_ids(SmartCollection::MostPlayed)),
+            _ => None,
+        };
+        let mut rows = if let Some(ids) = special_ids {
+            ids.into_iter()
+                .filter_map(|id| self.controller.track(id).map(|track| (id, track)))
+                .collect::<Vec<_>>()
+        } else if let Some(album_id) = album_mode {
             self.controller
                 .album_tracks(album_id)
                 .into_iter()
@@ -8566,10 +8997,18 @@ impl FluxReady {
                 || (self.filter_artwork == TriFilter::With)
                     == album.as_ref().is_some_and(|album| album.cover.is_some())
         });
+        if let Some(minimum) = self.filter_rating.minimum() {
+            rows.retain(|(id, _)| {
+                self.controller
+                    .rating(*id)
+                    .and_then(|rating| rating.rating)
+                    .is_some_and(|rating| rating >= minimum)
+            });
+        }
 
         if album_mode.is_none() && self.sort_tracks != TrackSort::Default {
             rows.sort_by(|(left_id, left), (right_id, right)| {
-                let ordering = match self.sort_tracks {
+                let mut ordering = match self.sort_tracks {
                     TrackSort::Default => std::cmp::Ordering::Equal,
                     TrackSort::Title => left
                         .title()
@@ -8595,7 +9034,33 @@ impl FluxReady {
                                     .cmp(&left_rating.and_then(|rating| rating.rating))
                             })
                     }
+                    TrackSort::Rating => self
+                        .controller
+                        .rating(*left_id)
+                        .and_then(|rating| rating.rating)
+                        .cmp(
+                            &self
+                                .controller
+                                .rating(*right_id)
+                                .and_then(|rating| rating.rating),
+                        ),
+                    TrackSort::PlayCount => self
+                        .controller
+                        .track_play_count(*left_id)
+                        .cmp(&self.controller.track_play_count(*right_id)),
+                    TrackSort::LastPlayed => self
+                        .controller
+                        .track_last_played_unix_ms(*left_id)
+                        .cmp(&self.controller.track_last_played_unix_ms(*right_id)),
+                    TrackSort::DateAdded => self
+                        .controller
+                        .track_created_unix_ms(*left_id)
+                        .cmp(&self.controller.track_created_unix_ms(*right_id)),
+                    TrackSort::Duration => left.duration().cmp(&right.duration()),
                 };
+                if self.sort_descending {
+                    ordering = ordering.reverse();
+                }
                 ordering.then_with(|| left_id.cmp(right_id))
             });
         }
@@ -8709,9 +9174,24 @@ impl FluxReady {
                 .style(ghost_style)
                 .padding([5, 8])
                 .on_press(Message::BatchFavorites(false)),
+            text("RATE").size(8).color(MUTED),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
+        for rating in 1..=5u8 {
+            row = row.push(
+                button(text(format!("{rating}★")).size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::BatchRating(Some(rating))),
+            );
+        }
+        row = row.push(
+            button(text("Clear").size(9))
+                .style(ghost_style)
+                .padding([5, 7])
+                .on_press(Message::BatchRating(None)),
+        );
         if playlists.is_empty() {
             row = row.push(
                 button(text("Create playlist…").size(10))
@@ -8775,6 +9255,20 @@ impl FluxReady {
             )
             .text_size(10)
             .padding([5, 7]),
+            pick_list(
+                vec![
+                    RatingFilter::Any,
+                    RatingFilter::One,
+                    RatingFilter::Two,
+                    RatingFilter::Three,
+                    RatingFilter::Four,
+                    RatingFilter::Five,
+                ],
+                Some(self.filter_rating),
+                Message::FilterRatingChanged,
+            )
+            .text_size(10)
+            .padding([5, 7]),
             text("SORT").size(8).color(MUTED),
         ]
         .spacing(6)
@@ -8791,12 +9285,23 @@ impl FluxReady {
                         TrackSort::Album,
                         TrackSort::TrackNumber,
                         TrackSort::Favorites,
+                        TrackSort::Rating,
+                        TrackSort::PlayCount,
+                        TrackSort::LastPlayed,
+                        TrackSort::DateAdded,
+                        TrackSort::Duration,
                     ],
                     Some(self.sort_tracks),
                     Message::SortTracksChanged,
                 )
                 .text_size(10)
                 .padding([5, 7]),
+            );
+            controls = controls.push(
+                button(text(if self.sort_descending { "Desc" } else { "Asc" }).size(9))
+                    .style(nav_style(self.sort_descending))
+                    .padding([5, 7])
+                    .on_press(Message::SortDirectionToggled),
             );
         }
         if self.filters_active() {
@@ -8955,6 +9460,14 @@ impl FluxReady {
                                 editable,
                                 checked: self.selected_tracks.contains(id),
                                 focused: self.focused_track == Some(*id),
+                                rating: self
+                                    .controller
+                                    .rating(*id)
+                                    .and_then(|rating| rating.rating),
+                                favorite: self
+                                    .controller
+                                    .rating(*id)
+                                    .is_some_and(|rating| rating.favorite),
                             },
                         ),
                         button(text("Locate").size(9))
@@ -9692,7 +10205,6 @@ impl FluxReady {
         self.lyrics_cache.borrow_mut().remove(&id);
     }
 
-    #[cfg(test)]
     fn lyrics_kind_for(&self, id: TrackId) -> LyricsKind {
         self.lyrics_cache_entry(id)
             .and_then(|entry| entry.document)
@@ -10469,6 +10981,359 @@ impl FluxReady {
         .into()
     }
 
+    fn most_played_breakdown(&self) -> Element<'_, Message> {
+        let mut artists: BTreeMap<String, u64> = BTreeMap::new();
+        let mut albums: BTreeMap<String, u64> = BTreeMap::new();
+        for (id, entry) in self.controller.playback_history().entries() {
+            let Some(track) = self.controller.track(id) else {
+                continue;
+            };
+            let artist = display_artist(track);
+            let album = display_album(track);
+            *artists.entry(artist).or_default() = artists
+                .get(&display_artist(track))
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(entry.play_count);
+            *albums.entry(album.clone()).or_default() = albums
+                .get(&album)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(entry.play_count);
+        }
+        let mut artists = artists.into_iter().collect::<Vec<_>>();
+        let mut albums = albums.into_iter().collect::<Vec<_>>();
+        artists.sort_by(|(left_name, left), (right_name, right)| {
+            right.cmp(left).then_with(|| left_name.cmp(right_name))
+        });
+        albums.sort_by(|(left_name, left), (right_name, right)| {
+            right.cmp(left).then_with(|| left_name.cmp(right_name))
+        });
+        let artist_text = artists
+            .iter()
+            .take(5)
+            .map(|(name, count)| format!("{name} ({count})"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let album_text = albums
+            .iter()
+            .take(5)
+            .map(|(name, count)| format!("{name} ({count})"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        column![
+            text(if artist_text.is_empty() {
+                "Top artists: no meaningful plays recorded yet."
+            } else {
+                "Top artists"
+            })
+            .size(9)
+            .color(ACCENT),
+            text(artist_text).size(9).color(MUTED),
+            text(if album_text.is_empty() {
+                "Top albums: no meaningful plays recorded yet."
+            } else {
+                "Top albums"
+            })
+            .size(9)
+            .color(ACCENT),
+            text(album_text).size(9).color(MUTED),
+        ]
+        .spacing(3)
+        .into()
+    }
+
+    fn dashboard_summary(&self) -> DashboardSummary {
+        let generation = self.controller.generation();
+        let history_generation = self.controller.history_generation();
+        if let Some(cached) = self.dashboard_cache.borrow().as_ref()
+            && cached.generation == generation
+            && cached.history_generation == history_generation
+        {
+            return cached.clone();
+        }
+        let tracks = self.controller.tracks();
+        let mut favorites = 0;
+        let mut rated = 0;
+        let mut with_lyrics = 0;
+        let mut synced_lyrics = 0;
+        let mut with_artwork = 0;
+        for (id, track) in tracks {
+            if let Some(rating) = self.controller.rating(*id) {
+                if rating.favorite {
+                    favorites += 1;
+                }
+                if rating.rating.is_some() {
+                    rated += 1;
+                }
+            }
+            if self.controller.track_has_lyrics(*id) {
+                with_lyrics += 1;
+                if self.lyrics_kind_for(*id) == LyricsKind::Synced {
+                    synced_lyrics += 1;
+                }
+            }
+            if self
+                .controller
+                .track_album_id(*id)
+                .and_then(|album| self.controller.album(album))
+                .is_some_and(|album| album.cover.is_some())
+            {
+                with_artwork += 1;
+            }
+            let _ = track;
+        }
+        let summary = DashboardSummary {
+            generation,
+            history_generation,
+            total_tracks: tracks.len(),
+            total_artists: self.controller.artists().len(),
+            total_albums: self.controller.albums().len(),
+            favorites,
+            rated,
+            with_lyrics,
+            synced_lyrics,
+            with_artwork,
+            recently_added: self
+                .smart_collection_ids(SmartCollection::RecentlyAdded)
+                .into_iter()
+                .take(6)
+                .collect(),
+            recently_played: self
+                .smart_collection_ids(SmartCollection::RecentlyPlayed)
+                .into_iter()
+                .take(6)
+                .collect(),
+            most_played: self
+                .smart_collection_ids(SmartCollection::MostPlayed)
+                .into_iter()
+                .take(6)
+                .collect(),
+            highly_rated: self
+                .smart_collection_ids(SmartCollection::HighlyRated)
+                .into_iter()
+                .take(6)
+                .collect(),
+        };
+        *self.dashboard_cache.borrow_mut() = Some(summary.clone());
+        summary
+    }
+
+    fn dashboard_track_list(
+        &self,
+        title: &'static str,
+        ids: &[TrackId],
+        collection: SmartCollection,
+    ) -> Element<'_, Message> {
+        let mut rows = column![
+            row![
+                text(title).size(11).color(ACCENT),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("View all").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::CollectionSelect(collection)),
+            ]
+            .align_y(Alignment::Center),
+        ]
+        .spacing(3);
+        if ids.is_empty() {
+            rows = rows.push(text("No tracked entries yet.").size(9).color(MUTED));
+        } else {
+            for id in ids {
+                let Some(track) = self.controller.track(*id) else {
+                    continue;
+                };
+                rows = rows.push(
+                    button(
+                        row![
+                                text(track.title().to_owned())
+                                    .size(11)
+                                    .color(TEXT)
+                                    .width(Length::Fill),
+                                text(format!(
+                                    "{} · {}",
+                                    display_artist(track),
+                                    match collection {
+                                        SmartCollection::MostPlayed => format!(
+                                            "{} play(s)",
+                                            self.controller.track_play_count(*id)
+                                        ),
+                                        SmartCollection::RecentlyPlayed => self
+                                            .controller
+                                            .track_last_played_unix_ms(*id)
+                                            .map_or_else(
+                                                || "played".to_owned(),
+                                                |ms| format!("last {ms}")
+                                            ),
+                                        _ => display_album(track),
+                                    }
+                                ))
+                                .size(9)
+                                .color(MUTED),
+                            ]
+                        .spacing(8),
+                    )
+                    .width(Length::Fill)
+                    .padding([4, 6])
+                    .style(group_style)
+                    .on_press(Message::PlayTrack(*id)),
+                );
+            }
+        }
+        rows.into()
+    }
+
+    fn dashboard_view(&self) -> Element<'_, Message> {
+        let summary = self.dashboard_summary();
+        if summary.total_tracks == 0 {
+            return container(
+                column![
+                    text("Your library is empty").size(20).color(TEXT),
+                    text("Import music to populate the dashboard and smart collections.")
+                        .size(11)
+                        .color(MUTED),
+                    button(text("Import music").size(11))
+                        .style(accent_button_style)
+                        .padding([7, 11])
+                        .on_press(Message::ImportOpen),
+                ]
+                .spacing(8)
+                .align_x(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill)
+            .into();
+        }
+        let stat = |label: &'static str, value: String, hint: &str| -> Element<'_, Message> {
+            container(
+                column![
+                    text(value).size(22).color(ACCENT),
+                    text(label).size(10).color(TEXT),
+                    text(hint.to_owned()).size(8).color(MUTED),
+                ]
+                .spacing(2),
+            )
+            .padding(10)
+            .width(Length::FillPortion(1))
+            .style(card_style)
+            .into()
+        };
+        let mut body = column![
+            text("Library dashboard").size(22).color(TEXT),
+            text("Canonical library totals and locally collected listening history. History begins when this feature is first used; no past plays are fabricated.")
+                .size(9)
+                .color(MUTED),
+            row![
+                stat("Tracks", summary.total_tracks.to_string(), "catalogue entries"),
+                stat("Artists", summary.total_artists.to_string(), "stable identities"),
+                stat("Albums", summary.total_albums.to_string(), "releases"),
+            ]
+            .spacing(7),
+            row![
+                stat("Favorites", summary.favorites.to_string(), "marked favorite"),
+                stat("Rated", summary.rated.to_string(), "have a rating"),
+                stat("With lyrics", summary.with_lyrics.to_string(), &format!("{} synchronized", summary.synced_lyrics)),
+            ]
+            .spacing(7),
+            row![
+                stat("With artwork", summary.with_artwork.to_string(), "album cover reference"),
+                stat("Plays recorded", self.controller.playback_history().total_plays().to_string(), "meaningful plays"),
+                stat("History tracks", self.controller.playback_history().len().to_string(), "distinct TrackIds"),
+            ]
+            .spacing(7),
+            row![
+                container(
+                    self.dashboard_track_list("RECENTLY ADDED", &summary.recently_added, SmartCollection::RecentlyAdded)
+                ).padding(10).width(Length::FillPortion(1)).style(card_style),
+                container(
+                    self.dashboard_track_list("RECENTLY PLAYED", &summary.recently_played, SmartCollection::RecentlyPlayed)
+                ).padding(10).width(Length::FillPortion(1)).style(card_style),
+            ].spacing(7),
+            row![
+                container(
+                    self.dashboard_track_list("MOST PLAYED", &summary.most_played, SmartCollection::MostPlayed)
+                ).padding(10).width(Length::FillPortion(1)).style(card_style),
+                container(
+                    self.dashboard_track_list("HIGHLY RATED", &summary.highly_rated, SmartCollection::HighlyRated)
+                ).padding(10).width(Length::FillPortion(1)).style(card_style),
+            ].spacing(7),
+            row![
+                button(text("Browse smart collections").size(11))
+                    .style(accent_button_style)
+                    .padding([7, 10])
+                    .on_press(Message::SelectView(LibraryView::Collections)),
+                button(text("Recently played").size(10))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press(Message::SelectView(LibraryView::RecentlyPlayed)),
+                button(text("Most played").size(10))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press(Message::SelectView(LibraryView::MostPlayed)),
+            ]
+            .spacing(7),
+        ]
+        .spacing(10);
+        if self.controller.playback_history().is_empty() {
+            body = body.push(
+                text("Play a track for at least 5 seconds or half its duration (up to 30 seconds) to record a meaningful play. Seeking, pausing and restart notifications alone do not count.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        }
+        scrollable(body).height(Length::Fill).into()
+    }
+
+    fn collections_view(&self) -> Element<'_, Message> {
+        let mut body = column![
+            text("Smart Collections").size(22).color(TEXT),
+            text("Dynamic canonical queries. Membership updates automatically; these are not editable playlists.")
+                .size(10)
+                .color(MUTED),
+        ]
+        .spacing(9);
+        let mut list = column![].spacing(6);
+        for collection in SmartCollection::ALL {
+            let ids = self.smart_collection_ids(collection);
+            let preview = ids
+                .iter()
+                .take(3)
+                .filter_map(|id| self.controller.track(*id).map(Track::title))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let subtitle = if preview.is_empty() {
+                collection.description().to_owned()
+            } else {
+                format!("{} track(s) · {preview}", ids.len())
+            };
+            list = list.push(
+                button(
+                    row![
+                        fallback_artwork(Some(collection.label()), 38.0),
+                        column![
+                            text(collection.label()).size(14).color(TEXT),
+                            text(subtitle).size(9).color(MUTED),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        text(format!("{}", ids.len())).size(12).color(ACCENT),
+                        text("›").size(18).color(MUTED),
+                    ]
+                    .spacing(9)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding(8)
+                .style(group_style)
+                .on_press(Message::CollectionSelect(collection)),
+            );
+        }
+        body = body.push(scrollable(list).height(Length::Fill));
+        body.height(Length::Fill).into()
+    }
+
     fn album_detail_view(&self, album_id: AlbumId) -> Element<'_, Message> {
         let Some(album) = self.controller.album(album_id) else {
             return text("Album is no longer in the library.")
@@ -10759,6 +11624,7 @@ impl FluxReady {
                 .size(9)
                 .color(MUTED)
                 .width(Length::FillPortion(4)),
+            text("RATE").size(8).color(MUTED).width(Length::Fixed(58.0)),
             text("TIME").size(9).color(MUTED).width(Length::Fixed(48.0)),
             text("+").size(9).color(MUTED).width(Length::Fixed(26.0)),
             text("NEXT").size(9).color(MUTED).width(Length::Fixed(34.0)),
@@ -10784,6 +11650,11 @@ impl FluxReady {
                     editable,
                     checked: self.selected_tracks.contains(id),
                     focused: self.focused_track == Some(*id),
+                    rating: self.controller.rating(*id).and_then(|rating| rating.rating),
+                    favorite: self
+                        .controller
+                        .rating(*id)
+                        .is_some_and(|rating| rating.favorite),
                 },
             ));
         }
@@ -11592,6 +12463,8 @@ struct TrackRowState {
     editable: bool,
     checked: bool,
     focused: bool,
+    rating: Option<u8>,
+    favorite: bool,
 }
 
 fn track_row<'a>(
@@ -11633,6 +12506,28 @@ fn track_row<'a>(
             .size(10)
             .color(MUTED)
             .width(Length::FillPortion(4)),
+        button(text(if state.favorite { "♥" } else { "♡" }).size(12))
+            .style(ghost_style)
+            .padding([4, 5])
+            .on_press(Message::TrackFavoriteToggle(id)),
+        button(
+            text(
+                state
+                    .rating
+                    .map_or_else(|| "☆".to_owned(), |rating| format!("{rating}★")),
+            )
+            .size(10),
+        )
+        .style(ghost_style)
+        .padding([4, 5])
+        .on_press(Message::TrackRatingSet(
+            id,
+            match state.rating {
+                None => Some(1),
+                Some(rating) if rating < 5 => Some(rating + 1),
+                Some(_) => None,
+            },
+        )),
         text(duration)
             .size(10)
             .color(MUTED)
@@ -12039,6 +12934,10 @@ mod tests {
             filter_artwork: TriFilter::Any,
             filter_release: ReleaseFilter::Any,
             sort_tracks: TrackSort::Default,
+            sort_descending: false,
+            filter_rating: RatingFilter::Any,
+            collection: None,
+            dashboard_cache: RefCell::new(None),
             batch_review: None,
             selected_playlist: None,
             playlist_entry_selection: Vec::new(),
@@ -14750,6 +15649,195 @@ mod tests {
         assert_eq!(
             gui.controller.track_lyrics(id).as_deref(),
             Some("new plain")
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn dashboard_summary_and_smart_collections_track_catalogue_changes() {
+        let dir = TempDir::new("gui-dashboard");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let one = import_named_track(
+            &mut gui,
+            &dir,
+            "One",
+            "Artist One",
+            "Album One",
+            ReleaseType::Album,
+            1,
+        );
+        let two = import_named_track(
+            &mut gui,
+            &dir,
+            "Two",
+            "Artist Two",
+            "Album Two",
+            ReleaseType::Album,
+            2,
+        );
+        let three = import_named_track(
+            &mut gui,
+            &dir,
+            "Three",
+            "Artist Three",
+            "Album Three",
+            ReleaseType::Album,
+            3,
+        );
+        gui.controller
+            .set_favorites(&[one], true)
+            .expect("favorite");
+        gui.controller
+            .set_track_rating(two, Some(5))
+            .expect("rating");
+        gui.controller
+            .set_lyrics(one, Some("[00:01.000]synced"))
+            .expect("synced");
+        gui.controller
+            .set_lyrics(two, Some("plain"))
+            .expect("plain");
+        let summary = gui.dashboard_summary();
+        assert_eq!(summary.total_tracks, 3);
+        assert_eq!(summary.total_artists, 3);
+        assert_eq!(summary.total_albums, 3);
+        assert_eq!(summary.favorites, 1);
+        assert_eq!(summary.rated, 1);
+        assert_eq!(summary.with_lyrics, 2);
+        assert_eq!(summary.synced_lyrics, 1);
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::Favorites),
+            vec![one]
+        );
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::HighlyRated),
+            vec![two]
+        );
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::NoLyrics),
+            vec![three]
+        );
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::SyncedLyrics),
+            vec![one]
+        );
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::RecentlyAdded)
+                .len(),
+            3
+        );
+        gui.controller
+            .set_favorites(&[three], true)
+            .expect("new favorite");
+        let summary = gui.dashboard_summary();
+        assert_eq!(summary.favorites, 2, "dashboard cache invalidates");
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::Favorites),
+            vec![one, three]
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn rating_filters_favorite_controls_and_advanced_sorting_are_stable() {
+        let dir = TempDir::new("gui-ratings-sort");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let low = import_named_track(
+            &mut gui,
+            &dir,
+            "Low",
+            "Artist Low",
+            "Album Low",
+            ReleaseType::Album,
+            1,
+        );
+        let high = import_named_track(
+            &mut gui,
+            &dir,
+            "High",
+            "Artist High",
+            "Album High",
+            ReleaseType::Album,
+            2,
+        );
+        let none = import_named_track(
+            &mut gui,
+            &dir,
+            "None",
+            "Artist None",
+            "Album None",
+            ReleaseType::Album,
+            3,
+        );
+        gui.controller.set_track_rating(low, Some(1)).expect("low");
+        gui.controller
+            .set_track_rating(high, Some(5))
+            .expect("high");
+        gui.controller
+            .set_favorites(&[high], true)
+            .expect("favorite");
+        send(&mut gui, Message::SortTracksChanged(TrackSort::Rating));
+        send(&mut gui, Message::SortDirectionToggled);
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![high, low, none]
+        );
+        send(&mut gui, Message::FilterRatingChanged(RatingFilter::Four));
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![high]
+        );
+        send(&mut gui, Message::ResetLibraryFilters);
+        send(&mut gui, Message::TrackFavoriteToggle(low));
+        assert!(
+            gui.controller
+                .rating(low)
+                .is_some_and(|rating| rating.favorite)
+        );
+        send(&mut gui, Message::TrackRatingSet(low, Some(4)));
+        assert_eq!(
+            gui.controller.rating(low).and_then(|rating| rating.rating),
+            Some(4)
+        );
+        assert!(
+            gui.controller
+                .rating(low)
+                .is_some_and(|rating| rating.favorite)
+        );
+        send(&mut gui, Message::TrackSelectionToggle(high));
+        send(&mut gui, Message::TrackSelectionToggle(none));
+        send(&mut gui, Message::BatchRating(Some(3)));
+        assert_eq!(
+            gui.controller.rating(high).and_then(|rating| rating.rating),
+            Some(3)
+        );
+        assert_eq!(
+            gui.controller.rating(none).and_then(|rating| rating.rating),
+            Some(3)
+        );
+        assert!(
+            gui.controller
+                .rating(high)
+                .is_some_and(|rating| rating.favorite)
         );
         gui.controller.shutdown();
     }
