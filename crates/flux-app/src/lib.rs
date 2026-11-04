@@ -7861,6 +7861,10 @@ mod tests {
         assert_eq!(controller.player_state(), PlaybackState::Playing);
         assert_eq!(controller.current_queue_entry_id(), Some(entry));
         assert!(controller.can_attempt_playback());
+        assert_eq!(
+            controller.preloaded_entry, None,
+            "a preload/crossfade authorization from the failed stream must be discarded"
+        );
         assert!(!control.is_running(), "the failed stream must be released");
         // Repeated/late notifications for the already-replaced stream must
         // not restart the attempt or create another recovery worker.
@@ -7881,6 +7885,10 @@ mod tests {
         assert_eq!(controller.current_queue_entry_id(), Some(entry));
         assert_eq!(controller.current_id(), Some(a));
         assert_eq!(controller.engine_loaded, Some(a));
+        assert!(
+            controller.preloaded_entry.is_some(),
+            "gapless/crossfade authorization was not re-established for the replacement stream"
+        );
         assert!(
             (controller.position().as_millis() as i64 - position.as_millis() as i64).abs() <= 2,
             "captured position {} was not restored: {}",
