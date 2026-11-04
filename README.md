@@ -298,6 +298,13 @@ with all output devices disabled the app reports the missing device.
 A minimal no-UI check is also available:
 `cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.mp3`.
 
+An automated low-amplitude Linux CPAL probe validated real 48 kHz stereo
+device delivery, pause/seek/stop/restart, gapless/crossfade transitions and
+duplicate-entry queue playback with zero reported underruns over roughly one
+minute on one PipeWire/ALSA host. It is deterministic instrumentation, not an
+audible or cross-platform guarantee; see the canonical audio documentation for
+the device, conditions and limitations.
+
 ## What does not exist yet
 
 Rating UI, EQ,

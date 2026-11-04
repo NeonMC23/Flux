@@ -485,10 +485,10 @@ from what remains structurally or physically unverified.
 | Decoder lifecycle, prepared cancellation, gapless/crossfade handoff | Confirmed by deterministic engine tests |
 | Queue authorization, duplicate `QueueEntryId`, transition identity | Confirmed by Controller/engine tests |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
-| Real-time callback content (ring pop, gain, silence) | Audited structurally and exercised only through `NullOutput` |
-| CPAL stream construction, sample formats, error propagation | Compiled and error path simulated; no hardware playback validation |
+| Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
+| CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; runtime error path simulated; no hotplug validation |
 | Device hotplug and automatic recovery | Not implemented / not tested |
-| Hardware underrun, latency and long-duration CPU/memory | Not measured |
+| Hardware underrun, latency and long-duration CPU/memory | Underrun count measured as zero for a ~60 s Linux hardware probe; latency and multi-hour CPU/memory not measured |
 | Non-finite decoded samples | Confirmed defect fixed at conversion boundary |
 
 Confirmed fixes from this audit:
@@ -547,6 +547,54 @@ where applicable, bounded transition counts, bounded generation changes, and
 correct current-entry/engine-ledger agreement. It is not a wall-clock
 real-time simulation and does not prove multi-hour hardware stability.
 
+#### Linux CPAL hardware validation (2026-11-04)
+
+A safely low-amplitude hardware probe was run on one Linux host:
+
+- Nobara Linux 44, kernel `7.3.0-203.nobara.fc44.x86_64`, PipeWire 1.6.9
+  with PulseAudio 15 compatibility, Rust 1.99.0 and CPAL 0.18.
+- Default output: Built-in Audio Analog Stereo, Realtek ALC295 on HDA Intel
+  PCH, front-left/front-right. PipeWire exposed the sink as `s32le 2ch
+  48000Hz`; the application stream was `float32le 2ch 48000Hz`.
+- Existing PipeWire sink inputs were active during the probe. The Flux stream
+  was mixed normally into the default hardware sink; no device was taken
+  exclusively, no system audio setting was changed, and no existing stream was
+  stopped.
+- Two generated 3-second, 44.1 kHz stereo WAV files with 220 Hz and 660 Hz
+  tones were used. Source peak amplitude was 0.05 and the Flux controller
+  volume was 0.02, keeping the probe intentionally quiet while still exercising
+  real resampling, conversion, buffering and device delivery.
+- PipeWire showed the stream as `PipeWire ALSA [hardware_probe]` connected to
+  the default hardware sink.
+
+Observed over the approximately 60-second probe:
+
+- 5,620 callback fill invocations and 2,852,864 delivered frames at 48 kHz
+  (about 59.4 seconds of device frames).
+- 2,877,440 requested frames; **0 underrun frames**.
+- 0 decoder errors, 0 preload failures and 0 output-stream errors.
+- Pause retained `490.666667 ms`; resume/seek and stop/restart produced the
+  expected position and generation changes.
+- Gapless mode produced gapless transitions with no reported underrun.
+- Crossfade settings 0/500/1000/3000/5000 ms were exercised. Steady-state
+  extended playback with 500 ms produced 8 consecutive crossfades. A few
+  phase-boundary transitions around stop/reconfigure fell back to gapless; no
+  underrun or false transition was observed.
+- Repeat One, Shuffle + Repeat All and duplicate queue-entry playback ran on
+  the real device. Duplicate entries retained distinct `QueueEntryId`s.
+- A rapid pause/resume/seek/next/previous/direct-selection/crossfade burst
+  recovered to `Playing` with no reported underrun or decoder error.
+- Process RSS was approximately 18.7 MiB after startup, increasing to about
+  19.9 MiB after roughly 49 seconds; process CPU was roughly 4–6% in that
+  sample. These are single-host observations, not guarantees.
+
+This validates the real CPAL callback/device path and transition bookkeeping
+under the stated conditions. It does **not** provide perceptual/audible
+verification: the probe was deliberately quiet, the sink monitor contained
+other active streams, and no isolated acoustic capture was performed. Device
+unplug/replug, audio-server restart, device format changes, exclusive-access
+behavior and multi-hour hardware stability remain untested.
+
 Resource bounds remain structural: at most one active decoder plus one prepared
 decoder; one bounded output ring (approximately two seconds); retained
 crossfade tail, incoming overlap and mixed pending audio bounded by the
@@ -562,7 +610,7 @@ rather than pretending playback continues. Physical device removal, hotplug,
 unsupported-channel configurations and hardware underrun behavior were not
 exercised on this host.
 
-### Discovery, ratings, history and dashboard### Discovery, ratings, history and dashboard
+### Discovery, ratings, history and dashboard
 
 Ratings/favorites remain canonical track data. Track rows expose a favorite
 toggle and deterministic rating cycle (none/1–5★); the batch bar applies
