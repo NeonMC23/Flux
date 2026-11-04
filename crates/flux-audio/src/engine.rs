@@ -87,8 +87,9 @@ use crate::output::{FillCallback, NullControl, NullOutput, OutputBackend, Output
 /// Frames decoded per worker iteration (per channel).
 const DECODE_CHUNK_FRAMES: usize = 4096;
 /// Minimum queued audio before a newly opened/restarted gate is made audible.
-/// This prevents the first device callback after load/seek/invalidation from
-/// observing an empty ring.
+/// The effective threshold is raised to the largest full device callback
+/// reported by the backend, so the first callback after startup/invalidation
+/// cannot drain more than the prebuffer produced.
 const GATE_PREBUFFER_FRAMES: usize = 1_024;
 /// Worker loop tick: how long to wait for a command before pumping
 /// more samples / checking end-of-track.
@@ -314,6 +315,13 @@ struct Shared {
     /// Requested natural-transition crossfade duration in milliseconds.
     /// Zero disables crossfade.
     crossfade_ms: AtomicU32,
+    /// Callback-reported device request size.
+    last_device_callback_frames: AtomicU64,
+    max_device_callback_frames: AtomicU64,
+    device_callback_observed: AtomicBool,
+    /// Callback-size growth that paused output until the ring was refilled.
+    gate_reprebuffers: AtomicU64,
+    gate_reprebuffer_frames: AtomicU64,
     /// Diagnostic counters, updated lock-free outside logging paths.
     callbacks: AtomicU64,
     requested_frames: AtomicU64,
@@ -344,6 +352,11 @@ impl Shared {
             position_locked: AtomicBool::new(false),
             requested_session: AtomicU64::new(0),
             crossfade_ms: AtomicU32::new(0),
+            last_device_callback_frames: AtomicU64::new(0),
+            max_device_callback_frames: AtomicU64::new(0),
+            device_callback_observed: AtomicBool::new(false),
+            gate_reprebuffers: AtomicU64::new(0),
+            gate_reprebuffer_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             requested_frames: AtomicU64::new(0),
             delivered_frames: AtomicU64::new(0),
@@ -371,6 +384,13 @@ impl Shared {
         self.generation_changes.fetch_add(1, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
+}
+
+/// The queued frames required before the gate may become audible. A full
+/// device callback can exceed the minimum, so the largest request observed
+/// by the callback raises the threshold.
+fn gate_prebuffer_frames(shared: &Shared) -> usize {
+    GATE_PREBUFFER_FRAMES.max(shared.max_device_callback_frames.load(Ordering::Acquire) as usize)
 }
 
 /// GUI-side tail of the lock-free waveform tap.
@@ -418,9 +438,37 @@ struct SampleSource {
     shared: Arc<Shared>,
     channels: usize,
     seen_generation: u64,
+    reprebuffer_pending: bool,
 }
 
 impl FillCallback for SampleSource {
+    fn note_device_request(&mut self, frames: usize) {
+        let frames = frames as u64;
+        let previous = self
+            .shared
+            .max_device_callback_frames
+            .fetch_max(frames, Ordering::AcqRel);
+        self.shared
+            .last_device_callback_frames
+            .store(frames, Ordering::Relaxed);
+        self.shared
+            .device_callback_observed
+            .store(true, Ordering::Release);
+        if frames > previous && self.shared.gate_open.load(Ordering::Acquire) {
+            let channels = self.channels.max(1);
+            let available = (self.consumer.occupied_len() / channels) as u64;
+            if available < frames {
+                // A variable-size backend has grown beyond the size the
+                // gate was prepared for and the ring cannot serve this
+                // callback. Stop producing audio until the worker observes
+                // the new demand and refills. This is intentional
+                // re-prebuffering, not an underrun.
+                self.reprebuffer_pending = true;
+                self.shared.gate_open.store(false, Ordering::Release);
+            }
+        }
+    }
+
     fn fill(&mut self, out: &mut [f32]) {
         self.shared.callbacks.fetch_add(1, Ordering::Relaxed);
         let requested_frames = (out.len() / self.channels) as u64;
@@ -436,6 +484,7 @@ impl FillCallback for SampleSource {
             // belonging to the new generation (see
             // `Shared::acked_generation`).
             self.seen_generation = generation;
+            self.reprebuffer_pending = false;
             self.consumer.clear();
             self.shared.played_frames.store(0, Ordering::Release);
             self.shared.ring_frames.store(0, Ordering::Release);
@@ -449,6 +498,22 @@ impl FillCallback for SampleSource {
             out.fill(0.0);
             self.tap(out);
             return;
+        }
+        if self.reprebuffer_pending {
+            self.reprebuffer_pending = false;
+            if !self.shared.gate_open.load(Ordering::Acquire) {
+                let available = (self.consumer.occupied_len() / self.channels.max(1)) as u64;
+                self.shared
+                    .gate_reprebuffers
+                    .fetch_add(1, Ordering::Relaxed);
+                self.shared.gate_reprebuffer_frames.fetch_add(
+                    requested_frames.saturating_sub(available),
+                    Ordering::Relaxed,
+                );
+                out.fill(0.0);
+                self.tap(out);
+                return;
+            }
         }
         if !self.shared.gate_open.load(Ordering::Acquire) {
             out.fill(0.0);
@@ -514,6 +579,14 @@ pub struct AudioDiagnostics {
     /// FillCallback invocations. A CPAL device callback whose buffer is
     /// processed in multiple fixed scratch windows counts once per fill.
     pub callbacks: u64,
+    /// Full device-callback frame count most recently reported.
+    pub device_callback_frames: u64,
+    /// Largest full device-callback frame count observed.
+    pub max_device_callback_frames: u64,
+    /// Callback-size growths that paused output for re-prebuffering.
+    pub gate_reprebuffers: u64,
+    /// Output frames intentionally paused during those re-prebuffers.
+    pub gate_reprebuffer_frames: u64,
     /// Output frames requested by the backend.
     pub requested_frames: u64,
     /// Output frames actually delivered from the ring.
@@ -851,6 +924,16 @@ impl EngineHandle {
             (self.config.sample_rate as usize * usize::from(channels) * 2).max(8192);
         AudioDiagnostics {
             callbacks: self.shared.callbacks.load(Ordering::Acquire),
+            device_callback_frames: self
+                .shared
+                .last_device_callback_frames
+                .load(Ordering::Acquire),
+            max_device_callback_frames: self
+                .shared
+                .max_device_callback_frames
+                .load(Ordering::Acquire),
+            gate_reprebuffers: self.shared.gate_reprebuffers.load(Ordering::Acquire),
+            gate_reprebuffer_frames: self.shared.gate_reprebuffer_frames.load(Ordering::Acquire),
             requested_frames: self.shared.requested_frames.load(Ordering::Acquire),
             delivered_frames: self.shared.delivered_frames.load(Ordering::Acquire),
             underrun_frames: self.shared.underrun_frames.load(Ordering::Acquire),
@@ -1279,6 +1362,7 @@ fn run_worker<F>(
         waveform,
         channels: usize::from(config.channels),
         seen_generation: shared.generation.load(Ordering::Acquire),
+        reprebuffer_pending: false,
         shared: Arc::clone(&shared),
     };
     let error_events = events.clone();
@@ -1703,7 +1787,14 @@ fn run_worker<F>(
                             }
                         }
                         playing = true;
-                        if producer.occupied_len() / output_channels >= GATE_PREBUFFER_FRAMES {
+                        let observed = shared.device_callback_observed.load(Ordering::Acquire);
+                        let generation_live =
+                            shared.acked_generation.load(Ordering::Acquire) == current_generation;
+                        let required = gate_prebuffer_frames(&shared);
+                        if generation_live
+                            && observed
+                            && producer.occupied_len() / output_channels >= required
+                        {
                             shared.gate_open.store(true, Ordering::Release);
                         }
                         send(EngineEvent::Started {
@@ -1979,9 +2070,11 @@ fn run_worker<F>(
             }
         }
         if generation_live && playing && !shared.gate_open.load(Ordering::Acquire) {
+            let observed = shared.device_callback_observed.load(Ordering::Acquire);
+            let required = gate_prebuffer_frames(&shared);
             let queued_frames = producer.occupied_len() / output_channels;
             let all_queued = eof_reached && pending.is_empty() && tail.is_empty();
-            if queued_frames >= GATE_PREBUFFER_FRAMES || all_queued {
+            if observed && (queued_frames >= required || all_queued) {
                 shared.gate_open.store(true, Ordering::Release);
             }
         }
@@ -2319,7 +2412,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        panic!("output gate did not open after prebuffering");
+        panic!(
+            "output gate did not open after prebuffering: {:?}",
+            engine.diagnostics()
+        );
     }
 
     fn start_playing(engine: &EngineHandle, control: &NullControl) {
@@ -2373,6 +2469,174 @@ mod tests {
             "prebuffer was below the gate threshold"
         );
         engine.shutdown();
+    }
+
+    #[test]
+    fn gate_opens_for_a_short_source_once_all_audio_is_queued() {
+        let dir = TempDir::new("gate-short-source");
+        let path = write_dc_wav(&dir, "short.wav", 44_100, 300, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.load(TrackId::new(1), path);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        assert!(!engine.shared.gate_open.load(Ordering::Acquire));
+        control.drain_frames(0);
+        wait_for_gate_open(&engine, &control);
+        assert_eq!(engine.shared.pushed_frames.load(Ordering::Acquire), 300);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn generation_change_keeps_gate_closed_until_new_prebuffer() {
+        let dir = TempDir::new("gate-generation");
+        let path_a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.4);
+        let path_b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.3);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.load(TrackId::new(1), path_a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        start_playing(&engine, &control);
+        control.drain_frames(512);
+
+        engine.load(TrackId::new(2), path_b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == TrackId::new(2)),
+        );
+        engine.play();
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        assert!(
+            !engine.shared.gate_open.load(Ordering::Acquire),
+            "generation invalidation must close the gate"
+        );
+        wait_for_gate_open(&engine, &control);
+        assert!(
+            engine.shared.pushed_frames.load(Ordering::Acquire) >= 1_024,
+            "the new generation must be prebuffered before the gate reopens"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn gate_adapts_to_a_larger_device_callback_before_opening() {
+        let dir = TempDir::new("gate-large-callback");
+        let path = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        control.set_callback_frames(4_096);
+        engine.load(TrackId::new(1), path);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        assert!(
+            !engine.shared.gate_open.load(Ordering::Acquire),
+            "gate opened before device demand was observed"
+        );
+        control.drain_frames(0);
+        wait_for_gate_open(&engine, &control);
+        assert!(
+            engine.shared.pushed_frames.load(Ordering::Acquire) >= 4_096,
+            "adaptive prebuffer did not cover the observed callback"
+        );
+        let diagnostics = engine.diagnostics();
+        assert_eq!(diagnostics.device_callback_frames, 4_096);
+        assert_eq!(diagnostics.max_device_callback_frames, 4_096);
+
+        let before = diagnostics.underrun_frames;
+        control.drain_frames(4_096);
+        assert_eq!(engine.diagnostics().underrun_frames, before);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn variable_callback_growth_does_not_underrun() {
+        let dir = TempDir::new("gate-variable-callback");
+        let path = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.load(TrackId::new(1), path);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        start_playing(&engine, &control);
+        let before = engine.diagnostics();
+        assert!(before.device_callback_frames > 0);
+
+        control.set_callback_frames(8_192);
+        control.drain_frames(8_192);
+        let after = engine.diagnostics();
+        assert_eq!(
+            after.underrun_frames, before.underrun_frames,
+            "a newly observed larger request must re-prebuffer, not underrun"
+        );
+        assert_eq!(after.max_device_callback_frames, 8_192);
+        wait_for_gate_open(&engine, &control);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn callback_growth_closes_gate_before_consuming() {
+        use std::sync::Arc;
+
+        use ringbuf::HeapRb;
+        use ringbuf::traits::{Producer, Split};
+
+        let shared = Arc::new(Shared::new());
+        shared
+            .max_device_callback_frames
+            .store(512, Ordering::Release);
+        shared
+            .last_device_callback_frames
+            .store(512, Ordering::Release);
+        shared
+            .device_callback_observed
+            .store(true, Ordering::Release);
+        shared.gate_open.store(true, Ordering::Release);
+        let (mut producer, consumer) = HeapRb::<f32>::new(4_096).split();
+        let (waveform, _waveform_reader) = HeapRb::<f32>::new(8).split();
+        let mut source = SampleSource {
+            consumer,
+            waveform,
+            shared: Arc::clone(&shared),
+            channels: 2,
+            seen_generation: 0,
+            reprebuffer_pending: false,
+        };
+        for _ in 0..4 {
+            producer.try_push(0.5).expect("ring has room");
+        }
+
+        source.note_device_request(1_024);
+        assert!(
+            !shared.gate_open.load(Ordering::Acquire),
+            "a larger device request must close the gate before delivery"
+        );
+        let mut output = vec![0.5f32; 2_048];
+        source.fill(&mut output);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(shared.delivered_frames.load(Ordering::Acquire), 0);
+        assert_eq!(
+            shared.underrun_frames.load(Ordering::Acquire),
+            0,
+            "intentional re-prebuffering must not be counted as starvation"
+        );
+        assert_eq!(
+            shared.max_device_callback_frames.load(Ordering::Acquire),
+            1_024
+        );
+        assert_eq!(
+            shared.last_device_callback_frames.load(Ordering::Acquire),
+            1_024
+        );
+        assert_eq!(shared.gate_reprebuffers.load(Ordering::Acquire), 1);
+        assert_eq!(
+            shared.gate_reprebuffer_frames.load(Ordering::Acquire),
+            1_022
+        );
     }
 
     #[test]
@@ -5437,7 +5701,6 @@ mod tests {
         use ringbuf::traits::{Producer, Split};
 
         let shared = Arc::new(Shared::new());
-        shared.gate_open.store(true, Ordering::Release);
         let (mut producer, consumer) = HeapRb::<f32>::new(8).split();
         let (waveform, _waveform_reader) = HeapRb::<f32>::new(8).split();
         let mut source = SampleSource {
@@ -5446,7 +5709,15 @@ mod tests {
             shared: Arc::clone(&shared),
             channels: 2,
             seen_generation: 0,
+            reprebuffer_pending: false,
         };
+        source.note_device_request(4);
+        assert_eq!(
+            shared.last_device_callback_frames.load(Ordering::Acquire),
+            4
+        );
+        assert_eq!(shared.max_device_callback_frames.load(Ordering::Acquire), 4);
+        shared.gate_open.store(true, Ordering::Release);
 
         let mut silence = [0.0f32; 8];
         source.fill(&mut silence);
@@ -5490,6 +5761,7 @@ mod tests {
             shared: Arc::clone(&shared),
             channels: 2,
             seen_generation: 0,
+            reprebuffer_pending: false,
         };
         // Strictly positive input: any 0.0 in the output is inserted
         // silence, never data.
@@ -5571,6 +5843,7 @@ mod tests {
             shared: Arc::clone(&shared),
             channels: 2,
             seen_generation: 0,
+            reprebuffer_pending: false,
         };
 
         assert_eq!(

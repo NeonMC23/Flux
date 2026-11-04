@@ -6,9 +6,11 @@
 //! format) and falls back to the device default, converting to the
 //! device's integer/float sample type in the callback via
 //! [`cpal::FromSample`]. The callback itself only forwards to the
-//! engine's lock-free [`FillCallback`]. The scratch buffer is allocated
-//! once before the stream starts and is reused without resizing; data
-//! exceeding one scratch window is filled in frame-aligned chunks.
+//! engine's lock-free [`FillCallback`]. The full device-callback size is
+//! reported before chunking so the engine can size its gate prebuffer.
+//! The scratch buffer is allocated once before the stream starts and is
+//! reused without resizing; data exceeding one scratch window is filled
+//! in frame-aligned chunks.
 //! Underruns degrade to silence — the callback never blocks, locks,
 //! allocates, or performs I/O.
 
@@ -67,7 +69,7 @@ impl CpalOutput {
             .build_output_stream::<T, _, _>(
                 stream_config,
                 move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
-                    fill_chunked(data, &mut scratch, fill.as_mut());
+                    fill_chunked(data, &mut scratch, fill.as_mut(), channels);
                 },
                 move |err: cpal::Error| on_error(format!("output stream error: {err}")),
                 None,
@@ -81,10 +83,16 @@ impl CpalOutput {
     }
 }
 
-fn fill_chunked<T>(data: &mut [T], scratch: &mut [f32], fill: &mut dyn FillCallback)
-where
+fn fill_chunked<T>(
+    data: &mut [T],
+    scratch: &mut [f32],
+    fill: &mut dyn FillCallback,
+    channels: usize,
+) where
     T: SizedSample + cpal::FromSample<f32>,
 {
+    let channels = channels.max(1);
+    fill.note_device_request(data.len() / channels);
     if scratch.is_empty() {
         for sample in data {
             *sample = T::from_sample(0.0);
@@ -180,9 +188,14 @@ mod tests {
         maximum_len: usize,
         channels: usize,
         frame_aligned: bool,
+        noted: usize,
     }
 
     impl FillCallback for Sequence {
+        fn note_device_request(&mut self, frames: usize) {
+            self.noted = frames;
+        }
+
         fn fill(&mut self, out: &mut [f32]) {
             self.calls += 1;
             self.maximum_len = self.maximum_len.max(out.len());
@@ -207,9 +220,14 @@ mod tests {
             maximum_len: 0,
             channels,
             frame_aligned: true,
+            noted: 0,
         };
-        fill_chunked(&mut data, &mut scratch, &mut fill);
+        fill_chunked(&mut data, &mut scratch, &mut fill, channels);
         assert_eq!(fill.calls, 3);
+        assert_eq!(
+            fill.noted, 11,
+            "full device request is reported before chunking"
+        );
         assert_eq!(fill.maximum_len, scratch_samples);
         assert_eq!(scratch.len(), original_len, "scratch must not resize");
         assert!(fill.frame_aligned);

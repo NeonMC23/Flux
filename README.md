@@ -304,11 +304,14 @@ duplicate-entry queue playback on one PipeWire/ALSA host. A later 30-minute
 session added monitor capture of gapless/crossfade envelopes and resource
 sampling. That run exposed one transient ~10 ms underrun accumulation during
 queue/action churn. The cause was isolated to output-gate opening before the
-ring was refilled after generation invalidation; the gate now waits for a small
-prebuffer. A post-fix 30-minute rerun reported zero underruns with zero
-decoder/output errors and stable memory/threads/fds. These are single-host
-observations, not perceptual or cross-platform guarantees; see the canonical
-audio documentation for the device, conditions and exact limitations.
+ring was refilled after generation invalidation; the gate now waits for a
+prebuffer sized from the observed device callback (minimum 1,024 frames). A
+post-fix 30-minute rerun reported zero underruns with zero decoder/output
+errors and stable memory/threads/fds. Low-amplitude real-backend runs with
+device callbacks from 256 through 16,384 frames also reported zero underruns.
+These are single-host observations, not perceptual or cross-platform guarantees;
+see the canonical audio documentation for the device, conditions and exact
+limitations.
 
 ## What does not exist yet
 

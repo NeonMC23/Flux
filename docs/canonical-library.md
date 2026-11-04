@@ -487,8 +487,9 @@ from what remains structurally or physically unverified.
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; runtime error path simulated; no hotplug validation |
+| Device callback-size compatibility | Adaptive gate verified with simulated and real callbacks from 256 to 16,384 frames on one Linux host; sizes above that, hardware callback-size changes and callbacks larger than the output ring are unverified |
 | Device hotplug and automatic recovery | Not implemented / not tested |
-| Hardware underrun, latency and long-duration CPU/memory | A ~60 s probe and post-fix 5/30-minute runs reported zero underruns; latency and multi-hour CPU/memory not measured |
+| Hardware underrun, latency and long-duration CPU/memory | Real callback-size runs, a ~60 s probe and post-fix 5/30-minute runs reported zero underruns; latency and multi-hour CPU/memory not measured |
 | Non-finite decoded samples | Confirmed defect fixed at conversion boundary |
 
 Confirmed fixes from this audit:
@@ -512,23 +513,28 @@ Confirmed fixes from this audit:
   values and existing clipping/headroom semantics.
 - Opening the output gate immediately after a new generation could expose the
   first CPAL callback to an empty ring. Load/seek/preload-invalidation paths
-  now keep the gate closed until the callback has acknowledged the generation
-  and at least 1,024 output frames are buffered (or all remaining source audio
-  is already queued). The fix was triggered by the underrun investigation
-  below.
+  now keep the gate closed until the callback has acknowledged the generation,
+  at least one full device-callback request has been observed, and the ring
+  holds `max(1,024, full_callback_frames)` output frames (or all remaining
+  source audio is queued). The adaptive part prevents a callback larger than
+  1,024 frames from starving immediately after the gate opens. The fix was
+  triggered by the underrun investigation below.
 
 `EngineHandle::diagnostics()` (also exposed as
 `Controller::audio_diagnostics()`) returns a local, lock-free snapshot:
-callback fill count, requested/delivered/underrun frames, current ring
-occupancy and capacity, generation, pushed/played frames, gapless/crossfade
-counts, preload failures, decoder errors, output errors and output
-rate/channels. The callback increments bounded atomics only; there is no
-logging, allocation, locking, telemetry or network access in the callback.
-`callbacks` counts `FillCallback` invocations, so a very large CPAL device
-buffer filled in multiple chunks counts multiple times. Ring occupancy is the
-most recent worker/callback observation and is diagnostic, not a scheduling
-barrier. Callback duration is intentionally not measured: doing so safely
-would require additional per-callback clock reads and was not justified.
+callback fill count, last/max full device-callback frames, gate re-prebuffer
+events and frames, requested/delivered/underrun frames, current ring occupancy
+and capacity, generation, pushed/played frames, gapless/crossfade counts,
+preload failures, decoder errors, output errors and output rate/channels. The
+callback increments bounded atomics only; there is no logging, allocation,
+locking, telemetry or network access in the callback. `callbacks` counts
+`FillCallback` invocations, so a very large CPAL device buffer filled in
+multiple chunks counts multiple times. `device_callback_frames` and
+`max_device_callback_frames` are the full device request before that chunking.
+Ring occupancy is the most recent worker/callback observation and is
+diagnostic, not a scheduling barrier. Callback duration is intentionally not
+measured: doing so safely would require additional per-callback clock reads and
+was not justified.
 
 `underrun_frames` is the sum, while the output gate is open, of requested minus
 actually popped output frames. It does not count intentional silence while the
@@ -538,6 +544,10 @@ gate-open shortfall, and CPAL chunk-fill shortfalls. One periodic diagnostic
 sample can aggregate multiple callback events; the counter does not identify
 which callback or whether the shortfall was transient startup versus
 established playback. This limitation motivated the gate-prebuffer correction.
+`gate_reprebuffers` and `gate_reprebuffer_frames` separately record output
+paused intentionally when a variable-size device callback grows beyond what
+the ring can serve; those frames are not underruns. A stable callback size does
+not produce them.
 
 Deterministic stress coverage:
 
@@ -719,6 +729,78 @@ The original single 496-frame event was therefore explained as the same
 gate-open starvation class with high confidence. Because the original metric
 did not tag event boundaries, the exact callback cannot be reconstructed from
 the old logs; the post-fix workload is the decisive validation.
+
+#### Adaptive gate prebuffer and callback-size compatibility (2026-11-04)
+
+A follow-up audit checked whether the fixed 1,024-frame gate threshold was safe
+for every device callback. It was not guaranteed to be. CPAL 0.18's
+`OutputCallbackInfo` exposes timestamps but no buffer length; the only reliable
+callback-size signal is the data slice passed to the stream callback. A CPAL
+device can produce callbacks larger than 1,024 frames (for example through
+`BufferSize::Fixed`), and a callback larger than the prebuffer could consume
+the entire ring immediately after the gate opened. The engine's internal
+4,096-frame chunking does not remove this: all chunks in one device callback
+run before the worker gets another turn.
+
+Correction:
+
+- `FillCallback::note_device_request` now reports the full device-callback
+  frame count before the CPAL wrapper splits it into 4,096-frame internal
+  chunks. `CpalOutput` calls it once per device callback; `NullControl` reports
+  a simulated callback size for tests. The callback implementation stores the
+  last and maximum values in atomics and reads the lock-free ring occupancy.
+- The worker requires a generation acknowledgment and at least one observed
+  device callback before opening the gate. The required prebuffer is
+  `max(1,024, max_observed_device_callback_frames)`. The first callback after
+  startup is therefore silent until its true demand is known; this avoids a
+  race where the worker opens the gate at 1,024 frames just before a larger
+  first callback arrives.
+- If a variable-size backend later grows beyond the size the gate was prepared
+  for and the ring cannot serve it, the callback closes the gate before
+  consuming. The worker refills to the new maximum and reopens. The skipped
+  callback is counted in `gate_reprebuffers`/`gate_reprebuffer_frames`, not in
+  `underrun_frames`. With a stable callback size this path is not taken.
+- Short sources still open once all remaining audio is queued. Pause/resume
+  with an already prebuffered ring still opens immediately. Generation
+  invalidation additionally checks that the new generation has been
+  acknowledged before Play can reopen the gate, preventing stale ring
+  occupancy from satisfying the threshold.
+- The prebuffer is bounded by the normal roughly two-second output ring. A
+  device callback larger than that ring cannot be prebuffered and is not
+  supported; no unbounded growth was added.
+
+Hardware callback-size probe on the same Linux/PipeWire host used a temporary,
+uncommitted override of CPAL's `BufferSize::Fixed` in the Flux engine. The
+override was reverted and is not part of the production configuration. A
+6-second, 44.1 kHz stereo source at low amplitude was resampled to 48 kHz and
+played through the real backend; diagnostics were sampled after 2, 4 and 6
+seconds.
+
+| Requested CPAL fixed size | Observed full callback | Internal fill chunks | Final requested frames | Final delivered frames | Underruns |
+|---|---:|---:|---:|---:|---:|
+| default | 512 | 1 | 288,768 | 286,720 | 0 |
+| 256 | 256 | 1 | 288,256 | 286,720 | 0 |
+| 512 | 512 | 1 | 288,768 | 286,720 | 0 |
+| 1,024 | 1,024 | 1 | 289,792 | 286,720 | 0 |
+| 2,048 | 2,048 | 1 | 290,816 | 286,720 | 0 |
+| 4,096 | 4,096 | 1 | 294,912 | 286,720 | 0 |
+| 8,192 | 8,192 | 2 | 303,104 | 286,720 | 0 |
+| 16,384 | 16,384 | 4 | 311,296 | 278,528 | 0 |
+
+Each run reported zero decoder, preload and output errors, one generation and
+no gate re-prebuffers. The 16,384-frame run reached about 5.8 seconds of
+delivered audio at the final sample, including end-of-source silence. Ring
+occupancy at the exact gate-opening instant was not separately instrumented;
+post-startup diagnostic samples were near capacity for every run. Additional
+runs with 4,096- and 16,384-frame callbacks performed a seek, pause/resume and
+load/replay sequence; they completed with generation changes 1→2→3 and zero
+underruns and zero gate re-prebuffers at every sampled stage. A separate direct-CPAL probe run
+before the engine tests observed a 1,024-frame default callback on the same
+host; the default callback size is therefore not assumed constant across runs
+or server configurations. Sizes above 16,384 frames, variable callback sizes
+on hardware, and devices whose callback exceeds the output ring were not
+exercised. These are single-host backend observations, not perceptual or
+cross-platform guarantees.
 
 Resource bounds remain structural: at most one active decoder plus one prepared
 decoder; one bounded output ring (approximately two seconds); retained

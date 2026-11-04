@@ -37,6 +37,12 @@ pub struct OutputConfig {
 /// mutexes, perform I/O, or block. The engine's implementation pops
 /// from a lock-free SPSC ring buffer and writes silence on underrun.
 pub trait FillCallback: Send {
+    /// Reports the full frame count of the next device callback before
+    /// the engine splits it into internal chunks. Implementations must
+    /// stay real-time safe and call this exactly once per device
+    /// callback; the engine uses it to size the gate prebuffer.
+    fn note_device_request(&mut self, frames: usize);
+
     /// Writes the next samples into `out` (whose length is a multiple
     /// of the channel count), filling any remainder with silence.
     fn fill(&mut self, out: &mut [f32]);
@@ -78,6 +84,8 @@ struct NullShared {
     captured: Mutex<Vec<f32>>,
     running: AtomicBool,
     starts: AtomicU32,
+    /// Simulated full device-callback frame count reported to the engine.
+    callback_frames: AtomicU32,
 }
 
 /// A device-free [`OutputBackend`] driven manually through
@@ -108,6 +116,7 @@ impl NullOutput {
             captured: Mutex::new(Vec::new()),
             running: AtomicBool::new(false),
             starts: AtomicU32::new(0),
+            callback_frames: AtomicU32::new(1_024),
         });
         (
             Self {
@@ -157,6 +166,22 @@ impl NullControl {
         self.shared.starts.load(Ordering::Acquire)
     }
 
+    /// Sets the full device-callback size reported to the engine. The
+    /// actual `drain_frames` amount remains the amount of audio consumed
+    /// by this test driver, allowing tests to simulate a device callback
+    /// larger or smaller than a convenient test drain.
+    pub fn set_callback_frames(&self, frames: u32) {
+        self.shared
+            .callback_frames
+            .store(frames.max(1), Ordering::Release);
+    }
+
+    /// The simulated full device-callback frame count.
+    #[must_use]
+    pub fn callback_frames(&self) -> u32 {
+        self.shared.callback_frames.load(Ordering::Acquire)
+    }
+
     /// Simulates the device consuming exactly `frames` frames,
     /// appending every produced sample (including silence) to the
     /// capture buffer. Returns the number of frames produced — 0 when
@@ -167,6 +192,7 @@ impl NullControl {
         }
         let mut slot = self.shared.fill.lock().expect("null output mutex");
         let Some(fill) = slot.as_mut() else { return 0 };
+        fill.note_device_request(self.shared.callback_frames.load(Ordering::Acquire) as usize);
         let mut chunk = vec![0.0f32; frames * usize::from(self.channels)];
         fill.fill(&mut chunk);
         self.shared
@@ -215,6 +241,8 @@ mod tests {
     struct Constant(f32);
 
     impl FillCallback for Constant {
+        fn note_device_request(&mut self, _frames: usize) {}
+
         fn fill(&mut self, out: &mut [f32]) {
             out.fill(self.0);
         }
