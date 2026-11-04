@@ -595,6 +595,68 @@ other active streams, and no isolated acoustic capture was performed. Device
 unplug/replug, audio-server restart, device format changes, exclusive-access
 behavior and multi-hour hardware stability remain untested.
 
+#### Extended Linux quality and long-run probe (2026-11-04)
+
+A second, non-exclusive probe was run on the same host and default
+PipeWire/ALSA sink. Sources were two 4-second, 44.1 kHz stereo WAVs with
+15,317 Hz and 18,311 Hz tones at source peak 0.05. The high frequencies kept the
+test distinguishable from unrelated stream content while remaining low-level.
+No system audio configuration was changed.
+
+Loopback capture used `pw-record` against the default sink's monitor source
+(explicit source serial `423`), 48 kHz stereo float32. This is an
+output-server monitor capture, not a microphone or speaker/headphone acoustic
+measurement.
+
+- A 16-second capture with gapless transitions (crossfade 0 ms) showed
+  three gapless handoffs. A 5 kHz high-pass RMS envelope across each boundary
+  had a minimum around 0.00326 versus a median near 0.00366 (about 89%),
+  with no silent interval at 20 ms resolution. Left/right high-band RMS ratio
+  was 1.0001. Application diagnostics reported 3 gapless transitions,
+  0 underruns and 0 errors.
+- Capture analysis at 500 ms, 1,000 ms and 3,000 ms crossfade settings
+  measured overlap regions of approximately 0.405 s, 0.811 s and 2.424 s
+  respectively (threshold/smoothing limited; the 3,000 ms case was shortened
+  by the 4-second sources and 1-second prebuffer). Normalizing against the
+  steady A/B levels, the median `outgoing_gain² + incoming_gain²` was
+  approximately 1.000 in all cases, consistent with the equal-power mixer.
+  Endpoints were outgoing-only and incoming-only. A 3,000 ms first handoff
+  was followed by gapless fallback on the very short remaining source, as
+  documented by the eligibility rules.
+- The loopback captures contained other active system audio. They are useful
+  for envelope/continuity checks but are not isolated acoustic measurements.
+  One capture contained near-full-scale samples from that unrelated mix;
+  no clipping or non-finite sample was attributable to the low-level Flux
+  probe.
+- A focused hardware pause/resume test ran 200 cycles (20–60 ms pauses) with
+  crossfade enabled: 0 underruns and 0 decoder/output errors.
+
+The 30-minute long-run session used crossfade/gapless/Repeat One/Shuffle All
+changes, queue append/removal, pause/resume, seek, next/previous and direct
+track selection at 30-second intervals, with diagnostic, RSS, thread and fd
+snapshots every 30 seconds.
+
+- Elapsed: 1,800.00 s.
+- RSS: 18,108 KiB shortly after startup, 18,340 KiB at 10 minutes,
+  18,384 KiB at 20 minutes, 18,504 KiB at 30 minutes.
+- Threads: stable at 6. File descriptors: 27–29.
+- Process CPU after warm-up: approximately 3.7–3.8% in sampled observations.
+- Callbacks: 168,752. Requested frames: 86,401,024. Delivered: 82,034,704.
+- Underruns: **496 frames total (≈10.3 ms)**, all accumulated in one observed
+  reporting interval; the counter did not grow after that interval.
+- Generations: 44. Gapless transitions: 190. Crossfades: 259.
+- Preload failures: 0. Decoder errors: 0. Output errors: 0.
+- Final Controller state: `Playing`, current TrackId(2), QueueEntryId(2).
+
+The single underrun occurred around 1,470 s during the queue/action-churn
+portion, after earlier steady gapless/crossfade periods had zero. It was not
+reproduced by 200 focused pause/resume cycles or by the short steady-state
+captures. Its exact trigger was not isolated; it is recorded as a transient
+hardware scheduling/transition event, not as a confirmed code defect. No
+source change was made. The session was not a perceptual listening test, and
+the process was stopped after 30 minutes rather than extrapolated to multi-hour
+or cross-platform guarantees.
+
 Resource bounds remain structural: at most one active decoder plus one prepared
 decoder; one bounded output ring (approximately two seconds); retained
 crossfade tail, incoming overlap and mixed pending audio bounded by the

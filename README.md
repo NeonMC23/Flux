@@ -300,10 +300,14 @@ A minimal no-UI check is also available:
 
 An automated low-amplitude Linux CPAL probe validated real 48 kHz stereo
 device delivery, pause/seek/stop/restart, gapless/crossfade transitions and
-duplicate-entry queue playback with zero reported underruns over roughly one
-minute on one PipeWire/ALSA host. It is deterministic instrumentation, not an
-audible or cross-platform guarantee; see the canonical audio documentation for
-the device, conditions and limitations.
+duplicate-entry queue playback on one PipeWire/ALSA host. A later 30-minute
+session added monitor capture of gapless/crossfade envelopes and resource
+sampling; it recorded one transient ~10 ms underrun accumulation during
+queue/action churn, with zero decoder/output errors and stable
+memory/threads/fds. These
+are single-host observations, not perceptual or cross-platform guarantees;
+see the canonical audio documentation for the device, conditions and exact
+limitations.
 
 ## What does not exist yet
 
