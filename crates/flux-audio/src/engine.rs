@@ -2105,6 +2105,15 @@ mod tests {
         );
     }
 
+    fn start_playing(engine: &EngineHandle) {
+        let events =
+            collect_events_until(engine, |event| matches!(event, EngineEvent::Started { .. }));
+        assert!(
+            matches!(events.last(), Some(EngineEvent::Started { .. })),
+            "expected Started before consuming audio: {events:?}"
+        );
+    }
+
     fn expected_equal_power(outgoing: f32, incoming: f32, frame: usize, total: usize) -> f32 {
         let theta = if total <= 1 {
             std::f32::consts::FRAC_PI_2
@@ -2836,6 +2845,7 @@ mod tests {
             |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
         );
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 2_200);
         let generation = engine.shared.generation.load(Ordering::Acquire);
         let start_count = control.start_count();
@@ -2939,6 +2949,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 2_000);
         control.clear_captured();
         control.drain_frames(1_001);
@@ -2992,6 +3003,7 @@ mod tests {
             |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_c),
         );
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 1_900);
         control.clear_captured();
         control.drain_frames(801);
@@ -3037,6 +3049,7 @@ mod tests {
             |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
         );
         engine.play();
+        start_playing(&engine);
         // A and B are fully queued and the B handoff is installed, but
         // no boundary frame has been consumed. Re-authorizing C must
         // flush and rewind the current source rather than promote B.
@@ -3096,6 +3109,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 1_700);
         engine.cancel_preload();
         // Pause follows cancellation on the command channel, so its
@@ -3152,6 +3166,7 @@ mod tests {
         });
         engine.cancel_preload();
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 1_000);
         control.clear_captured();
         control.drain_frames(1_000);
@@ -3197,6 +3212,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 2_000);
         control.drain_frames(900);
         engine.pause();
@@ -3249,6 +3265,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         // 2000 source frames at 22.05 kHz become 4000 output frames;
         // the stereo successor contributes 2000 mono output frames.
         wait_for_pushed_frames(&engine, &control, 6_000);
@@ -3351,6 +3368,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         // A and B are fully queued and the handoff is installed, but no
         // device frame has crossed the boundary yet.
         wait_for_pushed_frames(&engine, &control, 3_000);
@@ -3361,6 +3379,7 @@ mod tests {
             |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_c),
         );
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 1_500);
         control.clear_captured();
         control.drain_frames(1_500);
@@ -3404,6 +3423,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 6_000);
 
         let _ = engine.seek(Duration::from_millis(50));
@@ -3462,6 +3482,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 501);
         control.clear_captured();
         control.drain_frames(501);
@@ -3567,6 +3588,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         // 2 s sources at 44.1 kHz; 500 ms of tail, so the overlap starts
         // at output frame 66_150. Wait until the mixed tail is queued.
         wait_for_pushed_frames(&engine, &control, 88_200);
@@ -3683,6 +3705,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         // The ring is exactly 2 s at this fixture size. Drain one
         // decode chunk so the worker has room to reach EOF with no tail.
         wait_for_pushed_frames(&engine, &control, 4_096);
@@ -3724,6 +3747,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 4_096);
         control.drain_frames(4_096);
         control.clear_captured();
@@ -3768,6 +3792,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         // A 2 s source cannot donate 5 s. With the 1 s prebuffer, the
         // bounded overlap is 1 s: 44_100 output frames.
         wait_for_pushed_frames(&engine, &control, 88_200);
@@ -3809,6 +3834,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 22_050);
         control.clear_captured();
         control.drain_frames(22_050);
@@ -3851,6 +3877,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(88_200);
         let events = collect_events_until(&engine, |event| {
@@ -3887,6 +3914,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(66_150);
         let _ = collect_events_until(&engine, |event| {
@@ -3921,6 +3949,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(66_150);
         let events = collect_events_until(&engine, |event| {
@@ -3969,6 +3998,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(66_150);
         let _ = collect_events_until(&engine, |event| {
@@ -4017,6 +4047,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(1_000);
         engine.stop();
@@ -4061,6 +4092,7 @@ mod tests {
             |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
         );
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         engine.preload_entry(id_c, entry_c, c);
         let _ = collect_events_until(
@@ -4115,6 +4147,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(66_150);
         let first = collect_events_until(&engine, |event| {
@@ -4173,6 +4206,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(66_150);
         let events = collect_events_until(&engine, |event| {
@@ -4248,6 +4282,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(1_000);
         let _ = engine.seek(Duration::from_millis(200));
@@ -4303,6 +4338,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(1_000);
         engine.cancel_preload();
@@ -4351,6 +4387,7 @@ mod tests {
             EngineEvent::PreloadFailed { id, .. } if *id == id_b
         )));
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
         control.drain_frames(88_200);
         let events = collect_events_until(&engine, |event| {
@@ -4391,6 +4428,7 @@ mod tests {
             matches!(event, EngineEvent::Preloaded { .. })
         });
         engine.play();
+        start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
 
         engine.load_entry(id_c, entry_c, c);
@@ -4409,6 +4447,7 @@ mod tests {
                 .any(|event| matches!(event, EngineEvent::Transitioned { .. }))
         );
         engine.play();
+        start_playing(&engine);
         control.drain_frames(4_096);
         while let Ok(event) = engine.events().try_recv() {
             assert!(

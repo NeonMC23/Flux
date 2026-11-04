@@ -110,10 +110,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   order, current entry, mode, shuffle flag and position persist for canonical
   libraries and restore paused. The engine preloads the next queue entry and
   performs natural handoffs inside the audio pipeline at the exact
-  source-frame boundary, without restarting the output stream. An optional,
-  session-only equal-power crossfade of 0–5000 ms can overlap the outgoing and
-  incoming sources; zero retains gapless playback. There are no GUI/TUI
-  controls yet. The
+  source-frame boundary, without restarting the output stream. An optional
+  equal-power crossfade of 0–5000 ms can overlap the outgoing and incoming
+  sources; zero retains gapless playback. Crossfade is off by default and is
+  configured in the GUI **Settings** view (`K`) or the TUI (`K` toggles,
+  `[`/`]` adjusts by 250 ms). The shared setting is stored in
+  `<config>/flux/settings.json`. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
   then removes old files through journal cleanup. The same editor supports

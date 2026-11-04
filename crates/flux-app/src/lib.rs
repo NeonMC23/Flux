@@ -69,6 +69,13 @@ use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
 pub use flux_audio::engine::WAVEFORM_WINDOW;
 use flux_audio::engine::{EngineEvent, EngineHandle};
+mod settings;
+
+pub use settings::{
+    CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, LoadedSettings,
+    SETTINGS_SCHEMA_VERSION, SettingsError, SettingsStore,
+};
+
 use flux_core::{
     ArtistId, PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId,
 };
@@ -1105,6 +1112,13 @@ pub struct Controller {
     portable_recovery: Option<RecoveryInfo>,
     /// Directories scanned this session, for `refresh`.
     roots: Vec<PathBuf>,
+    /// Shared user settings (currently crossfade configuration).
+    settings_store: Option<SettingsStore>,
+    /// User-facing crossfade enabled state; zero duration still means
+    /// disabled at the engine layer.
+    crossfade_enabled: bool,
+    /// Configured duration retained even while crossfade is disabled.
+    crossfade_duration_ms: u64,
     scan_rx: Option<Receiver<ScanOutcome>>,
     outbox: Vec<ControllerEvent>,
     last_error: Option<String>,
@@ -1137,6 +1151,10 @@ struct PlaySession {
     listened_ms: u64,
     last_position_ms: u64,
     recorded: bool,
+}
+
+fn format_crossfade_seconds(milliseconds: u64) -> String {
+    format!("{:.1} s", milliseconds as f64 / 1000.0)
 }
 
 fn meaningful_play_threshold(duration_ms: Option<u64>) -> u64 {
@@ -1390,8 +1408,12 @@ impl Controller {
             })?;
         }
         let (engine, audio) = default_engine();
-        Self::new_canonical(engine, audio, &root)
-            .map_err(|err| ControllerOpenError::Canonical(err.to_string()))
+        let mut controller = Self::new_canonical(engine, audio, &root)
+            .map_err(|err| ControllerOpenError::Canonical(err.to_string()))?;
+        if let Some(path) = SettingsStore::default_path() {
+            controller.load_settings_from_path(path);
+        }
+        Ok(controller)
     }
 
     /// Shared construction once the initial library and backend are
@@ -1434,6 +1456,9 @@ impl Controller {
             playback_history,
             history_store,
             history_write_protected,
+            settings_store: None,
+            crossfade_enabled: false,
+            crossfade_duration_ms: CROSSFADE_DEFAULT_MS,
             history_generation: 0,
             shuffle: false,
             shuffle_order: Vec::new(),
@@ -2364,21 +2389,147 @@ impl Controller {
         self.engine.crossfade_ms()
     }
 
-    /// Sets the crossfade duration for subsequent natural transitions,
-    /// clamped by the engine to its supported maximum. Zero restores the
-    /// gapless path. This is session-only and is not persisted.
-    pub fn set_crossfade_ms(&mut self, milliseconds: u64) -> u64 {
-        let effective = self.engine.set_crossfade_ms(milliseconds);
-        if effective == 0 {
+    /// Whether crossfade is enabled in the shared user settings.
+    #[must_use]
+    pub fn crossfade_enabled(&self) -> bool {
+        self.crossfade_enabled
+    }
+
+    /// The selected crossfade duration in milliseconds. The duration is
+    /// retained while disabled so re-enabling uses the previous choice.
+    #[must_use]
+    pub fn crossfade_duration_ms(&self) -> u64 {
+        self.crossfade_duration_ms
+    }
+
+    /// The active settings file, when persistent settings are configured.
+    #[must_use]
+    pub fn settings_path(&self) -> Option<&Path> {
+        self.settings_store.as_ref().map(SettingsStore::path)
+    }
+
+    /// Loads shared settings from `path`, applies crossfade to the engine
+    /// before playback, and binds future saves to the same file. Malformed
+    /// files are preserved and reported; defaults remain usable.
+    pub fn load_settings_from_path(&mut self, path: impl Into<PathBuf>) -> Option<String> {
+        let LoadedSettings {
+            store,
+            crossfade,
+            warning,
+        } = SettingsStore::load(path);
+        self.crossfade_enabled = crossfade.enabled;
+        self.crossfade_duration_ms = crossfade.duration_ms;
+        self.engine.set_crossfade_ms(crossfade.effective_ms());
+        self.settings_store = Some(store);
+        if let Some(message) = &warning {
+            self.report_error(message.clone());
+        }
+        warning
+    }
+
+    /// Enables or disables crossfade and persists the shared setting.
+    /// Enabling without a selected duration uses the default.
+    pub fn set_crossfade_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        self.crossfade_enabled = enabled;
+        if enabled && self.crossfade_duration_ms == 0 {
+            self.crossfade_duration_ms = CROSSFADE_DEFAULT_MS;
+        }
+        self.apply_crossfade_setting();
+        let result = self.persist_crossfade_settings();
+        if self.crossfade_enabled {
+            self.report_status(format!(
+                "Crossfade enabled for future natural transitions at {}.",
+                format_crossfade_seconds(self.crossfade_duration_ms)
+            ));
+        } else {
+            self.report_status(
+                "Crossfade disabled; natural transitions remain gapless.".to_owned(),
+            );
+        }
+        result
+    }
+
+    /// Selects the crossfade duration (0–5000 ms), persisting the shared
+    /// setting. Zero disables crossfade; a positive value while disabled
+    /// updates the remembered duration without enabling playback overlap.
+    pub fn set_crossfade_duration_ms(&mut self, milliseconds: u64) -> Result<u64, String> {
+        let clamped = milliseconds.min(CROSSFADE_MAX_MS);
+        self.crossfade_duration_ms = clamped;
+        if clamped == 0 {
+            self.crossfade_enabled = false;
+        }
+        self.apply_crossfade_setting();
+        let result = self.persist_crossfade_settings();
+        if self.crossfade_enabled {
+            self.report_status(format!(
+                "Crossfade duration set to {} for future natural transitions.",
+                format_crossfade_seconds(clamped)
+            ));
+        } else if clamped == 0 {
             self.report_status(
                 "Crossfade disabled; natural transitions remain gapless.".to_owned(),
             );
         } else {
             self.report_status(format!(
-                "Crossfade for future natural transitions: {effective} ms."
+                "Crossfade duration set to {} (crossfade is off).",
+                format_crossfade_seconds(clamped)
             ));
         }
-        effective
+        result.map(|()| clamped)
+    }
+
+    /// Sets the effective crossfade duration. Zero disables crossfade and
+    /// positive values enable it. Retained for compatibility with the
+    /// engine-facing API; GUI/TUI settings use the enabled/duration pair.
+    pub fn set_crossfade_ms(&mut self, milliseconds: u64) -> u64 {
+        let clamped = milliseconds.min(CROSSFADE_MAX_MS);
+        if clamped == 0 {
+            let _ = self.set_crossfade_enabled(false);
+        } else {
+            self.crossfade_duration_ms = clamped;
+            self.crossfade_enabled = true;
+            self.apply_crossfade_setting();
+            let _ = self.persist_crossfade_settings();
+            self.report_status(format!(
+                "Crossfade enabled for future natural transitions at {}.",
+                format_crossfade_seconds(clamped)
+            ));
+        }
+        clamped
+    }
+
+    fn apply_crossfade_setting(&mut self) {
+        let settings = CrossfadeSettings {
+            enabled: self.crossfade_enabled,
+            duration_ms: self.crossfade_duration_ms,
+        }
+        .normalized();
+        self.crossfade_enabled = settings.enabled;
+        self.crossfade_duration_ms = settings.duration_ms;
+        self.engine.set_crossfade_ms(settings.effective_ms());
+    }
+
+    fn persist_crossfade_settings(&mut self) -> Result<(), String> {
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        let settings = CrossfadeSettings {
+            enabled: self.crossfade_enabled,
+            duration_ms: self.crossfade_duration_ms,
+        };
+        match store.save(settings) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = format!(
+                    "Could not save crossfade settings to {}: {error}. \
+                     The setting is active for this session only.",
+                    path.display()
+                );
+                self.report_error(message.clone());
+                Err(message)
+            }
+        }
     }
 
     /// Whether a background library scan is running.
@@ -7487,6 +7638,45 @@ mod tests {
     }
 
     #[test]
+    fn loaded_crossfade_settings_apply_to_the_first_transition() {
+        let dir = TempDir::new("crossfade-loaded-first");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+        let b_path = write_dc_wav(&root, "b.wav", 88_200, 0.8);
+        let settings = dir.path().join("config").join("settings.json");
+        fs::create_dir_all(settings.parent().expect("parent")).expect("config dir");
+        fs::write(
+            &settings,
+            br#"{"version":1,"crossfade":{"enabled":true,"duration_ms":500}}"#,
+        )
+        .expect("settings");
+
+        let (mut controller, control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        assert!(controller.crossfade_enabled());
+        assert_eq!(controller.crossfade_ms(), 500);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        let b = id_of(&controller, &b_path);
+        controller.play_track(a);
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        let session = controller.engine_session.expect("session");
+        drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id() == Some(entry_b)
+        });
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_b));
+        assert_eq!(controller.engine_session, Some(session));
+        controller.shutdown();
+    }
+
+    #[test]
     fn crossfade_api_defaults_to_disabled_and_clamps() {
         let dir = TempDir::new("crossfade-api");
         let (mut controller, _control) = boot(&dir);
@@ -7495,6 +7685,137 @@ mod tests {
         assert_eq!(controller.crossfade_ms(), 5_000);
         assert_eq!(controller.set_crossfade_ms(0), 0);
         assert_eq!(controller.crossfade_ms(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn crossfade_settings_persist_and_restore_before_playback() {
+        let dir = TempDir::new("crossfade-settings-persist");
+        let settings = dir.path().join("config").join("settings.json");
+        let (mut controller, _control) = boot(&dir);
+        assert!(!controller.crossfade_enabled());
+        assert_eq!(controller.crossfade_duration_ms(), 3_000);
+        assert_eq!(controller.crossfade_ms(), 0);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+
+        controller.set_crossfade_enabled(true).expect("enable");
+        assert!(controller.crossfade_enabled());
+        assert_eq!(controller.crossfade_ms(), 3_000);
+        assert!(settings.exists());
+        assert_eq!(
+            controller
+                .set_crossfade_duration_ms(4_200)
+                .expect("duration"),
+            4_200
+        );
+        assert_eq!(controller.crossfade_ms(), 4_200);
+        controller.shutdown();
+
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        assert!(controller.crossfade_enabled());
+        assert_eq!(controller.crossfade_duration_ms(), 4_200);
+        assert_eq!(controller.crossfade_ms(), 4_200);
+        controller.set_crossfade_enabled(false).expect("disable");
+        assert_eq!(controller.crossfade_ms(), 0);
+        assert_eq!(
+            controller.crossfade_duration_ms(),
+            4_200,
+            "disabling retains the chosen duration"
+        );
+        controller.shutdown();
+
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        assert!(!controller.crossfade_enabled());
+        assert_eq!(controller.crossfade_duration_ms(), 4_200);
+        assert_eq!(controller.crossfade_ms(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn malformed_crossfade_settings_are_reported_and_preserved() {
+        let dir = TempDir::new("crossfade-settings-malformed");
+        let settings = dir.path().join("config").join("settings.json");
+        fs::create_dir_all(settings.parent().expect("parent")).expect("config dir");
+        let original = b"{ malformed";
+        fs::write(&settings, original).expect("settings bytes");
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_some());
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|message| message.contains("parse settings")),
+            "{:?}",
+            controller.last_error()
+        );
+        assert!(!controller.crossfade_enabled());
+        assert_eq!(controller.crossfade_ms(), 0);
+        let result = controller.set_crossfade_enabled(true);
+        assert!(result.is_err(), "write-protected settings cannot be saved");
+        assert_eq!(
+            controller.crossfade_ms(),
+            3_000,
+            "runtime setting still applies for this session"
+        );
+        assert_eq!(fs::read(&settings).expect("preserved"), original);
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|message| message.contains("write-protected")),
+            "{:?}",
+            controller.last_error()
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn crossfade_save_failure_is_reported_and_runtime_change_survives() {
+        let dir = TempDir::new("crossfade-settings-save-failure");
+        let settings = dir.path().join("config").join("settings.json");
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        fs::create_dir_all(&settings).expect("block target path");
+        let result = controller.set_crossfade_enabled(true);
+        assert!(result.is_err());
+        assert_eq!(controller.crossfade_ms(), 3_000);
+        assert!(controller.crossfade_enabled());
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|message| message.contains("Could not save crossfade settings")),
+            "{:?}",
+            controller.last_error()
+        );
+        assert!(settings.is_dir(), "failed save left the path untouched");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn crossfade_runtime_changes_do_not_reload_current_playback() {
+        let dir = TempDir::new("crossfade-settings-runtime");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        controller.play_track(a);
+        let session = controller.engine_session.expect("session");
+        drive(&mut controller, &control, |c, _| {
+            c.player_state() == PlaybackState::Playing
+        });
+        assert!(controller.set_crossfade_enabled(true).is_ok());
+        assert_eq!(controller.engine_session, Some(session));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(controller.crossfade_ms(), 3_000);
+        assert!(controller.set_crossfade_duration_ms(1_500).is_ok());
+        assert_eq!(controller.engine_session, Some(session));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.crossfade_ms(), 1_500);
+        controller.set_crossfade_enabled(false).expect("disable");
+        assert_eq!(controller.crossfade_ms(), 0);
+        assert_eq!(controller.engine_session, Some(session));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
         controller.shutdown();
     }
 

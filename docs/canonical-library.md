@@ -335,10 +335,14 @@ replacement invalidate audio explicitly while adjacent tracks remain
 sample-contiguous. The callback still rejects samples from older generations.
 
 Natural transitions can optionally use equal-power crossfade. The engine API is
-`set_crossfade_ms(u64)` / `crossfade_ms()`; the Controller exposes the same pair.
-The default is `0` (disabled), values are clamped to `0..=5_000` ms, and the
-setting is session-only. A change affects sources loaded afterwards; it does not
-retroactively resize an already-loaded source's tail schedule.
+`set_crossfade_ms(u64)` / `crossfade_ms()`; the Controller exposes the
+enabled/duration pair through `crossfade_enabled()`,
+`crossfade_duration_ms()`, `set_crossfade_enabled()` and
+`set_crossfade_duration_ms()`. The default is disabled with a remembered
+duration of 3000 ms. Values are clamped to `0..=5_000` ms. A change applies to
+the running Controller without reloading the current source, but affects only
+sources loaded afterwards; it does not retroactively resize an already-loaded
+source's tail schedule.
 
 For crossfade, the engine keeps a bounded tail of outgoing output frames. The
 target overlap is:
@@ -377,6 +381,44 @@ source at its reported position before preparing the newly authorized entry;
 this recovery path may contain silence and is not advertised as gapless.
 Seek, stop, explicit load, cancellation and replacement likewise invalidate an
 obsolete overlap.
+
+### Crossfade settings
+
+The GUI exposes **Settings** in the sidebar (keyboard shortcut `K`) with an
+enable/disable toggler and an equal-power duration slider from 0 to 5 seconds in
+0.1-second steps. The slider commits on release rather than saving on every
+pointer movement. While disabled, the remembered duration is shown as a
+secondary value.
+
+The TUI uses `K` to toggle crossfade and `[` / `]` to decrease or increase the
+duration by 250 ms. The now-playing line shows `Xfade off` or the active
+duration, and the help bar lists both controls. The TUI uses the same
+Controller methods and the same settings file as the GUI.
+
+Settings are loaded by `Controller::open_default` before playback starts. The
+shared JSON file is located at `<platform config>/flux/settings.json`; on Linux
+that is normally `$XDG_CONFIG_HOME/flux/settings.json` (falling back to
+`~/.config/flux/settings.json`). The current schema is:
+
+```json
+{
+  "version": 1,
+  "crossfade": {
+    "enabled": false,
+    "duration_ms": 3000
+  }
+}
+```
+
+Missing and empty files use defaults. Unknown root/crossfade fields are
+preserved when crossfade is saved. Invalid durations are clamped or replaced by
+the default; malformed or unreadable files are preserved byte-for-byte, reported
+to the user, and write-protected for the session, matching the queue/history
+persistence convention. Saves use a sibling temporary file, flush, and atomic
+rename. A save failure leaves the previous settings file intact, applies the
+runtime setting for the current session, and reports the failure instead of
+claiming it was persisted. No background settings watcher or multi-process
+synchronization is used; GUI/TUI launches read the same file independently.
 
 The output ring remains the same bounded SPSC ring and the callback is unchanged.
 During an overlap there are at most two decoders: the outgoing decoder until its
@@ -1016,15 +1058,16 @@ cleanup.
     cannot reconstruct them without fabricating chronology. Recent/Most Played
     remain aggregate views.
 24. Natural gapless playback and optional equal-power crossfade are implemented
-    inside the engine. Crossfade is disabled by default, is configured in
-    milliseconds through the engine/Controller API only, and does not yet have
-    GUI/TUI controls or persisted settings. The outgoing tail, incoming head and
-    mixed pending audio are bounded by the 5-second maximum; sources whose
-    duration is unknown or too short for a meaningful tail use the gapless
-    fallback. Gapless and crossfade have been verified with deterministic
-    synthetic sources and an instrumented null backend, not by measuring real
-    hardware. One prepared successor is supported; a chain depends on the
-    Controller preloading the following entry after each accepted transition.
+    inside the engine. Crossfade is disabled by default, is configured in the
+    GUI Settings view and through TUI `K` / `[` / `]`, and is persisted in the
+    shared settings JSON file (3000 ms default duration, 0–5000 ms range). The
+    outgoing tail, incoming head and mixed pending audio are bounded by the
+    5-second maximum; sources whose duration is unknown or too short for a
+    meaningful tail use the gapless fallback. Gapless and crossfade have been
+    verified with deterministic synthetic sources and an instrumented null
+    backend, not by measuring real hardware. One prepared successor is
+    supported; a chain depends on the Controller preloading the following entry
+    after each accepted transition.
 25. Multi-entry queue removal and a dedicated queue clear action are not exposed
     in the GUI; individual removal/reorder and queue population from track/
     playlist actions remain available.

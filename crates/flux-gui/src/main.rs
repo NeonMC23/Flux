@@ -19,13 +19,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use flux_app::{
-    AlbumId, Artist, AudioStatus, Availability, CandidateStatus, CanonicalMigrationPlan,
-    Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan,
-    ImportProgress, ImportRequest, ImportStage, ImportStorage, LyricLine, LyricsDocument,
-    LyricsKind, PlaybackMode, PlaylistId, PreparedImport, ReconcileReport, RelPath, ReleaseType,
-    StorageMode, TrackAudioReplacementPlan, TrackMetadataEdit, TrackMetadataUpdatePlan,
-    TrackMovePlan, WAVEFORM_WINDOW, format_duration, is_track_playable, prepare_import_files,
-    prepare_import_plan,
+    AlbumId, Artist, AudioStatus, Availability, CROSSFADE_MAX_MS, CandidateStatus,
+    CanonicalMigrationPlan, Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision,
+    ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
+    LyricLine, LyricsDocument, LyricsKind, PlaybackMode, PlaylistId, PreparedImport,
+    ReconcileReport, RelPath, ReleaseType, StorageMode, TrackAudioReplacementPlan,
+    TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration,
+    is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, Track, TrackId};
 use iced::ContentFit;
@@ -37,7 +37,7 @@ use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::image::Handle as ImageHandle;
 use iced::widget::{
     button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, slider, stack,
-    text, text_input, tooltip,
+    text, text_input, toggler, tooltip,
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Rectangle, Shadow, Subscription, Task, Theme, mouse,
@@ -357,6 +357,25 @@ fn volume_style(_: &Theme, status: slider::Status) -> slider::Style {
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
         },
+    }
+}
+
+fn crossfade_toggler_style(_: &Theme, status: toggler::Status) -> toggler::Style {
+    let toggled = match status {
+        toggler::Status::Active { is_toggled }
+        | toggler::Status::Hovered { is_toggled }
+        | toggler::Status::Disabled { is_toggled } => is_toggled,
+    };
+    toggler::Style {
+        background: if toggled { ACCENT_SOFT } else { SURFACE_HI }.into(),
+        background_border_width: 1.0,
+        background_border_color: if toggled { ACCENT_BORDER } else { BORDER },
+        foreground: if toggled { ACCENT } else { MUTED }.into(),
+        foreground_border_width: 0.0,
+        foreground_border_color: Color::TRANSPARENT,
+        text_color: Some(TEXT),
+        border_radius: Some(12.0.into()),
+        padding_ratio: 0.16,
     }
 }
 
@@ -1217,7 +1236,8 @@ fn group_key(view: LibraryView, track: &Track) -> Option<String> {
         | LibraryView::Collections
         | LibraryView::RecentlyAdded
         | LibraryView::RecentlyPlayed
-        | LibraryView::MostPlayed => None,
+        | LibraryView::MostPlayed
+        | LibraryView::Settings => None,
     }
 }
 
@@ -1236,7 +1256,8 @@ fn group_title(view: LibraryView, key: &str) -> String {
         | LibraryView::Collections
         | LibraryView::RecentlyAdded
         | LibraryView::RecentlyPlayed
-        | LibraryView::MostPlayed => key.to_owned(),
+        | LibraryView::MostPlayed
+        | LibraryView::Settings => key.to_owned(),
     }
 }
 
@@ -1255,6 +1276,7 @@ enum LibraryView {
     RecentlyAdded,
     RecentlyPlayed,
     MostPlayed,
+    Settings,
 }
 
 impl LibraryView {
@@ -1271,6 +1293,7 @@ impl LibraryView {
             Self::RecentlyAdded => "Recently Added",
             Self::RecentlyPlayed => "Recently Played",
             Self::MostPlayed => "Most Played",
+            Self::Settings => "Settings",
         }
     }
 
@@ -1284,6 +1307,7 @@ impl LibraryView {
             Self::Dashboard => "Library is empty",
             Self::Collections => "No smart collections",
             Self::RecentlyAdded | Self::RecentlyPlayed | Self::MostPlayed => "No tracks yet",
+            Self::Settings => "Settings",
         }
     }
 }
@@ -1880,6 +1904,7 @@ struct FluxReady {
     last_queue_current: Option<QueueEntryId>,
     scope: FlowScope,
     seek_preview: Option<f32>,
+    crossfade_preview: Option<u64>,
     show_setup: bool,
     queue_visible: bool,
     window_width: f32,
@@ -2113,6 +2138,9 @@ enum Message {
     VolumeChanged(f32),
     SeekPreview(f32),
     SeekCommit,
+    CrossfadeEnabledChanged(bool),
+    CrossfadeDurationPreview(f32),
+    CrossfadeDurationCommit,
     KeyPressed(Key, Modifiers),
     Tick,
     WaveTick,
@@ -2194,6 +2222,7 @@ impl FluxReady {
             last_queue_current: current,
             scope: FlowScope::default(),
             seek_preview: None,
+            crossfade_preview: None,
             show_setup,
             queue_visible: true,
             window_width: 1_180.0,
@@ -3307,6 +3336,7 @@ impl FluxReady {
         self.lyrics_import = None;
         self.search.clear();
         self.page = 0;
+        self.crossfade_preview = None;
         self.show_setup = false;
     }
 
@@ -5343,6 +5373,22 @@ impl FluxReady {
                 }
             }
             Message::SeekCommit => self.commit_seek_preview(),
+            Message::CrossfadeEnabledChanged(enabled) => {
+                self.crossfade_preview = None;
+                let _ = self.controller.set_crossfade_enabled(enabled);
+            }
+            Message::CrossfadeDurationPreview(value) => {
+                if value.is_finite() {
+                    let maximum = CROSSFADE_MAX_MS as f32 / 1_000.0;
+                    let seconds = value.clamp(0.0, maximum);
+                    self.crossfade_preview = Some((seconds * 1_000.0).round() as u64);
+                }
+            }
+            Message::CrossfadeDurationCommit => {
+                if let Some(milliseconds) = self.crossfade_preview.take() {
+                    let _ = self.controller.set_crossfade_duration_ms(milliseconds);
+                }
+            }
             Message::QueueDragRelease => {
                 self.finish_playlist_drag();
                 self.finish_queue_drag();
@@ -5442,6 +5488,7 @@ impl FluxReady {
                     Key::Character("8") => self.select_view(LibraryView::Collections),
                     Key::Character("9") => self.select_view(LibraryView::RecentlyAdded),
                     Key::Character("0") => self.select_view(LibraryView::RecentlyPlayed),
+                    Key::Character("k") => self.select_view(LibraryView::Settings),
                     Key::Character("l") => self.toggle_setup(),
                     Key::Named(Named::Escape) => {
                         if self.track_editor.take().is_some() {
@@ -7765,13 +7812,16 @@ impl FluxReady {
             LibraryView::RecentlyAdded,
             LibraryView::RecentlyPlayed,
             LibraryView::MostPlayed,
+            LibraryView::Settings,
         ] {
             nav = nav.push(
                 button(
                     row![
                         text(view.label()).size(13),
                         iced::widget::Space::new().width(Length::Fill),
-                        text(
+                        text(if view == LibraryView::Settings {
+                            String::new()
+                        } else {
                             match view {
                                 LibraryView::Tracks => counts.0,
                                 LibraryView::Artists => counts.1,
@@ -7794,9 +7844,10 @@ impl FluxReady {
                                 LibraryView::RecentlyPlayed | LibraryView::MostPlayed => {
                                     self.controller.playback_history().len()
                                 }
+                                LibraryView::Settings => 0,
                             }
                             .to_string()
-                        )
+                        })
                         .size(9)
                         .color(MUTED),
                     ]
@@ -7828,7 +7879,11 @@ impl FluxReady {
         nav = nav.push(iced::widget::Space::new().height(Length::Fill));
         nav = nav.push(text("SPACE PLAY · N/P SKIP").size(8).color(MUTED));
         nav = nav.push(text("←/→ SEEK · SHIFT ±30S").size(8).color(MUTED));
-        nav = nav.push(text("1-4 VIEWS · L SETUP · / SEARCH").size(8).color(MUTED));
+        nav = nav.push(
+            text("1-4 VIEWS · K SETTINGS · / SEARCH")
+                .size(8)
+                .color(MUTED),
+        );
         nav = nav.push(iced::widget::Space::new().height(10));
 
         let library_state = match self.controller.storage_mode() {
@@ -7907,6 +7962,11 @@ impl FluxReady {
             (
                 "Search results".to_owned(),
                 "Artists, albums and tracks from the canonical catalogue.".to_owned(),
+            )
+        } else if self.view == LibraryView::Settings {
+            (
+                "Settings".to_owned(),
+                "Playback preferences shared by the GUI and TUI.".to_owned(),
             )
         } else if self.view == LibraryView::Dashboard {
             (
@@ -8114,6 +8174,123 @@ impl FluxReady {
         )
     }
 
+    fn settings_view(&self) -> Element<'_, Message> {
+        let enabled = self.controller.crossfade_enabled();
+        let configured = self.controller.crossfade_duration_ms();
+        let shown = self.crossfade_preview.unwrap_or(configured);
+        let seconds = shown as f32 / 1_000.0;
+        let maximum = CROSSFADE_MAX_MS as f32 / 1_000.0;
+        let configured_label = format!("{:.1} s", configured as f32 / 1_000.0);
+        let shown_label = format!("{seconds:.1} s");
+
+        let toggle = row![
+            column![
+                text("Crossfade").size(15).color(TEXT),
+                text(if enabled {
+                    "Natural transitions overlap using an equal-power envelope."
+                } else {
+                    "Natural transitions remain gapless."
+                })
+                .size(10)
+                .color(MUTED),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            toggler(enabled)
+                .on_toggle(Message::CrossfadeEnabledChanged)
+                .style(crossfade_toggler_style)
+                .size(26.0),
+        ]
+        .spacing(18)
+        .align_y(Alignment::Center);
+
+        let duration: Element<'_, Message> = if enabled {
+            let mut apply = button(text("Apply").size(10))
+                .style(ghost_style)
+                .padding([3, 8]);
+            if self.crossfade_preview.is_some() {
+                apply = apply.on_press(Message::CrossfadeDurationCommit);
+            }
+            column![
+                row![
+                    text("Duration").size(12).color(TEXT),
+                    iced::widget::Space::new().width(Length::Fill),
+                    text(shown_label).size(12).color(ACCENT),
+                    apply,
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                slider(
+                    0.0..=maximum,
+                    seconds,
+                    Message::CrossfadeDurationPreview,
+                )
+                .step(0.1_f32)
+                .shift_step(0.5_f32)
+                .width(Length::Fill)
+                .style(seek_style)
+                .on_release(Message::CrossfadeDurationCommit),
+                text("0 s disables crossfade. Release the slider or press Apply to save. Changes apply to future sources; the current track keeps playing.")
+                    .size(9)
+                    .color(MUTED),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            column![
+                row![
+                    text("Duration").size(12).color(MUTED),
+                    iced::widget::Space::new().width(Length::Fill),
+                    text(configured_label).size(12).color(MUTED),
+                ]
+                .align_y(Alignment::Center),
+                text("Enable crossfade to edit the duration. The remembered value is retained.")
+                    .size(9)
+                    .color(MUTED),
+            ]
+            .spacing(8)
+            .into()
+        };
+
+        let settings_path = self
+            .controller
+            .settings_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| {
+                "No shared settings file is configured; changes last for this session.".to_owned()
+            });
+
+        let card = container(
+            column![
+                toggle,
+                iced::widget::Space::new().height(14),
+                container(iced::widget::Space::new().height(1))
+                    .width(Length::Fill)
+                    .style(rule_style),
+                iced::widget::Space::new().height(14),
+                duration,
+                iced::widget::Space::new().height(12),
+                text("Crossfade applies only to eligible natural queue transitions. Short tracks, missing prepared decoders and unknown durations fall back to gapless playback. Exact skips, seeks and direct loads are unchanged.")
+                    .size(10)
+                    .color(MUTED),
+                iced::widget::Space::new().height(10),
+                text(format!("Shared setting: {settings_path}"))
+                    .size(9)
+                    .color(MUTED),
+            ]
+            .spacing(0),
+        )
+        .padding(20)
+        .width(Length::Fill)
+        .max_width(680.0)
+        .style(card_style);
+
+        column![text("PLAYBACK").size(9).color(MUTED), card,]
+            .spacing(10)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn library_view(&self) -> Element<'_, Message> {
         if self.track_editor.is_some() {
             return self.track_editor_view();
@@ -8138,6 +8315,9 @@ impl FluxReady {
                 || self.playlist_list_view(),
                 |id| self.playlist_detail_view(id),
             );
+        }
+        if self.view == LibraryView::Settings {
+            return self.settings_view();
         }
         if self.controller.tracks().is_empty() {
             return self.empty_library();
@@ -12987,14 +13167,109 @@ mod tests {
             last_queue_current,
             scope: FlowScope::default(),
             seek_preview: None,
+            crossfade_preview: None,
             show_setup: false,
             queue_visible: true,
             window_width: 1_180.0,
         }
     }
 
+    fn gui_with_settings(dir: &TempDir, settings: &std::path::Path) -> FluxReady {
+        let (engine, audio) = flux_app::default_engine();
+        let mut controller =
+            Controller::new(engine, audio, Some(dir.path().join("library-index.json")))
+                .expect("controller opens the test library");
+        controller.load_settings_from_path(settings);
+        FluxReady::new(controller)
+    }
+
     fn send(gui: &mut FluxReady, message: Message) {
         let _task = gui.update(message);
+    }
+
+    #[test]
+    fn settings_view_reflects_loaded_crossfade_and_updates_controller() {
+        let dir = TempDir::new("gui-crossfade-settings");
+        let settings = dir.path().join("config").join("settings.json");
+        std::fs::create_dir_all(settings.parent().expect("parent")).expect("config dir");
+        std::fs::write(
+            &settings,
+            br#"{"version":1,"crossfade":{"enabled":true,"duration_ms":4200}}"#,
+        )
+        .expect("seed settings");
+        let mut gui = gui_with_settings(&dir, &settings);
+        assert!(gui.controller.crossfade_enabled());
+        assert_eq!(gui.controller.crossfade_duration_ms(), 4_200);
+        assert_eq!(gui.controller.crossfade_ms(), 4_200);
+
+        send(&mut gui, Message::SelectView(LibraryView::Settings));
+        assert_eq!(gui.view, LibraryView::Settings);
+        let _ = gui.settings_view();
+        send(&mut gui, Message::CrossfadeEnabledChanged(false));
+        assert!(!gui.controller.crossfade_enabled());
+        assert_eq!(gui.controller.crossfade_ms(), 0);
+        assert_eq!(gui.controller.crossfade_duration_ms(), 4_200);
+        let saved = std::fs::read_to_string(&settings).expect("saved settings");
+        assert!(saved.contains("\"enabled\": false"));
+        assert!(saved.contains("\"duration_ms\": 4200"));
+
+        send(&mut gui, Message::CrossfadeEnabledChanged(true));
+        assert!(gui.controller.crossfade_enabled());
+        assert_eq!(gui.controller.crossfade_ms(), 4_200);
+        send(&mut gui, Message::CrossfadeDurationPreview(2.5));
+        assert_eq!(gui.crossfade_preview, Some(2_500));
+        send(&mut gui, Message::CrossfadeDurationCommit);
+        assert_eq!(gui.crossfade_preview, None);
+        assert_eq!(gui.controller.crossfade_duration_ms(), 2_500);
+        assert_eq!(gui.controller.crossfade_ms(), 2_500);
+        let saved = std::fs::read_to_string(&settings).expect("saved settings");
+        assert!(saved.contains("\"duration_ms\": 2500"));
+
+        send(&mut gui, Message::CrossfadeDurationPreview(1.0));
+        assert_eq!(gui.crossfade_preview, Some(1_000));
+        send(&mut gui, Message::SelectView(LibraryView::Tracks));
+        assert_eq!(
+            gui.crossfade_preview, None,
+            "leaving Settings must not keep a stale preview"
+        );
+        gui.controller.shutdown();
+
+        let restarted = gui_with_settings(&dir, &settings);
+        assert!(restarted.controller.crossfade_enabled());
+        assert_eq!(restarted.controller.crossfade_duration_ms(), 2_500);
+        assert_eq!(restarted.controller.crossfade_ms(), 2_500);
+        restarted.controller.shutdown();
+    }
+
+    #[test]
+    fn settings_view_surfaces_save_failures_without_losing_runtime_state() {
+        let dir = TempDir::new("gui-crossfade-save-failure");
+        let settings = dir.path().join("config").join("settings.json");
+        let mut gui = gui_with_settings(&dir, &settings);
+        std::fs::create_dir_all(&settings).expect("block settings path");
+        send(&mut gui, Message::CrossfadeEnabledChanged(true));
+        assert!(gui.controller.crossfade_enabled());
+        assert_eq!(gui.controller.crossfade_ms(), 3_000);
+        assert!(
+            gui.controller
+                .last_error()
+                .is_some_and(|message| message.contains("Could not save crossfade settings")),
+            "{:?}",
+            gui.controller.last_error()
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn settings_keyboard_shortcut_opens_the_settings_view() {
+        let dir = TempDir::new("gui-crossfade-shortcut");
+        let mut gui = gui_with_settings(&dir, &dir.path().join("config/settings.json"));
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("k".into()), Modifiers::default()),
+        );
+        assert_eq!(gui.view, LibraryView::Settings);
+        gui.controller.shutdown();
     }
 
     #[test]

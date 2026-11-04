@@ -19,6 +19,8 @@ flux-core.workspace = true
 flux-library.workspace = true
 flux-audio.workspace = true
 flux-platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 hound.workspace = true

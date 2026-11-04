@@ -17,6 +17,7 @@
 //! - `↑`/`k`, `↓`/`j` move; `PgUp`/`PgDn`, `g`/`G` jump
 //! - `Enter` play selected, `Space` play/pause, `s` stop
 //! - `n` next, `p` previous, `+`/`-` volume, `R` cycle repeat
+//! - `K` toggle crossfade, `[`/`]` decrease/increase its duration
 //! - `a` add selected track to the queue, `x` play it next,
 //!   `Delete` remove the current queue entry, `Ctrl+↑`/`Ctrl+↓`
 //!   reorder the current queue entry
@@ -287,6 +288,9 @@ impl Tui {
             KeyCode::Char('+') | KeyCode::Char('=') => self.controller.adjust_volume(0.05),
             KeyCode::Char('-') => self.controller.adjust_volume(-0.05),
             KeyCode::Char('R') => self.controller.cycle_repeat_mode(),
+            KeyCode::Char('K') => self.toggle_crossfade(),
+            KeyCode::Char(']') => self.adjust_crossfade_up(),
+            KeyCode::Char('[') => self.adjust_crossfade_down(),
             KeyCode::Char('o') => {
                 self.mode = Mode::ScanInput;
                 self.input.clear();
@@ -560,6 +564,67 @@ impl Tui {
             _ => {}
         }
         false
+    }
+
+    fn crossfade_state_message(&self) -> String {
+        if self.controller.crossfade_enabled() {
+            format!(
+                "Crossfade on · {:.1} s · shared with the GUI.",
+                self.controller.crossfade_duration_ms() as f64 / 1_000.0
+            )
+        } else {
+            format!(
+                "Crossfade off · remembered {:.1} s · natural transitions are gapless.",
+                self.controller.crossfade_duration_ms() as f64 / 1_000.0
+            )
+        }
+    }
+
+    fn toggle_crossfade(&mut self) {
+        let enabled = !self.controller.crossfade_enabled();
+        self.lifecycle_msg = Some(match self.controller.set_crossfade_enabled(enabled) {
+            Ok(()) => self.crossfade_state_message(),
+            Err(error) => error,
+        });
+    }
+
+    fn adjust_crossfade_up(&mut self) {
+        if !self.controller.crossfade_enabled() {
+            self.lifecycle_msg = Some(match self.controller.set_crossfade_enabled(true) {
+                Ok(()) => self.crossfade_state_message(),
+                Err(error) => error,
+            });
+            return;
+        }
+        let next = self
+            .controller
+            .crossfade_duration_ms()
+            .saturating_add(250)
+            .min(flux_app::CROSSFADE_MAX_MS);
+        self.lifecycle_msg = Some(match self.controller.set_crossfade_duration_ms(next) {
+            Ok(_) => self.crossfade_state_message(),
+            Err(error) => error,
+        });
+    }
+
+    fn adjust_crossfade_down(&mut self) {
+        if !self.controller.crossfade_enabled() {
+            self.lifecycle_msg = Some("Crossfade is already off.".to_owned());
+            return;
+        }
+        let current = self.controller.crossfade_duration_ms();
+        let next = current.saturating_sub(250);
+        self.lifecycle_msg = Some(if next == 0 {
+            match self.controller.set_crossfade_enabled(false) {
+                Ok(()) => self.crossfade_state_message(),
+                Err(error) => error,
+            }
+        } else {
+            match self.controller.set_crossfade_duration_ms(next) {
+                Ok(_) => self.crossfade_state_message(),
+                Err(error) => error,
+            }
+        });
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
@@ -999,15 +1064,7 @@ impl Tui {
 
         // Help / input line.
         let help = match self.mode {
-            Mode::Normal => "Enter play · Space pause · s stop · n/p skip · a add · x next \
-                             · Del rm · Ctrl+↑/↓ reorder · +/- vol · o scan · r refresh \
-                             · i/I quick copy-import · e edit track · y lyrics · V artists \
-                             · P new artist · Y rename artist · L relink · X reconcile \
-                             · / search · F favorites · H stats · R mode · O open · C create · M migrate \
-                             · D album · E albums · T transfer/delete (GUI) \
-                             · move/replace (GUI) · global search/filters/batch (GUI) \
-                             · playlists (GUI) · B index · U fix · q quit"
-                .to_owned(),
+            Mode::Normal => normal_help().to_owned(),
             Mode::ScanInput => format!(
                 "Scan folder (Enter to scan, Esc to cancel): {}_",
                 self.input
@@ -1088,6 +1145,14 @@ impl Tui {
             PlaybackState::Stopped => "■",
         };
         let volume = (self.controller.volume() * 100.0).round() as u32;
+        let crossfade = if self.controller.crossfade_enabled() {
+            format!(
+                "Xfade {:.1}s",
+                self.controller.crossfade_duration_ms() as f64 / 1_000.0
+            )
+        } else {
+            "Xfade off".to_owned()
+        };
         match self.controller.current_track() {
             Some(track) => {
                 let total = track
@@ -1096,15 +1161,17 @@ impl Tui {
                     .map(format_duration)
                     .unwrap_or_else(|| "--:--".to_owned());
                 format!(
-                    "{state_icon} {}    {} / {total}    Vol {volume}%",
+                    "{state_icon} {}    {} / {total}    Vol {volume}%    {crossfade}",
                     display_title(track),
                     format_duration(self.controller.position()),
                 )
             }
             None if self.controller.current_queue_entry_id().is_some() => {
-                format!("{state_icon} Queue entry missing from the library    Vol {volume}%")
+                format!(
+                    "{state_icon} Queue entry missing from the library    Vol {volume}%    {crossfade}"
+                )
             }
-            None => format!("{state_icon} Nothing selected    Vol {volume}%"),
+            None => format!("{state_icon} Nothing selected    Vol {volume}%    {crossfade}"),
         }
     }
 }
@@ -1266,6 +1333,17 @@ fn format_lyrics_timestamp(timestamp_ms: u64) -> String {
     format!("{minutes:02}:{seconds:02}.{millis:03}")
 }
 
+fn normal_help() -> &'static str {
+    "Enter play · Space pause · s stop · n/p skip · a add · x next \
+     · Del rm · Ctrl+↑/↓ reorder · +/- vol · K xfade · [ ] xfade duration \
+     · o scan · r refresh · i/I quick copy-import · e edit track · y lyrics \
+     · V artists · P new artist · Y rename artist · L relink · X reconcile \
+     · / search · F favorites · H stats · R mode · O open · C create · M migrate \
+     · D album · E albums · T transfer/delete (GUI) \
+     · move/replace (GUI) · global search/filters/batch (GUI) \
+     · playlists (GUI) · B index · U fix · q quit"
+}
+
 /// Left text plus right-aligned `right`, space-padded to `width`.
 /// Degenerate widths (a 0-column pty, `right` wider than the line)
 /// degrade to just the truncated left text instead of panicking.
@@ -1322,7 +1400,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, StorageMode, Track, Tui, pad_with_right};
+    use super::{Mode, StorageMode, Track, Tui, normal_help, pad_with_right};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1401,6 +1479,51 @@ mod tests {
             key(tui, KeyCode::Char(c));
         }
         key(tui, KeyCode::Enter);
+    }
+
+    #[test]
+    fn crossfade_keys_show_toggle_adjust_and_persist_shared_settings() {
+        let dir = TempDir::new("crossfade-keys");
+        let settings = dir.path().join("config").join("settings.json");
+        let mut app = tui(&dir);
+        app.controller.load_settings_from_path(&settings);
+        assert!(!app.controller.crossfade_enabled());
+        assert!(app.now_playing_line(120).contains("Xfade off"));
+        assert!(normal_help().contains("K xfade"));
+        assert!(normal_help().contains("[ ] xfade duration"));
+
+        key(&mut app, KeyCode::Char('K'));
+        assert!(app.controller.crossfade_enabled());
+        assert_eq!(app.controller.crossfade_duration_ms(), 3_000);
+        assert_eq!(app.controller.crossfade_ms(), 3_000);
+        assert!(
+            app.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("Crossfade on"))
+        );
+        assert!(app.now_playing_line(120).contains("Xfade 3.0s"));
+
+        key(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.controller.crossfade_duration_ms(), 3_250);
+        assert_eq!(app.controller.crossfade_ms(), 3_250);
+        key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.controller.crossfade_duration_ms(), 3_000);
+
+        let saved = std::fs::read_to_string(&settings).expect("shared settings saved");
+        assert!(saved.contains("\"enabled\": true"));
+        assert!(saved.contains("\"duration_ms\": 3000"));
+        app.controller.shutdown();
+
+        let mut restarted = tui(&dir);
+        restarted.controller.load_settings_from_path(&settings);
+        assert!(restarted.controller.crossfade_enabled());
+        assert_eq!(restarted.controller.crossfade_duration_ms(), 3_000);
+        assert_eq!(restarted.controller.crossfade_ms(), 3_000);
+        key(&mut restarted, KeyCode::Char('K'));
+        assert!(!restarted.controller.crossfade_enabled());
+        assert_eq!(restarted.controller.crossfade_ms(), 0);
+        assert!(restarted.now_playing_line(120).contains("Xfade off"));
+        restarted.controller.shutdown();
     }
 
     #[test]

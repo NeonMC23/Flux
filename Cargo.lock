@@ -935,6 +935,8 @@ dependencies = [
  "flux-library",
  "flux-platform",
  "hound",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
