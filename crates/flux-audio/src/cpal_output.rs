@@ -12,13 +12,14 @@
 //! reused without resizing; data exceeding one scratch window is filled
 //! in frame-aligned chunks.
 //! Underruns degrade to silence — the callback never blocks, locks,
-//! allocates, or performs I/O.
+//! allocates, or performs I/O. Fatal stream errors and nonfatal route
+//! notices are classified for the engine's lifecycle policy.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig};
+use cpal::{ErrorKind, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig};
 
 use crate::engine::EngineError;
-use crate::output::{FillCallback, OutputBackend, OutputConfig};
+use crate::output::{FillCallback, OutputBackend, OutputConfig, OutputIssue};
 
 /// Frames handed to the engine per scratch window. Larger device buffers
 /// are processed as multiple frame-aligned chunks without allocating.
@@ -57,7 +58,7 @@ impl CpalOutput {
         &mut self,
         stream_config: StreamConfig,
         mut fill: Box<dyn FillCallback>,
-        mut on_error: Box<dyn FnMut(String) + Send>,
+        mut on_issue: Box<dyn FnMut(OutputIssue) + Send>,
     ) -> Result<(), EngineError>
     where
         T: SizedSample + cpal::FromSample<f32>,
@@ -71,7 +72,11 @@ impl CpalOutput {
                 move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
                     fill_chunked(data, &mut scratch, fill.as_mut(), channels);
                 },
-                move |err: cpal::Error| on_error(format!("output stream error: {err}")),
+                move |err: cpal::Error| {
+                    if let Some(issue) = classify_output_error(err) {
+                        on_issue(issue);
+                    }
+                },
                 None,
             )
             .map_err(|err| EngineError::Output(format!("could not build output stream: {err}")))?;
@@ -108,6 +113,19 @@ fn fill_chunked<T>(
     }
 }
 
+/// Maps CPAL callbacks to lifecycle-relevant reports. Xruns and refused
+/// real-time promotion are audio-quality conditions, not stream death;
+/// `DeviceChanged` is an automatic route change and remains usable.
+fn classify_output_error(err: cpal::Error) -> Option<OutputIssue> {
+    match err.kind() {
+        ErrorKind::Xrun | ErrorKind::RealtimeDenied => None,
+        ErrorKind::DeviceChanged => Some(OutputIssue::Notice(format!(
+            "The audio route changed; output was rerouted by the audio server ({err})."
+        ))),
+        _ => Some(OutputIssue::Fatal(format!("output stream error: {err}"))),
+    }
+}
+
 impl OutputBackend for CpalOutput {
     fn config(&self) -> OutputConfig {
         OutputConfig {
@@ -119,22 +137,22 @@ impl OutputBackend for CpalOutput {
     fn start(
         &mut self,
         fill: Box<dyn FillCallback>,
-        on_error: Box<dyn FnMut(String) + Send>,
+        on_issue: Box<dyn FnMut(OutputIssue) + Send>,
     ) -> Result<(), EngineError> {
         let stream_config = self.supported.config();
         match self.supported.sample_format() {
-            SampleFormat::F32 => self.build::<f32>(stream_config, fill, on_error),
-            SampleFormat::F64 => self.build::<f64>(stream_config, fill, on_error),
-            SampleFormat::I8 => self.build::<i8>(stream_config, fill, on_error),
-            SampleFormat::I16 => self.build::<i16>(stream_config, fill, on_error),
-            SampleFormat::I24 => self.build::<cpal::I24>(stream_config, fill, on_error),
-            SampleFormat::I32 => self.build::<i32>(stream_config, fill, on_error),
-            SampleFormat::I64 => self.build::<i64>(stream_config, fill, on_error),
-            SampleFormat::U8 => self.build::<u8>(stream_config, fill, on_error),
-            SampleFormat::U16 => self.build::<u16>(stream_config, fill, on_error),
-            SampleFormat::U24 => self.build::<cpal::U24>(stream_config, fill, on_error),
-            SampleFormat::U32 => self.build::<u32>(stream_config, fill, on_error),
-            SampleFormat::U64 => self.build::<u64>(stream_config, fill, on_error),
+            SampleFormat::F32 => self.build::<f32>(stream_config, fill, on_issue),
+            SampleFormat::F64 => self.build::<f64>(stream_config, fill, on_issue),
+            SampleFormat::I8 => self.build::<i8>(stream_config, fill, on_issue),
+            SampleFormat::I16 => self.build::<i16>(stream_config, fill, on_issue),
+            SampleFormat::I24 => self.build::<cpal::I24>(stream_config, fill, on_issue),
+            SampleFormat::I32 => self.build::<i32>(stream_config, fill, on_issue),
+            SampleFormat::I64 => self.build::<i64>(stream_config, fill, on_issue),
+            SampleFormat::U8 => self.build::<u8>(stream_config, fill, on_issue),
+            SampleFormat::U16 => self.build::<u16>(stream_config, fill, on_issue),
+            SampleFormat::U24 => self.build::<cpal::U24>(stream_config, fill, on_issue),
+            SampleFormat::U32 => self.build::<u32>(stream_config, fill, on_issue),
+            SampleFormat::U64 => self.build::<u64>(stream_config, fill, on_issue),
             other => Err(EngineError::Output(format!(
                 "unsupported output device sample format: {other:?}"
             ))),
@@ -205,6 +223,26 @@ mod tests {
                 self.next += 1.0;
             }
         }
+    }
+
+    #[test]
+    fn cpal_error_classification_separates_fatal_and_notice() {
+        use cpal::{Error, ErrorKind};
+
+        assert!(super::classify_output_error(Error::new(ErrorKind::Xrun)).is_none());
+        assert!(super::classify_output_error(Error::new(ErrorKind::RealtimeDenied)).is_none());
+        assert!(matches!(
+            super::classify_output_error(Error::new(ErrorKind::DeviceChanged)),
+            Some(crate::output::OutputIssue::Notice(_))
+        ));
+        assert!(matches!(
+            super::classify_output_error(Error::new(ErrorKind::DeviceNotAvailable)),
+            Some(crate::output::OutputIssue::Fatal(_))
+        ));
+        assert!(matches!(
+            super::classify_output_error(Error::new(ErrorKind::StreamInvalidated)),
+            Some(crate::output::OutputIssue::Fatal(_))
+        ));
     }
 
     #[test]

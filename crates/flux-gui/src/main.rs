@@ -751,6 +751,11 @@ fn audio_summary(status: &AudioStatus) -> (&'static str, String, Color) {
         AudioStatus::DeviceUnavailable(reason) => {
             ("Output device unavailable", reason.clone(), DANGER)
         }
+        AudioStatus::Recovering(reason) => (
+            "Recovering audio output",
+            format!("{reason} Flux is attempting to reopen the current default device."),
+            ACCENT,
+        ),
     }
 }
 
@@ -12360,6 +12365,7 @@ impl FluxReady {
         let current_entry = self.controller.current_queue_entry();
         let state = self.controller.player_state();
         let audio_ready = self.controller.audio_status().is_ready();
+        let can_attempt = self.controller.can_attempt_playback();
         let playable = current.is_some_and(is_track_playable);
         let (title, subtitle) = match (current_entry, current) {
             (_, Some(track)) => (
@@ -12382,10 +12388,10 @@ impl FluxReady {
             .seek_preview
             .unwrap_or_else(|| self.controller.position().as_secs_f32())
             .clamp(0.0, total_secs.max(0.0));
-        let can_seek = audio_ready && playable && total.is_some_and(|d| !d.is_zero());
+        let can_seek = can_attempt && playable && total.is_some_and(|d| !d.is_zero());
 
-        let transport_enabled = audio_ready && current.is_some();
-        let play_enabled = audio_ready && playable;
+        let transport_enabled = can_attempt && current.is_some();
+        let play_enabled = can_attempt && playable;
         let skip_enabled = transport_enabled && self.controller.queue_len() > 0;
         let stop_enabled = transport_enabled && state != PlaybackState::Stopped;
 

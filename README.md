@@ -275,6 +275,20 @@ and macOS need no extra packages. If no device is available (or the
 build lacks the feature), the apps still run for browsing/scanning
 and say exactly why playback is unavailable.
 
+Runtime output failures are handled separately from decoder errors.
+Nonfatal CPAL notifications such as a route change do not stop
+playback. A fatal stream failure preserves the queue, current track
+identity and play/pause intent, releases the failed stream, and
+attempts up to four fresh opens of the current default device in the
+background with bounded backoff. A successful replacement gets a new
+ring, generation, device callback and prebuffer; it reloads the same
+queue entry and restores the last delivered position. Pause or stop
+during recovery prevents unexpected autoplay. If every attempt fails,
+the UI reports the output as unavailable and a later Play starts a
+new bounded attempt. Flux does not persist an explicit device choice,
+does not switch to a user-selected device, and does not claim gapless
+continuity across a device loss.
+
 One build prerequisite joined with MP3 support: the minimp3 decoder
 is C (bundled by the `rmp3` crate) and is compiled at build time, so
 building `flux-audio` needs the platform C toolchain (gcc/clang on

@@ -57,8 +57,8 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use flux_app::{
-    CanonicalMigrationPlan, Controller, ReconcileReport, StorageMode, TrackMetadataEdit,
-    format_duration, is_track_playable,
+    AudioStatus, CanonicalMigrationPlan, Controller, ReconcileReport, StorageMode,
+    TrackMetadataEdit, format_duration, is_track_playable,
 };
 use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
 
@@ -971,14 +971,13 @@ impl Tui {
         // Audio availability gets its own line so the reason remains
         // readable on narrow terminals.
         if let Some(reason) = self.controller.audio_status().reason() {
+            let label = if matches!(self.controller.audio_status(), AudioStatus::Recovering(_)) {
+                "Audio recovering"
+            } else {
+                "Audio unavailable"
+            };
             queue!(out, SetForegroundColor(Color::DarkYellow))?;
-            self.line(
-                out,
-                2,
-                &format!("Audio unavailable — {reason}"),
-                width,
-                false,
-            )?;
+            self.line(out, 2, &format!("{label} — {reason}"), width, false)?;
             queue!(out, SetForegroundColor(Color::Reset))?;
         } else {
             self.line(out, 2, "", width, false)?;

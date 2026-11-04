@@ -232,6 +232,12 @@ pub enum EngineEvent {
         /// The track that ended.
         id: TrackId,
     },
+    /// A nonfatal backend lifecycle notice, such as an automatic audio
+    /// route change. Playback continues on the same stream.
+    OutputNotice {
+        /// User-facing detail supplied by the backend.
+        message: String,
+    },
     /// Something failed. `session` is the load attempt concerned when
     /// applicable; `None` denotes a global output or command error.
     /// After a decode error the engine is stopped with nothing playing;
@@ -322,6 +328,10 @@ struct Shared {
     /// Callback-size growth that paused output until the ring was refilled.
     gate_reprebuffers: AtomicU64,
     gate_reprebuffer_frames: AtomicU64,
+    /// The current output stream reported a fatal failure.
+    output_failed: AtomicBool,
+    /// Nonfatal backend notices, such as automatic route changes.
+    output_notices: AtomicU64,
     /// Diagnostic counters, updated lock-free outside logging paths.
     callbacks: AtomicU64,
     requested_frames: AtomicU64,
@@ -357,6 +367,8 @@ impl Shared {
             device_callback_observed: AtomicBool::new(false),
             gate_reprebuffers: AtomicU64::new(0),
             gate_reprebuffer_frames: AtomicU64::new(0),
+            output_failed: AtomicBool::new(false),
+            output_notices: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             requested_frames: AtomicU64::new(0),
             delivered_frames: AtomicU64::new(0),
@@ -401,6 +413,7 @@ fn gate_ready(
     all_queued: bool,
 ) -> bool {
     generation_live
+        && !shared.output_failed.load(Ordering::Acquire)
         && shared.device_callback_observed.load(Ordering::Acquire)
         && (all_queued || queued_frames >= gate_prebuffer_frames(shared))
 }
@@ -527,7 +540,9 @@ impl FillCallback for SampleSource {
                 return;
             }
         }
-        if !self.shared.gate_open.load(Ordering::Acquire) {
+        if !self.shared.gate_open.load(Ordering::Acquire)
+            || self.shared.output_failed.load(Ordering::Acquire)
+        {
             out.fill(0.0);
             self.tap(out);
             return;
@@ -599,6 +614,10 @@ pub struct AudioDiagnostics {
     pub gate_reprebuffers: u64,
     /// Output frames intentionally paused during those re-prebuffers.
     pub gate_reprebuffer_frames: u64,
+    /// Whether the current output stream reported a fatal failure.
+    pub output_failed: bool,
+    /// Nonfatal backend notices, such as automatic route changes.
+    pub output_notices: u64,
     /// Output frames requested by the backend.
     pub requested_frames: u64,
     /// Output frames actually delivered from the ring.
@@ -946,6 +965,8 @@ impl EngineHandle {
                 .load(Ordering::Acquire),
             gate_reprebuffers: self.shared.gate_reprebuffers.load(Ordering::Acquire),
             gate_reprebuffer_frames: self.shared.gate_reprebuffer_frames.load(Ordering::Acquire),
+            output_failed: self.shared.output_failed.load(Ordering::Acquire),
+            output_notices: self.shared.output_notices.load(Ordering::Acquire),
             requested_frames: self.shared.requested_frames.load(Ordering::Acquire),
             delivered_frames: self.shared.delivered_frames.load(Ordering::Acquire),
             underrun_frames: self.shared.underrun_frames.load(Ordering::Acquire),
@@ -1379,15 +1400,25 @@ fn run_worker<F>(
     };
     let error_events = events.clone();
     let error_shared = Arc::clone(&shared);
-    let on_error = Box::new(move |message: String| {
-        error_shared.output_errors.fetch_add(1, Ordering::Relaxed);
-        let _ = error_events.send(EngineEvent::Error {
-            session: None,
-            id: None,
-            error: EngineError::Output(message),
-        });
+    let on_issue = Box::new(move |issue: crate::output::OutputIssue| match issue {
+        crate::output::OutputIssue::Fatal(message) => {
+            error_shared.output_errors.fetch_add(1, Ordering::Relaxed);
+            error_shared.gate_open.store(false, Ordering::Release);
+            let first = !error_shared.output_failed.swap(true, Ordering::AcqRel);
+            if first {
+                let _ = error_events.send(EngineEvent::Error {
+                    session: None,
+                    id: None,
+                    error: EngineError::Output(message),
+                });
+            }
+        }
+        crate::output::OutputIssue::Notice(message) => {
+            error_shared.output_notices.fetch_add(1, Ordering::Relaxed);
+            let _ = error_events.send(EngineEvent::OutputNotice { message });
+        }
     });
-    if let Err(err) = backend.start(Box::new(source), on_error) {
+    if let Err(err) = backend.start(Box::new(source), on_issue) {
         let _ = init.send(Err(err));
         return;
     }
@@ -2474,6 +2505,12 @@ mod tests {
             .store(4_096, Ordering::Release);
         assert!(!gate_ready(&shared, true, 1_024, false));
         assert!(gate_ready(&shared, true, 4_096, false));
+
+        shared.output_failed.store(true, Ordering::Release);
+        assert!(
+            !gate_ready(&shared, true, 8_192, false),
+            "a failed output stream must not reopen the gate"
+        );
     }
 
     #[test]
@@ -2615,6 +2652,37 @@ mod tests {
         assert_eq!(after.max_device_callback_frames, 8_192);
         wait_for_gate_open(&engine, &control);
         engine.shutdown();
+    }
+
+    #[test]
+    fn failed_output_silences_the_callback_without_an_underrun() {
+        use std::sync::Arc;
+
+        use ringbuf::HeapRb;
+        use ringbuf::traits::{Producer, Split};
+
+        let shared = Arc::new(Shared::new());
+        shared.gate_open.store(true, Ordering::Release);
+        shared.output_failed.store(true, Ordering::Release);
+        let (mut producer, consumer) = HeapRb::<f32>::new(16).split();
+        let (waveform, _waveform_reader) = HeapRb::<f32>::new(8).split();
+        let mut source = SampleSource {
+            consumer,
+            waveform,
+            shared: Arc::clone(&shared),
+            channels: 2,
+            seen_generation: 0,
+            reprebuffer_pending: false,
+        };
+        for _ in 0..8 {
+            producer.try_push(0.5).expect("ring has room");
+        }
+        let mut output = [0.5f32; 8];
+        source.fill(&mut output);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(shared.delivered_frames.load(Ordering::Acquire), 0);
+        assert_eq!(shared.underrun_frames.load(Ordering::Acquire), 0);
+        assert_eq!(shared.requested_frames.load(Ordering::Acquire), 4);
     }
 
     #[test]
@@ -5103,6 +5171,41 @@ mod tests {
     }
 
     #[test]
+    fn backend_start_failure_is_returned_synchronously() {
+        struct NeverStarts {
+            config: OutputConfig,
+        }
+
+        impl OutputBackend for NeverStarts {
+            fn config(&self) -> OutputConfig {
+                self.config
+            }
+
+            fn start(
+                &mut self,
+                _fill: Box<dyn FillCallback>,
+                _on_issue: Box<dyn FnMut(crate::output::OutputIssue) + Send>,
+            ) -> Result<(), EngineError> {
+                Err(EngineError::Output("simulated start failure".to_owned()))
+            }
+
+            fn stop(&mut self) {}
+        }
+
+        let config = OutputConfig {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let result = EngineHandle::spawn(move || {
+            Ok(Box::new(NeverStarts { config }) as Box<dyn OutputBackend>)
+        });
+        assert!(matches!(
+            result,
+            Err(EngineError::Output(message)) if message.contains("simulated start failure")
+        ));
+    }
+
+    #[test]
     fn output_backend_errors_are_reported_and_counted() {
         struct ErrorBackend {
             config: OutputConfig,
@@ -5116,9 +5219,14 @@ mod tests {
             fn start(
                 &mut self,
                 _fill: Box<dyn FillCallback>,
-                mut on_error: Box<dyn FnMut(String) + Send>,
+                mut on_issue: Box<dyn FnMut(crate::output::OutputIssue) + Send>,
             ) -> Result<(), EngineError> {
-                on_error("simulated device disconnect".to_owned());
+                on_issue(crate::output::OutputIssue::Fatal(
+                    "simulated device disconnect".to_owned(),
+                ));
+                on_issue(crate::output::OutputIssue::Fatal(
+                    "simulated device disconnect again".to_owned(),
+                ));
                 Ok(())
             }
 
@@ -5146,9 +5254,63 @@ mod tests {
             } if message.contains("simulated device disconnect")
         ));
         let diagnostics = engine.diagnostics();
-        assert_eq!(diagnostics.output_errors, 1);
+        assert_eq!(diagnostics.output_errors, 2);
+        assert!(diagnostics.output_failed);
+        assert_eq!(diagnostics.output_notices, 0);
         assert_eq!(diagnostics.sample_rate, 48_000);
         assert_eq!(diagnostics.channels, 2);
+        assert!(
+            engine.events().try_recv().is_err(),
+            "duplicate fatal notifications must not flood the application"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn nonfatal_output_notices_do_not_fail_the_stream() {
+        struct NoticeBackend {
+            config: OutputConfig,
+        }
+
+        impl OutputBackend for NoticeBackend {
+            fn config(&self) -> OutputConfig {
+                self.config
+            }
+
+            fn start(
+                &mut self,
+                _fill: Box<dyn FillCallback>,
+                mut on_issue: Box<dyn FnMut(crate::output::OutputIssue) + Send>,
+            ) -> Result<(), EngineError> {
+                on_issue(crate::output::OutputIssue::Notice(
+                    "simulated route change".to_owned(),
+                ));
+                Ok(())
+            }
+
+            fn stop(&mut self) {}
+        }
+
+        let config = OutputConfig {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let engine = EngineHandle::spawn(move || {
+            Ok(Box::new(NoticeBackend { config }) as Box<dyn OutputBackend>)
+        })
+        .expect("backend starts");
+        let event = engine
+            .events()
+            .recv_timeout(Duration::from_secs(1))
+            .expect("notice event");
+        assert!(matches!(
+            event,
+            EngineEvent::OutputNotice { message } if message.contains("simulated route change")
+        ));
+        let diagnostics = engine.diagnostics();
+        assert_eq!(diagnostics.output_errors, 0);
+        assert_eq!(diagnostics.output_notices, 1);
+        assert!(!diagnostics.output_failed);
         engine.shutdown();
     }
 

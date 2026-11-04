@@ -61,14 +61,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::fmt;
 
 use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
 pub use flux_audio::engine::{AudioDiagnostics, WAVEFORM_WINDOW};
-use flux_audio::engine::{EngineEvent, EngineHandle};
+use flux_audio::engine::{EngineError, EngineEvent, EngineHandle};
 mod settings;
 
 pub use settings::{
@@ -138,6 +138,10 @@ pub enum AudioStatus {
     /// An output backend exists in this build, but device
     /// initialization failed. The string is the user-facing reason.
     DeviceUnavailable(String),
+    /// The previous output stream failed and Flux is attempting to open a
+    /// fresh default output stream. Playback intent is retained separately
+    /// from actual output availability.
+    Recovering(String),
 }
 
 impl AudioStatus {
@@ -155,7 +159,92 @@ impl AudioStatus {
             Self::BuildWithoutBackend => {
                 Some("this build has no audio output backend (compiled without the `cpal` feature)")
             }
-            Self::DeviceUnavailable(reason) => Some(reason),
+            Self::DeviceUnavailable(reason) | Self::Recovering(reason) => Some(reason),
+        }
+    }
+}
+
+const AUDIO_RECOVERY_ATTEMPTS: u32 = 4;
+const AUDIO_RECOVERY_BACKOFF_MS: [u64; 3] = [250, 750, 1_500];
+
+/// Opens a fresh default output engine. Kept as a closure so tests can
+/// inject deterministic engines while production only opens CPAL.
+type AudioRecoveryFactory = Arc<dyn Fn() -> Result<EngineHandle, String> + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioRecoveryPhase {
+    /// No recovery is in progress; output is usable.
+    Idle,
+    /// The next bounded attempt is scheduled after a backoff.
+    Waiting,
+    /// A background thread is opening the default output device.
+    Opening,
+    /// All bounded attempts failed; user playback may retry explicitly.
+    Failed,
+}
+
+struct AudioRecovery {
+    factory: AudioRecoveryFactory,
+    phase: AudioRecoveryPhase,
+    attempts: u32,
+    next_attempt: Option<Instant>,
+    result_rx: Option<Receiver<Result<EngineHandle, String>>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    /// Delivered playback position captured from the failed stream.
+    position_ms: u64,
+    /// Queue entry that position belongs to.
+    position_entry: Option<QueueEntryId>,
+    last_reason: Option<String>,
+    started_at: Option<Instant>,
+}
+
+impl AudioRecovery {
+    #[cfg_attr(not(feature = "cpal"), allow(dead_code))]
+    fn new(factory: AudioRecoveryFactory) -> Self {
+        Self {
+            factory,
+            phase: AudioRecoveryPhase::Idle,
+            attempts: 0,
+            next_attempt: None,
+            result_rx: None,
+            join: None,
+            position_ms: 0,
+            position_entry: None,
+            last_reason: None,
+            started_at: None,
+        }
+    }
+
+    fn active(&self) -> bool {
+        matches!(
+            self.phase,
+            AudioRecoveryPhase::Waiting | AudioRecoveryPhase::Opening
+        )
+    }
+
+    fn failed(&self) -> bool {
+        self.phase == AudioRecoveryPhase::Failed
+    }
+
+    fn begin(&mut self, reason: String, position_ms: u64, entry: Option<QueueEntryId>) {
+        self.phase = AudioRecoveryPhase::Waiting;
+        self.attempts = 0;
+        self.next_attempt = Some(Instant::now());
+        self.position_ms = position_ms;
+        self.position_entry = entry;
+        self.last_reason = Some(reason);
+        self.started_at = Some(Instant::now());
+    }
+}
+
+impl Drop for AudioRecovery {
+    fn drop(&mut self) {
+        // Drop the result channel first so an engine arriving after the
+        // controller is gone is dropped (and cleanly shut down) rather
+        // than leaked in the channel.
+        self.result_rx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }
@@ -733,7 +822,8 @@ struct ScanOutcome {
 /// [`AudioStatus::DeviceUnavailable`]. A build without the feature
 /// returns [`AudioStatus::BuildWithoutBackend`]. In both cases the
 /// application can still browse while telling the user exactly why
-/// playback will not work. The null engine is never presented as a
+/// playback will not work. [`Controller::open_default`] additionally
+/// enables bounded runtime recovery for the default device. The null engine is never presented as a
 /// real device — playback commands check the status first.
 #[must_use]
 pub fn default_engine() -> (EngineHandle, AudioStatus) {
@@ -755,6 +845,11 @@ pub fn default_engine() -> (EngineHandle, AudioStatus) {
         let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
         (engine, AudioStatus::BuildWithoutBackend)
     }
+}
+
+#[cfg(feature = "cpal")]
+fn cpal_audio_recovery_factory() -> AudioRecoveryFactory {
+    Arc::new(|| EngineHandle::spawn_cpal_default().map_err(|err| err.to_string()))
 }
 
 /// The default library-index path: `library-index.json` inside the
@@ -1047,6 +1142,9 @@ pub struct Controller {
     player: Player,
     engine: EngineHandle,
     audio: AudioStatus,
+    /// Background default-device recovery policy, enabled by
+    /// `open_default` and disabled for caller-supplied engines.
+    audio_recovery: Option<AudioRecovery>,
     /// Sync ledger: the track this controller last asked the engine to
     /// load. Not a selection — `Player` owns that; this only decides
     /// "resume vs. load" when syncing.
@@ -1410,6 +1508,7 @@ impl Controller {
         let (engine, audio) = default_engine();
         let mut controller = Self::new_canonical(engine, audio, &root)
             .map_err(|err| ControllerOpenError::Canonical(err.to_string()))?;
+        controller.enable_default_audio_recovery();
         if let Some(path) = SettingsStore::default_path() {
             controller.load_settings_from_path(path);
         }
@@ -1444,6 +1543,7 @@ impl Controller {
             player,
             engine,
             audio,
+            audio_recovery: None,
             engine_loaded: None,
             engine_entry: None,
             engine_session: None,
@@ -2307,6 +2407,11 @@ impl Controller {
     /// zero when nothing is loaded).
     #[must_use]
     pub fn position(&self) -> Duration {
+        if let Some(recovery) = self.audio_recovery.as_ref()
+            && (recovery.active() || recovery.failed())
+        {
+            return Duration::from_millis(recovery.position_ms);
+        }
         self.engine.position()
     }
 
@@ -2361,6 +2466,21 @@ impl Controller {
         }
 
         let target = position.min(duration);
+        if self
+            .audio_recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.active() || recovery.failed())
+        {
+            let position_ms = target.as_millis().min(u128::from(u64::MAX)) as u64;
+            let entry = self.current_queue_entry_id();
+            if let Some(recovery) = self.audio_recovery.as_mut() {
+                recovery.position_ms = position_ms;
+                recovery.position_entry = entry;
+            }
+            self.restored_position_ms = 0;
+            self.persist_queue();
+            return Ok(target);
+        }
         let current_entry = self.current_queue_entry_id();
         let had_loaded_track = self.engine_loaded == Some(id) && self.engine_entry == current_entry;
         if !had_loaded_track && let Err(err) = self.load_into_engine(id, false) {
@@ -2549,6 +2669,286 @@ impl Controller {
     #[must_use]
     pub fn audio_status(&self) -> &AudioStatus {
         &self.audio
+    }
+
+    /// Whether a playback command can be attempted now. This is true for
+    /// a ready device and also while bounded recovery is enabled, so the
+    /// UI can request a retry after the device returns. It does not claim
+    /// that audio is currently audible.
+    #[must_use]
+    pub fn can_attempt_playback(&self) -> bool {
+        self.audio.is_ready() || self.audio_recovery.is_some()
+    }
+
+    /// Enables bounded recovery on the current default output device.
+    /// Caller-supplied engines deliberately keep their existing fatal
+    /// behavior; only Flux's normal default-device setup opts in.
+    fn enable_default_audio_recovery(&mut self) {
+        #[cfg(feature = "cpal")]
+        {
+            self.audio_recovery = Some(AudioRecovery::new(cpal_audio_recovery_factory()));
+            if !self.audio.is_ready() {
+                let reason = self
+                    .audio
+                    .reason()
+                    .unwrap_or("audio output is unavailable")
+                    .to_owned();
+                self.begin_audio_recovery(reason);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn enable_test_audio_recovery(&mut self, factory: AudioRecoveryFactory) {
+        self.audio_recovery = Some(AudioRecovery::new(factory));
+    }
+
+    fn audio_recovery_active(&self) -> bool {
+        self.audio_recovery
+            .as_ref()
+            .is_some_and(AudioRecovery::active)
+    }
+
+    fn audio_recovery_failed(&self) -> bool {
+        self.audio_recovery
+            .as_ref()
+            .is_some_and(AudioRecovery::failed)
+    }
+
+    fn begin_audio_recovery(&mut self, reason: String) {
+        let Some(recovery) = self.audio_recovery.as_ref() else {
+            return;
+        };
+        if recovery.active() {
+            return;
+        }
+        let (position_ms, entry) = if recovery.phase == AudioRecoveryPhase::Idle {
+            let engine_position =
+                self.engine.position().as_millis().min(u128::from(u64::MAX)) as u64;
+            let position_ms = if self.engine_loaded.is_some() {
+                engine_position
+            } else {
+                engine_position.max(self.restored_position_ms)
+            };
+            (position_ms, self.current_queue_entry_id())
+        } else {
+            (recovery.position_ms, recovery.position_entry)
+        };
+        if let Some(recovery) = self.audio_recovery.as_mut() {
+            recovery.begin(reason.clone(), position_ms, entry);
+        }
+        self.audio = AudioStatus::Recovering(reason.clone());
+        self.engine_loaded = None;
+        self.engine_entry = None;
+        self.engine_session = None;
+        self.stream_info = None;
+        self.preloaded_entry = None;
+        // Release the invalid stream immediately. The placeholder keeps the
+        // Controller's engine handle non-optional without ever being used for
+        // audible playback while recovery is active.
+        let (placeholder, _control) = EngineHandle::spawn_null(48_000, 2);
+        let failed = std::mem::replace(&mut self.engine, placeholder);
+        drop(failed);
+        self.report_status(format!(
+            "Audio output was interrupted ({reason}). Attempting to open the current default device."
+        ));
+        self.outbox.push(ControllerEvent::PlaybackChanged);
+        self.start_audio_recovery_attempt(Instant::now());
+    }
+
+    fn retry_audio_recovery_if_failed(&mut self) -> bool {
+        if !self.audio_recovery_failed() {
+            return false;
+        }
+        let reason = self
+            .audio_recovery
+            .as_ref()
+            .and_then(|recovery| recovery.last_reason.clone())
+            .unwrap_or_else(|| "audio output is unavailable".to_owned());
+        self.begin_audio_recovery(format!("Retrying audio output: {reason}"));
+        true
+    }
+
+    fn start_audio_recovery_attempt(&mut self, now: Instant) {
+        let Some(recovery) = self.audio_recovery.as_mut() else {
+            return;
+        };
+        if recovery.result_rx.is_some() {
+            return;
+        }
+        let factory = Arc::clone(&recovery.factory);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<EngineHandle, String>>();
+        let spawned = std::thread::Builder::new()
+            .name("flux-audio-recovery".to_owned())
+            .spawn(move || {
+                let _ = tx.send(factory());
+            });
+        match spawned {
+            Ok(join) => {
+                recovery.join = Some(join);
+                recovery.result_rx = Some(rx);
+                recovery.phase = AudioRecoveryPhase::Opening;
+                recovery.next_attempt = None;
+            }
+            Err(err) => {
+                recovery.last_reason = Some(format!("could not start recovery thread: {err}"));
+                self.audio_recovery_attempt_failed(
+                    now,
+                    format!("could not start recovery thread: {err}"),
+                );
+            }
+        }
+    }
+
+    fn poll_audio_recovery_at(&mut self, now: Instant) {
+        enum Action {
+            Start,
+            Success(EngineHandle),
+            Failure(String),
+        }
+        let mut action = None;
+        if let Some(recovery) = self.audio_recovery.as_mut() {
+            match recovery.phase {
+                AudioRecoveryPhase::Waiting
+                    if recovery.next_attempt.is_some_and(|at| now >= at) =>
+                {
+                    action = Some(Action::Start);
+                }
+                AudioRecoveryPhase::Opening => {
+                    let received = match recovery.result_rx.as_ref() {
+                        Some(rx) => match rx.try_recv() {
+                            Ok(result) => Some(result),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                Some(Err("audio recovery worker disconnected".to_owned()))
+                            }
+                        },
+                        None => Some(Err("audio recovery channel was missing".to_owned())),
+                    };
+                    if let Some(result) = received {
+                        recovery.result_rx = None;
+                        if let Some(join) = recovery.join.take() {
+                            let _ = join.join();
+                        }
+                        action = Some(match result {
+                            Ok(engine) => Action::Success(engine),
+                            Err(message) => Action::Failure(message),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        match action {
+            Some(Action::Start) => self.start_audio_recovery_attempt(now),
+            Some(Action::Success(engine)) => self.finish_audio_recovery_success(engine),
+            Some(Action::Failure(message)) => self.audio_recovery_attempt_failed(now, message),
+            None => {}
+        }
+    }
+
+    fn audio_recovery_attempt_failed(&mut self, now: Instant, message: String) {
+        let Some(recovery) = self.audio_recovery.as_mut() else {
+            return;
+        };
+        recovery.attempts = recovery.attempts.saturating_add(1);
+        recovery.last_reason = Some(message.clone());
+        if recovery.attempts < AUDIO_RECOVERY_ATTEMPTS {
+            let index = (recovery.attempts.saturating_sub(1) as usize)
+                .min(AUDIO_RECOVERY_BACKOFF_MS.len() - 1);
+            recovery.phase = AudioRecoveryPhase::Waiting;
+            recovery.next_attempt =
+                Some(now + Duration::from_millis(AUDIO_RECOVERY_BACKOFF_MS[index]));
+            return;
+        }
+        let attempts = recovery.attempts;
+        recovery.phase = AudioRecoveryPhase::Failed;
+        recovery.next_attempt = None;
+        recovery.result_rx = None;
+        if let Some(join) = recovery.join.take() {
+            let _ = join.join();
+        }
+        let reason =
+            format!("audio output unavailable after {attempts} recovery attempts: {message}");
+        self.audio = AudioStatus::DeviceUnavailable(reason.clone());
+        self.player.stop();
+        self.engine_loaded = None;
+        self.engine_entry = None;
+        self.engine_session = None;
+        self.stream_info = None;
+        self.preloaded_entry = None;
+        self.persist_queue();
+        self.report_error(reason);
+        self.outbox.push(ControllerEvent::PlaybackChanged);
+    }
+
+    fn finish_audio_recovery_success(&mut self, engine: EngineHandle) {
+        let Some(recovery) = self.audio_recovery.as_ref() else {
+            engine.shutdown();
+            return;
+        };
+        let position_ms = recovery.position_ms;
+        let position_entry = recovery.position_entry;
+        let elapsed = recovery
+            .started_at
+            .map_or(Duration::ZERO, |started| started.elapsed());
+        if let Some(recovery) = self.audio_recovery.as_mut() {
+            recovery.phase = AudioRecoveryPhase::Idle;
+            recovery.attempts = 0;
+            recovery.next_attempt = None;
+            recovery.result_rx = None;
+            recovery.last_reason = None;
+            recovery.started_at = None;
+        }
+        let placeholder = std::mem::replace(&mut self.engine, engine);
+        drop(placeholder);
+        self.engine.set_volume(self.volume);
+        self.engine.set_crossfade_ms(if self.crossfade_enabled {
+            self.crossfade_duration_ms
+        } else {
+            0
+        });
+        self.audio = AudioStatus::Ready;
+        self.engine_loaded = None;
+        self.engine_entry = None;
+        self.engine_session = None;
+        self.stream_info = None;
+        self.preloaded_entry = None;
+        self.restored_position_ms = 0;
+
+        if self.player_state() != PlaybackState::Stopped
+            && let Some(id) = self.current_id()
+        {
+            let current_entry = self.current_queue_entry_id();
+            let resume_ms = if current_entry == position_entry {
+                position_ms
+            } else {
+                0
+            };
+            if let Err(message) = self.load_into_engine(id, false) {
+                self.fail_playback(message);
+            } else {
+                if resume_ms > 0 {
+                    let session = self.engine.seek(Duration::from_millis(resume_ms));
+                    self.engine_session = Some(session);
+                }
+                if self.player_state() == PlaybackState::Playing {
+                    self.engine.play();
+                }
+                self.preload_next_queue_entry();
+            }
+        }
+        let outcome = match self.player_state() {
+            PlaybackState::Playing => "playback resumed at the last delivered position",
+            PlaybackState::Paused => "playback remains paused at the last delivered position",
+            PlaybackState::Stopped => "playback remains stopped",
+        };
+        self.report_status(format!(
+            "Audio output recovered after {:.0} ms; {outcome}.",
+            elapsed.as_secs_f64() * 1_000.0
+        ));
+        self.outbox.push(ControllerEvent::PlaybackChanged);
+        self.persist_queue();
     }
 
     /// The persistence backend this controller uses (fixed at
@@ -4400,6 +4800,8 @@ impl Controller {
         } else if before_entry != self.current_queue_entry_id() {
             self.after_queue_change();
         }
+        self.restart_recovery_position();
+        self.retry_audio_recovery_if_failed();
         self.sync_engine(true);
     }
 
@@ -4417,6 +4819,8 @@ impl Controller {
         if before != self.current_queue_entry_id() {
             self.after_queue_change();
         }
+        self.restart_recovery_position();
+        self.retry_audio_recovery_if_failed();
         self.sync_engine(true);
         Ok(())
     }
@@ -4536,6 +4940,16 @@ impl Controller {
     pub fn play(&mut self) {
         match self.player.play() {
             Ok(()) => {
+                let retried = self.retry_audio_recovery_if_failed();
+                if self.audio_recovery_active() {
+                    if !retried {
+                        self.report_status(
+                            "Audio output is recovering; playback will resume when the device is ready."
+                                .to_owned(),
+                        );
+                    }
+                    return;
+                }
                 if self.restored_position_ms > 0
                     && let Some(id) = self.player.current_track()
                 {
@@ -4960,6 +5374,9 @@ impl Controller {
     /// included), then stops the audio engine and joins its worker.
     pub fn shutdown(mut self) {
         self.persist_queue();
+        if let Some(recovery) = self.audio_recovery.take() {
+            drop(recovery);
+        }
         if let Some(rx) = self.scan_rx.take()
             && let Ok(outcome) = rx.recv()
         {
@@ -5028,7 +5445,7 @@ impl Controller {
             self.play_session = None;
             return;
         };
-        let position_ms = self.engine.position().as_millis().min(u128::from(u64::MAX)) as u64;
+        let position_ms = self.position().as_millis().min(u128::from(u64::MAX)) as u64;
         let same_entry = self
             .play_session
             .as_ref()
@@ -5158,6 +5575,7 @@ impl Controller {
         }
 
         self.update_playback_history();
+        self.poll_audio_recovery_at(Instant::now());
         events.append(&mut self.outbox);
         events
     }
@@ -5272,12 +5690,27 @@ impl Controller {
                     events.push(ControllerEvent::PlaybackChanged);
                 }
             }
+            EngineEvent::OutputNotice { message } => {
+                self.report_status(message);
+            }
             EngineEvent::Error { session, id, error } => {
                 // A session-qualified error is current only when it
                 // belongs to the load attempt the controller is still
-                // tracking. None is a global output failure and always
-                // matters.
+                // tracking.
                 if session.is_some() && session != self.engine_session {
+                    return;
+                }
+                let output_failure =
+                    session.is_none() && id.is_none() && matches!(&error, EngineError::Output(_));
+                if output_failure && self.audio_recovery.is_some() {
+                    if self.audio_recovery_active() {
+                        // Repeated/late notifications for the stream already
+                        // being replaced must not restart the attempt count.
+                        return;
+                    }
+                    let reason = error.to_string();
+                    self.begin_audio_recovery(reason);
+                    events.push(ControllerEvent::PlaybackChanged);
                     return;
                 }
                 let message = match id.and_then(|i| self.track(i)) {
@@ -5293,6 +5726,9 @@ impl Controller {
                 self.engine_session = None;
                 self.stream_info = None;
                 self.preloaded_entry = None;
+                if output_failure {
+                    self.audio = AudioStatus::DeviceUnavailable(error.to_string());
+                }
                 self.report_error(message);
                 events.push(ControllerEvent::PlaybackChanged);
             }
@@ -5312,6 +5748,7 @@ impl Controller {
     /// or a protected/recovered catalogue leaves the original file
     /// untouched.
     fn after_queue_change(&mut self) {
+        self.sync_recovery_selection();
         self.sync_shuffle_order();
         self.persist_queue();
         self.preload_next_queue_entry();
@@ -5325,7 +5762,7 @@ impl Controller {
         let Some(store) = &self.queue_store else {
             return;
         };
-        let position_ms = self.engine.position().as_millis().min(u128::from(u64::MAX)) as u64;
+        let position_ms = self.position().as_millis().min(u128::from(u64::MAX)) as u64;
         let playback = flux_library::PersistedPlaybackState {
             repeat_mode: self.player.repeat_mode(),
             shuffle: self.shuffle,
@@ -5376,7 +5813,32 @@ impl Controller {
     /// `force_reload` distinguishes "the user asked for (possibly the
     /// same) track explicitly — start it from the top" from "resume
     /// whatever is loaded".
+    fn sync_recovery_selection(&mut self) {
+        let entry = self.current_queue_entry_id();
+        if let Some(recovery) = self.audio_recovery.as_mut()
+            && (recovery.active() || recovery.failed())
+            && recovery.position_entry != entry
+        {
+            recovery.position_ms = 0;
+            recovery.position_entry = entry;
+        }
+    }
+
+    fn restart_recovery_position(&mut self) {
+        let entry = self.current_queue_entry_id();
+        if let Some(recovery) = self.audio_recovery.as_mut()
+            && (recovery.active() || recovery.failed())
+        {
+            recovery.position_ms = 0;
+            recovery.position_entry = entry;
+        }
+    }
+
     fn sync_engine(&mut self, force_reload: bool) {
+        if self.audio_recovery_active() {
+            self.preloaded_entry = None;
+            return;
+        }
         match self.player.state() {
             PlaybackState::Playing => {
                 let Some(id) = self.player.current_track() else {
@@ -5423,6 +5885,10 @@ impl Controller {
     }
 
     fn preload_next_queue_entry(&mut self) {
+        if self.audio_recovery_active() {
+            self.preloaded_entry = None;
+            return;
+        }
         if self.player_state() == PlaybackState::Stopped {
             if self.preloaded_entry.take().is_some() {
                 self.engine.cancel_preload();
@@ -5475,6 +5941,11 @@ impl Controller {
     /// format) are returned for the caller to surface; decode/IO
     /// failures arrive asynchronously as engine error events.
     fn load_into_engine(&mut self, id: TrackId, autoplay: bool) -> Result<(), String> {
+        if self.audio_recovery_active() {
+            return Err(
+                "Audio output is recovering; try again when the device is ready.".to_owned(),
+            );
+        }
         if let Some(reason) = self.audio.reason() {
             return Err(reason.to_owned());
         }
@@ -6440,7 +6911,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use flux_audio::engine::{EngineError, EngineEvent, EngineHandle};
     use flux_audio::output::NullControl;
@@ -6448,9 +6920,9 @@ mod tests {
     use flux_library::QueueStore;
 
     use super::{
-        AudioDiagnostics, AudioStatus, Controller, ControllerEvent, CreateLibraryError,
-        PlaybackMode, PortableOpenError, ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit,
-        create_canonical_library, create_portable_library, default_engine,
+        AudioDiagnostics, AudioRecoveryFactory, AudioStatus, Controller, ControllerEvent,
+        CreateLibraryError, PlaybackMode, PortableOpenError, ScanOutcome, StorageMode, SwitchError,
+        TrackMetadataEdit, create_canonical_library, create_portable_library,
         execute_legacy_migration, is_track_playable, migrate_legacy_library, plan_legacy_migration,
     };
 
@@ -6525,6 +6997,69 @@ mod tests {
                 .expect("controller opens the test library"),
             control,
         )
+    }
+
+    fn blocking_recovery_factory(
+        sample_rate: u32,
+        channels: u16,
+    ) -> (
+        AudioRecoveryFactory,
+        std::sync::mpsc::Sender<()>,
+        Arc<Mutex<Vec<NullControl>>>,
+    ) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release = Arc::new(Mutex::new(release_rx));
+        let controls = Arc::new(Mutex::new(Vec::<NullControl>::new()));
+        let factory_controls = Arc::clone(&controls);
+        let factory: AudioRecoveryFactory = Arc::new(move || {
+            release
+                .lock()
+                .expect("recovery release mutex")
+                .recv()
+                .map_err(|_| "test recovery was cancelled".to_owned())?;
+            let (engine, control) = EngineHandle::spawn_null(sample_rate, channels);
+            factory_controls
+                .lock()
+                .expect("recovery controls mutex")
+                .push(control);
+            Ok(engine)
+        });
+        (factory, release_tx, controls)
+    }
+
+    fn inject_fatal_output(controller: &mut Controller, message: &str) {
+        let mut events = Vec::new();
+        controller.handle_engine_event(
+            EngineEvent::Error {
+                session: None,
+                id: None,
+                error: EngineError::Output(message.to_owned()),
+            },
+            &mut events,
+        );
+    }
+
+    fn wait_for_audio_ready(controller: &mut Controller) {
+        for _ in 0..2_000 {
+            let _ = controller.poll();
+            if controller.audio_status().is_ready() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "audio recovery did not finish: {:?}",
+            controller.audio_status()
+        );
+    }
+
+    fn last_recovery_control(controls: &Arc<Mutex<Vec<NullControl>>>) -> NullControl {
+        controls
+            .lock()
+            .expect("recovery controls mutex")
+            .last()
+            .cloned()
+            .expect("recovery produced a control")
     }
 
     fn legacy_queue_file(dir: &TempDir) -> PathBuf {
@@ -7284,12 +7819,451 @@ mod tests {
         );
         assert_eq!(controller.player_state(), PlaybackState::Stopped);
         assert_eq!(controller.engine_session, None);
+        assert!(matches!(
+            controller.audio_status(),
+            AudioStatus::DeviceUnavailable(reason) if reason.contains("device disappeared")
+        ));
+        assert!(!controller.can_attempt_playback());
         assert!(
             controller
                 .last_error()
                 .is_some_and(|message| message.contains("device disappeared")),
             "{:?}",
             controller.last_error()
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn runtime_output_failure_recovers_and_preserves_intent_queue_and_position() {
+        let dir = TempDir::new("audio-recovery-success");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().played_frames > 0
+        });
+        control.drain_frames(2_048);
+        let _ = controller.poll();
+        let entry = controller.current_queue_entry_id().expect("current entry");
+        let position = controller.position();
+        assert!(position > Duration::ZERO);
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated device loss");
+        assert!(matches!(
+            controller.audio_status(),
+            AudioStatus::Recovering(reason) if reason.contains("simulated device loss")
+        ));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_queue_entry_id(), Some(entry));
+        assert!(controller.can_attempt_playback());
+        assert!(!control.is_running(), "the failed stream must be released");
+        // Repeated/late notifications for the already-replaced stream must
+        // not restart the attempt or create another recovery worker.
+        inject_fatal_output(&mut controller, "simulated duplicate device loss");
+        assert!(matches!(
+            controller.audio_status(),
+            AudioStatus::Recovering(_)
+        ));
+        // Queue edits during recovery must not disturb the selected identity.
+        let extra_entry = controller
+            .enqueue_track(a)
+            .expect("queue edit during recovery");
+        assert_eq!(controller.current_queue_entry_id(), Some(entry));
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_queue_entry_id(), Some(entry));
+        assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(controller.engine_loaded, Some(a));
+        assert!(
+            (controller.position().as_millis() as i64 - position.as_millis() as i64).abs() <= 2,
+            "captured position {} was not restored: {}",
+            position.as_millis(),
+            controller.position().as_millis()
+        );
+
+        let recovered = last_recovery_control(&controls);
+        drive(&mut controller, &recovered, |_, _| {
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        });
+        assert!(
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001),
+            "the replacement stream did not become audible"
+        );
+        assert!(
+            controller
+                .last_status()
+                .is_some_and(|status| status.contains("Audio output recovered")),
+            "{:?}",
+            controller.last_status()
+        );
+        assert!(
+            controller
+                .queue_entries()
+                .iter()
+                .any(|queued| queued.id() == extra_entry)
+        );
+        let diagnostics = controller.audio_diagnostics();
+        assert_eq!(diagnostics.underrun_frames, 0);
+        assert!(
+            diagnostics.device_callback_frames > 0,
+            "the replacement stream did not observe its own callback demand"
+        );
+
+        // A second loss/recovery cycle must start cleanly and keep the same
+        // current identity and playback intent.
+        inject_fatal_output(&mut controller, "simulated second device loss");
+        release.send(()).expect("release second recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.current_queue_entry_id(), Some(entry));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        let recovered_again = last_recovery_control(&controls);
+        assert!(
+            controls.lock().expect("recovery controls mutex").len() >= 2,
+            "repeated loss must create a fresh engine"
+        );
+        drive(&mut controller, &recovered_again, |_, _| {
+            recovered_again
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        });
+        assert!(
+            recovered_again
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn pause_during_recovery_prevents_automatic_playback() {
+        let dir = TempDir::new("audio-recovery-pause");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().played_frames > 0
+        });
+        let position = controller.position();
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated pause-time loss");
+        controller.pause();
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert!(
+            (controller.position().as_millis() as i64 - position.as_millis() as i64).abs() <= 2,
+            "paused position was not restored"
+        );
+        let recovered = last_recovery_control(&controls);
+        for _ in 0..100 {
+            recovered.drain_frames(512);
+            let _ = controller.poll();
+        }
+        assert!(
+            recovered.captured().iter().all(|sample| *sample == 0.0),
+            "recovery ignored the user's pause"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn startup_recovery_preserves_a_restored_paused_position() {
+        let dir = TempDir::new("audio-recovery-restored-position");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        controller.player.restore_paused();
+        controller.restored_position_ms = 100;
+        let entry = controller.current_queue_entry_id();
+
+        let (factory, release, _controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated startup-time loss");
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        assert_eq!(controller.restored_position_ms, 0);
+        assert!(
+            (controller.position().as_millis() as i64 - 100).abs() <= 2,
+            "restored position was not applied: {}",
+            controller.position().as_millis()
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn output_failure_while_paused_recovers_without_autoplay() {
+        let dir = TempDir::new("audio-recovery-paused-loss");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().played_frames > 0
+        });
+        controller.pause();
+        let position = controller.position();
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated paused-device loss");
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert!(
+            (controller.position().as_millis() as i64 - position.as_millis() as i64).abs() <= 2,
+            "paused position was not restored"
+        );
+        let recovered = last_recovery_control(&controls);
+        for _ in 0..100 {
+            recovered.drain_frames(512);
+            let _ = controller.poll();
+        }
+        assert!(recovered.captured().iter().all(|sample| *sample == 0.0));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn stop_during_recovery_prevents_automatic_playback() {
+        let dir = TempDir::new("audio-recovery-stop");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().played_frames > 0
+        });
+        let entry = controller.current_queue_entry_id();
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated stop-time loss");
+        controller.stop();
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        assert_eq!(controller.engine_loaded, None);
+        let recovered = last_recovery_control(&controls);
+        for _ in 0..50 {
+            recovered.drain_frames(512);
+            let _ = controller.poll();
+        }
+        assert!(
+            recovered.captured().iter().all(|sample| *sample == 0.0),
+            "recovery restarted playback after an explicit stop"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn track_selection_and_config_change_during_recovery_are_honored() {
+        let dir = TempDir::new("audio-recovery-reselect");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().played_frames > 0
+        });
+
+        let (factory, release, controls) = blocking_recovery_factory(48_000, 2);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated reselect loss");
+        controller.play_track(b);
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.engine.output_config().sample_rate, 48_000);
+        assert_eq!(controller.engine.output_config().channels, 2);
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.engine_loaded, Some(b));
+        assert!(controller.position() < Duration::from_millis(5));
+
+        let recovered = last_recovery_control(&controls);
+        drive(&mut controller, &recovered, |_, _| {
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        });
+        assert!(
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn recovery_attempts_are_bounded_and_fail_honestly() {
+        let dir = TempDir::new("audio-recovery-failure");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let entry = controller.current_queue_entry_id();
+        let calls = Arc::new(AtomicU32::new(0));
+        let controls = Arc::new(Mutex::new(Vec::<NullControl>::new()));
+        let factory_calls = Arc::clone(&calls);
+        let factory_controls = Arc::clone(&controls);
+        let factory: AudioRecoveryFactory = Arc::new(move || {
+            let attempt = factory_calls.fetch_add(1, Ordering::SeqCst);
+            if attempt < 4 {
+                Err("simulated no device".to_owned())
+            } else {
+                let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+                factory_controls
+                    .lock()
+                    .expect("recovery controls mutex")
+                    .push(control);
+                Ok(engine)
+            }
+        });
+        controller.enable_test_audio_recovery(factory);
+
+        inject_fatal_output(&mut controller, "simulated permanent loss");
+        for _ in 0..4 {
+            for _ in 0..2_000 {
+                controller.poll_audio_recovery_at(Instant::now());
+                if controller
+                    .audio_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.phase != super::AudioRecoveryPhase::Opening)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let phase = controller.audio_recovery.as_ref().map(|r| r.phase);
+            if phase == Some(super::AudioRecoveryPhase::Waiting) {
+                let next = controller
+                    .audio_recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.next_attempt)
+                    .expect("next retry deadline");
+                controller.poll_audio_recovery_at(next);
+            }
+        }
+        assert_eq!(
+            controller.audio_recovery.as_ref().map(|r| r.phase),
+            Some(super::AudioRecoveryPhase::Failed)
+        );
+        assert!(matches!(
+            controller.audio_status(),
+            AudioStatus::DeviceUnavailable(reason)
+                if reason.contains("after 4 recovery attempts")
+        ));
+        assert!(controller.can_attempt_playback());
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|error| error.contains("after 4 recovery attempts"))
+        );
+
+        // A user Play after final failure starts a fresh bounded cycle. The
+        // simulated device becomes available on that cycle.
+        controller.play();
+        assert!(matches!(
+            controller.audio_status(),
+            AudioStatus::Recovering(_)
+        ));
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        let recovered = last_recovery_control(&controls);
+        drive(&mut controller, &recovered, |_, _| {
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        });
+        assert!(
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn shutdown_during_pending_recovery_joins_cleanly() {
+        let dir = TempDir::new("audio-recovery-shutdown");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fixtures(&dir).root.clone());
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated shutdown-time loss");
+        assert_eq!(
+            controller.audio_recovery.as_ref().map(|r| r.phase),
+            Some(super::AudioRecoveryPhase::Opening)
+        );
+
+        // The worker is still blocked in device opening. Releasing it just
+        // before shutdown still exercises the join/cancellation path.
+        release.send(()).expect("release recovery");
+        controller.shutdown();
+        let controls = controls.lock().expect("recovery controls mutex");
+        assert!(
+            controls.last().is_some_and(|control| !control.is_running()),
+            "an engine completed after shutdown must be dropped, not leaked"
+        );
+    }
+
+    #[test]
+    fn nonfatal_route_notice_does_not_stop_playback() {
+        let dir = TempDir::new("audio-route-notice");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        controller.player.play().expect("queue has a current entry");
+        let mut events = Vec::new();
+        controller.handle_engine_event(
+            EngineEvent::OutputNotice {
+                message: "The audio route changed.".to_owned(),
+            },
+            &mut events,
+        );
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert!(
+            controller
+                .last_status()
+                .is_some_and(|status| status.contains("audio route changed"))
         );
         controller.shutdown();
     }
@@ -7464,12 +8438,16 @@ mod tests {
         let device = AudioStatus::DeviceUnavailable("no output device".to_owned());
         assert!(!device.is_ready());
         assert_eq!(device.reason(), Some("no output device"));
+
+        let recovering = AudioStatus::Recovering("opening default device".to_owned());
+        assert!(!recovering.is_ready());
+        assert_eq!(recovering.reason(), Some("opening default device"));
     }
 
     #[cfg(not(feature = "cpal"))]
     #[test]
     fn default_engine_does_not_claim_ready_without_a_backend() {
-        let (engine, status) = default_engine();
+        let (engine, status) = super::default_engine();
         assert_eq!(status, AudioStatus::BuildWithoutBackend);
         assert!(!status.is_ready());
         engine.shutdown();

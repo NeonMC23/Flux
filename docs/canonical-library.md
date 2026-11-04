@@ -486,9 +486,9 @@ from what remains structurally or physically unverified.
 | Queue authorization, duplicate `QueueEntryId`, transition identity | Confirmed by Controller/engine tests |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
-| CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; runtime error path simulated; no hotplug validation |
+| CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
 | Device callback-size compatibility | Adaptive gate verified with simulated and real callbacks from 256 to 16,384 frames on one Linux host; sizes above that, hardware callback-size changes and callbacks larger than the output ring are unverified |
-| Device hotplug and automatic recovery | Not implemented / not tested |
+| Device loss and bounded recovery | Default-output recovery implemented and tested with injected stream failures, blocked opens, repeated loss, pause/stop/reselection, configuration change and bounded exhaustion; no physical unplug or audio-server restart tested; no explicit device selection |
 | Hardware underrun, latency and long-duration CPU/memory | Real callback-size runs, a ~60 s probe and post-fix 5/30-minute runs reported zero underruns; latency and multi-hour CPU/memory not measured |
 | Non-finite decoded samples | Confirmed defect fixed at conversion boundary |
 
@@ -525,7 +525,8 @@ Confirmed fixes from this audit:
 callback fill count, last/max full device-callback frames, gate re-prebuffer
 events and frames, requested/delivered/underrun frames, current ring occupancy
 and capacity, generation, pushed/played frames, gapless/crossfade counts,
-preload failures, decoder errors, output errors and output rate/channels. The
+preload failures, decoder errors, output errors, output failure/notice state
+and output rate/channels. The
 callback increments bounded atomics only; there is no logging, allocation,
 locking, telemetry or network access in the callback. `callbacks` counts
 `FillCallback` invocations, so a very large CPAL device buffer filled in
@@ -802,6 +803,94 @@ on hardware, and devices whose callback exceeds the output ring were not
 exercised. These are single-host backend observations, not perceptual or
 cross-platform guarantees.
 
+#### Audio device lifecycle and bounded recovery (2026-11-04)
+
+A lifecycle audit found that a runtime CPAL failure previously produced only a
+string error event: the worker retained the dead stream, the Controller stopped
+playback and cleared its engine ledger, but `AudioStatus` still said `Ready`.
+Later Play commands could therefore appear to be accepted by an unusable
+stream. CPAL 0.18.2 also distinguishes conditions that must not be treated as
+stream death.
+
+Implemented semantics:
+
+- Backend reports are classified. `Xrun` and `RealtimeDenied` are audio-quality
+  conditions and are not fatal; `DeviceChanged` is a nonfatal, automatically
+  rerouted route change and is surfaced as `EngineEvent::OutputNotice`. Other
+  errors (including `DeviceNotAvailable`, `StreamInvalidated`,
+  `HostUnavailable`, configuration errors and unclassified backend failures)
+  are fatal.
+- On the first fatal report the callback side closes the output gate and sets
+  an atomic failure flag, so it cannot reopen on the dead stream. Repeated
+  fatal reports increment `output_errors` but do not flood the event channel or
+  restart recovery.
+- Flux's normal default-device entry point (`Controller::open_default`) enables
+  bounded recovery. Caller-supplied engines keep the prior explicit-failure
+  behavior. No device-selection preference exists; recovery always opens the
+  current default output device.
+- A fatal output failure preserves the `Player` queue, current `TrackId` and
+  stable `QueueEntryId`, and playback intent (`Playing`/`Paused`/`Stopped`)
+  while `AudioStatus::Recovering` separately reports that no valid output is
+  currently audible. The old engine is stopped and dropped, releasing its
+  stream, ring, callbacks and worker. A background thread opens a fresh engine
+  so a slow device open cannot block the UI event loop.
+- Attempts are bounded to four, with 250 ms, 750 ms and 1,500 ms backoff between
+  failures. Each attempt creates a fresh output configuration, ring, decoder
+  pipeline and generation; no callback or buffered sample from the failed
+  stream is reused. The replacement stream observes its own callback demand and
+  waits for its own prebuffer before the gate can open.
+- On success the latest engine is installed with the current volume/crossfade
+  settings, the queue selection is reloaded, and the captured delivered-frame
+  position is reapplied through Seek before Play when playback intent is
+  `Playing`. Paused intent loads the track paused at the captured position;
+  Stopped intent loads nothing. The recovery gap is not bridged: playback does
+  not claim gapless continuity across a device loss.
+- A pause or stop issued during recovery changes the preserved intent, so a
+  later successful recovery does not start unexpected audio. Track selection
+  during recovery resets the restore point to zero; queue edits preserve the
+  selected stable entry; seeking during recovery updates the restore point.
+- If all attempts fail, the Controller reports `AudioStatus::DeviceUnavailable`,
+  stops the model, preserves the queue/current selection, and emits one final
+  error. A later user Play starts a fresh bounded cycle, allowing a returning
+  device to be reconsidered without an unbounded background retry loop.
+- Shutdown joins any pending recovery thread. A recovered engine that arrives
+  after the Controller is gone is dropped and cleanly shut down by the channel
+  owner. The real-time fill callback still performs only ring/atomic work; all
+  device opening, failure classification, and retry scheduling happen off the
+  callback.
+
+Deterministic lifecycle tests cover initial start failure, fatal runtime
+reports, duplicate fatal reports, nonfatal notices, successful replacement,
+repeated loss/recovery, pause/stop/reselection/queue edits during recovery,
+seek/position policy, configuration changes (44.1 kHz mono to 48 kHz stereo),
+four-attempt exhaustion, recovery after a later device becomes available, and
+shutdown during a blocked recovery open. These tests use injected backends and
+threads; they do not prove physical unplug, audio-server restart, Windows/macOS
+behavior, or default-device changes on hardware.
+
+A separate low-amplitude hardware smoke run used the same Linux host's ALSA
+default device (`Default Audio Device`, PipeWire ALSA plugin), F32, 48 kHz,
+stereo. Stream creation succeeded, a 4-second stereo WAV was resampled and
+played for two seconds, and shutdown joined cleanly. Diagnostics reported a
+512-frame callback, 96,768 requested and 94,720 delivered frames, zero
+underruns, zero decoder/preload/output errors, zero notices and no gate
+re-prebuffers. No physical disconnect, default-device switch or audio-server
+restart was performed; recovery itself was exercised only with injected
+backends.
+
+Known lifecycle limits: Flux supports only the backend default output device and
+does not persist a device identifier or offer device selection. CPAL/PipeWire
+may report `DeviceChanged` and reroute a default-device stream; that is
+surfaced as a notice and the stream is retained. On backends such as Linux ALSA
+that do not follow default-device changes, a still-valid stream continues on
+the old device; Flux does not poll and reopen just because the system default
+changed. Recovery therefore occurs after a reported fatal stream failure, not
+proactively. Engine diagnostics are per engine instance and reset when the
+failed engine is replaced; Controller status/last-error events retain the
+lifecycle outcome. Recovery restores the last delivered position, not the
+elapsed wall-clock time during the outage, and never claims gapless continuity
+across the disconnection.
+
 Resource bounds remain structural: at most one active decoder plus one prepared
 decoder; one bounded output ring (approximately two seconds); retained
 crossfade tail, incoming overlap and mixed pending audio bounded by the
@@ -809,13 +898,8 @@ crossfade tail, incoming overlap and mixed pending audio bounded by the
 No decoder/resource count is exposed as a live metric, so the bound is audited
 in code rather than measured as a runtime gauge.
 
-CPAL failures are surfaced as `EngineEvent::Error` and counted in
-`output_errors`; the Controller stops playback and clears its engine ledger.
-There is no automatic device re-open or switching policy. A runtime device
-failure therefore requires recovery through the application/device lifecycle
-rather than pretending playback continues. Physical device removal, hotplug,
-unsupported-channel configurations and hardware underrun behavior were not
-exercised on this host.
+See the device-lifecycle section below for fatal/notice separation, bounded
+default-device recovery, and the remaining physical-hotplug limitations.
 
 ### Discovery, ratings, history and dashboard
 

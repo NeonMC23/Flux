@@ -28,6 +28,17 @@ pub struct OutputConfig {
     pub channels: u16,
 }
 
+/// An asynchronous output-stream report from a backend thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputIssue {
+    /// The stream is no longer usable. The backend will not deliver more
+    /// audio until it is rebuilt.
+    Fatal(String),
+    /// The stream remains usable, but an externally visible change such
+    /// as an automatic route change should be reported.
+    Notice(String),
+}
+
 /// Supplies interleaved `f32` samples to an output backend.
 ///
 /// # Real-time contract
@@ -58,9 +69,9 @@ pub trait OutputBackend: Send {
     /// The format this backend consumes; fixed for its lifetime.
     fn config(&self) -> OutputConfig;
 
-    /// Begins pulling samples from `fill`. Stream/runtime failures
-    /// after a successful start are reported through `on_error`
-    /// (called from the backend's own threads; must not block).
+    /// Begins pulling samples from `fill`. Stream/runtime failures and
+    /// nonfatal route notices after a successful start are reported
+    /// through `on_issue` (called from backend threads; must not block).
     ///
     /// # Errors
     ///
@@ -69,7 +80,7 @@ pub trait OutputBackend: Send {
     fn start(
         &mut self,
         fill: Box<dyn FillCallback>,
-        on_error: Box<dyn FnMut(String) + Send>,
+        on_issue: Box<dyn FnMut(OutputIssue) + Send>,
     ) -> Result<(), EngineError>;
 
     /// Stops pulling samples and releases the stream. Safe to call
@@ -139,7 +150,7 @@ impl OutputBackend for NullOutput {
     fn start(
         &mut self,
         fill: Box<dyn FillCallback>,
-        _on_error: Box<dyn FnMut(String) + Send>,
+        _on_issue: Box<dyn FnMut(OutputIssue) + Send>,
     ) -> Result<(), EngineError> {
         *self.shared.fill.lock().expect("null output mutex") = Some(fill);
         self.shared.starts.fetch_add(1, Ordering::Relaxed);
