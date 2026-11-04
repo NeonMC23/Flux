@@ -115,7 +115,10 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   sources; zero retains gapless playback. Crossfade is off by default and is
   configured in the GUI **Settings** view (`K`) or the TUI (`K` toggles,
   `[`/`]` adjusts by 250 ms). The shared setting is stored in
-  `<config>/flux/settings.json`. The
+  `<config>/flux/settings.json`. A local `AudioDiagnostics` snapshot exposes
+  callback/underrun/ring/transition counters without callback logging or
+  telemetry; deterministic stress coverage is documented in the canonical
+  audio documentation. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
   then removes old files through journal cleanup. The same editor supports

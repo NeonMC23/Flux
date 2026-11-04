@@ -45,17 +45,17 @@ fn main() -> std::process::ExitCode {
 
     loop {
         match engine.events().recv_timeout(Duration::from_millis(250)) {
-            Ok(EngineEvent::Loaded { id, info }) => {
+            Ok(EngineEvent::Loaded { id, info, .. }) => {
                 println!(
                     "loaded track {id}: {} Hz, {} channel(s), duration {:?}",
                     info.sample_rate, info.channels, info.duration
                 );
             }
-            Ok(EngineEvent::TrackEnded { id }) => {
+            Ok(EngineEvent::TrackEnded { id, .. }) => {
                 println!("track {id} ended at position {:?}", engine.position());
                 break;
             }
-            Ok(EngineEvent::Error { id, error }) => {
+            Ok(EngineEvent::Error { id, error, .. }) => {
                 eprintln!("engine error (track {id:?}): {error}");
                 return std::process::ExitCode::FAILURE;
             }

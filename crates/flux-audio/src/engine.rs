@@ -73,7 +73,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -300,9 +300,28 @@ struct Shared {
     /// preserved across the callback's generation flush so a seek is
     /// reflected immediately in [`EngineHandle::position`].
     base_frames: AtomicU64,
+    /// While true, position reports `base_frames` rather than adding
+    /// played frames from the old generation. The callback clears it
+    /// after flushing a changed generation.
+    position_locked: AtomicBool,
+    /// Newest load/seek session requested by the handle. Older worker
+    /// Seek commands must not overwrite the newer immediate position.
+    requested_session: AtomicU64,
     /// Requested natural-transition crossfade duration in milliseconds.
     /// Zero disables crossfade.
     crossfade_ms: AtomicU32,
+    /// Diagnostic counters, updated lock-free outside logging paths.
+    callbacks: AtomicU64,
+    requested_frames: AtomicU64,
+    delivered_frames: AtomicU64,
+    underrun_frames: AtomicU64,
+    ring_frames: AtomicU64,
+    generation_changes: AtomicU64,
+    gapless_transitions: AtomicU64,
+    crossfades: AtomicU64,
+    preload_failures: AtomicU64,
+    decoder_errors: AtomicU64,
+    output_errors: AtomicU64,
 }
 
 impl Shared {
@@ -318,18 +337,34 @@ impl Shared {
             pushed_frames: AtomicU64::new(0),
             source_start_frame: AtomicU64::new(0),
             base_frames: AtomicU64::new(0),
+            position_locked: AtomicBool::new(false),
+            requested_session: AtomicU64::new(0),
             crossfade_ms: AtomicU32::new(0),
+            callbacks: AtomicU64::new(0),
+            requested_frames: AtomicU64::new(0),
+            delivered_frames: AtomicU64::new(0),
+            underrun_frames: AtomicU64::new(0),
+            ring_frames: AtomicU64::new(0),
+            generation_changes: AtomicU64::new(0),
+            gapless_transitions: AtomicU64::new(0),
+            crossfades: AtomicU64::new(0),
+            preload_failures: AtomicU64::new(0),
+            decoder_errors: AtomicU64::new(0),
+            output_errors: AtomicU64::new(0),
         }
     }
 
     /// Starts a new generation (worker thread only): silences the
     /// callback and arms its flush-on-generation-change.
     fn bump_generation(&self) -> u64 {
+        self.position_locked.store(true, Ordering::Release);
         self.gate_open.store(false, Ordering::Release);
         self.decoder_eof.store(false, Ordering::Release);
         self.drained.store(false, Ordering::Release);
         self.pushed_frames.store(0, Ordering::Release);
+        self.ring_frames.store(0, Ordering::Release);
         self.source_start_frame.store(0, Ordering::Release);
+        self.generation_changes.fetch_add(1, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
@@ -383,6 +418,11 @@ struct SampleSource {
 
 impl FillCallback for SampleSource {
     fn fill(&mut self, out: &mut [f32]) {
+        self.shared.callbacks.fetch_add(1, Ordering::Relaxed);
+        let requested_frames = (out.len() / self.channels) as u64;
+        self.shared
+            .requested_frames
+            .fetch_add(requested_frames, Ordering::Relaxed);
         let generation = self.shared.generation.load(Ordering::Acquire);
         if generation != self.seen_generation {
             // Track changed or stopped: discard everything buffered
@@ -394,6 +434,8 @@ impl FillCallback for SampleSource {
             self.seen_generation = generation;
             self.consumer.clear();
             self.shared.played_frames.store(0, Ordering::Release);
+            self.shared.ring_frames.store(0, Ordering::Release);
+            self.shared.position_locked.store(false, Ordering::Release);
             // Acknowledge only *after* the flush: from this store on,
             // the worker may push this generation's samples and they
             // are guaranteed to survive.
@@ -422,7 +464,20 @@ impl FillCallback for SampleSource {
             self.shared
                 .played_frames
                 .fetch_add(frames, Ordering::Relaxed);
+            self.shared
+                .delivered_frames
+                .fetch_add(frames, Ordering::Relaxed);
         }
+        let shortfall = requested_frames.saturating_sub(frames);
+        if shortfall > 0 {
+            self.shared
+                .underrun_frames
+                .fetch_add(shortfall, Ordering::Relaxed);
+        }
+        self.shared.ring_frames.store(
+            (self.consumer.occupied_len() / self.channels) as u64,
+            Ordering::Relaxed,
+        );
         if self.shared.decoder_eof.load(Ordering::Acquire) && self.consumer.is_empty() {
             self.shared.drained.store(true, Ordering::Release);
         }
@@ -445,6 +500,48 @@ impl SampleSource {
             let _ = self.waveform.try_push(mono);
         }
     }
+}
+
+/// A lock-free snapshot of audio-pipeline counters. Values are local
+/// process diagnostics, not telemetry. `ring_frames` is the most recent
+/// occupancy reported by the push/pop paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AudioDiagnostics {
+    /// FillCallback invocations. A CPAL device callback whose buffer is
+    /// processed in multiple fixed scratch windows counts once per fill.
+    pub callbacks: u64,
+    /// Output frames requested by the backend.
+    pub requested_frames: u64,
+    /// Output frames actually delivered from the ring.
+    pub delivered_frames: u64,
+    /// Frames filled with silence while the gate was open.
+    pub underrun_frames: u64,
+    /// Most recently observed ring occupancy in frames.
+    pub ring_frames: u64,
+    /// Capacity of the output ring in frames.
+    pub ring_capacity_frames: u64,
+    /// Output frames pushed for the current generation.
+    pub pushed_frames: u64,
+    /// Output frames delivered for the current generation.
+    pub played_frames: u64,
+    /// Output generation counter.
+    pub generation: u64,
+    /// Generation changes caused by load/seek/stop/restart.
+    pub generation_changes: u64,
+    /// Gapless transitions promoted to the Controller.
+    pub gapless_transitions: u64,
+    /// Crossfade transitions promoted to the Controller.
+    pub crossfades: u64,
+    /// Preload open failures.
+    pub preload_failures: u64,
+    /// Decoder open/decode failures observed by the worker.
+    pub decoder_errors: u64,
+    /// Backend output-stream errors reported asynchronously.
+    pub output_errors: u64,
+    /// Current output sample rate.
+    pub sample_rate: u32,
+    /// Current output channel count.
+    pub channels: u16,
 }
 
 /// Handle to a running playback engine. All methods are non-blocking
@@ -582,6 +679,10 @@ impl EngineHandle {
             session != 0,
             "playback load-session identifier exhausted after 2^64 loads"
         );
+        self.shared
+            .requested_session
+            .store(session, Ordering::Release);
+        self.shared.position_locked.store(true, Ordering::Release);
         self.shared.base_frames.store(0, Ordering::Release);
         self.shared.played_frames.store(0, Ordering::Release);
         self.shared.source_start_frame.store(0, Ordering::Release);
@@ -653,6 +754,7 @@ impl EngineHandle {
 
     /// Stops playback and unloads the current track.
     pub fn stop(&self) {
+        self.shared.position_locked.store(true, Ordering::Release);
         self.shared.base_frames.store(0, Ordering::Release);
         self.shared.played_frames.store(0, Ordering::Release);
         self.shared.source_start_frame.store(0, Ordering::Release);
@@ -679,6 +781,10 @@ impl EngineHandle {
             "playback session identifier exhausted after 2^64 requests"
         );
         let frames = (position.as_secs_f64() * f64::from(self.config.sample_rate)).round() as u64;
+        self.shared
+            .requested_session
+            .store(session, Ordering::Release);
+        self.shared.position_locked.store(true, Ordering::Release);
         self.shared.base_frames.store(frames, Ordering::Release);
         self.shared.played_frames.store(0, Ordering::Release);
         self.shared.source_start_frame.store(0, Ordering::Release);
@@ -706,13 +812,15 @@ impl EngineHandle {
         if self.config.sample_rate == 0 {
             return Duration::ZERO;
         }
-        let played = self.shared.played_frames.load(Ordering::Relaxed);
-        let source_start = self.shared.source_start_frame.load(Ordering::Relaxed);
-        let frames = self
-            .shared
-            .base_frames
-            .load(Ordering::Relaxed)
-            .saturating_add(played.saturating_sub(source_start));
+        let base = self.shared.base_frames.load(Ordering::Relaxed);
+        let locked = self.shared.position_locked.load(Ordering::Acquire);
+        let frames = if locked {
+            base
+        } else {
+            let played = self.shared.played_frames.load(Ordering::Relaxed);
+            let source_start = self.shared.source_start_frame.load(Ordering::Relaxed);
+            base.saturating_add(played.saturating_sub(source_start))
+        };
         Duration::from_secs_f64(frames as f64 / f64::from(self.config.sample_rate))
     }
 
@@ -729,6 +837,33 @@ impl EngineHandle {
             Err(poisoned) => poisoned.into_inner(),
         };
         reader.snapshot()
+    }
+
+    /// Returns a local, lock-free snapshot of pipeline diagnostics.
+    #[must_use]
+    pub fn diagnostics(&self) -> AudioDiagnostics {
+        let channels = self.config.channels.max(1);
+        let capacity_samples =
+            (self.config.sample_rate as usize * usize::from(channels) * 2).max(8192);
+        AudioDiagnostics {
+            callbacks: self.shared.callbacks.load(Ordering::Acquire),
+            requested_frames: self.shared.requested_frames.load(Ordering::Acquire),
+            delivered_frames: self.shared.delivered_frames.load(Ordering::Acquire),
+            underrun_frames: self.shared.underrun_frames.load(Ordering::Acquire),
+            ring_frames: self.shared.ring_frames.load(Ordering::Acquire),
+            ring_capacity_frames: (capacity_samples / usize::from(channels)) as u64,
+            pushed_frames: self.shared.pushed_frames.load(Ordering::Acquire),
+            played_frames: self.shared.played_frames.load(Ordering::Acquire),
+            generation: self.shared.generation.load(Ordering::Acquire),
+            generation_changes: self.shared.generation_changes.load(Ordering::Acquire),
+            gapless_transitions: self.shared.gapless_transitions.load(Ordering::Acquire),
+            crossfades: self.shared.crossfades.load(Ordering::Acquire),
+            preload_failures: self.shared.preload_failures.load(Ordering::Acquire),
+            decoder_errors: self.shared.decoder_errors.load(Ordering::Acquire),
+            output_errors: self.shared.output_errors.load(Ordering::Acquire),
+            sample_rate: self.config.sample_rate,
+            channels: self.config.channels,
+        }
     }
 
     /// Stops the backend and joins the worker thread.
@@ -994,6 +1129,7 @@ struct PendingTransition {
     to_id: TrackId,
     to_entry: QueueEntryId,
     boundary_frame: u64,
+    crossfade_frames: u64,
     info: StreamInfo,
 }
 
@@ -1143,7 +1279,9 @@ fn run_worker<F>(
         shared: Arc::clone(&shared),
     };
     let error_events = events.clone();
+    let error_shared = Arc::clone(&shared);
     let on_error = Box::new(move |message: String| {
+        error_shared.output_errors.fetch_add(1, Ordering::Relaxed);
         let _ = error_events.send(EngineEvent::Error {
             session: None,
             id: None,
@@ -1187,162 +1325,159 @@ fn run_worker<F>(
     let output_channels = usize::from(config.channels);
 
     'worker: loop {
-        match commands.recv_timeout(WORKER_TICK) {
-            Ok(Command::Load {
-                session,
-                id,
-                entry,
-                path,
-            }) => {
-                current_session = session;
-                current_generation = shared.bump_generation();
-                decoder = None;
-                current = None;
-                incoming = None;
-                pending_transition = None;
-                converter = None;
-                pending.clear();
-                pending_sent = 0;
-                staging = Staging::default();
-                tail.clear();
-                playing = false;
-                eof_reached = false;
-                ended_sent = false;
-                last_load_failed = false;
-                let reusable = prepared.as_ref().is_some_and(|prepared| {
-                    prepared.id == id && prepared.entry == entry && prepared.path == path
-                });
-                let opened = if reusable {
-                    let prepared = prepared.take().expect("prepared exists");
-                    Ok((prepared.decoder, prepared.info))
-                } else {
-                    prepared = None;
-                    open_decoder(&path).map(|decoder| {
-                        let info = *decoder.info();
-                        (decoder, info)
-                    })
-                };
-                match opened {
-                    Ok((dec, info)) => {
-                        converter = Some(FormatConverter::new(&info, config));
-                        decoder = Some(dec);
-                        current = Some(LoadedTrack {
-                            id,
-                            entry,
-                            path,
-                            info,
-                        });
+        // Drain every command already queued before pumping audio. This
+        // prevents a fast decoder from reaching EOF before a Load/Play/
+        // Preload burst, which would incorrectly commit to a fallback
+        // transition while the intended prepared decoder was still
+        // waiting in the command channel.
+        let mut received_any = false;
+        loop {
+            let command = if received_any {
+                match commands.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => break 'worker,
+                }
+            } else {
+                match commands.recv_timeout(WORKER_TICK) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break 'worker,
+                }
+            };
+            let Some(command) = command else {
+                break;
+            };
+            received_any = true;
+            match command {
+                Command::Load {
+                    session,
+                    id,
+                    entry,
+                    path,
+                } => {
+                    current_session = session;
+                    current_generation = shared.bump_generation();
+                    decoder = None;
+                    current = None;
+                    incoming = None;
+                    pending_transition = None;
+                    converter = None;
+                    pending.clear();
+                    pending_sent = 0;
+                    staging = Staging::default();
+                    tail.clear();
+                    playing = false;
+                    eof_reached = false;
+                    ended_sent = false;
+                    last_load_failed = false;
+                    let reusable = prepared.as_ref().is_some_and(|prepared| {
+                        prepared.id == id && prepared.entry == entry && prepared.path == path
+                    });
+                    let opened = if reusable {
+                        let prepared = prepared.take().expect("prepared exists");
+                        Ok((prepared.decoder, prepared.info))
+                    } else {
+                        prepared = None;
+                        open_decoder(&path).map(|decoder| {
+                            let info = *decoder.info();
+                            (decoder, info)
+                        })
+                    };
+                    match opened {
+                        Ok((dec, info)) => {
+                            converter = Some(FormatConverter::new(&info, config));
+                            decoder = Some(dec);
+                            current = Some(LoadedTrack {
+                                id,
+                                entry,
+                                path,
+                                info,
+                            });
+                            let fade = crossfade_frames(
+                                u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                                config.sample_rate,
+                            );
+                            staging = Staging::reset(&info, config, fade, 0);
+                            tail.clear();
+                            send(EngineEvent::Loaded {
+                                session,
+                                id,
+                                entry,
+                                info,
+                            });
+                        }
+                        Err(err) => {
+                            last_load_failed = true;
+                            shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
+                            send(EngineEvent::Error {
+                                session: Some(session),
+                                id: Some(id),
+                                error: err.into(),
+                            });
+                        }
+                    }
+                }
+                Command::Seek { session, position } => {
+                    // A newer seek/load may have set the immediate
+                    // position while this older command waited in the
+                    // channel. Never let the stale target overwrite it.
+                    if session != shared.requested_session.load(Ordering::Acquire) {
+                        continue 'worker;
+                    }
+                    let Some((id, path, info)) = current
+                        .as_ref()
+                        .map(|track| (track.id, track.path.clone(), track.info))
+                    else {
+                        shared.base_frames.store(0, Ordering::Release);
+                        shared.played_frames.store(0, Ordering::Release);
+                        continue 'worker;
+                    };
+
+                    let total = info.duration;
+                    let target = total.map_or(position, |duration| position.min(duration));
+                    let output_rate = f64::from(config.sample_rate);
+                    let source_rate = f64::from(info.sample_rate);
+                    let target_output_frames = (target.as_secs_f64() * output_rate).round() as u64;
+
+                    current_session = session;
+                    current_generation = shared.bump_generation();
+                    shared
+                        .base_frames
+                        .store(target_output_frames, Ordering::Release);
+                    shared.played_frames.store(0, Ordering::Release);
+                    decoder = None;
+                    incoming = None;
+                    pending_transition = None;
+                    converter = None;
+                    pending.clear();
+                    pending_sent = 0;
+                    staging = Staging::default();
+                    tail.clear();
+                    ended_sent = false;
+                    last_load_failed = false;
+
+                    if total.is_some_and(|duration| target >= duration) {
+                        // The requested point is the end of the track. If a
+                        // prepared successor exists, the pump below will hand
+                        // off to it; otherwise the normal drained path ends
+                        // this source.
+                        eof_reached = true;
                         let fade = crossfade_frames(
                             u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
                             config.sample_rate,
                         );
-                        staging = Staging::reset(&info, config, fade, 0);
-                        tail.clear();
-                        send(EngineEvent::Loaded {
-                            session,
-                            id,
-                            entry,
-                            info,
-                        });
-                    }
-                    Err(err) => {
-                        last_load_failed = true;
-                        send(EngineEvent::Error {
-                            session: Some(session),
-                            id: Some(id),
-                            error: err.into(),
-                        });
-                    }
-                }
-            }
-            Ok(Command::Seek { session, position }) => {
-                let Some((id, path, info)) = current
-                    .as_ref()
-                    .map(|track| (track.id, track.path.clone(), track.info))
-                else {
-                    shared.base_frames.store(0, Ordering::Release);
-                    shared.played_frames.store(0, Ordering::Release);
-                    continue 'worker;
-                };
-
-                let total = info.duration;
-                let target = total.map_or(position, |duration| position.min(duration));
-                let output_rate = f64::from(config.sample_rate);
-                let source_rate = f64::from(info.sample_rate);
-                let target_output_frames = (target.as_secs_f64() * output_rate).round() as u64;
-
-                current_session = session;
-                current_generation = shared.bump_generation();
-                shared
-                    .base_frames
-                    .store(target_output_frames, Ordering::Release);
-                shared.played_frames.store(0, Ordering::Release);
-                decoder = None;
-                incoming = None;
-                pending_transition = None;
-                converter = None;
-                pending.clear();
-                pending_sent = 0;
-                staging = Staging::default();
-                tail.clear();
-                ended_sent = false;
-                last_load_failed = false;
-
-                if total.is_some_and(|duration| target >= duration) {
-                    // The requested point is the end of the track. If a
-                    // prepared successor exists, the pump below will hand
-                    // off to it; otherwise the normal drained path ends
-                    // this source.
-                    eof_reached = true;
-                    let fade = crossfade_frames(
-                        u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
-                        config.sample_rate,
-                    );
-                    staging = Staging::reset(&info, config, fade, target_output_frames);
-                    shared.gate_open.store(playing, Ordering::Release);
-                    continue 'worker;
-                }
-
-                let mut dec = match open_decoder(&path) {
-                    Ok(decoder) => decoder,
-                    Err(error) => {
-                        playing = false;
-                        shared.gate_open.store(false, Ordering::Release);
-                        ended_sent = true;
-                        eof_reached = true;
-                        send(EngineEvent::Error {
-                            session: Some(session),
-                            id: Some(id),
-                            error: error.into(),
-                        });
+                        staging = Staging::reset(&info, config, fade, target_output_frames);
+                        shared.gate_open.store(playing, Ordering::Release);
                         continue 'worker;
                     }
-                };
 
-                let source_frames = (target.as_secs_f64() * source_rate).round() as u64;
-                let channels = usize::from(info.channels);
-                let mut skipped = 0u64;
-                let mut hit_eof = false;
-                while skipped < source_frames {
-                    let want = (source_frames - skipped)
-                        .min(DECODE_CHUNK_FRAMES as u64)
-                        .max(1) as usize;
-                    match dec.next_chunk(want) {
-                        Ok(samples) if samples.is_empty() => {
-                            hit_eof = true;
-                            break;
-                        }
-                        Ok(samples) => {
-                            let frames = samples.len() / channels;
-                            if frames == 0 {
-                                hit_eof = true;
-                                break;
-                            }
-                            skipped = skipped.saturating_add(frames as u64);
-                        }
+                    let mut dec = match open_decoder(&path) {
+                        Ok(decoder) => decoder,
                         Err(error) => {
                             playing = false;
                             shared.gate_open.store(false, Ordering::Release);
+                            shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
                             ended_sent = true;
                             eof_reached = true;
                             send(EngineEvent::Error {
@@ -1352,223 +1487,263 @@ fn run_worker<F>(
                             });
                             continue 'worker;
                         }
-                    }
-                }
+                    };
 
-                let actual_source_frames = skipped.min(source_frames);
-                let actual_output_frames =
-                    (actual_source_frames as f64 / source_rate * output_rate).round() as u64;
-                let actual_target_frames = if hit_eof {
-                    actual_output_frames
-                } else {
-                    target_output_frames
-                };
-                shared
-                    .base_frames
-                    .store(actual_target_frames, Ordering::Release);
-                eof_reached = hit_eof;
-                decoder = Some(dec);
-                converter = Some(FormatConverter::new(&info, config));
-                if hit_eof {
-                    // The decoder is already at end-of-stream. The pump
-                    // below either hands off to a prepared successor or
-                    // lets the normal drained path end this source.
-                    decoder = None;
-                }
-                let fade = crossfade_frames(
-                    u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
-                    config.sample_rate,
-                );
-                staging = Staging::reset(&info, config, fade, actual_target_frames);
-                shared.gate_open.store(playing, Ordering::Release);
-            }
-            Ok(Command::Preload { id, entry, path }) => {
-                let incoming_matches = incoming.as_ref().is_some_and(|track| {
-                    track.id == id && track.entry == entry && track.path == path
-                });
-                if pending_transition.is_some() && incoming_matches {
-                    // The newly authorized successor is exactly the one
-                    // already installed. Keep it and do not open a
-                    // redundant decoder.
-                    continue 'worker;
-                }
-                if pending_transition.is_some() && incoming.is_some() {
-                    let Some(track) = current.as_ref() else {
-                        continue 'worker;
-                    };
-                    if let Err(error) = resume_current_after_invalidation(
-                        &shared,
-                        config,
-                        track,
-                        playing,
-                        &mut decoder,
-                        &mut converter,
-                        &mut pending,
-                        &mut pending_sent,
-                        &mut incoming,
-                        &mut pending_transition,
-                        &mut eof_reached,
-                        &mut ended_sent,
-                        &mut staging,
-                        &mut tail,
-                        &mut current_generation,
-                    ) {
-                        playing = false;
-                        shared.gate_open.store(false, Ordering::Release);
-                        ended_sent = true;
-                        eof_reached = true;
-                        prepared = None;
-                        send(EngineEvent::Error {
-                            session: Some(current_session),
-                            id: Some(track.id),
-                            error: error.into(),
-                        });
-                        continue 'worker;
-                    }
-                }
-                prepared = None;
-                match open_decoder(&path) {
-                    Ok(decoder) => {
-                        let info = *decoder.info();
-                        prepared = Some(PreparedTrack {
-                            id,
-                            entry,
-                            path,
-                            info,
-                            decoder,
-                        });
-                        send(EngineEvent::Preloaded { id, entry, info });
-                    }
-                    Err(error) => {
-                        send(EngineEvent::PreloadFailed {
-                            id,
-                            entry,
-                            error: error.into(),
-                        });
-                    }
-                }
-            }
-            Ok(Command::CancelPreload) => {
-                prepared = None;
-                if pending_transition.is_some() && incoming.is_some() {
-                    let Some(track) = current.as_ref() else {
-                        continue 'worker;
-                    };
-                    if let Err(error) = resume_current_after_invalidation(
-                        &shared,
-                        config,
-                        track,
-                        playing,
-                        &mut decoder,
-                        &mut converter,
-                        &mut pending,
-                        &mut pending_sent,
-                        &mut incoming,
-                        &mut pending_transition,
-                        &mut eof_reached,
-                        &mut ended_sent,
-                        &mut staging,
-                        &mut tail,
-                        &mut current_generation,
-                    ) {
-                        playing = false;
-                        shared.gate_open.store(false, Ordering::Release);
-                        ended_sent = true;
-                        eof_reached = true;
-                        send(EngineEvent::Error {
-                            session: Some(current_session),
-                            id: Some(track.id),
-                            error: error.into(),
-                        });
-                    }
-                }
-            }
-            Ok(Command::Play) => match &current {
-                None => {
-                    if !last_load_failed {
-                        send(EngineEvent::Error {
-                            session: None,
-                            id: None,
-                            error: EngineError::NoTrackLoaded,
-                        });
-                    }
-                }
-                Some(track) => {
-                    if decoder.is_none() && incoming.is_none() {
-                        // The track previously ended (or errored):
-                        // pressing play restarts it from the beginning.
-                        current_generation = shared.bump_generation();
-                        shared.base_frames.store(0, Ordering::Release);
-                        shared.played_frames.store(0, Ordering::Release);
-                        pending.clear();
-                        pending_sent = 0;
-                        eof_reached = false;
-                        ended_sent = false;
-                        pending_transition = None;
-                        tail.clear();
-                        match open_decoder(&track.path) {
-                            Ok(dec) => {
-                                converter = Some(FormatConverter::new(&track.info, config));
-                                decoder = Some(dec);
-                                let fade = crossfade_frames(
-                                    u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
-                                    config.sample_rate,
-                                );
-                                staging = Staging::reset(&track.info, config, fade, 0);
+                    let source_frames = (target.as_secs_f64() * source_rate).round() as u64;
+                    let channels = usize::from(info.channels);
+                    let mut skipped = 0u64;
+                    let mut hit_eof = false;
+                    while skipped < source_frames {
+                        let want = (source_frames - skipped)
+                            .min(DECODE_CHUNK_FRAMES as u64)
+                            .max(1) as usize;
+                        match dec.next_chunk(want) {
+                            Ok(samples) if samples.is_empty() => {
+                                hit_eof = true;
+                                break;
                             }
-                            Err(err) => {
+                            Ok(samples) => {
+                                let frames = samples.len() / channels;
+                                if frames == 0 {
+                                    hit_eof = true;
+                                    break;
+                                }
+                                skipped = skipped.saturating_add(frames as u64);
+                            }
+                            Err(error) => {
+                                playing = false;
+                                shared.gate_open.store(false, Ordering::Release);
+                                shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
+                                ended_sent = true;
+                                eof_reached = true;
                                 send(EngineEvent::Error {
-                                    session: Some(current_session),
-                                    id: Some(track.id),
-                                    error: err.into(),
+                                    session: Some(session),
+                                    id: Some(id),
+                                    error: error.into(),
                                 });
                                 continue 'worker;
                             }
                         }
                     }
-                    playing = true;
-                    shared.gate_open.store(true, Ordering::Release);
-                    send(EngineEvent::Started {
-                        session: current_session,
-                        id: track.id,
-                    });
+
+                    let actual_source_frames = skipped.min(source_frames);
+                    let actual_output_frames =
+                        (actual_source_frames as f64 / source_rate * output_rate).round() as u64;
+                    let actual_target_frames = if hit_eof {
+                        actual_output_frames
+                    } else {
+                        target_output_frames
+                    };
+                    shared
+                        .base_frames
+                        .store(actual_target_frames, Ordering::Release);
+                    eof_reached = hit_eof;
+                    decoder = Some(dec);
+                    converter = Some(FormatConverter::new(&info, config));
+                    if hit_eof {
+                        // The decoder is already at end-of-stream. The pump
+                        // below either hands off to a prepared successor or
+                        // lets the normal drained path end this source.
+                        decoder = None;
+                    }
+                    let fade = crossfade_frames(
+                        u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                        config.sample_rate,
+                    );
+                    staging = Staging::reset(&info, config, fade, actual_target_frames);
+                    shared.gate_open.store(playing, Ordering::Release);
                 }
-            },
-            Ok(Command::Pause) => {
-                if playing {
-                    playing = false;
-                    shared.gate_open.store(false, Ordering::Release);
-                    if let Some(track) = &current {
-                        send(EngineEvent::Paused {
+                Command::Preload { id, entry, path } => {
+                    let incoming_matches = incoming.as_ref().is_some_and(|track| {
+                        track.id == id && track.entry == entry && track.path == path
+                    });
+                    if pending_transition.is_some() && incoming_matches {
+                        // The newly authorized successor is exactly the one
+                        // already installed. Keep it and do not open a
+                        // redundant decoder.
+                        continue 'worker;
+                    }
+                    if pending_transition.is_some() && incoming.is_some() {
+                        let Some(track) = current.as_ref() else {
+                            continue 'worker;
+                        };
+                        if let Err(error) = resume_current_after_invalidation(
+                            &shared,
+                            config,
+                            track,
+                            playing,
+                            &mut decoder,
+                            &mut converter,
+                            &mut pending,
+                            &mut pending_sent,
+                            &mut incoming,
+                            &mut pending_transition,
+                            &mut eof_reached,
+                            &mut ended_sent,
+                            &mut staging,
+                            &mut tail,
+                            &mut current_generation,
+                        ) {
+                            playing = false;
+                            shared.gate_open.store(false, Ordering::Release);
+                            shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
+                            ended_sent = true;
+                            eof_reached = true;
+                            prepared = None;
+                            send(EngineEvent::Error {
+                                session: Some(current_session),
+                                id: Some(track.id),
+                                error: error.into(),
+                            });
+                            continue 'worker;
+                        }
+                    }
+                    prepared = None;
+                    match open_decoder(&path) {
+                        Ok(decoder) => {
+                            let info = *decoder.info();
+                            prepared = Some(PreparedTrack {
+                                id,
+                                entry,
+                                path,
+                                info,
+                                decoder,
+                            });
+                            send(EngineEvent::Preloaded { id, entry, info });
+                        }
+                        Err(error) => {
+                            shared.preload_failures.fetch_add(1, Ordering::Relaxed);
+                            send(EngineEvent::PreloadFailed {
+                                id,
+                                entry,
+                                error: error.into(),
+                            });
+                        }
+                    }
+                }
+                Command::CancelPreload => {
+                    prepared = None;
+                    if pending_transition.is_some() && incoming.is_some() {
+                        let Some(track) = current.as_ref() else {
+                            continue 'worker;
+                        };
+                        if let Err(error) = resume_current_after_invalidation(
+                            &shared,
+                            config,
+                            track,
+                            playing,
+                            &mut decoder,
+                            &mut converter,
+                            &mut pending,
+                            &mut pending_sent,
+                            &mut incoming,
+                            &mut pending_transition,
+                            &mut eof_reached,
+                            &mut ended_sent,
+                            &mut staging,
+                            &mut tail,
+                            &mut current_generation,
+                        ) {
+                            playing = false;
+                            shared.gate_open.store(false, Ordering::Release);
+                            shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
+                            ended_sent = true;
+                            eof_reached = true;
+                            send(EngineEvent::Error {
+                                session: Some(current_session),
+                                id: Some(track.id),
+                                error: error.into(),
+                            });
+                        }
+                    }
+                }
+                Command::Play => match &current {
+                    None => {
+                        if !last_load_failed {
+                            send(EngineEvent::Error {
+                                session: None,
+                                id: None,
+                                error: EngineError::NoTrackLoaded,
+                            });
+                        }
+                    }
+                    Some(track) => {
+                        if decoder.is_none() && incoming.is_none() {
+                            // The track previously ended (or errored):
+                            // pressing play restarts it from the beginning.
+                            current_generation = shared.bump_generation();
+                            shared.base_frames.store(0, Ordering::Release);
+                            shared.played_frames.store(0, Ordering::Release);
+                            pending.clear();
+                            pending_sent = 0;
+                            eof_reached = false;
+                            ended_sent = false;
+                            pending_transition = None;
+                            tail.clear();
+                            match open_decoder(&track.path) {
+                                Ok(dec) => {
+                                    converter = Some(FormatConverter::new(&track.info, config));
+                                    decoder = Some(dec);
+                                    let fade = crossfade_frames(
+                                        u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                                        config.sample_rate,
+                                    );
+                                    staging = Staging::reset(&track.info, config, fade, 0);
+                                }
+                                Err(err) => {
+                                    shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
+                                    send(EngineEvent::Error {
+                                        session: Some(current_session),
+                                        id: Some(track.id),
+                                        error: err.into(),
+                                    });
+                                    continue 'worker;
+                                }
+                            }
+                        }
+                        playing = true;
+                        shared.gate_open.store(true, Ordering::Release);
+                        send(EngineEvent::Started {
                             session: current_session,
                             id: track.id,
                         });
                     }
+                },
+                Command::Pause => {
+                    if playing {
+                        playing = false;
+                        shared.gate_open.store(false, Ordering::Release);
+                        if let Some(track) = &current {
+                            send(EngineEvent::Paused {
+                                session: current_session,
+                                id: track.id,
+                            });
+                        }
+                    }
                 }
+                Command::Stop => {
+                    current_generation = shared.bump_generation();
+                    shared.base_frames.store(0, Ordering::Release);
+                    shared.played_frames.store(0, Ordering::Release);
+                    current_session = 0;
+                    last_load_failed = false;
+                    decoder = None;
+                    prepared = None;
+                    current = None;
+                    incoming = None;
+                    pending_transition = None;
+                    converter = None;
+                    pending.clear();
+                    pending_sent = 0;
+                    staging = Staging::default();
+                    tail.clear();
+                    playing = false;
+                    eof_reached = false;
+                    ended_sent = false;
+                    send(EngineEvent::Stopped);
+                }
+                Command::Shutdown => break 'worker,
             }
-            Ok(Command::Stop) => {
-                current_generation = shared.bump_generation();
-                shared.base_frames.store(0, Ordering::Release);
-                shared.played_frames.store(0, Ordering::Release);
-                current_session = 0;
-                last_load_failed = false;
-                decoder = None;
-                prepared = None;
-                current = None;
-                incoming = None;
-                pending_transition = None;
-                converter = None;
-                pending.clear();
-                pending_sent = 0;
-                staging = Staging::default();
-                tail.clear();
-                playing = false;
-                eof_reached = false;
-                ended_sent = false;
-                send(EngineEvent::Stopped);
-            }
-            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break 'worker,
-            Err(RecvTimeoutError::Timeout) => {}
         }
 
         // Pump converted samples into the ring — but only once the
@@ -1595,6 +1770,10 @@ fn run_worker<F>(
                         pending_sent += pushed;
                         let frames = (pushed / output_channels) as u64;
                         shared.pushed_frames.fetch_add(frames, Ordering::Relaxed);
+                        shared.ring_frames.store(
+                            (producer.occupied_len() / output_channels) as u64,
+                            Ordering::Relaxed,
+                        );
                         progressed = true;
                     }
                     if pending_sent == pending.len() {
@@ -1644,6 +1823,7 @@ fn run_worker<F>(
                                         to_id: incoming.as_ref().expect("incoming set").id,
                                         to_entry: incoming.as_ref().expect("incoming set").entry,
                                         boundary_frame,
+                                        crossfade_frames: outcome.overlap_frames,
                                         info: incoming.as_ref().expect("incoming set").info,
                                     });
                                     progressed = true;
@@ -1654,6 +1834,7 @@ fn run_worker<F>(
                                     progressed = true;
                                 }
                                 Err(error) => {
+                                    shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
                                     let source_id = current.as_ref().map(|track| track.id);
                                     send(EngineEvent::Error {
                                         session: Some(current_session),
@@ -1698,6 +1879,7 @@ fn run_worker<F>(
                             to_id: next.id,
                             to_entry: next.entry,
                             boundary_frame,
+                            crossfade_frames: 0,
                             info: next.info,
                         };
                         converter = Some(FormatConverter::new(&next.info, config));
@@ -1754,6 +1936,7 @@ fn run_worker<F>(
                             progressed = true;
                         }
                         Err(err) => {
+                            shared.decoder_errors.fetch_add(1, Ordering::Relaxed);
                             let source_id = incoming
                                 .as_ref()
                                 .map(|track| track.id)
@@ -1809,6 +1992,11 @@ fn run_worker<F>(
         if transition_reached {
             let transition = pending_transition.take().expect("transition checked");
             if let Some(next) = incoming.take() {
+                if transition.crossfade_frames > 0 {
+                    shared.crossfades.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    shared.gapless_transitions.fetch_add(1, Ordering::Relaxed);
+                }
                 current = Some(next);
                 // Keep the generation's seek base (usually zero) and
                 // fold it into the new source start in one atomic store.
@@ -1856,6 +2044,13 @@ fn run_worker<F>(
     }
 
     backend.stop();
+}
+
+/// Rejects non-finite decoded values at the conversion boundary. A
+/// corrupt decoder or malformed float source must not inject NaN/infinity
+/// into position-independent mixing or the output backend.
+fn finite_or_zero(sample: f32) -> f32 {
+    if sample.is_finite() { sample } else { 0.0 }
 }
 
 /// Converts decoded audio (file rate/channels) to the output format:
@@ -1918,13 +2113,13 @@ impl FormatConverter {
                 for c in 0..stride {
                     let a = self.buffer[index * stride + c];
                     let b = self.buffer[(index + 1) * stride + c];
-                    out.push(a + (b - a) * frac);
+                    out.push(finite_or_zero(a + (b - a) * frac));
                 }
                 self.phase += self.step;
             } else if flushing && index < available {
                 // Hold the final frame for the remaining fraction.
                 for c in 0..stride {
-                    out.push(self.buffer[index * stride + c]);
+                    out.push(finite_or_zero(self.buffer[index * stride + c]));
                 }
                 self.phase += self.step;
                 if self.phase.floor() as usize >= available {
@@ -1955,7 +2150,7 @@ mod tests {
         WAVEFORM_WINDOW, WaveformReader, mix_equal_power_tail,
     };
     use crate::decode::{DecodeError, StreamInfo, open_decoder};
-    use crate::output::{FillCallback, NullControl, OutputConfig};
+    use crate::output::{FillCallback, NullControl, OutputBackend, OutputConfig};
 
     struct TempDir(PathBuf);
 
@@ -3650,6 +3845,16 @@ mod tests {
             start_count,
             "crossfade must not recreate the output stream"
         );
+        let diagnostics = engine.diagnostics();
+        assert!(diagnostics.callbacks > 0);
+        assert!(diagnostics.delivered_frames > 0);
+        assert_eq!(diagnostics.underrun_frames, 0);
+        assert_eq!(diagnostics.crossfades, 1);
+        assert_eq!(diagnostics.gapless_transitions, 0);
+        assert_eq!(diagnostics.generation_changes, 1);
+        assert_eq!(diagnostics.sample_rate, 44_100);
+        assert_eq!(diagnostics.channels, 1);
+        assert!(diagnostics.ring_capacity_frames > 0);
         assert_eq!(
             engine.position(),
             Duration::from_secs_f64(22_050.0 / 44_100.0),
@@ -4389,8 +4594,7 @@ mod tests {
         engine.play();
         start_playing(&engine);
         wait_for_pushed_frames(&engine, &control, 88_200);
-        control.drain_frames(88_200);
-        let events = collect_events_until(&engine, |event| {
+        let events = drive_until(&engine, &control, |event| {
             matches!(event, EngineEvent::TrackEnded { .. })
         });
         assert!(events.iter().any(|event| matches!(
@@ -4455,6 +4659,167 @@ mod tests {
                 "explicit load leaked the old crossfade: {event:?}"
             );
         }
+        engine.shutdown();
+    }
+
+    #[test]
+    fn load_play_preload_command_burst_reaches_crossfade() {
+        let dir = TempDir::new("crossfade-command-burst");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(380), QueueEntryId::new(381));
+
+        // No event waits or callback drains between these sends. The
+        // worker must process the whole burst before its first pump so
+        // the fast decoder cannot commit to a fallback transition.
+        engine.load_entry(id_a, entry_a, a);
+        engine.play();
+        engine.preload_entry(id_b, entry_b, b);
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(66_150);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 66_150,
+                ..
+            } if *to_id == id_b
+        )));
+        let diagnostics = engine.diagnostics();
+        assert_eq!(diagnostics.crossfades, 1);
+        assert_eq!(diagnostics.gapless_transitions, 0);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn repeated_preload_failures_do_not_disturb_active_playback() {
+        let dir = TempDir::new("preload-failure-stress");
+        let good = write_dc_wav(&dir, "good.wav", 44_100, 88_200, 0.2);
+        let bad = dir.0.join("bad.wav");
+        fs::write(&bad, b"not a real wav").expect("bad fixture");
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let entry_a = QueueEntryId::new(390);
+
+        engine.load_entry(id_a, entry_a, good);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        start_playing(&engine);
+        wait_for_pushed_frames(&engine, &control, 4_096);
+        control.drain_frames(4_096);
+        for index in 0..50 {
+            engine.preload_entry(id_b, QueueEntryId::new(400 + index), bad.clone());
+        }
+        let mut failures = 0;
+        for _ in 0..4_000 {
+            match engine.events().recv_timeout(Duration::from_millis(5)) {
+                Ok(EngineEvent::PreloadFailed { id, .. }) if id == id_b => {
+                    failures += 1;
+                    if failures == 50 {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert_eq!(failures, 50);
+        assert_eq!(engine.diagnostics().preload_failures, 50);
+        assert_eq!(engine.diagnostics().decoder_errors, 0);
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackEnded { entry, id, .. } if *entry == entry_a && *id == id_a
+        )));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn output_backend_errors_are_reported_and_counted() {
+        struct ErrorBackend {
+            config: OutputConfig,
+        }
+
+        impl OutputBackend for ErrorBackend {
+            fn config(&self) -> OutputConfig {
+                self.config
+            }
+
+            fn start(
+                &mut self,
+                _fill: Box<dyn FillCallback>,
+                mut on_error: Box<dyn FnMut(String) + Send>,
+            ) -> Result<(), EngineError> {
+                on_error("simulated device disconnect".to_owned());
+                Ok(())
+            }
+
+            fn stop(&mut self) {}
+        }
+
+        let config = OutputConfig {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let engine = EngineHandle::spawn(move || {
+            Ok(Box::new(ErrorBackend { config }) as Box<dyn OutputBackend>)
+        })
+        .expect("backend starts");
+        let event = engine
+            .events()
+            .recv_timeout(Duration::from_secs(1))
+            .expect("output error event");
+        assert!(matches!(
+            event,
+            EngineEvent::Error {
+                session: None,
+                id: None,
+                error: EngineError::Output(message),
+            } if message.contains("simulated device disconnect")
+        ));
+        let diagnostics = engine.diagnostics();
+        assert_eq!(diagnostics.output_errors, 1);
+        assert_eq!(diagnostics.sample_rate, 48_000);
+        assert_eq!(diagnostics.channels, 2);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn rapid_seeks_keep_the_newest_immediate_position() {
+        let dir = TempDir::new("rapid-seek-position");
+        let path = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.load(TrackId::new(1), path);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        start_playing(&engine);
+        control.drain_frames(4_096);
+
+        let _ = engine.seek(Duration::from_millis(100));
+        let _ = engine.seek(Duration::from_millis(50));
+        assert!(
+            (engine.position().as_millis() as i64 - 50).abs() <= 2,
+            "newest seek position was {:?}",
+            engine.position()
+        );
+        for _ in 0..20 {
+            control.drain_frames(0);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            (engine.position().as_millis() as i64 - 50).abs() <= 2,
+            "an older queued seek overwrote the newest position: {:?}",
+            engine.position()
+        );
         engine.shutdown();
     }
 
@@ -4945,6 +5310,106 @@ mod tests {
             "only silence may follow the track"
         );
         engine.shutdown();
+    }
+
+    #[test]
+    fn converter_sanitizes_nonfinite_samples_and_handles_extreme_rates() {
+        let info = StreamInfo {
+            sample_rate: 44_100,
+            channels: 1,
+            duration: None,
+        };
+        let config = OutputConfig {
+            sample_rate: 44_100,
+            channels: 1,
+        };
+        let mut converter = FormatConverter::new(&info, config);
+        let mut output =
+            converter.process(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5, -0.5]);
+        output.extend(converter.finish());
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.contains(&0.5));
+        assert!(output.contains(&-0.5));
+
+        let mut one = FormatConverter::new(&info, config);
+        let mut one_frame = one.process(&[0.25]);
+        one_frame.extend(one.finish());
+        assert_eq!(one_frame, vec![0.25]);
+
+        let mut empty = FormatConverter::new(&info, config);
+        assert!(empty.process(&[]).is_empty());
+        assert!(empty.finish().is_empty());
+
+        let low_info = StreamInfo {
+            sample_rate: 8_000,
+            channels: 1,
+            duration: None,
+        };
+        let high_info = StreamInfo {
+            sample_rate: 192_000,
+            channels: 1,
+            duration: None,
+        };
+        let high_config = OutputConfig {
+            sample_rate: 192_000,
+            channels: 1,
+        };
+        let mut up = FormatConverter::new(&low_info, high_config);
+        let mut upsampled = up.process(&[0.25; 800]);
+        upsampled.extend(up.finish());
+        assert!((upsampled.len() as i64 - 19_200).abs() <= 200);
+
+        let low_config = OutputConfig {
+            sample_rate: 8_000,
+            channels: 1,
+        };
+        let mut down = FormatConverter::new(&high_info, low_config);
+        let mut downsampled = down.process(&vec![0.25; 19_200]);
+        downsampled.extend(down.finish());
+        assert!(
+            (downsampled.len() as i64 - 800).abs() <= 2,
+            "downsample produced {} frames",
+            downsampled.len()
+        );
+    }
+
+    #[test]
+    fn callback_diagnostics_count_requested_delivered_and_underrun_frames() {
+        use std::sync::Arc;
+
+        use ringbuf::HeapRb;
+        use ringbuf::traits::{Producer, Split};
+
+        let shared = Arc::new(Shared::new());
+        shared.gate_open.store(true, Ordering::Release);
+        let (mut producer, consumer) = HeapRb::<f32>::new(8).split();
+        let (waveform, _waveform_reader) = HeapRb::<f32>::new(8).split();
+        let mut source = SampleSource {
+            consumer,
+            waveform,
+            shared: Arc::clone(&shared),
+            channels: 2,
+            seen_generation: 0,
+        };
+
+        let mut silence = [0.0f32; 8];
+        source.fill(&mut silence);
+        assert_eq!(shared.callbacks.load(Ordering::Acquire), 1);
+        assert_eq!(shared.requested_frames.load(Ordering::Acquire), 4);
+        assert_eq!(shared.delivered_frames.load(Ordering::Acquire), 0);
+        assert_eq!(shared.underrun_frames.load(Ordering::Acquire), 4);
+
+        for _ in 0..4 {
+            producer.try_push(0.5).expect("ring has room");
+        }
+        let mut output = [0.0f32; 8];
+        source.fill(&mut output);
+        assert_eq!(shared.callbacks.load(Ordering::Acquire), 2);
+        assert_eq!(shared.requested_frames.load(Ordering::Acquire), 8);
+        assert_eq!(shared.delivered_frames.load(Ordering::Acquire), 2);
+        assert_eq!(shared.underrun_frames.load(Ordering::Acquire), 6);
+        assert_eq!(&output[..4], &[0.5, 0.5, 0.5, 0.5]);
+        assert!(output[4..].iter().all(|sample| *sample == 0.0));
     }
 
     /// The callback-side source in isolation: irregular producer

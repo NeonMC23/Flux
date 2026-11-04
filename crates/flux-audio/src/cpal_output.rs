@@ -6,16 +6,21 @@
 //! format) and falls back to the device default, converting to the
 //! device's integer/float sample type in the callback via
 //! [`cpal::FromSample`]. The callback itself only forwards to the
-//! engine's lock-free [`FillCallback`]; the one allocation (a scratch
-//! buffer) grows to the device's buffer size during warm-up and is
-//! then reused. Underruns degrade to silence — the callback never
-//! blocks, locks, or performs I/O.
+//! engine's lock-free [`FillCallback`]. The scratch buffer is allocated
+//! once before the stream starts and is reused without resizing; data
+//! exceeding one scratch window is filled in frame-aligned chunks.
+//! Underruns degrade to silence — the callback never blocks, locks,
+//! allocates, or performs I/O.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig};
 
 use crate::engine::EngineError;
 use crate::output::{FillCallback, OutputBackend, OutputConfig};
+
+/// Frames handed to the engine per scratch window. Larger device buffers
+/// are processed as multiple frame-aligned chunks without allocating.
+const CALLBACK_CHUNK_FRAMES: usize = 4_096;
 
 /// An [`OutputBackend`] playing through a CPAL output device.
 pub struct CpalOutput {
@@ -55,21 +60,14 @@ impl CpalOutput {
     where
         T: SizedSample + cpal::FromSample<f32>,
     {
-        let mut scratch: Vec<f32> = Vec::new();
+        let channels = usize::from(stream_config.channels).max(1);
+        let mut scratch = vec![0.0f32; CALLBACK_CHUNK_FRAMES * channels];
         let stream = self
             .device
             .build_output_stream::<T, _, _>(
                 stream_config,
                 move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
-                    // Grows once to the device buffer size, then reuses.
-                    if scratch.len() < data.len() {
-                        scratch.resize(data.len(), 0.0);
-                    }
-                    let buffer = &mut scratch[..data.len()];
-                    fill.fill(buffer);
-                    for (out, sample) in data.iter_mut().zip(buffer.iter()) {
-                        *out = T::from_sample(*sample);
-                    }
+                    fill_chunked(data, &mut scratch, fill.as_mut());
                 },
                 move |err: cpal::Error| on_error(format!("output stream error: {err}")),
                 None,
@@ -80,6 +78,25 @@ impl CpalOutput {
             .map_err(|err| EngineError::Output(format!("could not start output stream: {err}")))?;
         self.stream = Some(stream);
         Ok(())
+    }
+}
+
+fn fill_chunked<T>(data: &mut [T], scratch: &mut [f32], fill: &mut dyn FillCallback)
+where
+    T: SizedSample + cpal::FromSample<f32>,
+{
+    if scratch.is_empty() {
+        for sample in data {
+            *sample = T::from_sample(0.0);
+        }
+        return;
+    }
+    for chunk in data.chunks_mut(scratch.len()) {
+        let buffer = &mut scratch[..chunk.len()];
+        fill.fill(buffer);
+        for (out, sample) in chunk.iter_mut().zip(buffer.iter()) {
+            *out = T::from_sample(*sample);
+        }
     }
 }
 
@@ -150,4 +167,57 @@ fn select_config(device: &cpal::Device) -> Result<SupportedStreamConfig, EngineE
         }
     }
     Ok(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fill_chunked;
+    use crate::output::FillCallback;
+
+    struct Sequence {
+        next: f32,
+        calls: usize,
+        maximum_len: usize,
+        channels: usize,
+        frame_aligned: bool,
+    }
+
+    impl FillCallback for Sequence {
+        fn fill(&mut self, out: &mut [f32]) {
+            self.calls += 1;
+            self.maximum_len = self.maximum_len.max(out.len());
+            self.frame_aligned &= out.len().is_multiple_of(self.channels);
+            for sample in out {
+                *sample = self.next;
+                self.next += 1.0;
+            }
+        }
+    }
+
+    #[test]
+    fn cpal_chunking_reuses_fixed_scratch_without_frame_splits() {
+        let channels = 2;
+        let scratch_samples = 4 * channels;
+        let mut scratch = vec![0.0f32; scratch_samples];
+        let original_len = scratch.len();
+        let mut data = vec![0.0f32; 11 * channels];
+        let mut fill = Sequence {
+            next: 1.0,
+            calls: 0,
+            maximum_len: 0,
+            channels,
+            frame_aligned: true,
+        };
+        fill_chunked(&mut data, &mut scratch, &mut fill);
+        assert_eq!(fill.calls, 3);
+        assert_eq!(fill.maximum_len, scratch_samples);
+        assert_eq!(scratch.len(), original_len, "scratch must not resize");
+        assert!(fill.frame_aligned);
+        assert!(data.iter().all(|sample| *sample > 0.0));
+        assert_eq!(
+            data[data.len() - 1],
+            22.0,
+            "all requested samples are delivered once in order"
+        );
+    }
 }

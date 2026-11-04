@@ -474,7 +474,95 @@ is verified with synthetic sources and the null backend.
 
 [`Controller`]: ../crates/flux-app/src/lib.rs
 
-### Discovery, ratings, history and dashboard
+### Audio reliability audit, diagnostics and stress coverage
+
+The audio pipeline has been audited against the existing null backend and
+core-level conversion code. The following table distinguishes what is covered
+from what remains structurally or physically unverified.
+
+| Area | Status |
+|---|---|
+| Decoder lifecycle, prepared cancellation, gapless/crossfade handoff | Confirmed by deterministic engine tests |
+| Queue authorization, duplicate `QueueEntryId`, transition identity | Confirmed by Controller/engine tests |
+| Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
+| Real-time callback content (ring pop, gain, silence) | Audited structurally and exercised only through `NullOutput` |
+| CPAL stream construction, sample formats, error propagation | Compiled and error path simulated; no hardware playback validation |
+| Device hotplug and automatic recovery | Not implemented / not tested |
+| Hardware underrun, latency and long-duration CPU/memory | Not measured |
+| Non-finite decoded samples | Confirmed defect fixed at conversion boundary |
+
+Confirmed fixes from this audit:
+
+- The CPAL callback previously grew a scratch `Vec` from inside the
+  real-time callback when a device buffer was larger than the prior one.
+  It now allocates a frame-aligned scratch window before starting the stream
+  and reuses it, splitting larger device buffers into fixed-size chunks.
+- A fast decoder could reach EOF before a queued `Load`/`Play`/`Preload`
+  burst was processed, committing to a fallback transition even though the
+  intended successor was already waiting in the command channel. The worker
+  now drains every queued command before pumping audio.
+- A stale queued `Seek` could overwrite the immediate position of a newer
+  seek after the second command was issued but before the worker processed
+  it. The newest requested load/seek session is published atomically, older
+  seeks are ignored, and position is locked to the new base until the
+  callback flushes/acknowledges the generation.
+- Non-finite decoded samples could propagate through interpolation and
+  crossfade into the output backend. `FormatConverter` now converts
+  NaN/infinity to zero at the conversion boundary while preserving finite
+  values and existing clipping/headroom semantics.
+
+`EngineHandle::diagnostics()` (also exposed as
+`Controller::audio_diagnostics()`) returns a local, lock-free snapshot:
+callback fill count, requested/delivered/underrun frames, current ring
+occupancy and capacity, generation, pushed/played frames, gapless/crossfade
+counts, preload failures, decoder errors, output errors and output
+rate/channels. The callback increments bounded atomics only; there is no
+logging, allocation, locking, telemetry or network access in the callback.
+`callbacks` counts `FillCallback` invocations, so a very large CPAL device
+buffer filled in multiple chunks counts multiple times. Ring occupancy is the
+most recent worker/callback observation and is diagnostic, not a scheduling
+barrier. Callback duration is intentionally not measured: doing so safely
+would require additional per-callback clock reads and was not justified.
+
+Deterministic stress coverage:
+
+- 2,000 gapless transitions with two short WAVs under Repeat All.
+- 100-transition crossfade stress with 2 s WAVs under Repeat All; at least
+  96 overlaps are required, with a small bounded fallback allowance under
+  scheduler contention.
+- 100 gapless Repeat One transitions, 100 Shuffle + Repeat All transitions
+  and 100 transitions with duplicate queue entries for the same TrackId.
+- Alternating gapless/crossfade configuration during a running session.
+- 50 consecutive failed preloads while the active source continues.
+- Rapid bursts of pause/resume/seek/next/previous/direct selection, queue
+  add/remove/reorder and crossfade setting changes.
+- Existing coverage for truncated successors, decoder failures, seek/stop/
+  load cancellation, pause during overlap, empty/short sources and stale
+  transition events.
+
+The stress harness is frame-driven through `NullOutput`; it paces drain
+operations using observed ring occupancy and acknowledges generations with
+zero-frame fills. It asserts zero underrun frames, zero decoder/preload errors
+where applicable, bounded transition counts, bounded generation changes, and
+correct current-entry/engine-ledger agreement. It is not a wall-clock
+real-time simulation and does not prove multi-hour hardware stability.
+
+Resource bounds remain structural: at most one active decoder plus one prepared
+decoder; one bounded output ring (approximately two seconds); retained
+crossfade tail, incoming overlap and mixed pending audio bounded by the
+5-second configured maximum plus decode chunks; one pending transition record.
+No decoder/resource count is exposed as a live metric, so the bound is audited
+in code rather than measured as a runtime gauge.
+
+CPAL failures are surfaced as `EngineEvent::Error` and counted in
+`output_errors`; the Controller stops playback and clears its engine ledger.
+There is no automatic device re-open or switching policy. A runtime device
+failure therefore requires recovery through the application/device lifecycle
+rather than pretending playback continues. Physical device removal, hotplug,
+unsupported-channel configurations and hardware underrun behavior were not
+exercised on this host.
+
+### Discovery, ratings, history and dashboard### Discovery, ratings, history and dashboard
 
 Ratings/favorites remain canonical track data. Track rows expose a favorite
 toggle and deterministic rating cycle (none/1–5★); the batch bar applies

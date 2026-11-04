@@ -67,7 +67,7 @@ use std::fmt;
 
 use flux_audio::Player;
 use flux_audio::decode::StreamInfo;
-pub use flux_audio::engine::WAVEFORM_WINDOW;
+pub use flux_audio::engine::{AudioDiagnostics, WAVEFORM_WINDOW};
 use flux_audio::engine::{EngineEvent, EngineHandle};
 mod settings;
 
@@ -2308,6 +2308,13 @@ impl Controller {
     #[must_use]
     pub fn position(&self) -> Duration {
         self.engine.position()
+    }
+
+    /// Local, lock-free audio pipeline diagnostics. This is a snapshot;
+    /// no diagnostics are logged from the real-time callback.
+    #[must_use]
+    pub fn audio_diagnostics(&self) -> AudioDiagnostics {
+        self.engine.diagnostics()
     }
 
     /// The latest real output samples for the oscilloscope.
@@ -6441,8 +6448,8 @@ mod tests {
     use flux_library::QueueStore;
 
     use super::{
-        AudioStatus, Controller, ControllerEvent, CreateLibraryError, PlaybackMode,
-        PortableOpenError, ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit,
+        AudioDiagnostics, AudioStatus, Controller, ControllerEvent, CreateLibraryError,
+        PlaybackMode, PortableOpenError, ScanOutcome, StorageMode, SwitchError, TrackMetadataEdit,
         create_canonical_library, create_portable_library, default_engine,
         execute_legacy_migration, is_track_playable, migrate_legacy_library, plan_legacy_migration,
     };
@@ -6564,6 +6571,48 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         seen
+    }
+
+    /// Frame-driven convergence for long deterministic simulations. Drains
+    /// only when the engine reports a full read window, yielding/sleeping
+    /// briefly when the worker needs to catch up. This is not a real-time
+    /// timing assertion; it keeps the controlled null device from
+    /// outrunning decoder production.
+    fn drive_audio_diagnostics(
+        controller: &mut Controller,
+        control: &NullControl,
+        transitions: u64,
+    ) -> AudioDiagnostics {
+        let mut idle = 0;
+        for _ in 0..200_000 {
+            let _ = controller.poll();
+            // Acknowledge a new generation without consuming audio. The
+            // worker deliberately waits for this before pushing.
+            control.drain_frames(0);
+            let diagnostics = controller.audio_diagnostics();
+            if diagnostics.gapless_transitions + diagnostics.crossfades >= transitions {
+                // Give the Controller a bounded chance to drain the final
+                // engine event before the caller inspects identity state.
+                for _ in 0..8 {
+                    let _ = controller.poll();
+                    std::thread::yield_now();
+                }
+                return controller.audio_diagnostics();
+            }
+            if diagnostics.ring_frames >= 1_024 {
+                control.drain_frames(1_024);
+                control.clear_captured();
+                idle = 0;
+            } else {
+                idle += 1;
+                assert!(idle < 20_000, "audio worker stalled: {diagnostics:?}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        panic!(
+            "did not reach {transitions} transitions: {:?}",
+            controller.audio_diagnostics()
+        );
     }
 
     fn scanned(controller: &mut Controller, control: &NullControl, root: PathBuf) {
@@ -7860,6 +7909,225 @@ mod tests {
             "the incoming position starts at the crossfade boundary"
         );
         assert_eq!(controller.playback_history().total_plays(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn long_gapless_playback_has_no_underruns_or_resource_drift() {
+        let dir = TempDir::new("stress-gapless");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        controller.set_crossfade_ms(0);
+        controller.set_playback_mode(PlaybackMode::RepeatAll);
+        controller.play_track(a);
+        let diagnostics = drive_audio_diagnostics(&mut controller, &control, 2_000);
+        assert!(diagnostics.gapless_transitions >= 2_000, "{diagnostics:?}");
+        assert_eq!(diagnostics.crossfades, 0);
+        assert_eq!(diagnostics.underrun_frames, 0, "{diagnostics:?}");
+        assert_eq!(diagnostics.decoder_errors, 0);
+        assert_eq!(diagnostics.preload_failures, 0);
+        assert!(
+            diagnostics.generation_changes <= 20,
+            "fallback reloads must remain bounded: {diagnostics:?}"
+        );
+        assert!(diagnostics.callbacks > 0);
+        assert!(diagnostics.delivered_frames > 0);
+        assert!(diagnostics.ring_capacity_frames >= 1_024);
+        assert!(controller.current_id().is_some());
+        assert_eq!(controller.engine_entry, controller.current_queue_entry_id());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn long_crossfade_playback_has_no_underruns_or_resource_drift() {
+        let dir = TempDir::new("stress-crossfade");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+        let b_path = write_dc_wav(&root, "b.wav", 88_200, 0.8);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        let b = id_of(&controller, &b_path);
+        controller.set_crossfade_ms(500);
+        assert_eq!(controller.crossfade_ms(), 500);
+        controller.set_playback_mode(PlaybackMode::RepeatAll);
+        controller.play_track(a);
+        let diagnostics = drive_audio_diagnostics(&mut controller, &control, 100);
+        assert!(diagnostics.crossfades >= 96, "{diagnostics:?}");
+        assert!(
+            diagnostics.gapless_transitions <= 4,
+            "fallback transitions must remain bounded: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics.underrun_frames, 0, "{diagnostics:?}");
+        assert_eq!(diagnostics.decoder_errors, 0);
+        assert_eq!(diagnostics.preload_failures, 0);
+        assert!(
+            diagnostics.generation_changes <= 10,
+            "fallback reloads must remain bounded: {diagnostics:?}"
+        );
+        assert!(matches!(controller.current_id(), Some(id) if id == a || id == b));
+        assert_eq!(controller.engine_entry, controller.current_queue_entry_id());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn alternating_crossfade_configuration_during_playback_stays_coherent() {
+        let dir = TempDir::new("stress-alternating-crossfade");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+        write_dc_wav(&root, "b.wav", 88_200, 0.8);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        controller.set_playback_mode(PlaybackMode::RepeatAll);
+        controller.set_crossfade_ms(500);
+        controller.play_track(a);
+
+        let first = drive_audio_diagnostics(&mut controller, &control, 10);
+        assert!(first.crossfades >= 9, "{first:?}");
+        controller.set_crossfade_ms(0);
+        let second = drive_audio_diagnostics(&mut controller, &control, 20);
+        assert!(
+            second.gapless_transitions >= 9,
+            "gapless transitions did not resume: {second:?}"
+        );
+        controller.set_crossfade_ms(500);
+        let third = drive_audio_diagnostics(&mut controller, &control, 32);
+        assert!(
+            third.crossfades >= second.crossfades + 4,
+            "crossfade did not resume for future sources: {third:?}"
+        );
+        assert_eq!(third.underrun_frames, 0, "{third:?}");
+        assert_eq!(third.decoder_errors, 0);
+        assert!(third.generation_changes <= 10, "{third:?}");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn repeat_one_stress_preserves_entry_and_avoids_reloads() {
+        let dir = TempDir::new("stress-repeat-one");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 11_025, 0.4);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        controller.set_repeat_mode(RepeatMode::One);
+        controller.set_crossfade_ms(0);
+        controller.play_track(a);
+        let schema = drive_audio_diagnostics(&mut controller, &control, 100);
+        assert!(schema.gapless_transitions >= 100, "{schema:?}");
+        assert_eq!(schema.crossfades, 0);
+        assert_eq!(schema.underrun_frames, 0);
+        assert_eq!(schema.decoder_errors, 0);
+        assert!(schema.generation_changes <= 10, "{schema:?}");
+        assert_eq!(controller.current_id(), Some(a));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn shuffle_all_stress_keeps_authoritative_current_entry() {
+        let dir = TempDir::new("stress-shuffle-all");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        let b = id_of(&controller, &root.join("b.wav"));
+        controller.set_playback_mode(PlaybackMode::ShuffleAll);
+        controller.set_crossfade_ms(0);
+        controller.play_track(a);
+        let diagnostics = drive_audio_diagnostics(&mut controller, &control, 40);
+        assert!(diagnostics.gapless_transitions >= 40, "{diagnostics:?}");
+        assert_eq!(diagnostics.underrun_frames, 0);
+        assert_eq!(diagnostics.decoder_errors, 0);
+        assert!(diagnostics.generation_changes <= 10, "{diagnostics:?}");
+        assert!(matches!(controller.current_id(), Some(id) if id == a || id == b));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn duplicate_entries_stress_preserve_engine_queue_identity() {
+        let dir = TempDir::new("stress-duplicate-entries");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 11_025, 0.4);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        controller.play_track(a);
+        controller.enqueue_track(a).expect("duplicate entry");
+        let entries = controller.queue_entries().to_vec();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].track(), entries[1].track());
+        assert_ne!(entries[0].id(), entries[1].id());
+        controller.set_playback_mode(PlaybackMode::RepeatAll);
+        controller.set_crossfade_ms(0);
+        let diagnostics = drive_audio_diagnostics(&mut controller, &control, 100);
+        assert!(diagnostics.gapless_transitions >= 100, "{diagnostics:?}");
+        assert_eq!(diagnostics.underrun_frames, 0);
+        assert_eq!(diagnostics.decoder_errors, 0);
+        assert_eq!(
+            controller.engine_entry,
+            controller.current_queue_entry_id(),
+            "the engine ledger must track the authoritative duplicate entry"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| Some(entry.id()) == controller.current_queue_entry_id())
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn rapid_user_actions_leave_playback_coherent() {
+        let dir = TempDir::new("stress-rapid-actions");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        let b = id_of(&controller, &root.join("b.wav"));
+        controller.play_track(a);
+        for iteration in 0..60 {
+            if iteration % 2 == 0 {
+                controller.pause();
+            } else {
+                controller.play();
+            }
+            let _ = controller.seek(Duration::from_millis(50 + (iteration % 5) * 10));
+            controller.next();
+            controller.previous();
+            controller.play_track(if iteration % 2 == 0 { a } else { b });
+            let added = controller.enqueue_track(b).expect("enqueue");
+            let _ = controller.remove_queue_entry(added);
+            if let Some(entry) = controller.current_queue_entry_id() {
+                let _ =
+                    controller.move_queue_entry_by(entry, if iteration % 2 == 0 { -1 } else { 1 });
+            }
+            let _ = controller.set_crossfade_duration_ms(if iteration % 2 == 0 { 0 } else { 500 });
+            let _ = controller.set_crossfade_enabled(iteration % 2 == 0);
+            let _ = controller.poll();
+        }
+        controller.stop();
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None);
+        assert_eq!(controller.last_error(), None);
+        controller.play();
+        drive(&mut controller, &control, |c, _| {
+            c.player_state() == PlaybackState::Playing
+        });
+        let diagnostics = controller.audio_diagnostics();
+        assert_eq!(diagnostics.underrun_frames, 0, "{diagnostics:?}");
+        assert_eq!(diagnostics.decoder_errors, 0, "{diagnostics:?}");
+        assert!(
+            diagnostics.generation_changes <= 500,
+            "command burst must retire generations without unbounded accumulation: {diagnostics:?}"
+        );
+        assert!(controller.current_id().is_some());
         controller.shutdown();
     }
 
@@ -9923,7 +10191,11 @@ mod tests {
             .seek(Duration::from_millis(50))
             .expect("stopped seek");
         assert_eq!(target, Duration::from_millis(50));
-        assert!((controller.position().as_millis() as i64 - 50).abs() <= 2);
+        assert!(
+            (controller.position().as_millis() as i64 - 50).abs() <= 2,
+            "stopped seek position was {:?}",
+            controller.position()
+        );
         assert_eq!(controller.player_state(), PlaybackState::Stopped);
         assert_eq!(controller.current_queue_entry_id(), current);
 
