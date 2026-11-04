@@ -302,12 +302,13 @@ An automated low-amplitude Linux CPAL probe validated real 48 kHz stereo
 device delivery, pause/seek/stop/restart, gapless/crossfade transitions and
 duplicate-entry queue playback on one PipeWire/ALSA host. A later 30-minute
 session added monitor capture of gapless/crossfade envelopes and resource
-sampling; it recorded one transient ~10 ms underrun accumulation during
-queue/action churn, with zero decoder/output errors and stable
-memory/threads/fds. These
-are single-host observations, not perceptual or cross-platform guarantees;
-see the canonical audio documentation for the device, conditions and exact
-limitations.
+sampling. That run exposed one transient ~10 ms underrun accumulation during
+queue/action churn. The cause was isolated to output-gate opening before the
+ring was refilled after generation invalidation; the gate now waits for a small
+prebuffer. A post-fix 30-minute rerun reported zero underruns with zero
+decoder/output errors and stable memory/threads/fds. These are single-host
+observations, not perceptual or cross-platform guarantees; see the canonical
+audio documentation for the device, conditions and exact limitations.
 
 ## What does not exist yet
 

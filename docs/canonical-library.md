@@ -488,7 +488,7 @@ from what remains structurally or physically unverified.
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; runtime error path simulated; no hotplug validation |
 | Device hotplug and automatic recovery | Not implemented / not tested |
-| Hardware underrun, latency and long-duration CPU/memory | Underrun count measured as zero for a ~60 s Linux hardware probe; latency and multi-hour CPU/memory not measured |
+| Hardware underrun, latency and long-duration CPU/memory | A ~60 s probe and post-fix 5/30-minute runs reported zero underruns; latency and multi-hour CPU/memory not measured |
 | Non-finite decoded samples | Confirmed defect fixed at conversion boundary |
 
 Confirmed fixes from this audit:
@@ -510,6 +510,12 @@ Confirmed fixes from this audit:
   crossfade into the output backend. `FormatConverter` now converts
   NaN/infinity to zero at the conversion boundary while preserving finite
   values and existing clipping/headroom semantics.
+- Opening the output gate immediately after a new generation could expose the
+  first CPAL callback to an empty ring. Load/seek/preload-invalidation paths
+  now keep the gate closed until the callback has acknowledged the generation
+  and at least 1,024 output frames are buffered (or all remaining source audio
+  is already queued). The fix was triggered by the underrun investigation
+  below.
 
 `EngineHandle::diagnostics()` (also exposed as
 `Controller::audio_diagnostics()`) returns a local, lock-free snapshot:
@@ -523,6 +529,15 @@ buffer filled in multiple chunks counts multiple times. Ring occupancy is the
 most recent worker/callback observation and is diagnostic, not a scheduling
 barrier. Callback duration is intentionally not measured: doing so safely
 would require additional per-callback clock reads and was not justified.
+
+`underrun_frames` is the sum, while the output gate is open, of requested minus
+actually popped output frames. It does not count intentional silence while the
+gate is closed for pause/stop, nor the generation-flush callback after
+load/seek/stop. It does count gate-open startup/rewind starvation, end-of-stream
+gate-open shortfall, and CPAL chunk-fill shortfalls. One periodic diagnostic
+sample can aggregate multiple callback events; the counter does not identify
+which callback or whether the shortfall was transient startup versus
+established playback. This limitation motivated the gate-prebuffer correction.
 
 Deterministic stress coverage:
 
@@ -649,13 +664,61 @@ snapshots every 30 seconds.
 - Final Controller state: `Playing`, current TrackId(2), QueueEntryId(2).
 
 The single underrun occurred around 1,470 s during the queue/action-churn
-portion, after earlier steady gapless/crossfade periods had zero. It was not
-reproduced by 200 focused pause/resume cycles or by the short steady-state
-captures. Its exact trigger was not isolated; it is recorded as a transient
-hardware scheduling/transition event, not as a confirmed code defect. No
-source change was made. The session was not a perceptual listening test, and
-the process was stopped after 30 minutes rather than extrapolated to multi-hour
-or cross-platform guarantees.
+portion, after earlier steady gapless/crossfade periods had zero. This was
+subsequently investigated and traced to output-gate opening before the ring
+had been refilled after a generation change. The exact 496-frame event was not
+replayed callback-for-callback, but the mechanism was reproduced deterministically
+on the real device as 512-frame shortfalls during rapid queue append/remove
+churn. See the underrun investigation below. The session was not a perceptual
+listening test, and the process was stopped after 30 minutes rather than
+extrapolated to multi-hour or cross-platform guarantees.
+
+#### Underrun investigation and gate-prebuffer correction
+
+Controlled hardware experiments isolated the failure:
+
+- 30-second continuous restart, direct-selection, pause/resume, next, previous,
+  seek and crossfade-change workloads each reported zero underruns.
+- A 30-second rapid queue append/remove workload reported **2,048 underrun
+  frames** (four 512-frame shortfalls). Diagnostic samples showed generation
+  changes, an empty ring, and playback still logically `Playing`.
+- A detailed 8-second queue-churn run reproduced shortfalls with generation
+  bumps while the ring was zero; the underrun appeared on the callback
+  immediately following a preload-invalidation flush.
+
+Root cause: queue mutations can change the authorized successor while an
+incoming source is already installed. The engine must invalidate that installed
+handoff, flush the generation and reopen the audible source. The old recovery
+path reopened the output gate as soon as playback intent was set, even though
+the generation flush had just emptied the ring. The next CPAL callback could
+therefore request a full buffer with only a few or zero frames available. This
+is the same startup/gate-opening class counted by `underrun_frames`.
+
+Correction: load, seek and preload-invalidation paths now close the output gate.
+The worker opens it only after the generation is acknowledged and either:
+
+- at least 1,024 output frames are buffered; or
+- all remaining source audio has been queued (short/end-of-stream sources).
+
+Play with an already-prefilled ring still opens immediately; resume latency is
+not changed for a normal pause. A regression test verifies that Play does not
+open the gate before prebuffering and that the gate opens after the ring has
+been primed.
+
+Post-fix hardware results on the same device:
+
+- 5-minute baseline: 0 underruns, 85 crossfades, 28,131 fills, exact requested
+  and delivered frame counts.
+- 30-second rapid queue append/remove: **0 underruns** (previously 2,048).
+- 30-minute combined queue/mode/pause/seek/crossfade workload: **0 underruns**;
+  184 gapless transitions, 257 crossfades, 166,025 fills, 43 generations,
+  0 preload/decoder/output errors. RSS was 17,904 KiB shortly after startup and
+  11,336 KiB at the end; threads stayed at 6 and fds at 26–29.
+
+The original single 496-frame event was therefore explained as the same
+gate-open starvation class with high confidence. Because the original metric
+did not tag event boundaries, the exact callback cannot be reconstructed from
+the old logs; the post-fix workload is the decisive validation.
 
 Resource bounds remain structural: at most one active decoder plus one prepared
 decoder; one bounded output ring (approximately two seconds); retained
