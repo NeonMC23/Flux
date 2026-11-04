@@ -393,6 +393,18 @@ fn gate_prebuffer_frames(shared: &Shared) -> usize {
     GATE_PREBUFFER_FRAMES.max(shared.max_device_callback_frames.load(Ordering::Acquire) as usize)
 }
 
+/// Whether the output gate has enough evidence and queued audio to open.
+fn gate_ready(
+    shared: &Shared,
+    generation_live: bool,
+    queued_frames: usize,
+    all_queued: bool,
+) -> bool {
+    generation_live
+        && shared.device_callback_observed.load(Ordering::Acquire)
+        && (all_queued || queued_frames >= gate_prebuffer_frames(shared))
+}
+
 /// GUI-side tail of the lock-free waveform tap.
 ///
 /// The audio callback owns the producer side; this reader is touched
@@ -1787,14 +1799,14 @@ fn run_worker<F>(
                             }
                         }
                         playing = true;
-                        let observed = shared.device_callback_observed.load(Ordering::Acquire);
                         let generation_live =
                             shared.acked_generation.load(Ordering::Acquire) == current_generation;
-                        let required = gate_prebuffer_frames(&shared);
-                        if generation_live
-                            && observed
-                            && producer.occupied_len() / output_channels >= required
-                        {
+                        if gate_ready(
+                            &shared,
+                            generation_live,
+                            producer.occupied_len() / output_channels,
+                            false,
+                        ) {
                             shared.gate_open.store(true, Ordering::Release);
                         }
                         send(EngineEvent::Started {
@@ -2070,11 +2082,9 @@ fn run_worker<F>(
             }
         }
         if generation_live && playing && !shared.gate_open.load(Ordering::Acquire) {
-            let observed = shared.device_callback_observed.load(Ordering::Acquire);
-            let required = gate_prebuffer_frames(&shared);
             let queued_frames = producer.occupied_len() / output_channels;
             let all_queued = eof_reached && pending.is_empty() && tail.is_empty();
-            if observed && (queued_frames >= required || all_queued) {
+            if gate_ready(&shared, generation_live, queued_frames, all_queued) {
                 shared.gate_open.store(true, Ordering::Release);
             }
         }
@@ -2251,7 +2261,7 @@ mod tests {
 
     use super::{
         EngineError, EngineEvent, EngineHandle, FormatConverter, SampleSource, Shared,
-        WAVEFORM_WINDOW, WaveformReader, mix_equal_power_tail,
+        WAVEFORM_WINDOW, WaveformReader, gate_ready, mix_equal_power_tail,
     };
     use crate::decode::{DecodeError, StreamInfo, open_decoder};
     use crate::output::{FillCallback, NullControl, OutputBackend, OutputConfig};
@@ -2435,6 +2445,35 @@ mod tests {
             (frame as f32 / (total - 1) as f32) * std::f32::consts::FRAC_PI_2
         };
         (outgoing * theta.cos() + incoming * theta.sin()).clamp(-1.0, 1.0)
+    }
+
+    #[test]
+    fn gate_ready_requires_generation_observation_and_prebuffer() {
+        let shared = Shared::new();
+        assert!(
+            !gate_ready(&shared, true, 8_192, false),
+            "unobserved callback demand must keep the gate closed"
+        );
+        assert!(
+            !gate_ready(&shared, true, 0, true),
+            "short-source bypass also requires an observed callback"
+        );
+        shared
+            .device_callback_observed
+            .store(true, Ordering::Release);
+        assert!(
+            !gate_ready(&shared, false, 8_192, false),
+            "an unacknowledged generation must keep the gate closed"
+        );
+        assert!(!gate_ready(&shared, true, 1_023, false));
+        assert!(gate_ready(&shared, true, 1_024, false));
+        assert!(gate_ready(&shared, true, 300, true));
+
+        shared
+            .max_device_callback_frames
+            .store(4_096, Ordering::Release);
+        assert!(!gate_ready(&shared, true, 1_024, false));
+        assert!(gate_ready(&shared, true, 4_096, false));
     }
 
     #[test]
