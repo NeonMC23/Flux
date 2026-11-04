@@ -46,6 +46,14 @@
 //!   ring. No device restart, ring flush or artificial gap is inserted.
 //!   [`EngineEvent::Transitioned`] is emitted exactly once when the
 //!   device has consumed up to the old source's final output frame.
+//! - With a positive [`EngineHandle::set_crossfade_ms`] duration, the
+//!   worker retains a bounded tail of outgoing output frames. At EOF it
+//!   decodes the incoming head, mixes both through an equal-power
+//!   envelope in the worker, and queues the mixed frames in the same
+//!   generation. The Controller-visible transition is emitted at the
+//!   **start** of that overlap, when incoming source position is zero.
+//!   The outgoing tail continues fading after the event. Zero duration
+//!   preserves the gapless path above exactly.
 //! - [`EngineHandle::preload`] opens at most one future decoder on the
 //!   worker, independently of the active one. A matching load consumes
 //!   it; a different load, cancellation or replacement drops it. A
@@ -81,6 +89,14 @@ const DECODE_CHUNK_FRAMES: usize = 4096;
 /// Worker loop tick: how long to wait for a command before pumping
 /// more samples / checking end-of-track.
 const WORKER_TICK: Duration = Duration::from_millis(5);
+
+/// Largest supported natural-transition crossfade. Zero disables
+/// crossfade and preserves the frame-boundary gapless path.
+pub const MAX_CROSSFADE_MS: u64 = 5_000;
+
+/// Minimum outgoing audio normally pushed before holding the crossfade
+/// tail. This keeps startup and short-source handling bounded.
+const CROSSFADE_PREBUFFER_SECONDS: u32 = 1;
 
 /// Number of post-mix samples exposed to the GUI oscilloscope.
 ///
@@ -280,10 +296,13 @@ struct Shared {
     /// reported source began. Zero after load/seek; advanced only when a
     /// natural transition actually reaches the output boundary.
     source_start_frame: AtomicU64,
-    /// Device frames represented by an earlier seek. Reset on load/stop;
+    /// Output frames represented by an earlier seek. Reset on load/stop;
     /// preserved across the callback's generation flush so a seek is
     /// reflected immediately in [`EngineHandle::position`].
     base_frames: AtomicU64,
+    /// Requested natural-transition crossfade duration in milliseconds.
+    /// Zero disables crossfade.
+    crossfade_ms: AtomicU32,
 }
 
 impl Shared {
@@ -299,6 +318,7 @@ impl Shared {
             pushed_frames: AtomicU64::new(0),
             source_start_frame: AtomicU64::new(0),
             base_frames: AtomicU64::new(0),
+            crossfade_ms: AtomicU32::new(0),
         }
     }
 
@@ -594,6 +614,25 @@ impl EngineHandle {
         let _ = self.commands.send(Command::CancelPreload);
     }
 
+    /// Sets the crossfade duration for subsequent natural transitions.
+    /// Values are clamped to `0..=MAX_CROSSFADE_MS`; zero disables
+    /// crossfade and preserves gapless behavior. A change does not
+    /// retroactively resize an in-flight source's already-computed tail
+    /// window. Returns the effective duration.
+    pub fn set_crossfade_ms(&self, milliseconds: u64) -> u64 {
+        let effective = milliseconds.min(MAX_CROSSFADE_MS);
+        self.shared
+            .crossfade_ms
+            .store(effective as u32, Ordering::Release);
+        effective
+    }
+
+    /// The configured natural-transition crossfade duration.
+    #[must_use]
+    pub fn crossfade_ms(&self) -> u64 {
+        u64::from(self.shared.crossfade_ms.load(Ordering::Acquire))
+    }
+
     /// Starts or resumes playback of the loaded track. If the track
     /// previously played to completion, it restarts from the beginning.
     /// Emits [`EngineEvent::Started`].
@@ -727,6 +766,228 @@ struct PreparedTrack {
     decoder: Box<dyn Decoder>,
 }
 
+/// Bounded tail staging for one source. The last `hold_frames` output
+/// frames are retained in a decoder-side buffer so a natural handoff can
+/// mix them with the prepared successor before anything is pushed.
+#[derive(Debug, Clone, Copy, Default)]
+struct Staging {
+    produced_frames: u64,
+    hold_start_frame: u64,
+    hold_frames: u64,
+    holding: bool,
+}
+
+impl Staging {
+    fn reset(
+        info: &StreamInfo,
+        config: OutputConfig,
+        fade_frames: u64,
+        produced_frames: u64,
+    ) -> Self {
+        let output_rate = f64::from(config.sample_rate);
+        let total_output_frames = info.duration.map_or(0, |duration| {
+            (duration.as_secs_f64() * output_rate).round() as u64
+        });
+        let prebuffer_frames =
+            u64::from(config.sample_rate) * u64::from(CROSSFADE_PREBUFFER_SECONDS);
+        if fade_frames == 0 || total_output_frames == 0 || total_output_frames <= prebuffer_frames {
+            return Self {
+                produced_frames,
+                ..Self::default()
+            };
+        }
+        let hold_frames = fade_frames.min(total_output_frames - prebuffer_frames);
+        let hold_start_frame = total_output_frames - hold_frames;
+        if hold_frames == 0 || produced_frames >= hold_start_frame {
+            // Once a source has already advanced into its would-be tail
+            // (for example after a late seek), do not pretend those
+            // frames can be held.
+            return Self {
+                produced_frames,
+                ..Self::default()
+            };
+        }
+        Self {
+            produced_frames,
+            hold_start_frame,
+            hold_frames,
+            holding: false,
+        }
+    }
+}
+
+/// Splits newly converted outgoing output into immediately-pushable
+/// samples and the bounded tail retained for the next crossfade. With
+/// `hold_frames == 0` this is a no-copy pass-through.
+fn stage_outgoing_output(
+    output: Vec<f32>,
+    channels: usize,
+    staging: &mut Staging,
+    tail: &mut VecDeque<f32>,
+) -> Vec<f32> {
+    let channels = channels.max(1);
+    let frames = output.len() / channels;
+    let produced_before = staging.produced_frames;
+    staging.produced_frames = staging.produced_frames.saturating_add(frames as u64);
+    if staging.hold_frames == 0 {
+        return output;
+    }
+
+    let mut pushable = Vec::new();
+    if staging.holding {
+        tail.extend(output);
+    } else {
+        let split = staging
+            .hold_start_frame
+            .saturating_sub(produced_before)
+            .min(frames as u64) as usize;
+        let split_samples = split * channels;
+        pushable.extend_from_slice(&output[..split_samples]);
+        tail.extend(&output[split_samples..]);
+        if split < frames {
+            staging.holding = true;
+        }
+    }
+
+    let excess_frames = (tail.len() / channels).saturating_sub(staging.hold_frames as usize);
+    for _ in 0..excess_frames {
+        for _ in 0..channels {
+            if let Some(sample) = tail.pop_front() {
+                pushable.push(sample);
+            }
+        }
+    }
+    pushable
+}
+
+fn crossfade_frames(milliseconds: u64, sample_rate: u32) -> u64 {
+    if milliseconds == 0 {
+        return 0;
+    }
+    (milliseconds.saturating_mul(u64::from(sample_rate)) / 1_000).max(1)
+}
+
+struct CrossfadeOutcome {
+    incoming: LoadedTrack,
+    decoder: Box<dyn Decoder>,
+    converter: FormatConverter,
+    mixed: Vec<f32>,
+    surplus: Vec<f32>,
+    overlap_frames: u64,
+}
+
+enum CrossfadeAttempt {
+    Mixed(CrossfadeOutcome),
+    Fallback(PreparedTrack),
+}
+
+/// Equal-power crossfade of the retained outgoing tail with the first
+/// `N` incoming output frames. Frame 0 has gains (1, 0); the final frame
+/// has (0, 1). With one overlap frame the incoming source wins. Mixed
+/// samples are clamped to the interleaved f32 output range so correlated
+/// full-scale sources cannot exceed the backend's nominal range.
+fn mix_equal_power_tail(
+    tail: &mut VecDeque<f32>,
+    incoming_pcm: &[f32],
+    channels: usize,
+) -> (Vec<f32>, usize) {
+    let channels = channels.max(1);
+    let overlap_frames = tail.len() / channels;
+    let mut mixed = Vec::with_capacity(overlap_frames * channels);
+    let denom = overlap_frames.saturating_sub(1).max(1) as f32;
+    for frame in 0..overlap_frames {
+        let theta = if overlap_frames == 1 {
+            std::f32::consts::FRAC_PI_2
+        } else {
+            (frame as f32 / denom) * std::f32::consts::FRAC_PI_2
+        };
+        let outgoing_gain = theta.cos();
+        let incoming_gain = theta.sin();
+        for channel in 0..channels {
+            let outgoing = tail.pop_front().unwrap_or(0.0);
+            let incoming = incoming_pcm
+                .get(frame * channels + channel)
+                .copied()
+                .unwrap_or(0.0);
+            let sample = outgoing * outgoing_gain + incoming * incoming_gain;
+            mixed.push(sample.clamp(-1.0, 1.0));
+        }
+    }
+    (mixed, overlap_frames)
+}
+
+fn attempt_crossfade(
+    prepared: PreparedTrack,
+    tail: &mut VecDeque<f32>,
+    config: OutputConfig,
+) -> Result<CrossfadeAttempt, DecodeError> {
+    let channels = usize::from(config.channels).max(1);
+    let overlap_frames = tail.len() / channels;
+    if overlap_frames == 0 {
+        return Ok(CrossfadeAttempt::Fallback(prepared));
+    }
+    let total_incoming_frames = prepared.info.duration.map_or(0, |duration| {
+        (duration.as_secs_f64() * f64::from(config.sample_rate)).round() as u64
+    });
+    if total_incoming_frames == 0 || total_incoming_frames < overlap_frames as u64 {
+        return Ok(CrossfadeAttempt::Fallback(prepared));
+    }
+
+    let PreparedTrack {
+        id,
+        entry,
+        path,
+        info,
+        mut decoder,
+    } = prepared;
+    let mut converter = FormatConverter::new(&info, config);
+    let mut incoming_pcm: Vec<f32> = Vec::new();
+    loop {
+        let available_frames = incoming_pcm.len() / channels;
+        if available_frames >= overlap_frames {
+            break;
+        }
+        match decoder.next_chunk(DECODE_CHUNK_FRAMES) {
+            Ok(samples) if samples.is_empty() => {
+                // Metadata promised enough samples but the decoder hit
+                // EOF early. Reopen from the start and fall back to the
+                // gapless path rather than mixing incomplete audio.
+                drop(decoder);
+                let decoder = open_decoder(&path)?;
+                let info = *decoder.info();
+                return Ok(CrossfadeAttempt::Fallback(PreparedTrack {
+                    id,
+                    entry,
+                    path,
+                    info,
+                    decoder,
+                }));
+            }
+            Ok(samples) => {
+                incoming_pcm.extend(converter.process(&samples));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mixed_samples = overlap_frames * channels;
+    let (mixed, _) = mix_equal_power_tail(tail, &incoming_pcm, channels);
+    let surplus = incoming_pcm.split_off(mixed_samples);
+    Ok(CrossfadeAttempt::Mixed(CrossfadeOutcome {
+        incoming: LoadedTrack {
+            id,
+            entry,
+            path,
+            info,
+        },
+        decoder,
+        converter,
+        mixed,
+        surplus,
+        overlap_frames: overlap_frames as u64,
+    }))
+}
+
 struct PendingTransition {
     from_id: TrackId,
     from_entry: QueueEntryId,
@@ -756,6 +1017,9 @@ fn resume_current_after_invalidation(
     pending_transition: &mut Option<PendingTransition>,
     eof_reached: &mut bool,
     ended_sent: &mut bool,
+    staging: &mut Staging,
+    tail: &mut VecDeque<f32>,
+    current_generation: &mut u64,
 ) -> Result<(), DecodeError> {
     let output_rate = f64::from(config.sample_rate);
     let source_rate = f64::from(current.info.sample_rate);
@@ -772,7 +1036,7 @@ fn resume_current_after_invalidation(
         .map_or(position, |duration| position.min(duration));
     let target_output_frames = (target.as_secs_f64() * output_rate).round() as u64;
 
-    shared.bump_generation();
+    *current_generation = shared.bump_generation();
     shared
         .base_frames
         .store(target_output_frames, Ordering::Release);
@@ -784,6 +1048,11 @@ fn resume_current_after_invalidation(
     *incoming = None;
     *pending_transition = None;
     *ended_sent = false;
+    tail.clear();
+    let fade = crossfade_frames(
+        u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+        config.sample_rate,
+    );
 
     if current
         .info
@@ -791,6 +1060,7 @@ fn resume_current_after_invalidation(
         .is_some_and(|duration| target >= duration)
     {
         *eof_reached = true;
+        *staging = Staging::reset(&current.info, config, fade, target_output_frames);
         shared.gate_open.store(playing, Ordering::Release);
         return Ok(());
     }
@@ -835,6 +1105,7 @@ fn resume_current_after_invalidation(
     *eof_reached = hit_eof;
     *converter = Some(FormatConverter::new(&current.info, config));
     *decoder = if hit_eof { None } else { Some(dec) };
+    *staging = Staging::reset(&current.info, config, fade, actual_target_frames);
     shared.gate_open.store(playing, Ordering::Release);
     Ok(())
 }
@@ -900,6 +1171,8 @@ fn run_worker<F>(
     let mut converter: Option<FormatConverter> = None;
     let mut pending: Vec<f32> = Vec::new();
     let mut pending_sent = 0usize;
+    let mut staging = Staging::default();
+    let mut tail: VecDeque<f32> = VecDeque::new();
     let mut playing = false;
     let mut eof_reached = false;
     let mut ended_sent = false;
@@ -930,6 +1203,8 @@ fn run_worker<F>(
                 converter = None;
                 pending.clear();
                 pending_sent = 0;
+                staging = Staging::default();
+                tail.clear();
                 playing = false;
                 eof_reached = false;
                 ended_sent = false;
@@ -957,6 +1232,12 @@ fn run_worker<F>(
                             path,
                             info,
                         });
+                        let fade = crossfade_frames(
+                            u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                            config.sample_rate,
+                        );
+                        staging = Staging::reset(&info, config, fade, 0);
+                        tail.clear();
                         send(EngineEvent::Loaded {
                             session,
                             id,
@@ -1002,6 +1283,8 @@ fn run_worker<F>(
                 converter = None;
                 pending.clear();
                 pending_sent = 0;
+                staging = Staging::default();
+                tail.clear();
                 ended_sent = false;
                 last_load_failed = false;
 
@@ -1011,6 +1294,11 @@ fn run_worker<F>(
                     // off to it; otherwise the normal drained path ends
                     // this source.
                     eof_reached = true;
+                    let fade = crossfade_frames(
+                        u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                        config.sample_rate,
+                    );
+                    staging = Staging::reset(&info, config, fade, target_output_frames);
                     shared.gate_open.store(playing, Ordering::Release);
                     continue 'worker;
                 }
@@ -1087,6 +1375,11 @@ fn run_worker<F>(
                     // lets the normal drained path end this source.
                     decoder = None;
                 }
+                let fade = crossfade_frames(
+                    u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                    config.sample_rate,
+                );
+                staging = Staging::reset(&info, config, fade, actual_target_frames);
                 shared.gate_open.store(playing, Ordering::Release);
             }
             Ok(Command::Preload { id, entry, path }) => {
@@ -1116,6 +1409,9 @@ fn run_worker<F>(
                         &mut pending_transition,
                         &mut eof_reached,
                         &mut ended_sent,
+                        &mut staging,
+                        &mut tail,
+                        &mut current_generation,
                     ) {
                         playing = false;
                         shared.gate_open.store(false, Ordering::Release);
@@ -1171,6 +1467,9 @@ fn run_worker<F>(
                         &mut pending_transition,
                         &mut eof_reached,
                         &mut ended_sent,
+                        &mut staging,
+                        &mut tail,
+                        &mut current_generation,
                     ) {
                         playing = false;
                         shared.gate_open.store(false, Ordering::Release);
@@ -1206,10 +1505,16 @@ fn run_worker<F>(
                         eof_reached = false;
                         ended_sent = false;
                         pending_transition = None;
+                        tail.clear();
                         match open_decoder(&track.path) {
                             Ok(dec) => {
                                 converter = Some(FormatConverter::new(&track.info, config));
                                 decoder = Some(dec);
+                                let fade = crossfade_frames(
+                                    u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                                    config.sample_rate,
+                                );
+                                staging = Staging::reset(&track.info, config, fade, 0);
                             }
                             Err(err) => {
                                 send(EngineEvent::Error {
@@ -1255,6 +1560,8 @@ fn run_worker<F>(
                 converter = None;
                 pending.clear();
                 pending_sent = 0;
+                staging = Staging::default();
+                tail.clear();
                 playing = false;
                 eof_reached = false;
                 ended_sent = false;
@@ -1295,38 +1602,123 @@ fn run_worker<F>(
                         pending_sent = 0;
                     }
                 } else if eof_reached && incoming.is_none() {
-                    let Some(next) = prepared.take() else {
-                        break 'pump;
-                    };
-                    let Some(from) = current.as_ref() else {
-                        prepared = Some(next);
-                        break 'pump;
-                    };
-                    let boundary_frame = shared.pushed_frames.load(Ordering::Acquire);
-                    let transition = PendingTransition {
-                        from_id: from.id,
-                        from_entry: from.entry,
-                        to_id: next.id,
-                        to_entry: next.entry,
-                        boundary_frame,
-                        info: next.info,
-                    };
-                    converter = Some(FormatConverter::new(&next.info, config));
-                    decoder = Some(next.decoder);
-                    incoming = Some(LoadedTrack {
-                        id: next.id,
-                        entry: next.entry,
-                        path: next.path,
-                        info: next.info,
-                    });
-                    pending.clear();
-                    pending_sent = 0;
-                    eof_reached = false;
-                    ended_sent = false;
-                    shared.decoder_eof.store(false, Ordering::Release);
-                    shared.drained.store(false, Ordering::Release);
-                    pending_transition = Some(transition);
-                    progressed = true;
+                    let fade = crossfade_frames(
+                        u64::from(shared.crossfade_ms.load(Ordering::Acquire)),
+                        config.sample_rate,
+                    );
+                    if !tail.is_empty() {
+                        if fade > 0
+                            && let Some(next) = prepared.take()
+                        {
+                            match attempt_crossfade(next, &mut tail, config) {
+                                Ok(CrossfadeAttempt::Mixed(outcome)) => {
+                                    let Some(from) = current.as_ref() else {
+                                        prepared = None;
+                                        tail.clear();
+                                        break 'pump;
+                                    };
+                                    let boundary_frame =
+                                        shared.pushed_frames.load(Ordering::Acquire);
+                                    let surplus_frames =
+                                        (outcome.surplus.len() / output_channels) as u64;
+                                    staging = Staging::reset(
+                                        &outcome.incoming.info,
+                                        config,
+                                        fade,
+                                        outcome.overlap_frames + surplus_frames,
+                                    );
+                                    tail.clear();
+                                    converter = Some(outcome.converter);
+                                    decoder = Some(outcome.decoder);
+                                    incoming = Some(outcome.incoming);
+                                    pending = outcome.mixed;
+                                    pending.extend(outcome.surplus);
+                                    pending_sent = 0;
+                                    eof_reached = false;
+                                    ended_sent = false;
+                                    shared.decoder_eof.store(false, Ordering::Release);
+                                    shared.drained.store(false, Ordering::Release);
+                                    pending_transition = Some(PendingTransition {
+                                        from_id: from.id,
+                                        from_entry: from.entry,
+                                        to_id: incoming.as_ref().expect("incoming set").id,
+                                        to_entry: incoming.as_ref().expect("incoming set").entry,
+                                        boundary_frame,
+                                        info: incoming.as_ref().expect("incoming set").info,
+                                    });
+                                    progressed = true;
+                                }
+                                Ok(CrossfadeAttempt::Fallback(next)) => {
+                                    prepared = Some(next);
+                                    pending.extend(tail.drain(..));
+                                    progressed = true;
+                                }
+                                Err(error) => {
+                                    let source_id = current.as_ref().map(|track| track.id);
+                                    send(EngineEvent::Error {
+                                        session: Some(current_session),
+                                        id: source_id,
+                                        error: error.into(),
+                                    });
+                                    decoder = None;
+                                    prepared = None;
+                                    incoming = None;
+                                    pending_transition = None;
+                                    converter = None;
+                                    pending.clear();
+                                    pending_sent = 0;
+                                    staging = Staging::default();
+                                    tail.clear();
+                                    playing = false;
+                                    shared.gate_open.store(false, Ordering::Release);
+                                    ended_sent = true;
+                                    eof_reached = true;
+                                    break 'pump;
+                                }
+                            }
+                        } else {
+                            // No in-flight crossfade (disabled, no prepared
+                            // successor, or no eligible tail): preserve the
+                            // existing gapless/fallback path.
+                            pending.extend(tail.drain(..));
+                            progressed = true;
+                        }
+                    } else {
+                        let Some(next) = prepared.take() else {
+                            break 'pump;
+                        };
+                        let Some(from) = current.as_ref() else {
+                            prepared = Some(next);
+                            break 'pump;
+                        };
+                        let boundary_frame = shared.pushed_frames.load(Ordering::Acquire);
+                        let transition = PendingTransition {
+                            from_id: from.id,
+                            from_entry: from.entry,
+                            to_id: next.id,
+                            to_entry: next.entry,
+                            boundary_frame,
+                            info: next.info,
+                        };
+                        converter = Some(FormatConverter::new(&next.info, config));
+                        decoder = Some(next.decoder);
+                        incoming = Some(LoadedTrack {
+                            id: next.id,
+                            entry: next.entry,
+                            path: next.path,
+                            info: next.info,
+                        });
+                        staging = Staging::reset(&next.info, config, fade, 0);
+                        tail.clear();
+                        pending.clear();
+                        pending_sent = 0;
+                        eof_reached = false;
+                        ended_sent = false;
+                        shared.decoder_eof.store(false, Ordering::Release);
+                        shared.drained.store(false, Ordering::Release);
+                        pending_transition = Some(transition);
+                        progressed = true;
+                    }
                 } else if !eof_reached && pending.is_empty() {
                     let Some(dec) = decoder.as_mut() else {
                         break 'pump;
@@ -1338,14 +1730,26 @@ fn run_worker<F>(
                     match dec.next_chunk(DECODE_CHUNK_FRAMES) {
                         Ok(samples) if samples.is_empty() => {
                             if let Some(conv) = converter.as_mut() {
-                                pending = conv.finish();
+                                let output = conv.finish();
+                                pending = stage_outgoing_output(
+                                    output,
+                                    output_channels,
+                                    &mut staging,
+                                    &mut tail,
+                                );
                             }
                             eof_reached = true;
                             progressed = true;
                         }
                         Ok(samples) => {
                             if let Some(conv) = converter.as_mut() {
-                                pending = conv.process(&samples);
+                                let output = conv.process(&samples);
+                                pending = stage_outgoing_output(
+                                    output,
+                                    output_channels,
+                                    &mut staging,
+                                    &mut tail,
+                                );
                             }
                             progressed = true;
                         }
@@ -1366,6 +1770,8 @@ fn run_worker<F>(
                             converter = None;
                             pending.clear();
                             pending_sent = 0;
+                            staging = Staging::default();
+                            tail.clear();
                             playing = false;
                             shared.gate_open.store(false, Ordering::Release);
                             // Output stops here: with the gate closed the
@@ -1386,7 +1792,11 @@ fn run_worker<F>(
                 }
             }
         }
-        if eof_reached && pending.is_empty() && (incoming.is_some() || prepared.is_none()) {
+        if eof_reached
+            && pending.is_empty()
+            && tail.is_empty()
+            && (incoming.is_some() || prepared.is_none())
+        {
             shared.decoder_eof.store(true, Ordering::Release);
         }
 
@@ -1428,6 +1838,7 @@ fn run_worker<F>(
             && !ended_sent
             && incoming.is_none()
             && pending_transition.is_none()
+            && tail.is_empty()
             && shared.drained.load(Ordering::Acquire)
         {
             if let Some(track) = &current {
@@ -1541,7 +1952,7 @@ mod tests {
 
     use super::{
         EngineError, EngineEvent, EngineHandle, FormatConverter, SampleSource, Shared,
-        WAVEFORM_WINDOW, WaveformReader,
+        WAVEFORM_WINDOW, WaveformReader, mix_equal_power_tail,
     };
     use crate::decode::{DecodeError, StreamInfo, open_decoder};
     use crate::output::{FillCallback, NullControl, OutputConfig};
@@ -1692,6 +2103,15 @@ mod tests {
             "worker pushed {} of {frames} expected frames",
             engine.shared.pushed_frames.load(Ordering::Acquire)
         );
+    }
+
+    fn expected_equal_power(outgoing: f32, incoming: f32, frame: usize, total: usize) -> f32 {
+        let theta = if total <= 1 {
+            std::f32::consts::FRAC_PI_2
+        } else {
+            (frame as f32 / (total - 1) as f32) * std::f32::consts::FRAC_PI_2
+        };
+        (outgoing * theta.cos() + incoming * theta.sin()).clamp(-1.0, 1.0)
     }
 
     #[test]
@@ -3127,6 +3547,875 @@ mod tests {
             )),
             "a failed successor must not report a clean A end"
         );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn crossfade_mixes_equal_power_envelope_and_transitions_at_start() {
+        let dir = TempDir::new("crossfade-envelope");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        assert_eq!(engine.set_crossfade_ms(500), 500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(200), QueueEntryId::new(201));
+
+        let session = engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        // 2 s sources at 44.1 kHz; 500 ms of tail, so the overlap starts
+        // at output frame 66_150. Wait until the mixed tail is queued.
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        let generation = engine.shared.generation.load(Ordering::Acquire);
+        let start_count = control.start_count();
+
+        // Consume the un-crossfaded prefix, then capture only the overlap.
+        control.drain_frames(66_150);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(22_050);
+        let mixed = control.captured();
+        assert_eq!(mixed.len(), 22_050);
+        assert!((mixed[0] - 0.2).abs() < 0.01);
+        assert!(
+            (mixed[11_025] - (0.2 + 0.8) * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "midpoint must use equal-power gains: {}",
+            mixed[11_025]
+        );
+        assert!((mixed[22_049] - 0.8).abs() < 0.01);
+        assert!(mixed.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
+        let transition = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::Transitioned {
+                    session: got_session,
+                    generation: got_generation,
+                    from_id,
+                    from_entry,
+                    to_id,
+                    to_entry,
+                    boundary_frame,
+                    ..
+                } => Some((
+                    *got_session,
+                    *got_generation,
+                    *from_id,
+                    *from_entry,
+                    *to_id,
+                    *to_entry,
+                    *boundary_frame,
+                )),
+                _ => None,
+            })
+            .expect("transition event");
+        assert_eq!(
+            transition,
+            (session, generation, id_a, entry_a, id_b, entry_b, 66_150)
+        );
+        assert_eq!(
+            engine.shared.generation.load(Ordering::Acquire),
+            generation,
+            "crossfade must stay in one output generation"
+        );
+        assert_eq!(
+            control.start_count(),
+            start_count,
+            "crossfade must not recreate the output stream"
+        );
+        assert_eq!(
+            engine.position(),
+            Duration::from_secs_f64(22_050.0 / 44_100.0),
+            "the incoming source position starts at the crossfade boundary"
+        );
+        control.drain_frames(500);
+        while let Ok(event) = engine.events().try_recv() {
+            assert!(
+                !matches!(event, EngineEvent::Transitioned { .. }),
+                "crossfade transition reported more than once: {event:?}"
+            );
+        }
+        engine.shutdown();
+    }
+
+    #[test]
+    fn equal_power_envelope_is_defined_for_one_frame_and_endpoints() {
+        use std::collections::VecDeque;
+
+        let mut one = VecDeque::from([0.2f32]);
+        let (mixed, frames) = mix_equal_power_tail(&mut one, &[0.8], 1);
+        assert_eq!(frames, 1);
+        assert_eq!(mixed, vec![0.8], "one-frame overlap selects incoming");
+
+        let mut tail = VecDeque::from([0.2f32, 0.2]);
+        let incoming = [0.8f32, 0.8];
+        let (mixed, frames) = mix_equal_power_tail(&mut tail, &incoming, 1);
+        assert_eq!(frames, 2);
+        assert!((mixed[0] - 0.2).abs() < 1e-6);
+        assert!((mixed[1] - 0.8).abs() < 1e-6);
+
+        for frame in 0..1_000 {
+            let sample = expected_equal_power(0.4, 0.9, frame, 1_000);
+            assert!(sample.is_finite());
+            assert!(sample.abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn zero_crossfade_preserves_the_gapless_boundary() {
+        let dir = TempDir::new("crossfade-zero");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        assert_eq!(engine.set_crossfade_ms(0), 0);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(210), QueueEntryId::new(211));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        // The ring is exactly 2 s at this fixture size. Drain one
+        // decode chunk so the worker has room to reach EOF with no tail.
+        wait_for_pushed_frames(&engine, &control, 4_096);
+        control.drain_frames(4_096);
+        control.clear_captured();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(88_200 - 4_096);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                to_entry,
+                boundary_frame: 88_200,
+                ..
+            } if *to_id == id_b && *to_entry == entry_b
+        )));
+        let captured = control.captured();
+        assert!(captured.iter().all(|s| (*s - 0.2).abs() < 0.01));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn very_short_crossfade_uses_the_exact_frame_window() {
+        let dir = TempDir::new("crossfade-1ms");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        assert_eq!(engine.set_crossfade_ms(1), 1);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(220), QueueEntryId::new(221));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 4_096);
+        control.drain_frames(4_096);
+        control.clear_captured();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(88_156 - 4_096);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(44);
+        let mixed = control.captured();
+        assert_eq!(mixed.len(), 44);
+        for (frame, sample) in mixed.iter().enumerate() {
+            let expected = expected_equal_power(0.2, 0.8, frame, 44);
+            assert!((sample - expected).abs() < 0.01, "frame {frame}");
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 88_156,
+                ..
+            } if *to_id == id_b
+        )));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn short_outgoing_source_uses_a_bounded_available_overlap() {
+        let dir = TempDir::new("crossfade-short-outgoing");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 132_300, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        assert_eq!(engine.set_crossfade_ms(5_000), 5_000);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(230), QueueEntryId::new(231));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        // A 2 s source cannot donate 5 s. With the 1 s prebuffer, the
+        // bounded overlap is 1 s: 44_100 output frames.
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(44_100);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(44_100);
+        let mixed = control.captured();
+        assert_eq!(mixed.len(), 44_100);
+        assert!((mixed[0] - 0.2).abs() < 0.01);
+        assert!((mixed[44_099] - 0.8).abs() < 0.01);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 44_100,
+                ..
+            } if *to_id == id_b
+        )));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn outgoing_shorter_than_prebuffer_falls_back_to_gapless() {
+        let dir = TempDir::new("crossfade-too-short-outgoing");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 22_050, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(240), QueueEntryId::new(241));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 22_050);
+        control.clear_captured();
+        control.drain_frames(22_050);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 22_050,
+                ..
+            } if *to_id == id_b
+        )));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            EngineEvent::Transitioned { boundary_frame, .. }
+                if *boundary_frame < 22_050
+        )));
+        control.clear_captured();
+        control.drain_frames(1);
+        assert!((control.captured()[0] - 0.8).abs() < 0.01);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn incoming_shorter_than_overlap_falls_back_to_gapless() {
+        let dir = TempDir::new("crossfade-short-incoming");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 8_820, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(250), QueueEntryId::new(251));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(88_200);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 88_200,
+                ..
+            } if *to_id == id_b
+        )));
+        control.clear_captured();
+        control.drain_frames(1);
+        assert!((control.captured()[0] - 0.8).abs() < 0.01);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn correlated_peaks_are_clamped_during_equal_power_mix() {
+        let dir = TempDir::new("crossfade-clip");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.9);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(260), QueueEntryId::new(261));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(66_150);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(22_050);
+        let mixed = control.captured();
+        assert!(mixed.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
+        assert!(
+            (mixed[11_025] - 1.0).abs() < 0.001,
+            "equal-power correlated peaks must be clamped: {}",
+            mixed[11_025]
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn crossfade_normalizes_rate_and_channel_boundaries() {
+        let dir = TempDir::new("crossfade-format");
+        let a = write_dc_wav(&dir, "a.wav", 22_050, 44_100, 0.2);
+        let b = write_dc_wav_channels(&dir, "b.wav", 44_100, 2, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 2);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(270), QueueEntryId::new(271));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(66_150);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(22_050);
+        let mixed = control.captured();
+        assert_eq!(mixed.len(), 22_050 * 2);
+        for frame in 0..mixed.len() / 2 {
+            let expected = expected_equal_power(0.2, 0.8, frame, 22_050);
+            assert!(
+                (mixed[frame * 2] - expected).abs() < 0.01,
+                "left frame {frame}"
+            );
+            assert!(
+                (mixed[frame * 2 + 1] - expected).abs() < 0.01,
+                "right frame {frame}"
+            );
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 66_150,
+                ..
+            } if *to_id == id_b
+        )));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn pause_freezes_the_crossfade_envelope_until_resume() {
+        let dir = TempDir::new("crossfade-pause");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(280), QueueEntryId::new(281));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(66_150);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(5_000);
+        engine.pause();
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Paused { .. }));
+        let frozen = engine.position();
+        control.drain_frames(1_000);
+        assert_eq!(
+            engine.position(),
+            frozen,
+            "paused output must not advance the envelope"
+        );
+
+        engine.play();
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        control.clear_captured();
+        control.drain_frames(1_000);
+        let resumed = control.captured();
+        for (offset, sample) in resumed.iter().enumerate() {
+            let expected = expected_equal_power(0.2, 0.8, 5_000 + offset, 22_050);
+            assert!((sample - expected).abs() < 0.01, "frame {}", 5_000 + offset);
+        }
+        engine.shutdown();
+    }
+
+    #[test]
+    fn stop_invalidates_a_queued_crossfade_without_a_transition() {
+        let dir = TempDir::new("crossfade-stop");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(290), QueueEntryId::new(291));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(1_000);
+        engine.stop();
+        let events = collect_events_until(&engine, |event| matches!(event, EngineEvent::Stopped));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Stopped))
+        );
+        control.clear_captured();
+        control.drain_frames(4_096);
+        while let Ok(event) = engine.events().try_recv() {
+            assert!(
+                !matches!(event, EngineEvent::Transitioned { .. }),
+                "stopped crossfade leaked a transition: {event:?}"
+            );
+        }
+        assert!(control.captured().iter().all(|s| *s == 0.0));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn reauthorizing_during_crossfade_discards_the_old_successor() {
+        let dir = TempDir::new("crossfade-reauthorize");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.5);
+        let c = write_dc_wav(&dir, "c.wav", 44_100, 88_200, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b, id_c) = (TrackId::new(1), TrackId::new(2), TrackId::new(3));
+        let (entry_a, entry_b, entry_c) = (
+            QueueEntryId::new(300),
+            QueueEntryId::new(301),
+            QueueEntryId::new(302),
+        );
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        engine.preload_entry(id_c, entry_c, c);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_c),
+        );
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(66_150);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                to_entry,
+                boundary_frame: 66_150,
+                ..
+            } if *to_id == id_c && *to_entry == entry_c
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned { to_id, .. } if *to_id == id_b
+        )));
+        control.clear_captured();
+        control.drain_frames(22_050);
+        let mixed = control.captured();
+        assert!((mixed[0] - 0.2).abs() < 0.01);
+        assert!((mixed[22_049] - 0.9).abs() < 0.01);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn consecutive_crossfades_preserve_queue_entry_identity() {
+        let dir = TempDir::new("crossfade-consecutive");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.5);
+        let c = write_dc_wav(&dir, "c.wav", 44_100, 88_200, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b, id_c) = (TrackId::new(1), TrackId::new(2), TrackId::new(3));
+        let (entry_a, entry_b, entry_c) = (
+            QueueEntryId::new(310),
+            QueueEntryId::new(311),
+            QueueEntryId::new(312),
+        );
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(66_150);
+        let first = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(first.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                from_entry,
+                to_entry,
+                boundary_frame: 66_150,
+                ..
+            } if *from_entry == entry_a && *to_entry == entry_b
+        )));
+        engine.preload_entry(id_c, entry_c, c);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_c),
+        );
+        let second = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(
+            second.iter().any(|event| matches!(
+                event,
+                EngineEvent::Transitioned {
+                    from_id,
+                    from_entry,
+                    to_id,
+                    to_entry,
+                    boundary_frame: 132_300,
+                    ..
+                } if *from_id == id_b
+                    && *from_entry == entry_b
+                    && *to_id == id_c
+                    && *to_entry == entry_c
+            )),
+            "second crossfade must start at B's tail: {second:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn duplicate_track_ids_crossfade_with_distinct_entry_ids() {
+        let dir = TempDir::new("crossfade-duplicate");
+        let path = write_dc_wav(&dir, "same.wav", 44_100, 88_200, 0.5);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let id = TrackId::new(9);
+        let (entry_a, entry_b) = (QueueEntryId::new(320), QueueEntryId::new(321));
+
+        engine.load_entry(id, entry_a, path.clone());
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id, entry_b, path);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(66_150);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                from_id,
+                from_entry,
+                to_id,
+                to_entry,
+                boundary_frame: 66_150,
+                ..
+            } if *from_id == id
+                && *to_id == id
+                && *from_entry == entry_a
+                && *to_entry == entry_b
+        )));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn truncated_incoming_crossfade_never_reports_success() {
+        let dir = TempDir::new("crossfade-truncated");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let full = write_dc_wav(&dir, "b-full.wav", 44_100, 88_200, 0.8);
+        let truncated = dir.0.join("b.wav");
+        let mut bytes = fs::read(&full).expect("read full wav");
+        bytes.truncate(bytes.len() - 100);
+        fs::write(&truncated, bytes).expect("write truncated wav");
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(330), QueueEntryId::new(331));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, truncated);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::Error { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Error { id: Some(id), .. } if *id == id_b
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. }))
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn seek_before_crossfade_completion_rebuilds_the_tail_window() {
+        let dir = TempDir::new("crossfade-seek");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(340), QueueEntryId::new(341));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b.clone());
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(1_000);
+        let _ = engine.seek(Duration::from_millis(200));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        // Seek to 8_820 output frames, leaving 57_330 before the 22_050
+        // frame tail window. The old 66_150 boundary must not survive.
+        wait_for_pushed_frames(&engine, &control, 79_380);
+        control.drain_frames(57_330);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_id,
+                boundary_frame: 57_330,
+                ..
+            } if *to_id == id_b
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                boundary_frame: 66_150,
+                ..
+            }
+        )));
+        control.clear_captured();
+        control.drain_frames(22_050);
+        let mixed = control.captured();
+        assert!((mixed[0] - 0.2).abs() < 0.01);
+        assert!((mixed[22_049] - 0.8).abs() < 0.01);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn cancelling_a_queued_crossfade_resumes_current_and_ends_it() {
+        let dir = TempDir::new("crossfade-cancel");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(350), QueueEntryId::new(351));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(1_000);
+        engine.cancel_preload();
+        // Pause is queued after cancellation, proving it was processed.
+        engine.pause();
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Paused { .. }));
+        engine.play();
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Started { .. })
+        });
+        let events = drive_until(&engine, &control, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackEnded { entry, id, .. }
+                if *entry == entry_a && *id == id_a
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. }))
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn crossfade_preload_failure_drains_tail_and_ends_normally() {
+        let dir = TempDir::new("crossfade-preload-failure");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let bad = dir.0.join("bad.wav");
+        fs::write(&bad, b"not a real wav").expect("bad fixture");
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(360), QueueEntryId::new(361));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, bad);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::PreloadFailed { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::PreloadFailed { id, .. } if *id == id_b
+        )));
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(88_200);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::TrackEnded { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::TrackEnded { entry, id, .. }
+                if *entry == entry_a && *id == id_a
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. }))
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn explicit_load_during_a_queued_crossfade_replaces_both_sources() {
+        let dir = TempDir::new("crossfade-explicit-load");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.5);
+        let c = write_dc_wav(&dir, "c.wav", 44_100, 88_200, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b, id_c) = (TrackId::new(1), TrackId::new(2), TrackId::new(3));
+        let (entry_a, entry_b, entry_c) = (
+            QueueEntryId::new(370),
+            QueueEntryId::new(371),
+            QueueEntryId::new(372),
+        );
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        wait_for_pushed_frames(&engine, &control, 88_200);
+
+        engine.load_entry(id_c, entry_c, c);
+        let events = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_c),
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Loaded { id, .. } if *id == id_c))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Transitioned { .. }))
+        );
+        engine.play();
+        control.drain_frames(4_096);
+        while let Ok(event) = engine.events().try_recv() {
+            assert!(
+                !matches!(event, EngineEvent::Transitioned { .. }),
+                "explicit load leaked the old crossfade: {event:?}"
+            );
+        }
         engine.shutdown();
     }
 

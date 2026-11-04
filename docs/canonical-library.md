@@ -296,7 +296,7 @@ Play. Queue files without the optional playback fields remain readable with
 defaults. Saves remain atomic and malformed files are preserved. Non-canonical
 legacy/portable backends retain their existing queue workflow.
 
-### Audio engine and gapless handoff
+### Audio engine, gapless handoff and crossfade
 
 The audio crate keeps policy and mechanism separate. [`Controller`] decides
 which stable `QueueEntryId` should play; `flux-audio::engine` owns decoding,
@@ -333,6 +333,63 @@ callback flush stale buffered samples. A natural handoff deliberately does not
 bump it: the old tail and new head share one output sequence, so seek/stop/
 replacement invalidate audio explicitly while adjacent tracks remain
 sample-contiguous. The callback still rejects samples from older generations.
+
+Natural transitions can optionally use equal-power crossfade. The engine API is
+`set_crossfade_ms(u64)` / `crossfade_ms()`; the Controller exposes the same pair.
+The default is `0` (disabled), values are clamped to `0..=5_000` ms, and the
+setting is session-only. A change affects sources loaded afterwards; it does not
+retroactively resize an already-loaded source's tail schedule.
+
+For crossfade, the engine keeps a bounded tail of outgoing output frames. The
+target overlap is:
+
+- `fade_frames = duration_ms * output_rate / 1000`;
+- at most 1 second of outgoing audio is normally pushed before holding begins;
+- `overlap = min(fade_frames, outgoing_output_frames - 1 second)`;
+- crossfade is only attempted when the outgoing duration is known, the overlap
+  is non-zero, and the prepared incoming duration is known to contain at least
+  the overlap. Otherwise the verified gapless/fallback path is used.
+
+At EOF, the worker decodes exactly the incoming head needed for the overlap,
+matches it with the held outgoing tail, and mixes in the worker. The envelope is
+equal-power:
+
+```text
+t = frame / (overlap_frames - 1)
+outgoing_gain = cos(t * pi / 2)
+incoming_gain = sin(t * pi / 2)
+mixed = clamp(outgoing * outgoing_gain + incoming * incoming_gain, -1, 1)
+```
+
+For a one-frame overlap the incoming frame wins (outgoing gain 0, incoming gain
+1). Endpoints are exactly outgoing-only and incoming-only. Correlated sources
+can exceed unity under equal-power gains, so the mixed sample is clamped to the
+nominal interleaved f32 output range; the tests cover this headroom policy.
+
+The Controller-visible `Transitioned` event is emitted at the **start** of the
+overlap, at the first mixed output frame. The incoming `QueueEntryId` becomes
+current there, its source-relative position is zero, and lyrics/artwork/history
+follow the incoming entry. The outgoing tail continues fading out after that
+event but is no longer the visible/current source. Crossfade completion emits no
+second event. A queue mutation before the start event invalidates the queued
+mixed audio, flushes that unpromoted generation and reopens the audible current
+source at its reported position before preparing the newly authorized entry;
+this recovery path may contain silence and is not advertised as gapless.
+Seek, stop, explicit load, cancellation and replacement likewise invalidate an
+obsolete overlap.
+
+The output ring remains the same bounded SPSC ring and the callback is unchanged.
+During an overlap there are at most two decoders: the outgoing decoder until its
+tail has been extracted and the prepared incoming decoder. The retained tail,
+predecoded incoming head, mixed pending audio and ring are all bounded by the
+5-second maximum plus normal decode chunks. No PCM accumulates without a bound,
+and the outgoing decoder is released once its tail has been mixed.
+
+At the engine's current support level there is only one prepared successor.
+An extremely short successor may end before the next preload arrives and falls
+through to the normal `TrackEnded` load path. Codec/container priming and
+intentional source silence remain part of the decoded material; crossfade does
+not fabricate or remove them.
 
 The Controller preloads the intended successor for Normal, Repeat One, Repeat
 All, Shuffle and Shuffle + Repeat All. A queue change or mode change replaces or
@@ -958,16 +1015,16 @@ cleanup.
     objects/boundaries are not implemented; the aggregate `history.flux`
     cannot reconstruct them without fabricating chronology. Recent/Most Played
     remain aggregate views.
-24. Natural gapless playback is implemented inside the engine: a prepared
-    queue entry is handed off in the same output generation at the source-frame
-    boundary, and the Controller follows a single authoritative transition
-    event. Crossfade remains deferred because there is still no dual-source
-    mixing graph or gain-envelope transition policy. Flux does not simulate
-    crossfade with UI timers or volume automation. Gapless has been verified
-    with deterministic synthetic sources and an instrumented null backend, not
-    by measuring real hardware. One prepared successor is supported; a chain
-    depends on the Controller preloading the following entry after each accepted
-    transition.
+24. Natural gapless playback and optional equal-power crossfade are implemented
+    inside the engine. Crossfade is disabled by default, is configured in
+    milliseconds through the engine/Controller API only, and does not yet have
+    GUI/TUI controls or persisted settings. The outgoing tail, incoming head and
+    mixed pending audio are bounded by the 5-second maximum; sources whose
+    duration is unknown or too short for a meaningful tail use the gapless
+    fallback. Gapless and crossfade have been verified with deterministic
+    synthetic sources and an instrumented null backend, not by measuring real
+    hardware. One prepared successor is supported; a chain depends on the
+    Controller preloading the following entry after each accepted transition.
 25. Multi-entry queue removal and a dedicated queue clear action are not exposed
     in the GUI; individual removal/reorder and queue population from track/
     playlist actions remain available.

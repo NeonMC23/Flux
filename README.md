@@ -109,8 +109,11 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   the current track after three seconds and otherwise moves backward. Queue
   order, current entry, mode, shuffle flag and position persist for canonical
   libraries and restore paused. The engine preloads the next queue entry and
-  performs the natural decoder handoff inside the audio pipeline at the exact
-  source-frame boundary, without restarting the output stream. The
+  performs natural handoffs inside the audio pipeline at the exact
+  source-frame boundary, without restarting the output stream. An optional,
+  session-only equal-power crossfade of 0–5000 ms can overlap the outgoing and
+  incoming sources; zero retains gapless playback. There are no GUI/TUI
+  controls yet. The
   pencil edits canonical metadata and exposes **Transfer owner** with an
   explicit destination release title; the transfer copies and verifies audio,
   then removes old files through journal cleanup. The same editor supports
@@ -292,7 +295,7 @@ A minimal no-UI check is also available:
 
 ## What does not exist yet
 
-Rating UI, crossfade, EQ,
+Rating UI, EQ,
 frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
 imports are intentionally rejected in canonical mode. Rating storage APIs exist

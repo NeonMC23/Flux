@@ -2357,6 +2357,30 @@ impl Controller {
         self.volume
     }
 
+    /// The configured natural-transition crossfade duration in
+    /// milliseconds. Zero means disabled.
+    #[must_use]
+    pub fn crossfade_ms(&self) -> u64 {
+        self.engine.crossfade_ms()
+    }
+
+    /// Sets the crossfade duration for subsequent natural transitions,
+    /// clamped by the engine to its supported maximum. Zero restores the
+    /// gapless path. This is session-only and is not persisted.
+    pub fn set_crossfade_ms(&mut self, milliseconds: u64) -> u64 {
+        let effective = self.engine.set_crossfade_ms(milliseconds);
+        if effective == 0 {
+            self.report_status(
+                "Crossfade disabled; natural transitions remain gapless.".to_owned(),
+            );
+        } else {
+            self.report_status(format!(
+                "Crossfade for future natural transitions: {effective} ms."
+            ));
+        }
+        effective
+    }
+
     /// Whether a background library scan is running.
     #[must_use]
     pub fn is_scanning(&self) -> bool {
@@ -7458,6 +7482,92 @@ mod tests {
             controller.engine_session,
             Some(session_b),
             "B-to-C must hand off without a new load session"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn crossfade_api_defaults_to_disabled_and_clamps() {
+        let dir = TempDir::new("crossfade-api");
+        let (mut controller, _control) = boot(&dir);
+        assert_eq!(controller.crossfade_ms(), 0, "crossfade defaults off");
+        assert_eq!(controller.set_crossfade_ms(60_000), 5_000);
+        assert_eq!(controller.crossfade_ms(), 5_000);
+        assert_eq!(controller.set_crossfade_ms(0), 0);
+        assert_eq!(controller.crossfade_ms(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn controller_follows_crossfade_start_without_reloading() {
+        let dir = TempDir::new("controller-crossfade");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+        let b_path = write_dc_wav(&root, "b.wav", 88_200, 0.8);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        let b = id_of(&controller, &b_path);
+
+        controller.set_crossfade_ms(500);
+        controller.play_track(a);
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        let session = controller.engine_session.expect("load session");
+        let events = drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id() == Some(entry_b)
+        });
+        assert!(
+            events.contains(&ControllerEvent::PlaybackChanged),
+            "{events:?}"
+        );
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_b));
+        assert_eq!(controller.engine_entry, Some(entry_b));
+        assert_eq!(
+            controller.engine_session,
+            Some(session),
+            "crossfade start must not create a load session"
+        );
+        assert!(
+            controller.position() < Duration::from_secs(1),
+            "the incoming position starts at the crossfade boundary"
+        );
+        assert_eq!(controller.playback_history().total_plays(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn repeat_one_crossfades_into_the_same_entry_without_reloading() {
+        let dir = TempDir::new("repeat-one-crossfade");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        controller.play_track(a);
+        controller.set_repeat_mode(RepeatMode::One);
+        controller.set_crossfade_ms(500);
+        let session = controller.engine_session.expect("load session");
+        drive(&mut controller, &control, |_, _| {
+            control
+                .captured()
+                .iter()
+                .filter(|sample| sample.abs() > 0.001)
+                .count()
+                >= 132_300
+        });
+        assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(
+            controller.engine_session,
+            Some(session),
+            "Repeat One crossfade must stay in one engine session"
         );
         controller.shutdown();
     }
