@@ -530,8 +530,8 @@ Deterministic stress coverage:
 - 100-transition crossfade stress with 2 s WAVs under Repeat All; at least
   96 overlaps are required, with a small bounded fallback allowance under
   scheduler contention.
-- 100 gapless Repeat One transitions, 100 Shuffle + Repeat All transitions
-  and 100 transitions with duplicate queue entries for the same TrackId.
+- 100 gapless Repeat One transitions, 40 Shuffle + Repeat All transitions and
+  100 transitions with duplicate queue entries for the same TrackId.
 - Alternating gapless/crossfade configuration during a running session.
 - 50 consecutive failed preloads while the active source continues.
 - Rapid bursts of pause/resume/seek/next/previous/direct selection, queue
