@@ -42,9 +42,10 @@ re-checks both when applying, so a stale plan cannot publish into another
 instance even if a caller bypasses the GUI gate. Switching cancels/closes the
 Import Manager and clears library-owned selection, playlist, editor, lyrics,
 artwork, search-cache, smart-collection, dashboard, batch-review and import
-state. The TUI clears its cursor/search/input/lyrics state in the same place.
-Global filters, sort choice, volume, crossfade, and other preferences are
-preserved.
+state. The TUI clears its cursor/search/input/lyrics state, queue-view
+cursor/offset, help/import-result panel and pending confirmation state in the
+same place, then reports the newly active library. Global filters, sort choice,
+volume, crossfade, and other preferences are preserved.
 
 The audio engine is device-scoped and is stopped at the switch boundary; old
 load/transition/end events are rejected by session correlation, no preload or
@@ -76,9 +77,10 @@ root may leave its documented temporary leftovers there after the switch.
   in the canonical engine. The GUI implements playlist management and a full
   lyrics library/editor/karaoke workflow; a dedicated rating screen is not
   implemented.
-- The GUI/TUI Import Manager is review-first and copy-only. Reference imports
-  are rejected in canonical mode; the old portable import tests still cover
-  their compatibility behavior.
+- The GUI Import Manager is review-first and copy-only; the TUI exposes the
+  same canonical validation through a synchronous quick copy-import path with a
+  scrollable per-path result panel. Reference imports are rejected in canonical
+  mode; the old portable import tests still cover their compatibility behavior.
 - Managed artwork decoding uses Iced's raster image widget plus the `image`
   crate with only PNG, JPEG and WebP codecs enabled. The crate is already the
   decoder behind Iced's optional image widget; enabling that existing optional
@@ -127,6 +129,52 @@ planning/preparation pipeline.
 Status, lifecycle messages, import progress and destructive-action results stay
 in the existing GUI surfaces. No new notification framework or network service
 was introduced.
+
+### TUI navigation and safety
+
+The TUI remains a single hand-rolled crossterm view over `flux_app::Controller`.
+It has no separate catalogue, playback, queue, history, import or persistence
+logic. The header shows the active storage mode/library identity (full path on
+wider terminals, final component on narrow ones), current view, queue length,
+playback mode, and active search/favorites filter. Track rows distinguish
+missing from inaccessible audio. Empty-copy distinguishes an empty library,
+empty search, and favourites-only search with no matches.
+
+`?` opens a scrollable help/details view containing the complete keys and
+limitations; normal mode keeps only a short help line so it is not clipped on
+ordinary terminals. Input lines retain their trailing path/cursor when longer
+than the terminal by showing an ellipsis and the tail. Terminal dimensions are
+clamped to safe minimums for tiny/0-column pseudo-terminals; detail/queue/lyrics
+views below 8 rows show an explicit resize message instead of overlapping the
+status line. All terminal restoration/panic paths remain unchanged. Ctrl-C
+quits from normal, input, help, lyrics and queue views.
+
+`Q` opens a Controller-backed queue-entry view. Each row shows its position and
+stable `QueueEntryId`, so duplicate tracks are visibly distinct. Enter plays the
+selected entry through `play_queue_entry`, Delete/`d` removes that exact entry,
+and Ctrl+Up/Down reorders that entry with its identity preserved. The track view
+still supports append/play-next/remove-current/reorder-current; deletion only
+removes queue entries, never catalogue tracks or audio files.
+
+Quick TUI imports remain synchronous copy-only operations with no review or
+cancel phase. Folder and file imports report added/updated/already-indexed/
+copied/issue counts. If any per-path issue exists, the TUI opens a scrollable
+result panel listing every issue path/reason; it never silently converts a
+partial or failed import into success. H1 decoder preflight, fingerprints,
+canonical transaction rules and Controller report semantics are unchanged.
+
+`U` (preserve/replace protected legacy index) and `A` (acknowledge portable
+recovery by restoring the catalogue backup) require explicit `y` confirmation;
+any other key cancels without changing the library. Migration plans remain
+non-writing until `y`, and an unready plan is refused before execution. Failed
+or cancelled library switches leave the active library untouched and report the
+cancellation/failure. Successful switches reset cursor/search/queue-view/help
+state and announce the newly active library.
+
+Track deletion, audio/artwork/lyrics repair, ownership/album/artist transfer,
+playlists, batch actions and global filters remain GUI-only. The TUI never
+bypasses H2 deletion/repair safety, never deletes external audio, and does not
+treat an inaccessible path as missing.
 
 ## Canonical layout
 
@@ -512,7 +560,7 @@ secondary value.
 
 The TUI uses `K` to toggle crossfade and `[` / `]` to decrease or increase the
 duration by 250 ms. The now-playing line shows `Xfade off` or the active
-duration, and the help bar lists both controls. The TUI uses the same
+duration; the full `?` help panel lists both controls. The TUI uses the same
 Controller methods and the same settings file as the GUI.
 
 Settings are loaded by `Controller::open_default` before playback starts. The
@@ -612,6 +660,7 @@ from what remains structurally or physically unverified.
 | Import discovery, decode validation, partial preparation, cancellation and folder traversal | Confirmed by deterministic filesystem/import tests; real native dialogs and cross-platform traversal remain unverified |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
+| TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -1790,3 +1839,17 @@ cleanup.
     to follow, but a path that disappears before enumeration cannot be named;
     refresh and the authoritative H1 planning/preparation checks remain the
     safety boundary.
+29. The TUI remains a quick synchronous importer: it has no candidate review,
+    target-album selection, preparation progress, or in-flight cancellation.
+    Per-path failures are retained and shown, but users needing those controls
+    must use the GUI Import Manager.
+30. TUI track deletion, audio/artwork/lyrics repair, ownership and album/artist
+    transfer, playlists, batch actions and global filters remain GUI-only. The
+    TUI does not expose a queue clear/bulk-removal operation.
+31. TUI truncation is character-based rather than display-cell-based. Combining
+    marks and double-width East Asian glyphs may occupy different terminal
+    cells; no `unicode-width` dependency was added, and broad terminal-emulator
+    compatibility was not exhaustively tested.
+32. TUI runtime validation covers deterministic key/Controller behavior plus a
+    pseudo-terminal startup/help/quit probe. Real terminal multiplexers,
+    accessibility tooling and remote-terminal latency were not exercised.

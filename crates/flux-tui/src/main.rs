@@ -3,14 +3,14 @@
 //! A minimal interactive player over the shared [`flux_app::Controller`]
 //! — the same controller the GUI uses, so behavior matches exactly.
 //! Rendering is hand-rolled on top of `crossterm` (no widget
-//! framework): a header, a now-playing line, a scrollable track list,
-//! a status/error line, and a help bar. Playback, scanning, and
-//! persistence all happen on the controller/engine workers; this
-//! thread only draws and reads keys.
+//! framework): a header, a now-playing line, a scrollable track or queue
+//! list, a status/error line, and a help/input line. Playback, scanning,
+//! import, catalogue and persistence decisions all stay in the shared
+//! Controller; this thread only draws and routes keys.
 //!
-//! Usage: `flux-tui [MUSIC_DIR]` — with a directory argument, a scan
-//! of it starts immediately. Real audio output requires a build with
-//! `--features cpal`; otherwise the app says so and playback commands
+//! Usage: `flux-tui [MUSIC_DIR]` — with a directory argument, a copy-only
+//! recursive import starts immediately. Real audio output requires a build
+//! with `--features cpal`; otherwise the app says so and playback commands
 //! report why (see the README).
 //!
 //! Keys:
@@ -18,33 +18,36 @@
 //! - `Enter` play selected, `Space` play/pause, `s` stop
 //! - `n` next, `p` previous, `+`/`-` volume, `R` cycle repeat
 //! - `K` toggle crossfade, `[`/`]` decrease/increase its duration
-//! - `a` add selected track to the queue, `x` play it next,
-//!   `Delete` remove the current queue entry, `Ctrl+↑`/`Ctrl+↓`
-//!   reorder the current queue entry
+//! - `a` add selected track to the queue, `x` play it next
+//! - `Q` open the queue-entry view: `Enter` plays the selected stable
+//!   QueueEntryId, `Delete`/`d` removes it, `Ctrl+↑`/`Ctrl+↓` reorders it;
+//!   duplicate tracks remain distinct entries
 //! - `o` scan a folder (type a path), `r` refresh scanned folders
-//! - `i`/`I` quick copy-import paths into the canonical library
-//!   the portable library (the GUI has the full review-first Import
-//!   Manager), `e` edit the selected track, `P` create an artist,
-//!   `Y` rename an artist (`artist-id|new-name`), `V` list artist IDs,
-//!   `X` reconcile, `L` relink a unique reported move candidate
-//! - `/` search/filter, `Esc` clear search or cancel input
+//! - `i`/`I` quick copy-import paths into the canonical library;
+//!   per-path issues open a scrollable result panel (the GUI has the full
+//!   review-first Import Manager), `e` edit the selected track,
+//!   `P` create an artist, `Y` rename an artist (`artist-id|new-name`),
+//!   `V` list artist IDs, `X` reconcile, `L` relink a unique reported
+//!   move candidate
+//! - `/` search/filter, `Esc` clear search or cancel input, `?` opens
+//!   the full scrollable help/limitations panel
 //! - `q` or `Ctrl-C` quit (terminal state is always restored)
-//! - `U` preserve and replace an unreadable legacy app index (writes
-//!   are otherwise disabled so it can never be overwritten)
-//! - `O` open a portable library (type its folder), `C` create one,
-//!   `M` migrate a legacy index (type index file, then destination
-//!   folder; review the plan, `y` executes, `Esc` cancels; in the
+//! - `U` preserve and replace an unreadable legacy app index only after
+//!   an explicit `y` confirmation
+//! - `O` open a canonical library (type its folder), `C` create one,
+//!   `M` migrate a legacy index/portable library (type source, then
+//!   destination; review the plan, `y` executes, `Esc` cancels; in the
 //!   migration-complete screen, `a` opens the migrated library), `B`
-//!   switch back to the app library index, `A` acknowledge a recovered
-//!   library, `X` reconcile the portable catalogue with the filesystem
-//!   (refresh
-//!   availability/fingerprints; missing records are kept and
-//!   possible new locations are only reported, never auto-applied)
+//!   explains that legacy runtime switching is disabled, `A` acknowledges
+//!   a recovered portable library only after explicit confirmation,
+//!   `X` reconciles the portable catalogue with the filesystem
+//!   (missing records are kept and possible locations are never
+//!   auto-applied)
 //!
-//! Startup always uses the legacy app index: opening, creating,
-//! migrating, or switching libraries only ever happens through the
-//! explicit keys above, and a failed/cancelled switch leaves the
-//! active library untouched.
+//! Startup uses `Controller::open_default` (canonical by default). Opening,
+//! creating, migrating, or switching libraries only ever happens through the
+//! explicit keys above, and a failed/cancelled switch leaves the active
+//! library untouched.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -57,7 +60,7 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use flux_app::{
-    AudioStatus, CanonicalMigrationPlan, Controller, ReconcileReport, StorageMode,
+    AudioStatus, CanonicalMigrationPlan, Controller, ImportReport, ReconcileReport, StorageMode,
     TrackMetadataEdit, format_duration, is_track_playable,
 };
 use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
@@ -106,7 +109,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
     ScanInput,
@@ -135,6 +138,14 @@ enum Mode {
     MigratedDone,
     /// Read-only managed lyrics for the selected track (`y`).
     LyricsView,
+    /// Scrollable help or import-result details.
+    InfoView,
+    /// Stable QueueEntryId list with playback, removal and reordering.
+    QueueView,
+    /// Explicit confirmation before preserving and replacing a protected index.
+    ConfirmPreserveIndex,
+    /// Explicit confirmation before acknowledging portable recovery.
+    ConfirmAcknowledgeRecovery,
 }
 
 struct Tui {
@@ -168,6 +179,14 @@ struct Tui {
     lyrics_scroll: usize,
     /// Human-readable lyrics title/status.
     lyrics_title: String,
+    /// Cursor within the stable queue-entry list.
+    queue_cursor: usize,
+    /// First visible queue row.
+    queue_offset: usize,
+    /// Title and lines for help/import-detail info views.
+    info_title: String,
+    info_lines: Vec<String>,
+    info_scroll: usize,
 }
 
 impl Tui {
@@ -189,6 +208,84 @@ impl Tui {
             .collect()
     }
 
+    fn library_full_identity(&self) -> String {
+        match self.controller.storage_mode() {
+            StorageMode::Legacy => self.controller.legacy_index_path().map_or_else(
+                || "legacy index (session-only)".to_owned(),
+                |path| format!("legacy index {}", path.display()),
+            ),
+            StorageMode::Portable => self.controller.portable_root().map_or_else(
+                || "portable library".to_owned(),
+                |root| format!("portable {}", root.display()),
+            ),
+            StorageMode::Canonical => self.controller.canonical_root().map_or_else(
+                || "canonical library".to_owned(),
+                |root| format!("canonical {}", root.display()),
+            ),
+        }
+    }
+
+    fn library_header_identity(&self, width: usize) -> String {
+        let full = self.library_full_identity();
+        if width >= 96 {
+            return full;
+        }
+        let path = self
+            .controller
+            .canonical_root()
+            .or_else(|| self.controller.portable_root())
+            .or_else(|| self.controller.legacy_index_path());
+        let Some(path) = path else {
+            return full;
+        };
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        match self.controller.storage_mode() {
+            StorageMode::Legacy => format!("legacy {name}"),
+            StorageMode::Portable => format!("portable {name}"),
+            StorageMode::Canonical => format!("canonical {name}"),
+        }
+    }
+
+    fn empty_rows_message(&self) -> String {
+        if self.controller.tracks().is_empty() {
+            return "Library is empty — press o to scan a folder, i to import files, or ? for help."
+                .to_owned();
+        }
+        if self.favorites_only {
+            if self.search.trim().is_empty() {
+                "No favorite tracks — press F to show all tracks.".to_owned()
+            } else {
+                "No favorite tracks match the current search — Esc clears search, F shows all."
+                    .to_owned()
+            }
+        } else if self.search.trim().is_empty() {
+            "No tracks in this library view — press ? for help.".to_owned()
+        } else {
+            "No tracks match the current search — Esc clears it.".to_owned()
+        }
+    }
+
+    fn open_info(&mut self, title: impl Into<String>, lines: Vec<String>) {
+        self.info_title = title.into();
+        self.info_lines = lines;
+        self.info_scroll = 0;
+        self.mode = Mode::InfoView;
+    }
+
+    fn open_queue_view(&mut self) {
+        self.queue_cursor = self
+            .controller
+            .current_queue_entry_id()
+            .and_then(|entry| self.controller.queue_entry_index(entry))
+            .unwrap_or(0)
+            .min(self.controller.queue_len().saturating_sub(1));
+        self.queue_offset = self.queue_cursor;
+        self.mode = Mode::QueueView;
+    }
+
     fn event_loop(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         loop {
             self.controller.poll();
@@ -205,22 +302,177 @@ impl Tui {
         }
     }
 
+    fn handle_info_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if ctrl_c || key.code == KeyCode::Char('q') {
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('Q') => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.info_scroll = self.info_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.info_scroll = self.info_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => self.info_scroll = self.info_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.info_scroll = self.info_scroll.saturating_add(10),
+            KeyCode::Home | KeyCode::Char('g') => self.info_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.info_scroll = self.info_lines.len().saturating_sub(1);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_queue_view_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if ctrl_c {
+            return true;
+        }
+        let len = self.controller.queue_len();
+        self.queue_cursor = self.queue_cursor.min(len.saturating_sub(1));
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+            if let Some(entry) = self
+                .controller
+                .queue_entries()
+                .get(self.queue_cursor)
+                .copied()
+            {
+                match self.controller.move_queue_entry_by(entry.id(), delta) {
+                    Ok(true) => {
+                        if let Some(index) = self.controller.queue_entry_index(entry.id()) {
+                            self.queue_cursor = index;
+                        }
+                        self.lifecycle_msg = Some(format!(
+                            "Moved queue entry #{} by one position.",
+                            entry.id()
+                        ));
+                    }
+                    Ok(false) => {
+                        self.lifecycle_msg = Some(
+                            "That queue entry cannot move further in that direction.".to_owned(),
+                        );
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            } else {
+                self.lifecycle_msg = Some("The queue is empty.".to_owned());
+            }
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Esc | KeyCode::Char('Q') => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.queue_cursor = self.queue_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.queue_cursor = (self.queue_cursor + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::PageUp => self.queue_cursor = self.queue_cursor.saturating_sub(10),
+            KeyCode::PageDown => {
+                self.queue_cursor = (self.queue_cursor + 10).min(len.saturating_sub(1));
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.queue_cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => self.queue_cursor = len.saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(entry) = self
+                    .controller
+                    .queue_entries()
+                    .get(self.queue_cursor)
+                    .copied()
+                {
+                    match self.controller.play_queue_entry(entry.id()) {
+                        Ok(()) => {
+                            self.lifecycle_msg =
+                                Some(format!("Playing queue entry #{}.", entry.id()));
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("The queue is empty.".to_owned());
+                }
+            }
+            KeyCode::Delete | KeyCode::Char('d') => {
+                if let Some(entry) = self
+                    .controller
+                    .queue_entries()
+                    .get(self.queue_cursor)
+                    .copied()
+                {
+                    match self.controller.remove_queue_entry(entry.id()) {
+                        Ok(true) => {
+                            self.queue_cursor = self
+                                .queue_cursor
+                                .min(self.controller.queue_len().saturating_sub(1));
+                            self.lifecycle_msg =
+                                Some(format!("Removed queue entry #{}.", entry.id()));
+                        }
+                        Ok(false) => {
+                            self.lifecycle_msg =
+                                Some("That queue entry was already removed.".to_owned());
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("The queue is empty.".to_owned());
+                }
+            }
+            KeyCode::Char(' ') => self.controller.toggle_play_pause(),
+            KeyCode::Char('s') => self.controller.stop(),
+            KeyCode::Char('n') => {
+                self.controller.next();
+                self.follow_current_queue();
+            }
+            KeyCode::Char('p') => {
+                self.controller.previous();
+                self.follow_current_queue();
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => self.controller.adjust_volume(0.05),
+            KeyCode::Char('-') => self.controller.adjust_volume(-0.05),
+            _ => {}
+        }
+        false
+    }
+
     /// Returns true when the user asked to quit.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if self.mode == Mode::LyricsView {
+            if ctrl_c || key.code == KeyCode::Char('q') {
+                return true;
+            }
             match key.code {
                 KeyCode::Esc => self.mode = Mode::Normal,
-                KeyCode::Up => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1),
-                KeyCode::Down => self.lyrics_scroll = self.lyrics_scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.lyrics_scroll = self.lyrics_scroll.saturating_add(1);
+                }
                 KeyCode::PageUp => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(10),
                 KeyCode::PageDown => self.lyrics_scroll = self.lyrics_scroll.saturating_add(10),
+                KeyCode::Home | KeyCode::Char('g') => self.lyrics_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.lyrics_scroll = self.lyrics_lines.len().saturating_sub(1);
+                }
                 _ => {}
             }
             return false;
         }
+        match self.mode {
+            Mode::InfoView => return self.handle_info_key(key, ctrl_c),
+            Mode::QueueView => return self.handle_queue_view_key(key, ctrl_c),
+            _ => {}
+        }
         if self.mode != Mode::Normal {
+            if ctrl_c {
+                return true;
+            }
             return self.handle_input_key(key, ctrl_c);
         }
         if ctrl_c {
@@ -255,23 +507,54 @@ impl Tui {
             KeyCode::Char('G') | KeyCode::End => self.cursor = len.saturating_sub(1),
             KeyCode::Enter => {
                 if let Some(id) = self.rows().get(self.cursor).copied() {
+                    let title = self
+                        .controller
+                        .track(id)
+                        .map(display_title)
+                        .unwrap_or_else(|| format!("Track {id}"));
                     self.controller.play_track(id);
+                    self.lifecycle_msg = Some(format!("Playing {title}."));
                 }
             }
             KeyCode::Char(' ') => self.controller.toggle_play_pause(),
             KeyCode::Char('a') => {
                 if let Some(id) = self.rows().get(self.cursor).copied() {
-                    let _ = self.controller.enqueue_track(id);
+                    match self.controller.enqueue_track(id) {
+                        Ok(entry) => {
+                            self.lifecycle_msg = Some(format!("Added queue entry #{entry}."));
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a track to add to the queue.".to_owned());
                 }
             }
             KeyCode::Char('x') => {
                 if let Some(id) = self.rows().get(self.cursor).copied() {
-                    let _ = self.controller.play_next_track(id);
+                    match self.controller.play_next_track(id) {
+                        Ok(entry) => {
+                            self.lifecycle_msg =
+                                Some(format!("Queue entry #{entry} will play next."));
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a track to play next.".to_owned());
                 }
             }
             KeyCode::Delete => {
                 if let Some(entry) = self.controller.current_queue_entry_id() {
-                    let _ = self.controller.remove_queue_entry(entry);
+                    match self.controller.remove_queue_entry(entry) {
+                        Ok(true) => {
+                            self.lifecycle_msg =
+                                Some(format!("Removed current queue entry #{entry}."));
+                        }
+                        Ok(false) => {
+                            self.lifecycle_msg =
+                                Some("That queue entry was already removed.".to_owned());
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
                 } else {
                     self.lifecycle_msg = Some("The queue is empty.".to_owned());
                 }
@@ -524,24 +807,33 @@ impl Tui {
                     self.lifecycle_msg =
                         Some("The active library index is not write-protected.".to_owned());
                 } else {
-                    match self.controller.replace_unreadable_legacy_index() {
-                        Ok(backup) => {
-                            self.lifecycle_msg = Some(format!(
-                                "Unreadable index preserved as {}; scanning and saving are enabled.",
-                                backup.display()
-                            ));
-                        }
-                        Err(err) => self.lifecycle_msg = Some(err),
-                    }
+                    self.lifecycle_msg = Some(
+                        "U will move the unreadable index to a preserved backup and enable \
+                         scanning/saving. Press y to confirm, Esc to cancel."
+                            .to_owned(),
+                    );
+                    self.mode = Mode::ConfirmPreserveIndex;
                 }
             }
             KeyCode::Char('A') => {
-                if self.controller.portable_recovery().is_some()
-                    && let Err(err) = self.controller.acknowledge_portable_recovery()
-                {
-                    self.lifecycle_msg = Some(err);
+                if self.controller.portable_recovery().is_none() {
+                    self.lifecycle_msg =
+                        Some("There is no portable recovery marker to acknowledge.".to_owned());
+                } else {
+                    self.lifecycle_msg = Some(
+                        "A will replace the portable catalogue from its preserved backup and \
+                         re-enable writes. Press y to confirm, Esc to cancel."
+                            .to_owned(),
+                    );
+                    self.mode = Mode::ConfirmAcknowledgeRecovery;
                 }
             }
+            KeyCode::Char('?') => {
+                let library = self.library_full_identity();
+                let lines = help_lines(&self.controller, &library);
+                self.open_info("Flux TUI help", lines);
+            }
+            KeyCode::Char('Q') => self.open_queue_view(),
             KeyCode::Char('X') => {
                 if self.controller.storage_mode() == StorageMode::Canonical {
                     self.controller.refresh();
@@ -560,6 +852,11 @@ impl Tui {
             KeyCode::Esc => {
                 self.search.clear();
                 self.cursor = 0;
+                self.lifecycle_msg = Some("Search cleared.".to_owned());
+            }
+            KeyCode::Char(command) => {
+                self.lifecycle_msg =
+                    Some(format!("Unknown command '{command}'. Press ? for help."));
             }
             _ => {}
         }
@@ -642,14 +939,58 @@ impl Tui {
                 return false;
             }
             Mode::MigratedDone => {
+                let mut activated = false;
+                let mut activation_error = None;
                 if key.code == KeyCode::Char('a')
                     && let Some(destination) = self.migrated_dest.clone()
-                    && self.controller.switch_to_canonical(&destination).is_ok()
                 {
-                    self.after_switch();
+                    match self.controller.switch_to_canonical(&destination) {
+                        Ok(()) => {
+                            self.after_switch();
+                            activated = true;
+                        }
+                        Err(error) => {
+                            activation_error = Some(format!(
+                                "Migrated library activation failed: {error}. The current \
+                                 library remains active."
+                            ));
+                        }
+                    }
+                }
+                if !activated {
+                    self.lifecycle_msg = activation_error.or_else(|| {
+                        Some(
+                            "Migrated library was not activated; the current library remains \
+                             active."
+                                .to_owned(),
+                        )
+                    });
                 }
                 self.migrated_dest = None;
                 self.mode = Mode::Normal;
+                return false;
+            }
+            Mode::ConfirmPreserveIndex => {
+                if key.code == KeyCode::Char('y') {
+                    self.confirm_preserve_index();
+                } else {
+                    self.lifecycle_msg = Some(
+                        "Index replacement cancelled; the protected file is unchanged.".to_owned(),
+                    );
+                    self.mode = Mode::Normal;
+                }
+                return false;
+            }
+            Mode::ConfirmAcknowledgeRecovery => {
+                if key.code == KeyCode::Char('y') {
+                    self.confirm_acknowledge_recovery();
+                } else {
+                    self.lifecycle_msg = Some(
+                        "Recovery acknowledgement cancelled; the library remains read-only."
+                            .to_owned(),
+                    );
+                    self.mode = Mode::Normal;
+                }
                 return false;
             }
             _ => {}
@@ -659,8 +1000,12 @@ impl Tui {
             KeyCode::Esc => {
                 // Cancelling an input never changes the active
                 // library and abandons any in-flight plan.
+                let cancelled = self.mode;
                 self.pending_plan = None;
                 self.mode = Mode::Normal;
+                if let Some(message) = cancel_message(cancelled) {
+                    self.lifecycle_msg = Some(message.to_owned());
+                }
             }
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.input);
@@ -668,25 +1013,26 @@ impl Tui {
                 match self.mode {
                     Mode::ScanInput => {
                         let path = text.trim();
-                        if !path.is_empty() {
+                        if path.is_empty() {
+                            self.lifecycle_msg =
+                                Some("No folder path entered; nothing was scanned.".to_owned());
+                        } else {
                             match self.controller.import_folder(Path::new(path), true) {
                                 Ok(report) => {
-                                    let mut summary = format!(
-                                        "Import: {} added, {} duplicate(s), {} issue(s).",
-                                        report.added,
-                                        report.deduplicated,
-                                        report.issues.len()
-                                    );
-                                    if let Some(issue) = report.issues.first() {
-                                        summary.push_str(&format!(
-                                            " First issue: {} — {}",
-                                            issue.path().display(),
-                                            issue.reason()
-                                        ));
+                                    self.lifecycle_msg =
+                                        Some(import_summary("Folder import", &report));
+                                    if !report.issues.is_empty() {
+                                        self.open_info(
+                                            "Folder import results",
+                                            import_detail_lines("Folder import", &report),
+                                        );
+                                        next = Mode::InfoView;
                                     }
-                                    self.lifecycle_msg = Some(summary);
                                 }
-                                Err(err) => self.lifecycle_msg = Some(err),
+                                Err(err) => {
+                                    self.lifecycle_msg =
+                                        Some(format!("Folder import failed: {err}"));
+                                }
                             }
                         }
                     }
@@ -707,24 +1053,19 @@ impl Tui {
                         } else {
                             match self.controller.import_files(&paths, self.import_copy) {
                                 Ok(report) => {
-                                    let mut summary = format!(
-                                        "Import: {} added, {} updated, {} already indexed, {} copied, {} issue(s).",
-                                        report.added,
-                                        report.updated,
-                                        report.deduplicated,
-                                        report.copied.len(),
-                                        report.issues.len()
-                                    );
-                                    if let Some(issue) = report.issues.first() {
-                                        summary.push_str(&format!(
-                                            " First issue: {} — {}",
-                                            issue.path().display(),
-                                            issue.reason()
-                                        ));
+                                    self.lifecycle_msg =
+                                        Some(import_summary("File import", &report));
+                                    if !report.issues.is_empty() {
+                                        self.open_info(
+                                            "File import results",
+                                            import_detail_lines("File import", &report),
+                                        );
+                                        next = Mode::InfoView;
                                     }
-                                    self.lifecycle_msg = Some(summary);
                                 }
-                                Err(err) => self.lifecycle_msg = Some(err),
+                                Err(err) => {
+                                    self.lifecycle_msg = Some(format!("File import failed: {err}"));
+                                }
                             }
                         }
                     }
@@ -777,46 +1118,82 @@ impl Tui {
                         }
                     }
                     Mode::OpenInput => {
-                        let path = PathBuf::from(text.trim());
-                        if self.controller.switch_to_canonical(&path).is_ok() {
-                            self.after_switch();
+                        if text.trim().is_empty() {
+                            self.lifecycle_msg = Some(
+                                "No library folder entered; active library unchanged.".to_owned(),
+                            );
+                        } else {
+                            let path = PathBuf::from(text.trim());
+                            match self.controller.switch_to_canonical(&path) {
+                                Ok(()) => self.after_switch(),
+                                Err(error) => {
+                                    self.lifecycle_msg = Some(format!(
+                                        "Open failed: {error}. Active library unchanged."
+                                    ));
+                                }
+                            }
                         }
                     }
                     Mode::CreateInput => {
-                        let path = PathBuf::from(text.trim());
-                        if self
-                            .controller
-                            .switch_to_new_canonical_library(&path)
-                            .is_ok()
-                        {
-                            self.after_switch();
+                        if text.trim().is_empty() {
+                            self.lifecycle_msg = Some(
+                                "No destination folder entered; active library unchanged."
+                                    .to_owned(),
+                            );
+                        } else {
+                            let path = PathBuf::from(text.trim());
+                            match self.controller.switch_to_new_canonical_library(&path) {
+                                Ok(_) => self.after_switch(),
+                                Err(error) => {
+                                    self.lifecycle_msg = Some(format!(
+                                        "Create failed: {error}. Active library unchanged."
+                                    ));
+                                }
+                            }
                         }
                     }
                     Mode::MigrateSourceInput => {
                         let source = text.trim();
-                        if !source.is_empty() {
+                        if source.is_empty() {
+                            self.lifecycle_msg =
+                                Some("No legacy index path entered; nothing planned.".to_owned());
+                        } else {
                             self.migrate_source = PathBuf::from(source);
                             next = Mode::MigrateDestInput;
                         }
                     }
                     Mode::MigrateDestInput => {
-                        let destination = PathBuf::from(text.trim());
-                        match flux_app::plan_canonical_migration(&self.migrate_source, &destination)
-                        {
-                            Ok(plan) => {
-                                self.lifecycle_msg = Some(migration_plan_summary(&plan));
-                                self.pending_plan = Some(plan);
-                                self.migrated_dest = None;
-                                next = Mode::MigrateConfirm;
-                            }
-                            Err(err) => {
-                                self.lifecycle_msg =
-                                    Some(format!("Migration planning failed: {err}"));
+                        let destination = text.trim();
+                        if destination.is_empty() {
+                            self.lifecycle_msg =
+                                Some("No destination folder entered; nothing planned.".to_owned());
+                        } else {
+                            let destination = PathBuf::from(destination);
+                            match flux_app::plan_canonical_migration(
+                                &self.migrate_source,
+                                &destination,
+                            ) {
+                                Ok(plan) => {
+                                    self.lifecycle_msg = Some(migration_plan_summary(&plan));
+                                    self.pending_plan = Some(plan);
+                                    self.migrated_dest = None;
+                                    next = Mode::MigrateConfirm;
+                                }
+                                Err(err) => {
+                                    self.lifecycle_msg =
+                                        Some(format!("Migration planning failed: {err}"));
+                                }
                             }
                         }
                     }
-                    Mode::Normal | Mode::MigrateConfirm | Mode::MigratedDone | Mode::LyricsView => {
-                    }
+                    Mode::Normal
+                    | Mode::MigrateConfirm
+                    | Mode::MigratedDone
+                    | Mode::LyricsView
+                    | Mode::InfoView
+                    | Mode::QueueView
+                    | Mode::ConfirmPreserveIndex
+                    | Mode::ConfirmAcknowledgeRecovery => {}
                 }
                 self.mode = next;
             }
@@ -832,6 +1209,33 @@ impl Tui {
         false
     }
 
+    fn confirm_preserve_index(&mut self) {
+        self.mode = Mode::Normal;
+        match self.controller.replace_unreadable_legacy_index() {
+            Ok(backup) => {
+                self.lifecycle_msg = Some(format!(
+                    "Unreadable index preserved as {}; scanning and saving are enabled.",
+                    backup.display()
+                ));
+            }
+            Err(err) => self.lifecycle_msg = Some(format!("Index preservation failed: {err}")),
+        }
+    }
+
+    fn confirm_acknowledge_recovery(&mut self) {
+        self.mode = Mode::Normal;
+        match self.controller.acknowledge_portable_recovery() {
+            Ok(()) => {
+                self.lifecycle_msg = Some(
+                    "Portable recovery acknowledged; scanning and saving are enabled.".to_owned(),
+                );
+            }
+            Err(err) => {
+                self.lifecycle_msg = Some(format!("Recovery acknowledgement failed: {err}"));
+            }
+        }
+    }
+
     /// Runs the migration the user confirmed with `y`. Execution
     /// never switches the active library by itself; success moves to
     /// [`Mode::MigratedDone`], where `a` activates the result.
@@ -840,6 +1244,15 @@ impl Tui {
             self.mode = Mode::Normal;
             return;
         };
+        if !plan.is_ready() {
+            self.lifecycle_msg = Some(format!(
+                "Migration blocked by {} issue(s); nothing was executed. Fix the source or \
+                 destination and plan again.",
+                plan.issues().len()
+            ));
+            self.mode = Mode::Normal;
+            return;
+        }
         let destination = plan.destination().to_path_buf();
         match flux_app::execute_canonical_migration(&plan) {
             Ok(report) => {
@@ -912,11 +1325,16 @@ impl Tui {
         self.search.clear();
         self.pending_plan = None;
         self.migrated_dest = None;
-        self.lifecycle_msg = None;
         self.last_reconcile = None;
         self.lyrics_lines.clear();
         self.lyrics_scroll = 0;
         self.lyrics_title.clear();
+        self.queue_cursor = 0;
+        self.queue_offset = 0;
+        self.info_title.clear();
+        self.info_lines.clear();
+        self.info_scroll = 0;
+        self.lifecycle_msg = Some(format!("Active library: {}", self.library_full_identity()));
     }
 
     /// After next/previous, put the cursor on the player's selection.
@@ -928,12 +1346,19 @@ impl Tui {
         }
     }
 
+    fn follow_current_queue(&mut self) {
+        if let Some(entry) = self.controller.current_queue_entry_id()
+            && let Some(index) = self.controller.queue_entry_index(entry)
+        {
+            self.queue_cursor = index;
+        }
+    }
+
     fn draw(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        let (width, height) = terminal::size().unwrap_or((80, 24));
+        let (raw_width, raw_height) = terminal::size().unwrap_or((80, 24));
+        let (width, height) = clamp_terminal_size(raw_width, raw_height);
         // A fresh pty can report 0 columns; lay out for at least a
         // minimal sane width rather than dividing the void.
-        let width = usize::from(width.max(20));
-        let height = usize::from(height.max(6));
         let rows = self.rows();
         let current = self.controller.current_id();
 
@@ -951,23 +1376,45 @@ impl Tui {
 
         queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
 
+        if !detail_view_fits(height)
+            && matches!(
+                self.mode,
+                Mode::InfoView | Mode::QueueView | Mode::LyricsView
+            )
+        {
+            self.line(
+                out,
+                0,
+                "Terminal too small for this view — resize to at least 8 rows or press Esc.",
+                width,
+                true,
+            )?;
+            self.line(out, (height - 1) as u16, "Esc back · q quit", width, false)?;
+            out.flush()?;
+            return Ok(());
+        }
+
         // Header.
-        let library_label = match self.controller.storage_mode() {
-            StorageMode::Legacy => "library: legacy index".to_owned(),
-            StorageMode::Portable => match self.controller.portable_root() {
-                Some(root) => format!("library: portable {}", root.display()),
-                None => "library: portable".to_owned(),
-            },
-            StorageMode::Canonical => match self.controller.canonical_root() {
-                Some(root) => format!("library: canonical {}", root.display()),
-                None => "library: canonical".to_owned(),
-            },
+        let library_label = self.library_header_identity(width);
+        let view_label = match self.mode {
+            Mode::QueueView => "queue",
+            Mode::InfoView => "help/info",
+            Mode::LyricsView => "lyrics",
+            Mode::Normal => "tracks",
+            _ => "input",
         };
         let mut header = format!(
-            "Flux {MILESTONE} — terminal player   [{library_label}]   [queue {}]   [mode {}]",
+            "Flux {MILESTONE} [{library_label}] [view {view_label}] [queue {}] [playback {}]",
             self.controller.queue_len(),
             self.controller.playback_mode().label()
         );
+        if self.favorites_only {
+            header.push_str(" [favorites]");
+        }
+        if !self.search.trim().is_empty() {
+            let search = self.search.chars().take(24).collect::<String>();
+            header.push_str(&format!(" [search \"{search}\"]"));
+        }
         if self.controller.portable_recovery().is_some() {
             header.push_str("   [recovered — read-only, A acknowledges]");
         }
@@ -996,68 +1443,142 @@ impl Tui {
             self.line(out, 2, "", width, false)?;
         }
 
-        if self.mode == Mode::LyricsView {
+        let detail_height = height.saturating_sub(list_top + 4).max(1);
+        if self.mode == Mode::InfoView {
+            self.line(out, list_top as u16, &self.info_title, width, true)?;
+            let max_scroll = self.info_lines.len().saturating_sub(detail_height);
+            self.info_scroll = self.info_scroll.min(max_scroll);
+            for (row, line) in self
+                .info_lines
+                .iter()
+                .skip(self.info_scroll)
+                .take(detail_height)
+                .enumerate()
+            {
+                self.line(out, (list_top + 1 + row) as u16, line, width, false)?;
+            }
+        } else if self.mode == Mode::QueueView {
+            let entries = self.controller.queue_entries();
+            self.queue_cursor = self.queue_cursor.min(entries.len().saturating_sub(1));
+            if self.queue_cursor < self.queue_offset {
+                self.queue_offset = self.queue_cursor;
+            }
+            if self.queue_cursor >= self.queue_offset + detail_height {
+                self.queue_offset = self.queue_cursor + 1 - detail_height;
+            }
+            self.queue_offset = self
+                .queue_offset
+                .min(entries.len().saturating_sub(detail_height));
+            let title = format!(
+                "QUEUE · {} entr{} · Enter play · Del remove · Ctrl+↑/↓ reorder · Esc back",
+                entries.len(),
+                if entries.len() == 1 { "y" } else { "ies" }
+            );
+            self.line(out, list_top as u16, &title, width, true)?;
+            if entries.is_empty() {
+                self.line(
+                    out,
+                    (list_top + 1) as u16,
+                    "Queue is empty — add a track with a or x from the track view.",
+                    width,
+                    false,
+                )?;
+            }
+            for (row, entry) in entries
+                .iter()
+                .skip(self.queue_offset)
+                .take(detail_height)
+                .enumerate()
+            {
+                let index = self.queue_offset + row;
+                let current = self.controller.current_queue_entry_id() == Some(entry.id());
+                let track = self.controller.track(entry.track());
+                let mut text = format!(
+                    "{} {}. #{} {}",
+                    if index == self.queue_cursor { ">" } else { " " },
+                    index + 1,
+                    entry.id(),
+                    track.map_or_else(
+                        || "Missing from library".to_owned(),
+                        |track| format!(
+                            "{} — {}",
+                            display_title(track),
+                            credit_display(&self.controller, entry.track())
+                        ),
+                    )
+                );
+                if current {
+                    text.push_str("  ▶ current");
+                }
+                if let Some(label) =
+                    resource_label(self.controller.track_audio_resource_state(entry.track()))
+                {
+                    text.push_str("  ");
+                    text.push_str(label);
+                }
+                let duration = track
+                    .and_then(Track::duration)
+                    .map(format_duration)
+                    .unwrap_or_default();
+                let text = pad_with_right(&text, &duration, width);
+                let y = (list_top + 1 + row) as u16;
+                if index == self.queue_cursor {
+                    queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                    self.line(out, y, &text, width, false)?;
+                    queue!(out, SetAttribute(Attribute::Reset))?;
+                } else {
+                    self.line(out, y, &text, width, false)?;
+                }
+            }
+        } else if self.mode == Mode::LyricsView {
             self.line(out, list_top as u16, &self.lyrics_title, width, true)?;
-            let available = height.saturating_sub(list_top + 4).max(1);
-            let max_scroll = self.lyrics_lines.len().saturating_sub(available);
+            let max_scroll = self.lyrics_lines.len().saturating_sub(detail_height);
             self.lyrics_scroll = self.lyrics_scroll.min(max_scroll);
             for (row, line) in self
                 .lyrics_lines
                 .iter()
                 .skip(self.lyrics_scroll)
-                .take(available)
+                .take(detail_height)
                 .enumerate()
             {
                 self.line(out, (list_top + 1 + row) as u16, line, width, false)?;
             }
-            let help = format!(
-                "Lyrics read-only — ↑/↓ scroll · PgUp/PgDn · Esc back · {}-{} of {}",
-                self.lyrics_scroll + 1,
-                (self.lyrics_scroll + available).min(self.lyrics_lines.len()),
-                self.lyrics_lines.len()
-            );
-            self.line(out, (height - 1) as u16, &help, width, false)?;
-            return Ok(());
-        }
-
-        // Track list.
-        if rows.is_empty() {
-            let msg = if self.controller.tracks().is_empty() {
-                "Library is empty — press o, type a music folder path, and press Enter to scan."
-            } else {
-                "No tracks match the current search — Esc clears it."
-            };
-            self.line(out, list_top as u16, msg, width, false)?;
-        }
-        for (row, id) in rows.iter().skip(self.offset).take(list_height).enumerate() {
-            let index = self.offset + row;
-            let Some(track) = self.controller.track(*id) else {
-                continue;
-            };
-            let mut text = format!(
-                "{} {} {}  · {}",
-                if index == self.cursor { ">" } else { " " },
-                if Some(*id) == current { "▶" } else { " " },
-                display_title(track),
-                credit_display(&self.controller, *id),
-            );
-            if !is_track_playable(track) {
-                text.push_str("  [indexed — not playable yet]");
+        } else {
+            // Track list.
+            if rows.is_empty() {
+                let message = self.empty_rows_message();
+                self.line(out, list_top as u16, &message, width, false)?;
             }
-            match self.controller.track_audio_resource_state(*id) {
-                Some(flux_app::ResourceState::Missing) => text.push_str("  [missing]"),
-                Some(flux_app::ResourceState::Unavailable(_)) => text.push_str("  [inaccessible]"),
-                _ => {}
-            }
-            let duration = track.duration().map(format_duration).unwrap_or_default();
-            let text = pad_with_right(&text, &duration, width);
-            let y = (list_top + row) as u16;
-            if index == self.cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
-                self.line(out, y, &text, width, false)?;
-                queue!(out, SetAttribute(Attribute::Reset))?;
-            } else {
-                self.line(out, y, &text, width, false)?;
+            for (row, id) in rows.iter().skip(self.offset).take(list_height).enumerate() {
+                let index = self.offset + row;
+                let Some(track) = self.controller.track(*id) else {
+                    continue;
+                };
+                let mut text = format!(
+                    "{} {} {}  · {}",
+                    if index == self.cursor { ">" } else { " " },
+                    if Some(*id) == current { "▶" } else { " " },
+                    display_title(track),
+                    credit_display(&self.controller, *id),
+                );
+                if !is_track_playable(track) {
+                    text.push_str("  [indexed — not playable yet]");
+                }
+                if let Some(label) = resource_label(self.controller.track_audio_resource_state(*id))
+                {
+                    text.push_str("  ");
+                    text.push_str(label);
+                }
+                let duration = track.duration().map(format_duration).unwrap_or_default();
+                let text = pad_with_right(&text, &duration, width);
+                let y = (list_top + row) as u16;
+                if index == self.cursor {
+                    queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                    self.line(out, y, &text, width, false)?;
+                    queue!(out, SetAttribute(Attribute::Reset))?;
+                } else {
+                    self.line(out, y, &text, width, false)?;
+                }
             }
         }
 
@@ -1074,45 +1595,43 @@ impl Tui {
         }
 
         // Help / input line.
+        let input_line = |prefix: &str| fit_input_line(prefix, &self.input, width);
         let help = match self.mode {
             Mode::Normal => normal_help().to_owned(),
-            Mode::ScanInput => format!(
-                "Scan folder (Enter to scan, Esc to cancel): {}_",
-                self.input
+            Mode::InfoView => format!(
+                "Help/details — ↑/↓ scroll · PgUp/PgDn · Esc/Q back · {}-{} of {}",
+                self.info_scroll + 1,
+                (self.info_scroll + detail_height).min(self.info_lines.len()),
+                self.info_lines.len()
             ),
-            Mode::SearchInput => format!("Search (Enter to apply, Esc to cancel): {}_", self.input),
-            Mode::ImportInput => format!(
-                "{} import paths separated by ; (Enter to import, Esc to cancel): {}_",
-                "Copy", self.input
+            Mode::QueueView => {
+                "Queue — ↑/↓ select · Enter play · Del/d remove · Ctrl+↑/↓ reorder · Esc/Q back"
+                    .to_owned()
+            }
+            Mode::ScanInput => input_line("Scan folder (Enter scan, Esc cancel): "),
+            Mode::SearchInput => input_line("Search (Enter apply, Esc cancel): "),
+            Mode::ImportInput => {
+                input_line("Copy import paths separated by ; (Enter import, Esc cancel): ")
+            }
+            Mode::TrackEditInput => input_line(
+                "Edit track title|album|track|disc|artist-id|credit-ids (Enter save, Esc cancel): ",
             ),
-            Mode::TrackEditInput => format!(
-                "Edit selected track as title|album|track|disc|artist-id|credit-ids (Enter save, Esc cancel): {}_",
-                self.input
-            ),
-            Mode::ArtistCreateInput => format!(
-                "New artist name (Enter to create, Esc to cancel): {}_",
-                self.input
-            ),
-            Mode::ArtistRenameInput => format!(
-                "Rename artist as artist-id|new-name (Enter to rename, Esc to cancel): {}_",
-                self.input
-            ),
-            Mode::OpenInput => format!(
-                "Open portable library folder (Enter to switch, Esc to cancel): {}_",
-                self.input
-            ),
-            Mode::CreateInput => format!(
-                "Create portable library in folder (Enter to create + switch, Esc to cancel): {}_",
-                self.input
-            ),
-            Mode::MigrateSourceInput => format!(
-                "Legacy index file to migrate (Enter for destination, Esc to cancel): {}_",
-                self.input
-            ),
-            Mode::MigrateDestInput => format!(
-                "Migration destination folder (Enter to plan, Esc to cancel): {}_",
-                self.input
-            ),
+            Mode::ArtistCreateInput => input_line("New artist name (Enter create, Esc cancel): "),
+            Mode::ArtistRenameInput => {
+                input_line("Rename artist-id|new-name (Enter rename, Esc cancel): ")
+            }
+            Mode::OpenInput => {
+                input_line("Open canonical library folder (Enter switch, Esc cancel): ")
+            }
+            Mode::CreateInput => {
+                input_line("Create canonical library folder (Enter create+switch, Esc cancel): ")
+            }
+            Mode::MigrateSourceInput => {
+                input_line("Legacy index file to migrate (Enter next, Esc cancel): ")
+            }
+            Mode::MigrateDestInput => {
+                input_line("Migration destination folder (Enter plan, Esc cancel): ")
+            }
             Mode::MigrateConfirm => {
                 "Migration planned — review the status line: y executes, Esc cancels.".to_owned()
             }
@@ -1120,7 +1639,16 @@ impl Tui {
                 "Migration done — a opens the migrated library, Esc keeps the current one."
                     .to_owned()
             }
-            Mode::LyricsView => "Lyrics read-only — ↑/↓ scroll, Esc back.".to_owned(),
+            Mode::LyricsView => {
+                "Lyrics read-only — ↑/↓ scroll · PgUp/PgDn · Esc back · q quits.".to_owned()
+            }
+            Mode::ConfirmPreserveIndex => {
+                "Preserve and replace protected index? y confirms; any other key cancels."
+                    .to_owned()
+            }
+            Mode::ConfirmAcknowledgeRecovery => {
+                "Acknowledge portable recovery? y confirms; any other key cancels.".to_owned()
+            }
         };
         self.line(out, (height - 1) as u16, &help, width, false)?;
 
@@ -1345,14 +1873,156 @@ fn format_lyrics_timestamp(timestamp_ms: u64) -> String {
 }
 
 fn normal_help() -> &'static str {
-    "Enter play · Space pause · s stop · n/p skip · a add · x next \
-     · Del rm · Ctrl+↑/↓ reorder · +/- vol · K xfade · [ ] xfade duration \
-     · o scan · r refresh · i/I quick copy-import · e edit track · y lyrics \
-     · V artists · P new artist · Y rename artist · L relink · X reconcile \
-     · / search · F favorites · H stats · R mode · O open · C create · M migrate \
-     · D album · E albums · T transfer/delete (GUI) \
-     · move/replace (GUI) · global search/filters/batch (GUI) \
-     · playlists (GUI) · B index · U fix · q quit"
+    "↑/↓ move · Enter play · Space pause · / search · Q queue · ? help · q quit"
+}
+
+fn resource_label(state: Option<flux_app::ResourceState>) -> Option<&'static str> {
+    match state {
+        Some(flux_app::ResourceState::Missing) => Some("[missing]"),
+        Some(flux_app::ResourceState::Unavailable(_)) => Some("[inaccessible]"),
+        Some(flux_app::ResourceState::Present) | None => None,
+    }
+}
+
+fn clamp_terminal_size(width: u16, height: u16) -> (usize, usize) {
+    (usize::from(width.max(20)), usize::from(height.max(6)))
+}
+
+fn detail_view_fits(height: usize) -> bool {
+    height >= 8
+}
+
+fn fit_input_line(prefix: &str, input: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let line = format!("{prefix}{input}_");
+    if line.chars().count() <= width {
+        return line;
+    }
+    let keep = width.saturating_sub(1);
+    let mut tail = line
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    if width > 0 {
+        tail.insert(0, '…');
+    }
+    tail
+}
+
+fn import_summary(label: &str, report: &ImportReport) -> String {
+    format!(
+        "{label}: {} added, {} updated, {} already indexed, {} copied, {} issue(s).",
+        report.added,
+        report.updated,
+        report.deduplicated,
+        report.copied.len(),
+        report.issues.len()
+    )
+}
+
+fn import_detail_lines(label: &str, report: &ImportReport) -> Vec<String> {
+    let mut lines = vec![import_summary(label, report)];
+    if report.issues.is_empty() {
+        lines.push("No per-path issues were reported.".to_owned());
+        return lines;
+    }
+    lines.push(format!("Per-path issues ({}):", report.issues.len()));
+    lines.extend(report.issues.iter().enumerate().map(|(index, issue)| {
+        format!(
+            "{}. {} — {}",
+            index + 1,
+            issue.path().display(),
+            issue.reason()
+        )
+    }));
+    lines
+}
+
+fn cancel_message(mode: Mode) -> Option<&'static str> {
+    match mode {
+        Mode::ScanInput => Some("Scan cancelled; no folder was scanned."),
+        Mode::SearchInput => Some("Search input cancelled; the previous filter is unchanged."),
+        Mode::ImportInput => Some("Import cancelled; no files were imported."),
+        Mode::TrackEditInput => Some("Track edit cancelled; no changes were made."),
+        Mode::ArtistCreateInput => Some("Artist creation cancelled."),
+        Mode::ArtistRenameInput => Some("Artist rename cancelled; no changes were made."),
+        Mode::OpenInput | Mode::CreateInput => {
+            Some("Library switch cancelled; the active library is unchanged.")
+        }
+        Mode::MigrateSourceInput | Mode::MigrateDestInput => {
+            Some("Migration cancelled before planning; nothing was written.")
+        }
+        Mode::Normal
+        | Mode::MigrateConfirm
+        | Mode::MigratedDone
+        | Mode::LyricsView
+        | Mode::InfoView
+        | Mode::QueueView
+        | Mode::ConfirmPreserveIndex
+        | Mode::ConfirmAcknowledgeRecovery => None,
+    }
+}
+
+fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
+    let audio = match controller.audio_status() {
+        AudioStatus::Ready => "ready".to_owned(),
+        AudioStatus::DeviceUnavailable(reason) => format!("unavailable — {reason}"),
+        AudioStatus::Recovering(reason) => format!("recovering — {reason}"),
+        other => other.reason().unwrap_or("unknown").to_owned(),
+    };
+    vec![
+        "Flux TUI quick reference".to_owned(),
+        format!("Active library: {library}"),
+        format!(
+            "Audio output: {audio} · queue {} · playback mode {}",
+            controller.queue_len(),
+            controller.playback_mode().label()
+        ),
+        String::new(),
+        "NAVIGATION".to_owned(),
+        "↑/↓ or k/j move · PgUp/PgDn · g/G first/last".to_owned(),
+        "/ search · Esc clears the active search · F favorites".to_owned(),
+        "Q queue view · ? help · q or Ctrl-C quits".to_owned(),
+        String::new(),
+        "PLAYBACK".to_owned(),
+        "Enter play · Space play/pause · s stop · n/p skip".to_owned(),
+        "+/- volume · R playback mode · K crossfade · [ ] crossfade duration".to_owned(),
+        String::new(),
+        "QUEUE".to_owned(),
+        "a add selected · x play selected next".to_owned(),
+        "Q opens the stable queue-entry view".to_owned(),
+        "Enter play selected entry · Del/d remove selected entry".to_owned(),
+        "Ctrl+↑/↓ reorder selected entry; duplicate tracks remain distinct by #entry id".to_owned(),
+        String::new(),
+        "CATALOGUE".to_owned(),
+        "o scan folder · i/I copy-import files · r refresh".to_owned(),
+        "e edit selected metadata · y read managed lyrics".to_owned(),
+        "H local history · D selected album · E album list".to_owned(),
+        "V artist IDs · P create artist · Y rename artist".to_owned(),
+        "X refresh/reconcile · L relink a unique reported move candidate".to_owned(),
+        String::new(),
+        "LIBRARY LIFECYCLE".to_owned(),
+        "O open canonical library · C create canonical library".to_owned(),
+        "M migrate a legacy index/portable library".to_owned(),
+        "U preserve and replace a protected legacy index (confirmation required)".to_owned(),
+        "A acknowledge portable recovery from backup (confirmation required)".to_owned(),
+        "B legacy runtime switching is disabled; use M instead".to_owned(),
+        String::new(),
+        "SAFETY AND LIMITS".to_owned(),
+        "Imports are synchronous quick copy operations; there is no TUI cancel/review phase."
+            .to_owned(),
+        "All per-path import issues are shown in a scrollable result panel.".to_owned(),
+        "Missing resources are retained; inaccessible paths are not treated as missing.".to_owned(),
+        "The TUI never deletes external audio and never deletes library tracks.".to_owned(),
+        "Track deletion, audio/artwork/lyrics repair, ownership/album/artist transfer,".to_owned(),
+        "playlists, batch actions and global filters require the GUI review workflows.".to_owned(),
+    ]
 }
 
 /// Left text plus right-aligned `right`, space-padded to `width`.
@@ -1371,24 +2041,16 @@ fn pad_with_right(left: &str, right: &str, width: usize) -> String {
 fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
     let mut controller =
         Controller::open_default().map_err(|err| std::io::Error::other(err.to_string()))?;
-    let initial_import = initial_dir.map(|dir| match controller.import_folder(&dir, true) {
-        Ok(report) => {
-            let mut summary = format!(
-                "Startup folder import: {} added, {} duplicate(s), {} issue(s).",
-                report.added,
-                report.deduplicated,
-                report.issues.len()
-            );
-            if let Some(issue) = report.issues.first() {
-                summary.push_str(&format!(
-                    " First issue: {} — {}",
-                    issue.path().display(),
-                    issue.reason()
-                ));
+    let (initial_import, initial_info) = initial_dir.map_or((None, None), |dir| {
+        match controller.import_folder(&dir, true) {
+            Ok(report) => {
+                let summary = import_summary("Startup folder import", &report);
+                let details = (!report.issues.is_empty())
+                    .then(|| import_detail_lines("Startup folder import", &report));
+                (Some(summary), details)
             }
-            summary
+            Err(error) => (Some(format!("Startup folder import failed: {error}")), None),
         }
-        Err(error) => format!("Startup folder import failed: {error}"),
     });
 
     let guard = TerminalGuard::enter()?;
@@ -1403,7 +2065,11 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         controller,
         cursor: 0,
         offset: 0,
-        mode: Mode::Normal,
+        mode: if initial_info.is_some() {
+            Mode::InfoView
+        } else {
+            Mode::Normal
+        },
         input: String::new(),
         search: String::new(),
         favorites_only: false,
@@ -1411,6 +2077,15 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         lyrics_lines: Vec::new(),
         lyrics_scroll: 0,
         lyrics_title: String::new(),
+        queue_cursor: 0,
+        queue_offset: 0,
+        info_title: if initial_info.is_some() {
+            "Startup folder import results".to_owned()
+        } else {
+            String::new()
+        },
+        info_lines: initial_info.unwrap_or_default(),
+        info_scroll: 0,
         pending_plan: None,
         migrated_dest: None,
         lifecycle_msg: initial_import,
@@ -1427,7 +2102,10 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, StorageMode, Track, Tui, normal_help, pad_with_right};
+    use super::{
+        Mode, StorageMode, Track, Tui, clamp_terminal_size, detail_view_fits, fit_input_line,
+        help_lines, normal_help, pad_with_right, resource_label,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1479,6 +2157,11 @@ mod tests {
             lyrics_lines: Vec::new(),
             lyrics_scroll: 0,
             lyrics_title: String::new(),
+            queue_cursor: 0,
+            queue_offset: 0,
+            info_title: String::new(),
+            info_lines: Vec::new(),
+            info_scroll: 0,
             pending_plan: None,
             migrated_dest: None,
             lifecycle_msg: None,
@@ -1512,36 +2195,41 @@ mod tests {
     fn crossfade_keys_show_toggle_adjust_and_persist_shared_settings() {
         let dir = TempDir::new("crossfade-keys");
         let settings = dir.path().join("config").join("settings.json");
-        let mut app = tui(&dir);
-        app.controller.load_settings_from_path(&settings);
-        assert!(!app.controller.crossfade_enabled());
-        assert!(app.now_playing_line(120).contains("Xfade off"));
-        assert!(normal_help().contains("K xfade"));
-        assert!(normal_help().contains("[ ] xfade duration"));
+        {
+            let mut app = tui(&dir);
+            app.controller.load_settings_from_path(&settings);
+            assert!(!app.controller.crossfade_enabled());
+            assert!(app.now_playing_line(120).contains("Xfade off"));
+            let help = help_lines(&app.controller, "test library").join("\n");
+            assert!(help.contains("K crossfade"), "{help}");
+            assert!(help.contains("[ ] crossfade duration"), "{help}");
+            assert!(normal_help().contains("? help"));
 
-        key(&mut app, KeyCode::Char('K'));
-        assert!(app.controller.crossfade_enabled());
-        assert_eq!(app.controller.crossfade_duration_ms(), 3_000);
-        assert_eq!(app.controller.crossfade_ms(), 3_000);
-        assert!(
-            app.lifecycle_msg
-                .as_deref()
-                .is_some_and(|message| message.contains("Crossfade on"))
-        );
-        assert!(app.now_playing_line(120).contains("Xfade 3.0s"));
+            key(&mut app, KeyCode::Char('K'));
+            assert!(app.controller.crossfade_enabled());
+            assert_eq!(app.controller.crossfade_duration_ms(), 3_000);
+            assert_eq!(app.controller.crossfade_ms(), 3_000);
+            assert!(
+                app.lifecycle_msg
+                    .as_deref()
+                    .is_some_and(|message| message.contains("Crossfade on"))
+            );
+            assert!(app.now_playing_line(120).contains("Xfade 3.0s"));
 
-        key(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.controller.crossfade_duration_ms(), 3_250);
-        assert_eq!(app.controller.crossfade_ms(), 3_250);
-        key(&mut app, KeyCode::Char('['));
-        assert_eq!(app.controller.crossfade_duration_ms(), 3_000);
+            key(&mut app, KeyCode::Char(']'));
+            assert_eq!(app.controller.crossfade_duration_ms(), 3_250);
+            assert_eq!(app.controller.crossfade_ms(), 3_250);
+            key(&mut app, KeyCode::Char('['));
+            assert_eq!(app.controller.crossfade_duration_ms(), 3_000);
 
-        let saved = std::fs::read_to_string(&settings).expect("shared settings saved");
-        assert!(saved.contains("\"enabled\": true"));
-        assert!(saved.contains("\"duration_ms\": 3000"));
-        app.controller.shutdown();
+            let saved = std::fs::read_to_string(&settings).expect("shared settings saved");
+            assert!(saved.contains("\"enabled\": true"));
+            assert!(saved.contains("\"duration_ms\": 3000"));
+            app.controller.shutdown();
+        }
 
-        let mut restarted = tui(&dir);
+        let restarted_dir = TempDir::new("crossfade-keys-restarted");
+        let mut restarted = tui(&restarted_dir);
         restarted.controller.load_settings_from_path(&settings);
         assert!(restarted.controller.crossfade_enabled());
         assert_eq!(restarted.controller.crossfade_duration_ms(), 3_000);
@@ -1570,6 +2258,23 @@ mod tests {
         assert_eq!(tui.mode, Mode::Normal);
         assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
         assert!(!root.join(".flux").exists());
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("cancelled")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
+
+        // A rejected destination preserves the active library.
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, b"not a directory").expect("occupied file");
+        tui.search = "preserve me".to_owned();
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &occupied);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
+        assert_eq!(tui.search, "preserve me");
 
         // Full flow: C, type folder, Enter → created + switched. State tied
         // to the old library is cleared, while the global filter survives.
@@ -1580,6 +2285,9 @@ mod tests {
         tui.lyrics_title = "old title".to_owned();
         tui.favorites_only = true;
         key(&mut tui, KeyCode::Char('C'));
+        tui.queue_cursor = 5;
+        tui.queue_offset = 3;
+        tui.info_lines = vec!["stale info".to_owned()];
         type_path(&mut tui, &root);
         assert_eq!(tui.mode, Mode::Normal);
         assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
@@ -1588,7 +2296,18 @@ mod tests {
         assert!(tui.input.is_empty());
         assert!(tui.lyrics_lines.is_empty());
         assert!(tui.lyrics_title.is_empty());
+        assert_eq!(tui.queue_cursor, 0);
+        assert_eq!(tui.queue_offset, 0);
+        assert!(tui.info_lines.is_empty());
+        assert!(tui.info_title.is_empty());
         assert!(tui.favorites_only);
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("Active library")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
         assert!(
             root.join("catalog.flux").exists(),
             "canonical catalogue created"
@@ -1857,6 +2576,22 @@ mod tests {
         assert!(tui.controller.legacy_index_write_protected());
 
         key(&mut tui, KeyCode::Char('U'));
+        assert_eq!(tui.mode, Mode::ConfirmPreserveIndex);
+        assert!(tui.controller.legacy_index_write_protected());
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert!(tui.controller.legacy_index_write_protected());
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("cancelled")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
+
+        key(&mut tui, KeyCode::Char('U'));
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.mode, Mode::Normal);
         assert!(!tui.controller.legacy_index_write_protected());
         assert!(
             tui.lifecycle_msg
@@ -1866,6 +2601,25 @@ mod tests {
             tui.lifecycle_msg
         );
         tui.controller.save_index().expect("new index writes");
+        key(&mut tui, KeyCode::Char('A'));
+        assert_eq!(tui.mode, Mode::Normal);
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("no portable recovery")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
+        tui.mode = Mode::ConfirmAcknowledgeRecovery;
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("remains read-only")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
         tui.controller.shutdown();
     }
 
@@ -1958,6 +2712,223 @@ mod tests {
                 .is_some_and(|message| message.contains("GUI"))
         );
         assert_eq!(tui.mode, Mode::Normal);
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn help_info_and_input_lines_support_discovery_and_long_unicode_paths() {
+        let dir = TempDir::new("tui-help-info");
+        let mut tui = tui(&dir);
+        assert!(normal_help().contains("? help"));
+        assert!(
+            tui.library_header_identity(40)
+                .contains("library-index.json")
+        );
+        key(&mut tui, KeyCode::Char('?'));
+        assert_eq!(tui.mode, Mode::InfoView);
+        assert!(tui.info_title.contains("help"));
+        let help = tui.info_lines.join("\n");
+        assert!(help.contains("Q queue view"), "{help}");
+        assert!(help.contains("Active library:"), "{help}");
+        assert!(help.contains("SAFETY AND LIMITS"), "{help}");
+        assert!(help.contains("GUI review workflows"), "{help}");
+        assert!(help.contains("synchronous quick copy"), "{help}");
+        key(&mut tui, KeyCode::Down);
+        assert_eq!(tui.info_scroll, 1);
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+
+        assert_eq!(clamp_terminal_size(0, 0), (20, 6));
+        assert_eq!(clamp_terminal_size(120, 40), (120, 40));
+        assert!(!detail_view_fits(6));
+        assert!(detail_view_fits(8));
+        assert_eq!(
+            resource_label(Some(flux_app::ResourceState::Missing)),
+            Some("[missing]")
+        );
+        assert_eq!(
+            resource_label(Some(flux_app::ResourceState::Unavailable(
+                "permission denied".to_owned()
+            ))),
+            Some("[inaccessible]")
+        );
+        assert_eq!(resource_label(Some(flux_app::ResourceState::Present)), None);
+        assert_eq!(resource_label(None), None);
+        let long = format!("{}{}", "a".repeat(80), "é".repeat(20));
+        let line = fit_input_line("Path: ", &long, 24);
+        assert_eq!(line.chars().count(), 24);
+        assert!(line.starts_with('…'), "{line}");
+        assert!(line.ends_with('_'), "{line}");
+        assert_eq!(fit_input_line("Path: ", "short", 40), "Path: short_");
+        key(&mut tui, KeyCode::Char('?'));
+        assert!(
+            tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            "Ctrl-C must quit from an info view"
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn queue_view_preserves_entry_identity_and_supports_play_move_and_remove() {
+        let dir = TempDir::new("tui-queue-view");
+        let root = dir.path().join("music");
+        std::fs::create_dir_all(&root).expect("music dir");
+        let one = root.join("one.wav");
+        let two = root.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        std::fs::write(&two, minimal_wav()).expect("two");
+        std::fs::write(
+            dir.path().join("library-index.json"),
+            format!(
+                r#"{{"version":1,"next_id":3,"tracks":[{{"id":1,"title":"One","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}},{{"id":2,"title":"Two","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
+                one.display(),
+                two.display()
+            ),
+        )
+        .expect("index");
+        let mut tui = tui(&dir);
+        let first = tui.controller.tracks()[0].0;
+        tui.controller
+            .enqueue_track(first)
+            .expect("duplicate entry");
+        let entries = tui.controller.queue_entries().to_vec();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.track() == first)
+                .count(),
+            2
+        );
+        assert_ne!(entries[0].id(), entries[2].id());
+
+        key(&mut tui, KeyCode::Char('Q'));
+        assert_eq!(tui.mode, Mode::QueueView);
+        let selected = tui.controller.queue_entries()[tui.queue_cursor].id();
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.controller.current_queue_entry_id(), Some(selected));
+        let before_index = tui.queue_cursor;
+        assert!(
+            !tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
+            "Ctrl+Down must not quit"
+        );
+        assert_eq!(tui.controller.current_queue_entry_id(), Some(selected));
+        assert_eq!(tui.queue_cursor, before_index + 1);
+
+        let mut rendered = Vec::new();
+        tui.draw(&mut rendered).expect("queue view render");
+        let rendered = String::from_utf8_lossy(&rendered);
+        assert!(rendered.contains("QUEUE"), "{rendered}");
+        assert!(rendered.contains(&format!("#{selected}")), "{rendered}");
+
+        let len_before = tui.controller.queue_len();
+        key(&mut tui, KeyCode::Delete);
+        assert_eq!(tui.controller.queue_len(), len_before - 1);
+        assert!(
+            tui.controller
+                .queue_entries()
+                .iter()
+                .all(|entry| entry.id() != selected)
+        );
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_import_partial_success_preserves_every_issue_detail() {
+        let dir = TempDir::new("tui-import-issues");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source = dir.path().join("Source/Album/song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("source dir");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let missing = dir.path().join("Source/Album/missing.wav");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('i'));
+        type_text(
+            &mut tui,
+            &format!("{};{}", source.display(), missing.display()),
+        );
+
+        assert_eq!(tui.controller.tracks().len(), 1);
+        assert_eq!(tui.mode, Mode::InfoView);
+        let summary = tui.lifecycle_msg.as_deref().expect("summary");
+        assert!(summary.contains("1 added"), "{summary}");
+        assert!(summary.contains("1 issue"), "{summary}");
+        let details = tui.info_lines.join("\n");
+        assert!(details.contains("Per-path issues (1)"), "{details}");
+        assert!(
+            details.contains(&missing.display().to_string()),
+            "{details}"
+        );
+        assert_eq!(tui.info_title, "File import results");
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_folder_import_reports_unsupported_files_and_missing_directories() {
+        let dir = TempDir::new("tui-folder-issues");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let folder = dir.path().join("Incoming");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("good.wav"), minimal_wav()).expect("good wav");
+        std::fs::write(folder.join("notes.txt"), b"not audio").expect("text file");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('o'));
+        type_path(&mut tui, &folder);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        assert_eq!(tui.mode, Mode::InfoView);
+        let details = tui.info_lines.join("\n");
+        assert!(details.contains("notes.txt"), "{details}");
+        assert!(details.contains("Per-path issues"), "{details}");
+        key(&mut tui, KeyCode::Esc);
+
+        let missing = dir.path().join("does-not-exist");
+        key(&mut tui, KeyCode::Char('o'));
+        type_path(&mut tui, &missing);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("Folder import failed")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn empty_messages_distinguish_search_and_favorites() {
+        let dir = TempDir::new("tui-empty-messages");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source = dir.path().join("Artist/Album/song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("song");
+        let mut tui = tui(&dir);
+        assert!(tui.empty_rows_message().contains("Library is empty"));
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &source);
+        tui.search = "not present".to_owned();
+        assert!(tui.empty_rows_message().contains("current search"));
+        tui.favorites_only = true;
+        assert!(
+            tui.empty_rows_message()
+                .contains("No favorite tracks match")
+        );
+        tui.search.clear();
+        assert!(tui.empty_rows_message().contains("No favorite tracks"));
         tui.controller.shutdown();
     }
 

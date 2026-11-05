@@ -160,27 +160,41 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   audio replacement and artwork selection; every selection still enters the
   existing review/confirmation flow. Cancellation leaves the workflow unchanged.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
-  stops, `n/p` skip, `+/-` volume, `R` repeat, `o` recursively imports a
-  folder (type the path; per-path errors and a startup-import summary remain
-  visible), `r` refreshes, `/` searches tracks by title, artist or album,
-  `q` quit. `i` quick-imports
-  paths (separated by `;`) by copying them into the canonical library, `e`
-  edits the selected track as `title|album|track|disc|artist-id|credit-ids`, `P` creates
-  an artist, `Y` renames an artist (`id|new-name`), `V` lists artist IDs, `X`
+  stops, `n/p` skip, `+/-` volume, `R` repeat, and `q`/`Ctrl-C` quit; `Ctrl-C`
+  quits from input, help, lyrics and queue views too. `/` searches tracks by
+  title, artist or album, `F` toggles favorites-only, and `H` reports local
+  play statistics. `?` opens the full scrollable command/safety reference
+  instead of relying on a clipped one-line help bar. The header identifies the
+  active library, view, queue length, playback mode and active search/favorite
+  filter; long paths/inputs are bounded and input lines keep their trailing
+  path visible.
+  `o` recursively copy-imports a folder, and `i` copy-imports
+  paths separated by `;` into the canonical library. Import summaries include
+  added, updated, already-indexed, copied and issue counts; any per-path errors
+  open a scrollable result panel containing every issue rather than only the
+  first. This quick flow remains synchronous and has no review or cancel phase.
+  `e` edits the selected track as
+  `title|album|track|disc|artist-id|credit-ids`, `P` creates an artist, `Y`
+  renames an artist (`id|new-name`), `V` lists artist IDs, `X`
   refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. `y` opens read-only lyrics, `F` toggles favorites-only
-  browsing, and `H` reports most-played/local history statistics.
+  migration workflow. `y` opens read-only managed lyrics.
   Global artist/album/track search, filters, multi-selection, playlist
   management, lyrics editing/import/export/karaoke and batch playlist/favorite
   actions require the GUI.
 
+  `Q` opens a queue-entry view: `Enter` plays the selected stable
+  `QueueEntryId`, `Delete`/`d` removes it, and `Ctrl+↑`/`Ctrl+↓` reorders it.
+  Duplicate tracks remain visibly distinct by position and `#entry` id. From
+  the track view, `a` appends and `x` plays next. Missing managed audio and
+  inaccessible paths are labelled separately; the TUI never rewrites them or
+  treats an inaccessible path as missing.
   Track moves, managed-audio repair/replacement, artwork repair and
-  single-track deletion also require the GUI review workflow. `D` shows the selected track's album ownership; `E` lists
-  every catalogue album, including empty albums, with owner, track count and
-  cover availability. `T` refuses ownership transfer and destructive artist deletion,
-  directing the user to the GUI review/confirmation workflow. For the
-  queue, `a` appends, `x` plays next, `Delete` removes the current entry, and
-  `Ctrl+↑`/`Ctrl+↓` reorder. The terminal is always restored on exit.
+  single-track deletion require the GUI review workflow. `D` shows the selected
+  track's album ownership; `E` lists every catalogue album, including empty
+  albums, with owner, track count and cover availability. `T` refuses ownership
+  transfer and destructive artist deletion, directing the user to the GUI.
+  `U` preserving a protected index and `A` acknowledging portable recovery both
+  require an explicit `y` confirmation. The terminal is always restored on exit.
 
 ### Import Manager
 
