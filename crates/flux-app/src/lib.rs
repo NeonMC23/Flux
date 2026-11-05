@@ -4628,6 +4628,9 @@ impl Controller {
         }
         let canonical = std::fs::canonicalize(source)
             .map_err(|err| format!("cannot resolve the file path: {err}"))?;
+        if let Err(error) = flux_audio::decode::open_decoder(&canonical) {
+            return Err(format!("audio could not be decoded: {error}"));
+        }
         if canonical.starts_with(root) {
             return Ok(canonical);
         }
@@ -4754,6 +4757,13 @@ impl Controller {
         let mut files = Vec::new();
         let mut issues = Vec::new();
         collect_audio_files(root, recursive, &mut files, &mut issues)?;
+        if files.is_empty() && issues.is_empty() {
+            issues.push(ImportIssue {
+                path: root.to_path_buf(),
+                reason: "no supported audio files were discovered in the selected folder"
+                    .to_owned(),
+            });
+        }
         let mut report = self.import_files(&files, true)?;
         report.issues.extend(issues);
         Ok(report)
@@ -4791,6 +4801,13 @@ impl Controller {
                 });
                 continue;
             };
+            if let Err(error) = flux_audio::decode::open_decoder(source) {
+                report.issues.push(ImportIssue {
+                    path: source.clone(),
+                    reason: format!("audio could not be decoded: {error}"),
+                });
+                continue;
+            }
             let fingerprint = match flux_library::canonical::ContentFingerprint::of_file(source) {
                 Ok(fingerprint) => fingerprint,
                 Err(err) => {
@@ -6860,8 +6877,19 @@ fn collect_audio_files(
     }
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|err| format!("Cannot list {}: {err}", dir.display()))?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if dir == root => {
+                return Err(format!("Cannot list {}: {err}", dir.display()));
+            }
+            Err(err) => {
+                issues.push(ImportIssue {
+                    path: dir.clone(),
+                    reason: format!("could not read directory: {err}"),
+                });
+                continue;
+            }
+        };
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -6874,6 +6902,9 @@ fn collect_audio_files(
                 }
             };
             let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some(FLUX_DIR_NAME) {
+                continue;
+            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(err) => {
@@ -13191,6 +13222,90 @@ mod tests {
         assert!(
             !root.join(".flux").exists(),
             "no legacy portable backend is created"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn import_folder_reports_an_empty_selection() {
+        let dir = TempDir::new("import-empty-folder");
+        let (root, _source) = canonical_track_fixture(&dir);
+        let empty = dir.path().join("empty-source");
+        fs::create_dir_all(&empty).expect("empty source");
+        fs::create_dir_all(empty.join(".flux")).expect("internal store dir");
+        write_dc_wav(&empty.join(".flux"), "internal.wav", 4_410, 0.2);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let report = controller
+            .import_folder(&empty, true)
+            .expect("empty folder is a reportable no-op");
+        assert_eq!(report.added, 0);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.reason().contains("no supported audio files")),
+            "{:?}",
+            report.issues
+        );
+        controller.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_folder_keeps_valid_files_when_a_subdirectory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("import-partial-folder");
+        let (root, _source) = canonical_track_fixture(&dir);
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).expect("source dir");
+        let good = write_dc_wav(&source, "good.wav", 4_410, 0.2);
+        let blocked = source.join("blocked");
+        fs::create_dir_all(&blocked).expect("blocked dir");
+        write_dc_wav(&blocked, "hidden.wav", 4_410, 0.4);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))
+            .expect("make nested directory unreadable");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let report = controller
+            .import_folder(&source, true)
+            .expect("valid sibling files remain importable");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        assert_eq!(report.added, 1, "issues: {:?}", report.issues);
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].1.title(), "good");
+        assert!(controller.tracks()[0].1.source().path().is_file());
+        assert!(
+            report.issues.iter().any(|issue| issue.path() == blocked),
+            "{:?}",
+            report.issues
+        );
+        assert!(good.is_file(), "source is never moved or deleted");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_quick_import_reports_invalid_audio_and_keeps_valid_files() {
+        let dir = TempDir::new("canonical-quick-invalid");
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).expect("source dir");
+        let good = write_dc_wav(&source, "good.wav", 4_410, 0.2);
+        let invalid = source.join("broken.wav");
+        fs::write(&invalid, b"not a wave file").expect("invalid audio");
+        let (root, _fixture_source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let report = controller
+            .import_files(&[invalid.clone(), good], true)
+            .expect("quick import reports item failures");
+        assert_eq!(report.added, 1, "issues: {:?}", report.issues);
+        assert_eq!(controller.tracks().len(), 1);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.path() == invalid && issue.reason().contains("decoded")),
+            "{:?}",
+            report.issues
         );
         controller.shutdown();
     }

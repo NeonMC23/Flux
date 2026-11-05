@@ -671,12 +671,20 @@ impl Tui {
                         if !path.is_empty() {
                             match self.controller.import_folder(Path::new(path), true) {
                                 Ok(report) => {
-                                    self.lifecycle_msg = Some(format!(
+                                    let mut summary = format!(
                                         "Import: {} added, {} duplicate(s), {} issue(s).",
                                         report.added,
                                         report.deduplicated,
                                         report.issues.len()
-                                    ));
+                                    );
+                                    if let Some(issue) = report.issues.first() {
+                                        summary.push_str(&format!(
+                                            " First issue: {} — {}",
+                                            issue.path().display(),
+                                            issue.reason()
+                                        ));
+                                    }
+                                    self.lifecycle_msg = Some(summary);
                                 }
                                 Err(err) => self.lifecycle_msg = Some(err),
                             }
@@ -1364,9 +1372,25 @@ fn pad_with_right(left: &str, right: &str, width: usize) -> String {
 fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
     let mut controller =
         Controller::open_default().map_err(|err| std::io::Error::other(err.to_string()))?;
-    if let Some(dir) = initial_dir {
-        let _ = controller.import_folder(&dir, true);
-    }
+    let initial_import = initial_dir.map(|dir| match controller.import_folder(&dir, true) {
+        Ok(report) => {
+            let mut summary = format!(
+                "Startup folder import: {} added, {} duplicate(s), {} issue(s).",
+                report.added,
+                report.deduplicated,
+                report.issues.len()
+            );
+            if let Some(issue) = report.issues.first() {
+                summary.push_str(&format!(
+                    " First issue: {} — {}",
+                    issue.path().display(),
+                    issue.reason()
+                ));
+            }
+            summary
+        }
+        Err(error) => format!("Startup folder import failed: {error}"),
+    });
 
     let guard = TerminalGuard::enter()?;
     // Restore the terminal even if a panic unwinds through the loop.
@@ -1390,7 +1414,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         lyrics_title: String::new(),
         pending_plan: None,
         migrated_dest: None,
-        lifecycle_msg: None,
+        lifecycle_msg: initial_import,
         import_copy: true,
         last_reconcile: None,
     };

@@ -991,12 +991,24 @@ fn collect_sources(
         let mut children: Vec<PathBuf> = Vec::new();
         match std::fs::read_dir(&source) {
             Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.file_name().and_then(|name| name.to_str()) == Some(FLUX_DIR_NAME) {
-                        continue;
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => {
+                            let path = entry.path();
+                            if path.file_name().and_then(|name| name.to_str())
+                                == Some(FLUX_DIR_NAME)
+                            {
+                                continue;
+                            }
+                            children.push(path);
+                        }
+                        Err(err) => {
+                            issues.push(ImportIssue {
+                                path: source.clone(),
+                                reason: format!("could not inspect a directory entry: {err}"),
+                            });
+                        }
                     }
-                    children.push(path);
                 }
                 children.sort();
             }
@@ -1076,19 +1088,27 @@ fn probe_candidates(
         }
         set_progress_item(progress, index, ImportItemState::Scanning);
         if let Some(inferred) = crate::infer_canonical_import(&path) {
-            let mut track = Track::new(inferred.title, TrackSource::local(path.clone()));
-            track = track.with_artist(inferred.artist_name);
-            if let Some(album) = inferred.album_title {
-                track = track.with_album(album);
+            if let Err(error) = flux_audio::decode::open_decoder(&path) {
+                issues.push(ImportIssue {
+                    path,
+                    reason: format!("audio could not be decoded: {error}"),
+                });
+                set_progress_item(progress, index, ImportItemState::Failed);
+            } else {
+                let mut track = Track::new(inferred.title, TrackSource::local(path.clone()));
+                track = track.with_artist(inferred.artist_name);
+                if let Some(album) = inferred.album_title {
+                    track = track.with_album(album);
+                }
+                if let Some(number) = inferred.track_number {
+                    track = track.with_track_number(number);
+                }
+                if let Some(disc) = inferred.disc_number {
+                    track = track.with_disc_number(disc);
+                }
+                candidates.push((path, track));
+                set_progress_item(progress, index, ImportItemState::Ready);
             }
-            if let Some(number) = inferred.track_number {
-                track = track.with_track_number(number);
-            }
-            if let Some(disc) = inferred.disc_number {
-                track = track.with_disc_number(disc);
-            }
-            candidates.push((path, track));
-            set_progress_item(progress, index, ImportItemState::Ready);
         } else {
             issues.push(ImportIssue {
                 path,
@@ -1135,6 +1155,16 @@ fn same_core_metadata(track: &Track, existing: &ExistingTrackMatch) -> bool {
     normalized(Some(track.title())) == normalized(Some(&existing.title))
         && normalized(track.artist()) == normalized(existing.artist_name.as_deref())
         && normalized(track.album()) == normalized(existing.album_title.as_deref())
+}
+
+fn source_matches_review(candidate: &ImportCandidate) -> bool {
+    match candidate.source_fingerprint {
+        Some(expected) => {
+            flux_library::canonical::ContentFingerprint::of_file(&candidate.source_path).ok()
+                == Some(expected)
+        }
+        None => candidate.source_path.is_file(),
+    }
 }
 
 fn file_size(path: &Path) -> Option<u64> {
@@ -1404,6 +1434,16 @@ pub fn prepare_import_plan(
     );
     let paths = collect_sources(&sources, recursive, &cancel, &progress, &mut issues);
     let mut was_cancelled = is_cancelled(&cancel);
+    if paths.is_empty()
+        && issues.is_empty()
+        && !was_cancelled
+        && let Some(source) = sources.first()
+    {
+        issues.push(ImportIssue {
+            path: source.clone(),
+            reason: "no supported audio files were discovered in the selected sources".to_owned(),
+        });
+    }
     let mut candidates = if was_cancelled {
         Vec::new()
     } else {
@@ -1549,7 +1589,15 @@ fn copy_reviewed_file(
 ) -> Result<PathBuf, String> {
     let mut reserved = HashSet::new();
     let destination = match preferred {
-        Some(path) if path.starts_with(root) && !path.exists() => path.to_path_buf(),
+        Some(path) if path.starts_with(root) => {
+            if path.exists() {
+                return Err(format!(
+                    "the reviewed destination {} now exists; review the import again",
+                    path.display()
+                ));
+            }
+            path.to_path_buf()
+        }
         _ => unique_destination(root, source, &mut reserved),
     };
     let mut input = std::fs::File::open(source)
@@ -1614,17 +1662,29 @@ where
         }
         let candidate = &plan.candidates[index];
         set_progress_item(&progress, index, ImportItemState::Importing);
+        let source_changed = !source_matches_review(candidate);
         let canonical = plan.library_root.join("catalog.flux").is_file();
-        let result = if canonical {
+        let result = if source_changed {
+            Err("The source file changed or disappeared after review; review it again.".to_owned())
+        } else if canonical {
             std::fs::metadata(&candidate.source_path)
                 .ok()
                 .filter(|metadata| metadata.is_file())
-                .map(|_| candidate.source_path.clone())
                 .ok_or_else(|| {
                     format!(
                         "source is missing or not a regular file: {}",
                         candidate.source_path.display()
                     )
+                })
+                .and_then(|_| {
+                    flux_audio::decode::open_decoder(&candidate.source_path)
+                        .map(|_| candidate.source_path.clone())
+                        .map_err(|error| {
+                            format!(
+                                "audio could not be decoded ({}): {error}",
+                                candidate.source_path.display()
+                            )
+                        })
                 })
         } else if candidate.source_path.starts_with(&plan.library_root) {
             Ok(candidate.source_path.clone())
@@ -1672,6 +1732,9 @@ where
         );
     }
 
+    if is_cancelled(&cancel) {
+        prepared.cancelled = true;
+    }
     if prepared.cancelled {
         for path in &prepared.created_files {
             let _ = std::fs::remove_file(path);
@@ -1864,6 +1927,7 @@ fn resolve_import_artist_refs(
 fn apply_import_plan_canonical(
     controller: &mut Controller,
     plan: &ImportPlan,
+    prepared: &PreparedImport,
 ) -> Result<ImportApplyReport, String> {
     use flux_library::canonical::{
         CanonicalImportAlbumRef, CanonicalImportArtistRef, CanonicalImportTrackRequest,
@@ -1891,6 +1955,11 @@ fn apply_import_plan_canonical(
         }
     }
 
+    let prepared_by_index: HashMap<usize, &PreparedImportItem> = prepared
+        .items
+        .iter()
+        .map(|item| (item.index, item))
+        .collect();
     let mut report = ImportApplyReport::default();
     let mut requests = Vec::new();
     let mut request_indices = Vec::new();
@@ -1936,6 +2005,17 @@ fn apply_import_plan_canonical(
                         state: ImportItemState::Failed,
                         message: "That duplicate is in another album. The fixed target cannot silently redirect it; use the general import manager or skip."
                             .to_owned(),
+                    });
+                    continue;
+                }
+                if !source_matches_review(candidate) {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(existing.track_id),
+                        state: ImportItemState::Failed,
+                        message:
+                            "The source file changed or disappeared since review; review it again."
+                                .to_owned(),
                     });
                     continue;
                 }
@@ -2011,6 +2091,58 @@ fn apply_import_plan_canonical(
                 update_indices.push(index);
             }
             ImportDecision::ImportNew => {
+                let Some(item) = prepared_by_index.get(&index) else {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "The file was not prepared for this review.".to_owned(),
+                    });
+                    continue;
+                };
+                if let Some(error) = &item.error {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: error.clone(),
+                    });
+                    continue;
+                }
+                if item.final_path.is_none() {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "The source file is unavailable; review again.".to_owned(),
+                    });
+                    continue;
+                }
+                if let Some(expected) = candidate.source_fingerprint {
+                    match flux_library::canonical::ContentFingerprint::of_file(
+                        &candidate.source_path,
+                    ) {
+                        Ok(actual) if actual == expected => {}
+                        _ => {
+                            report.items.push(AppliedImportItem {
+                                index,
+                                track_id: None,
+                                state: ImportItemState::Failed,
+                                message: "The source file changed since review; review it again."
+                                    .to_owned(),
+                            });
+                            continue;
+                        }
+                    }
+                } else if !candidate.source_path.is_file() {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: None,
+                        state: ImportItemState::Failed,
+                        message: "The source file is unavailable; review again.".to_owned(),
+                    });
+                    continue;
+                }
                 let refs = match resolve_import_artist_refs(controller, candidate) {
                     Ok(refs) => refs,
                     Err(message) => {
@@ -2188,7 +2320,7 @@ pub fn apply_import_plan(
         );
     }
     if controller.storage_mode() == StorageMode::Canonical {
-        return apply_import_plan_canonical(controller, plan);
+        return apply_import_plan_canonical(controller, plan, prepared);
     }
     if controller.storage_mode() != StorageMode::Portable {
         return Err(
@@ -2245,6 +2377,17 @@ pub fn apply_import_plan(
                         track_id: Some(id),
                         state: ImportItemState::Failed,
                         message: "The existing track is no longer in the catalogue.".to_owned(),
+                    });
+                    continue;
+                }
+                if !source_matches_review(candidate) {
+                    report.items.push(AppliedImportItem {
+                        index,
+                        track_id: Some(id),
+                        state: ImportItemState::Failed,
+                        message:
+                            "The source file changed or disappeared since review; review it again."
+                                .to_owned(),
                     });
                     continue;
                 }
@@ -2359,7 +2502,7 @@ mod tests {
     use super::{
         ArtistId, CandidateStatus, ImportAlbumTarget, ImportCredit, ImportDecision,
         ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
-        PreparedImport, prepare_import_files, prepare_import_plan,
+        prepare_import_files, prepare_import_files_with_hook, prepare_import_plan,
     };
 
     struct TempDir(PathBuf);
@@ -2520,6 +2663,14 @@ mod tests {
         prepare_import_files(plan, progress, cancel)
     }
 
+    fn prepared_for(plan: &ImportPlan) -> super::PreparedImport {
+        prepare_import_files(
+            plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
     #[test]
     fn folder_discovery_respects_recursive_and_ignores_duplicate_paths() {
         let dir = TempDir::new("discover");
@@ -2528,6 +2679,7 @@ mod tests {
         let source = dir.path().join("source");
         wav(&source, "top.wav", 441, 0.1);
         wav(&source, "nested/deep.wav", 441, 0.2);
+        wav(&source, ".flux/internal.wav", 441, 0.3);
         fs::write(source.join("notes.txt"), b"not audio").expect("notes");
 
         let (shallow, progress, _cancel) = plan(
@@ -2562,6 +2714,50 @@ mod tests {
             deep.candidates
                 .iter()
                 .any(|candidate| candidate.title() == "deep")
+        );
+
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).expect("empty directory");
+        let (empty_plan, _progress, _cancel) =
+            plan(&controller, vec![empty.clone()], true, ImportStorage::Copy);
+        assert!(empty_plan.candidates.is_empty());
+        assert!(
+            empty_plan.issues.iter().any(|issue| {
+                issue.path() == empty
+                    && issue
+                        .reason()
+                        .contains("no supported audio files were discovered")
+            }),
+            "{:?}",
+            empty_plan.issues
+        );
+        controller.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_keeps_valid_siblings_when_a_nested_directory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("discover-unreadable");
+        let root = dir.path().join("library");
+        let (controller, _control) = portable_controller(&root);
+        let source = dir.path().join("source");
+        wav(&source, "good.wav", 441, 0.1);
+        let blocked = source.join("blocked");
+        fs::create_dir_all(&blocked).expect("blocked dir");
+        wav(&blocked, "hidden.wav", 441, 0.2);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))
+            .expect("make nested dir unreadable");
+        let (plan, _progress, _cancel) = plan(&controller, vec![source], true, ImportStorage::Copy);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].title(), "good");
+        assert!(
+            plan.issues.iter().any(|issue| issue.path() == blocked),
+            "{:?}",
+            plan.issues
         );
         controller.shutdown();
     }
@@ -2759,6 +2955,40 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_destination_collision_is_reported_instead_of_silently_renamed() {
+        let dir = TempDir::new("destination-collision");
+        let root = dir.path().join("library");
+        let (mut controller, _control) = portable_controller(&root);
+        let source = wav(&dir.path().join("source"), "collision.wav", 441, 0.1);
+        let (plan, progress, cancel) = plan(&controller, vec![source], false, ImportStorage::Copy);
+        let destination = plan.candidates[0]
+            .destination()
+            .expect("reviewed destination")
+            .to_path_buf();
+        fs::write(&destination, b"appeared after review").expect("occupy destination");
+        let prepared = prepare(&plan, progress, cancel);
+        assert!(prepared.created_files.is_empty());
+        assert!(
+            prepared.items[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("now exists")),
+            "{:?}",
+            prepared.items
+        );
+        let report = controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("collision is itemized");
+        assert_eq!(report.imported, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            fs::read(&destination).expect("occupied file"),
+            b"appeared after review"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn invalid_sources_and_partial_copy_failures_are_itemized() {
         let dir = TempDir::new("partial");
         let root = dir.path().join("library");
@@ -2801,6 +3031,40 @@ mod tests {
     }
 
     #[test]
+    fn portable_source_changed_after_plan_is_failed_alone() {
+        let dir = TempDir::new("portable-source-race");
+        let root = dir.path().join("library");
+        let (mut controller, _control) = portable_controller(&root);
+        let source_dir = dir.path().join("source");
+        let good = wav(&source_dir, "good.wav", 4_410, 0.2);
+        let changed = wav(&source_dir, "changed.wav", 4_410, 0.4);
+        let (plan, progress, cancel) = plan(
+            &controller,
+            vec![good, changed.clone()],
+            false,
+            ImportStorage::Copy,
+        );
+        fs::write(&changed, b"replaced after plan").expect("replace source");
+        let prepared = prepare(&plan, progress, cancel);
+        assert_eq!(
+            prepared
+                .items
+                .iter()
+                .filter(|item| item.error.is_some())
+                .count(),
+            1
+        );
+        let report = controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("partial portable import");
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].1.title(), "good");
+        controller.shutdown();
+    }
+
+    #[test]
     fn cancellation_removes_copies_and_never_publishes_a_catalogue_entry() {
         let dir = TempDir::new("cancel");
         let root = dir.path().join("library");
@@ -2811,6 +3075,28 @@ mod tests {
         let prepared = prepare_import_files(&plan, progress, cancel);
         assert!(prepared.cancelled);
         assert!(prepared.created_files.is_empty());
+        assert!(controller.apply_import_plan(&plan, &prepared).is_err());
+        assert_eq!(controller.tracks().len(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn cancellation_after_the_last_copy_still_removes_temporary_files() {
+        let dir = TempDir::new("cancel-last");
+        let root = dir.path().join("library");
+        let (mut controller, _control) = portable_controller(&root);
+        let source = wav(&dir.path().join("source"), "cancel-last.wav", 441, 0.1);
+        let (plan, progress, cancel) = plan(&controller, vec![source], false, ImportStorage::Copy);
+        let hook_cancel = Arc::clone(&cancel);
+        let prepared =
+            prepare_import_files_with_hook(&plan, progress, Arc::clone(&cancel), move |_| {
+                hook_cancel.store(true, std::sync::atomic::Ordering::Release)
+            });
+        assert!(prepared.cancelled);
+        assert!(
+            prepared.created_files.iter().all(|path| !path.exists()),
+            "cancel-left copies remain on disk"
+        );
         assert!(controller.apply_import_plan(&plan, &prepared).is_err());
         assert_eq!(controller.tracks().len(), 0);
         controller.shutdown();
@@ -3035,7 +3321,7 @@ mod tests {
         plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
         plan.candidates[0].set_title("Corrected title");
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("metadata update");
         assert_eq!(report.updated, 1);
         assert_eq!(report.imported, 0);
@@ -3099,7 +3385,7 @@ mod tests {
         plan.candidates[0].set_owner_index(0);
         plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("same audio metadata update");
         assert_eq!(report.updated, 1);
         assert_eq!(controller.track_album_id(id), album_before);
@@ -3112,6 +3398,45 @@ mod tests {
                 .artists()
                 .iter()
                 .any(|artist| artist.name() == "Other")
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_duplicate_update_rejects_a_source_changed_after_review() {
+        let dir = TempDir::new("canonical-duplicate-race");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source = wav(&dir.path().join("Artist/Album"), "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("base import");
+        let id = controller.tracks()[0].0;
+        let managed = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let copy = source.clone();
+        fs::copy(&managed, &copy).expect("duplicate copy");
+        let request = canonical_request(&controller, &root, vec![copy.clone()], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        plan.candidates[0].set_title("Should not apply");
+        fs::write(&copy, b"changed after review").expect("replace source");
+        let report = controller
+            .apply_import_plan(&plan, &prepared_for(&plan))
+            .expect("changed duplicate source is itemized");
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            controller.track(id).map(|track| track.title()),
+            Some("Song")
         );
         controller.shutdown();
     }
@@ -3141,7 +3466,7 @@ mod tests {
         let original_title = controller.track(id).map(|track| track.title().to_owned());
         plan.bulk_skip();
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("keep existing");
         assert_eq!(report.skipped, 1);
         assert_eq!(
@@ -3151,7 +3476,7 @@ mod tests {
         plan.candidates[0].set_decision(ImportDecision::ImportNew);
         assert_eq!(plan.candidates[0].decision(), ImportDecision::ImportNew);
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("separate import");
         assert_eq!(report.imported, 1);
         assert_eq!(controller.tracks().len(), 2);
@@ -3202,7 +3527,7 @@ mod tests {
         plan.bulk_skip();
         assert!(!plan.can_import());
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("all skipped");
         assert_eq!(report.skipped, 2);
         assert_eq!(report.imported, 0);
@@ -3247,7 +3572,7 @@ mod tests {
         plan.candidates[0].set_title("Updated existing");
         plan.candidates[1].set_decision(ImportDecision::ImportNew);
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("mixed batch");
         assert_eq!(report.updated, 1);
         assert_eq!(report.imported, 1);
@@ -3262,6 +3587,113 @@ mod tests {
                 .iter()
                 .any(|artist| artist.name() == "New Artist")
         );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_missing_prepared_source_does_not_discard_valid_candidates() {
+        let dir = TempDir::new("canonical-partial-prepare");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let good = wav(&dir.path().join("Artist/Album"), "Good.wav", 4_410, 0.2);
+        let vanished = wav(&dir.path().join("Artist/Album"), "Vanished.wav", 4_410, 0.4);
+        let request = canonical_request(&controller, &root, vec![good, vanished.clone()], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(plan.candidates.len(), 2);
+        fs::remove_file(&vanished).expect("source disappears after review");
+        let prepared = prepared_for(&plan);
+        assert_eq!(prepared.items.len(), 2);
+        assert_eq!(
+            prepared
+                .items
+                .iter()
+                .filter(|item| item.error.is_some())
+                .count(),
+            1
+        );
+        let report = controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("partial canonical import");
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].1.title(), "Good");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_source_changed_after_prepare_is_failed_alone() {
+        let dir = TempDir::new("canonical-source-race");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let good = wav(&dir.path().join("Artist/Album"), "Good.wav", 4_410, 0.2);
+        let changed = wav(&dir.path().join("Artist/Album"), "Changed.wav", 4_410, 0.4);
+        let request = canonical_request(&controller, &root, vec![good, changed.clone()], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let prepared = prepared_for(&plan);
+        fs::write(&changed, b"replaced after preparation").expect("replace source");
+        let report = controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("changed source is itemized");
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].1.title(), "Good");
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.message.contains("changed since review"))
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_invalid_audio_is_rejected_without_discarding_valid_audio() {
+        let dir = TempDir::new("canonical-invalid-audio");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let good = wav(&dir.path().join("Artist/Album"), "Good.wav", 4_410, 0.2);
+        let invalid = dir.path().join("Artist/Album/Broken.wav");
+        fs::write(&invalid, b"not a wave file").expect("invalid audio");
+        let request = canonical_request(&controller, &root, vec![good, invalid], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(
+            plan.issues
+                .iter()
+                .any(|issue| issue.reason().contains("could not be decoded")),
+            "{:?}",
+            plan.issues
+        );
+        let prepared = prepared_for(&plan);
+        assert_eq!(
+            prepared
+                .items
+                .iter()
+                .filter(|item| item.error.is_some())
+                .count(),
+            0
+        );
+        let report = controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("valid candidate survives invalid audio");
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].1.title(), "Good");
         controller.shutdown();
     }
 
@@ -3294,7 +3726,7 @@ mod tests {
         assert_eq!(plan.candidates[0].decision(), ImportDecision::ImportNew);
         plan.bulk_skip();
         controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("skip uncertain");
         assert_eq!(controller.tracks().len(), 1);
 
@@ -3323,7 +3755,7 @@ mod tests {
         );
         plan.candidates[0].set_decision(ImportDecision::ImportNew);
         controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("explicit separate duplicate");
         assert_eq!(controller.tracks().len(), 2);
 
@@ -3388,7 +3820,7 @@ mod tests {
         plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
         plan.candidates[0].set_title("Target update");
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("target update");
         assert_eq!(report.updated, 1);
         assert_eq!(
@@ -3427,7 +3859,7 @@ mod tests {
         plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
         plan.candidates[0].set_title("Illegal redirect");
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("off-album update is reported");
         assert_eq!(report.failed, 1);
         assert_eq!(
@@ -3457,7 +3889,7 @@ mod tests {
         );
         fs::write(&source, b"changed after review").expect("change source");
         let report = controller
-            .apply_import_plan(&plan, &PreparedImport::default())
+            .apply_import_plan(&plan, &prepared_for(&plan))
             .expect("stale source is reported");
         assert_eq!(report.failed, 1);
         assert!(controller.tracks().is_empty());

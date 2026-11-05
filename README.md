@@ -146,8 +146,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   selection; every selection still enters the existing review/confirmation
   flow. Cancellation leaves the workflow unchanged.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
-  stops, `n/p` skip, `+/-` volume, `R` repeat, `o` imports a folder
-  (type the path), `r` refreshes, `/` searches tracks by title, artist or album,
+  stops, `n/p` skip, `+/-` volume, `R` repeat, `o` recursively imports a
+  folder (type the path; per-path errors and a startup-import summary remain
+  visible), `r` refreshes, `/` searches tracks by title, artist or album,
   `q` quit. `i` quick-imports
   paths (separated by `;`) by copying them into the canonical library, `e`
   edits the selected track as `title|album|track|disc|artist-id|credit-ids`, `P` creates
@@ -182,6 +183,10 @@ player remains visible:
   and choose the physical owner from the credits; the first credit is the
   default owner;
 - review and edit every candidate, with incomplete metadata visibly marked;
+- validate each candidate by opening its decoder before review and again while
+  preparing the copy; unsupported extensions, malformed audio, missing files
+  and unreadable paths are itemized while unrelated valid files remain
+  importable;
 - classify exact/repeated selection paths, identical content at different
   paths, and similar metadata with different content; similar tracks are never
   merged automatically;

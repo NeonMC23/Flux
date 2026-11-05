@@ -565,6 +565,7 @@ from what remains structurally or physically unverified.
 | Entry-bound position, restore/seek/transition persistence, idempotent shutdown | Confirmed by deterministic Controller/GUI tests; no physical GUI-close or hardware-unplug validation |
 | Library-session isolation, same-path reopen, stale async results, switch-time playback/state reset | Confirmed by deterministic Controller/GUI/TUI tests with disposable libraries; no filesystem-watcher or physical GUI-interaction validation |
 | Meaningful-listening accounting, seek/pause/recovery/transition attribution, history persistence and dashboard aggregates | Confirmed by deterministic Controller/GUI tests with injected positions and transitions; no acoustic measurement or physical-device timing validation |
+| Import discovery, decode validation, partial preparation, cancellation and folder traversal | Confirmed by deterministic filesystem/import tests; real native dialogs and cross-platform traversal remain unverified |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -1176,6 +1177,42 @@ Populated album deletion is blocked in the GUI; tracks must first be transferred
 or explicitly deleted through the existing reviewed workflows. Empty deletion
 removes `album.flux` and any cover as journal cleanup; the artist remains.
 
+### Import discovery and validation
+
+Audio candidates are accepted only when the extension is recognized and the
+file opens with a Flux decoder: WAV, FLAC, MP3, AAC in ADTS, supported
+M4A/M4B/MP4 AAC, Ogg Vorbis and Opus/OGA. AIFF/AIF and other recognized-but-
+undecodable extensions are reported as unsupported audio rather than imported.
+Decoder validation reads container facts only; embedded audio tags are never
+used for canonical metadata. Malformed audio, missing files, permission errors
+and disappearing inputs are itemized, and unrelated valid candidates continue
+through discovery, preparation and application.
+
+Folder import walks selected directories recursively when the GUI **Include
+subfolders** toggle is enabled (the TUI folder import is recursive). Symbolic
+links are never followed, `.flux` store directories are skipped, overlapping
+selections are canonicalized and imported once, and directory-entry or nested
+directory read errors are reported without discarding valid sibling files.
+An empty or all-unsupported selection reports an explicit discovery issue.
+Unsupported files in mixed directories are listed individually.
+
+Preparation re-checks each selected source, opens its decoder, and captures the
+final copy path. Canonical application requires the corresponding prepared
+item, rejects a source that disappeared or changed fingerprint after review as
+an individual failure, and submits only the remaining reviewed requests in the
+atomic catalogue transaction. A prepared failure therefore no longer forces
+unrelated valid requests to fail with it. A transaction-level failure still
+leaves the previous catalogue authoritative through C1 recovery. Portable
+compatibility imports retain their existing prepare/commit path.
+
+Cancellation during discovery or preparation performs no catalogue write and
+removes copies created by that copy run. Cancellation after the final copy is
+also detected before catalogue application. Import does not extract or copy
+embedded artwork or lyrics; managed artwork/lyrics on existing tracks are
+untouched. Re-importing the same content is deduplicated by canonical
+fingerprint, while an explicit **Import separately** decision creates a new
+TrackId and a unique managed path.
+
 ### Atomic import and existing-album import
 
 Every canonical import path now stages the complete reviewed batch in one
@@ -1541,8 +1578,10 @@ cleanup.
    and existing-artist selection. A separate featuring boolean and release-type
    picker are not exposed; the canonical model stores order only.
 3. Import copy/publication runs synchronously at the canonical commit boundary;
-   cancellation is safe before commit, but there is no background byte-copy
-   progress for very large files.
+   cancellation is safe before commit. Import preflight opens the decoder and
+   validates the container/header plus the source fingerprint, but it does not
+   decode every frame; corruption later in a stream may surface only during
+   playback.
 4. Single-track ownership transfer, whole-album transfer and multi-item artist
    deletion are implemented with copy-first publication, journal cleanup and
    no-op retry. Album transfer intentionally preserves AlbumId and does not merge
