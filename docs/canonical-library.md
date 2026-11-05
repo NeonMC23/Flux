@@ -8,6 +8,54 @@ sources; normal front-end workflows no longer select or write them. The public
 Controller still retains compatibility constructors for migration/tests, so
 legacy retirement at the API level is not complete.
 
+## Library-instance isolation
+
+Every successful library install advances an in-memory `library_session`
+identity. It is deliberately not persisted: reopening the same path, even with
+identical IDs and files, creates a new session and invalidates work started
+against the previous instance. A failed, refused, or cancelled switch does not
+advance it.
+
+Switching is staged. The candidate store is opened, validated, and its own
+queue/history are loaded before the install point. On any failure the outgoing
+library, session, queue, playback intent, and library-derived UI state remain
+unchanged; only the normal user-facing failure status/error is reported.
+At install the Controller stops the player and engine, clears engine/session
+and preload ledgers, discards queued Controller events and old errors/status,
+clears shuffle/restored-position/session-local play state, installs the
+destination queue and stores, and rebinds any in-flight device recovery to the
+new current entry at zero position before applying that library's own paused
+state. Volume, repeat/crossfade settings, and other explicit user preferences
+are not library-owned and survive.
+
+Same-path reopen reuses the existing ownership lease but opens a fresh store
+instance and advances the session. Scanning still blocks a switch outright
+rather than racing the scan worker; shutdown joins it as before. A stale scan
+result therefore cannot cross a switch.
+
+GUI asynchronous results carry the initiating library session and are dropped
+before publication when the session changed. Covered results are import plan
+and copy preparation, native import-file/folder pickers, artwork decoding,
+lyrics file picking, and track-replacement/album-cover file pickers. Import
+plans additionally record both the library root and session, and the Controller
+re-checks both when applying, so a stale plan cannot publish into another
+instance even if a caller bypasses the GUI gate. Switching cancels/closes the
+Import Manager and clears library-owned selection, playlist, editor, lyrics,
+artwork, search-cache, smart-collection, dashboard, batch-review and import
+state. The TUI clears its cursor/search/input/lyrics state in the same place.
+Global filters, sort choice, volume, crossfade, and other preferences are
+preserved.
+
+The audio engine is device-scoped and is stopped at the switch boundary; old
+load/transition/end events are rejected by session correlation, no preload or
+crossfade authorization survives, and the destination queue is installed
+paused/stopped. Device recovery that completes after a switch can install a
+fresh output engine but is bound to the new library's current entry and cannot
+resume the old queue. There is no filesystem watcher: external deletion or
+replacement of an active library is observed only through an explicit
+refresh/reopen, and import-copy preparation already running against the old
+root may leave its documented temporary leftovers there after the switch.
+
 ## Audit findings
 
 - The original runtime had two persistent backends: the legacy app-data
@@ -513,6 +561,7 @@ from what remains structurally or physically unverified.
 | Decoder lifecycle, prepared cancellation, gapless/crossfade handoff | Confirmed by deterministic engine tests |
 | Queue authorization, duplicate `QueueEntryId`, transition identity | Confirmed by Controller/engine tests |
 | Entry-bound position, restore/seek/transition persistence, idempotent shutdown | Confirmed by deterministic Controller/GUI tests; no physical GUI-close or hardware-unplug validation |
+| Library-session isolation, same-path reopen, stale async results, switch-time playback/state reset | Confirmed by deterministic Controller/GUI/TUI tests with disposable libraries; no filesystem-watcher or physical GUI-interaction validation |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |

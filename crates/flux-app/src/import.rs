@@ -658,6 +658,8 @@ pub struct ImportPlan {
     pub cancelled: bool,
     /// Canonical generation captured by the plan.
     pub generation: u64,
+    /// Active library instance identity captured by the plan.
+    pub library_session: u64,
     /// Existing catalogue path spellings, used for destination previews.
     existing_paths: Vec<PathBuf>,
     /// Fixed existing album target, when importing into an album.
@@ -833,6 +835,8 @@ pub struct ImportRequest {
     pub target_album: Option<ImportAlbumTarget>,
     /// Canonical catalogue generation captured before review.
     pub generation: u64,
+    /// Active library instance identity captured before review.
+    pub library_session: u64,
 }
 
 /// One file ready for the catalogue after the copy phase.
@@ -1388,6 +1392,7 @@ pub fn prepare_import_plan(
         existing_album_ids,
         target_album,
         generation,
+        library_session,
     } = request;
     let mut issues = Vec::new();
     update_progress(
@@ -1419,6 +1424,7 @@ pub fn prepare_import_plan(
             .collect(),
         target_album: target_album.clone(),
         generation,
+        library_session,
     };
     if plan.cancelled {
         update_progress(
@@ -2170,6 +2176,17 @@ pub fn apply_import_plan(
     if plan.cancelled || prepared.cancelled {
         return Err("The import was cancelled; no catalogue changes were made.".to_owned());
     }
+    let active_root = controller
+        .canonical_root()
+        .or_else(|| controller.portable_root());
+    if plan.library_session != controller.library_session()
+        || active_root != Some(plan.library_root.as_path())
+    {
+        return Err(
+            "This import belongs to a library that is no longer active; review it again."
+                .to_owned(),
+        );
+    }
     if controller.storage_mode() == StorageMode::Canonical {
         return apply_import_plan_canonical(controller, plan);
     }
@@ -2434,6 +2451,7 @@ mod tests {
                 .collect(),
             target_album: None,
             generation: controller.generation(),
+            library_session: controller.library_session(),
         }
     }
 
@@ -2466,6 +2484,7 @@ mod tests {
                 .collect(),
             target_album,
             generation: controller.generation(),
+            library_session: controller.library_session(),
         }
     }
 

@@ -76,7 +76,12 @@ cargo run -p flux-gui --features cpal            # binary name: flux
 cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
 ```
 
-- **GUI:** create or open a canonical library in *Library setup*. Use
+- **GUI:** create or open a canonical library in *Library setup*. Each
+  successful open or same-path reopen establishes a fresh in-memory library
+  session; failed opens leave the active library untouched, and scans must
+  finish before switching. Stale import, artwork, lyrics and file-picker
+  results are dropped, and the previous library's selection, queue, editor,
+  caches and pending playback are cleared while global preferences remain. Use
   **Import music** for the review-first copy-only Import Manager: native file
   or folder picker, Flux Browser, drag-and-drop, name-inferred editable review,
   duplicate decisions, and real progress/cancel. Click a track to play it; use

@@ -546,6 +546,8 @@ pub enum CreateLibraryError {
     /// create-and-switch; nothing was created. (Only returned by
     /// [`Controller::switch_to_new_portable_library`].)
     ScanInProgress,
+    /// The controller has begun shutting down; nothing was created.
+    ShuttingDown,
 }
 
 impl fmt::Display for CreateLibraryError {
@@ -580,6 +582,7 @@ impl fmt::Display for CreateLibraryError {
                     "a library scan is in progress; try again when it finishes"
                 )
             }
+            Self::ShuttingDown => write!(f, "the application is shutting down"),
         }
     }
 }
@@ -625,6 +628,9 @@ pub enum SwitchError {
     /// A scan is in progress (the library is owned by the scan
     /// thread); retry when it finishes.
     ScanInProgress,
+    /// The controller has begun shutting down; the active library was
+    /// unchanged.
+    ShuttingDown,
     /// The portable candidate could not be opened or validated.
     Portable(PortableOpenError),
     /// The legacy candidate index could not be loaded or validated.
@@ -644,6 +650,7 @@ impl fmt::Display for SwitchError {
                     "a library scan is in progress; try again when it finishes"
                 )
             }
+            Self::ShuttingDown => write!(f, "the application is shutting down"),
             Self::Portable(err) => write!(f, "could not switch libraries: {err}"),
             Self::Legacy(err) => write!(f, "could not switch libraries: {err}"),
             Self::Lock(err) => write!(f, "could not switch libraries: {err}"),
@@ -655,7 +662,7 @@ impl fmt::Display for SwitchError {
 impl std::error::Error for SwitchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ScanInProgress => None,
+            Self::ScanInProgress | Self::ShuttingDown => None,
             Self::Portable(err) => Some(err),
             Self::Legacy(err) => Some(err),
             Self::Lock(err) => Some(err),
@@ -1225,6 +1232,10 @@ pub struct Controller {
     /// Configured duration retained even while crossfade is disabled.
     crossfade_duration_ms: u64,
     scan_rx: Option<Receiver<ScanOutcome>>,
+    /// In-memory identity of the active library instance. Incremented on
+    /// every successful install, including a same-path reopen, so async work
+    /// can distinguish instances even when IDs/paths overlap.
+    library_session: u64,
     /// Set by the idempotent shutdown path; rejects later playback mutations.
     shutdown: bool,
     outbox: Vec<ControllerEvent>,
@@ -1583,6 +1594,7 @@ impl Controller {
             portable_recovery,
             roots,
             scan_rx: None,
+            library_session: 1,
             shutdown: false,
             outbox: Vec::new(),
             last_error: None,
@@ -3002,8 +3014,16 @@ impl Controller {
         self.persist_queue();
     }
 
-    /// The persistence backend this controller uses (fixed at
-    /// construction).
+    /// Identity of the currently active library instance. It changes on
+    /// every successful switch/install, including reopening the same path,
+    /// and can be captured by asynchronous front-end work to reject stale
+    /// results before publication.
+    #[must_use]
+    pub fn library_session(&self) -> u64 {
+        self.library_session
+    }
+
+    /// The persistence backend currently active for this controller.
     #[must_use]
     pub fn storage_mode(&self) -> StorageMode {
         match &self.storage {
@@ -3138,6 +3158,10 @@ impl Controller {
 
     /// Switches the active library to an existing canonical library.
     pub fn switch_to_canonical(&mut self, library_root: &Path) -> Result<(), SwitchError> {
+        if self.shutdown {
+            self.report_error(SwitchError::ShuttingDown.to_string());
+            return Err(SwitchError::ShuttingDown);
+        }
         if self.is_scanning() {
             self.report_error(SwitchError::ScanInProgress.to_string());
             return Err(SwitchError::ScanInProgress);
@@ -3147,18 +3171,23 @@ impl Controller {
             self.report_error(err.to_string());
             err
         })?;
-        if self.canonical_root() == Some(root.as_path()) {
-            self.report_status(format!(
-                "Already using the canonical library at {}.",
-                root.display()
-            ));
-            return Ok(());
-        }
-        let lock = LibraryLock::acquire_portable_root(&root).map_err(|err| {
-            let err = SwitchError::Canonical(CanonicalOpenError::Lock(err));
-            self.report_error(err.to_string());
-            err
-        })?;
+        let same_root = self.canonical_root() == Some(root.as_path());
+        // Reopening the same path must still create a fresh library session.
+        // Keep the existing lease and validate a fresh store while the old
+        // instance is still installed; any failure leaves it untouched.
+        let lock = if same_root {
+            self.library_lock.as_ref().cloned()
+        } else {
+            None
+        };
+        let lock = match lock {
+            Some(lock) => lock,
+            None => Arc::new(LibraryLock::acquire_portable_root(&root).map_err(|err| {
+                let err = SwitchError::Canonical(CanonicalOpenError::Lock(err));
+                self.report_error(err.to_string());
+                err
+            })?),
+        };
         let store = CanonicalLibrary::open(&root).map_err(|err| {
             let err = SwitchError::Canonical(CanonicalOpenError::Store(err));
             self.report_error(err.to_string());
@@ -3178,7 +3207,7 @@ impl Controller {
         self.install_library(LibrarySeed {
             library,
             storage: StorageBackend::Canonical { root: root.clone() },
-            library_lock: Some(Arc::new(lock)),
+            library_lock: Some(lock),
             portable_store: None,
             canonical_store: Some(store),
             portable_recovery: None,
@@ -3193,7 +3222,8 @@ impl Controller {
         });
         self.restore_queue_playback(restored_playback);
         self.report_status(format!(
-            "Switched to the canonical library at {}.",
+            "{} the canonical library at {}.",
+            if same_root { "Reopened" } else { "Switched to" },
             root.display()
         ));
         if let Some(error) = queue_error {
@@ -3211,6 +3241,9 @@ impl Controller {
         &mut self,
         library_root: &Path,
     ) -> Result<CreatedLibrary, CreateLibraryError> {
+        if self.shutdown {
+            return Err(CreateLibraryError::ShuttingDown);
+        }
         if self.is_scanning() {
             return Err(CreateLibraryError::ScanInProgress);
         }
@@ -3247,6 +3280,10 @@ impl Controller {
     /// is also mirrored into [`last_error`](Self::last_error) /
     /// [`last_status`](Self::last_status) for front-ends.
     pub fn switch_to_portable(&mut self, library_root: &Path) -> Result<(), SwitchError> {
+        if self.shutdown {
+            self.report_error(SwitchError::ShuttingDown.to_string());
+            return Err(SwitchError::ShuttingDown);
+        }
         if self.is_scanning() {
             self.report_error(SwitchError::ScanInProgress.to_string());
             return Err(SwitchError::ScanInProgress);
@@ -3259,19 +3296,38 @@ impl Controller {
                 return Err(err);
             }
         };
-        if self.portable_root() == Some(root.as_path()) {
-            self.report_status(format!(
-                "Already using the portable library at {}.",
-                root.display()
-            ));
-            return Ok(());
-        }
-        let (lock, opened, library, skipped) = match open_portable_candidate_at(&root) {
-            Ok(candidate) => candidate,
-            Err(err) => {
-                let err = SwitchError::from(err);
-                self.report_error(err.to_string());
-                return Err(err);
+        let same_root = self.portable_root() == Some(root.as_path());
+        let (lock, opened, library, skipped) = if same_root {
+            let lock = match self.library_lock.as_ref().cloned() {
+                Some(lock) => lock,
+                None => Arc::new(match LibraryLock::acquire_portable_root(&root) {
+                    Ok(lock) => lock,
+                    Err(err) => {
+                        let err = SwitchError::Portable(PortableOpenError::Lock(err));
+                        self.report_error(err.to_string());
+                        return Err(err);
+                    }
+                }),
+            };
+            match PortableStore::open(&root) {
+                Ok(opened) => {
+                    let (library, skipped) = Library::from_portable_store(&opened.store);
+                    (lock, opened, library, skipped)
+                }
+                Err(err) => {
+                    let err = SwitchError::Portable(PortableOpenError::Store(err));
+                    self.report_error(err.to_string());
+                    return Err(err);
+                }
+            }
+        } else {
+            match open_portable_candidate_at(&root) {
+                Ok((lock, opened, library, skipped)) => (Arc::new(lock), opened, library, skipped),
+                Err(err) => {
+                    let err = SwitchError::from(err);
+                    self.report_error(err.to_string());
+                    return Err(err);
+                }
             }
         };
         let recovery = opened.recovery;
@@ -3281,7 +3337,7 @@ impl Controller {
         self.install_library(LibrarySeed {
             library,
             storage: StorageBackend::Portable { root: root.clone() },
-            library_lock: Some(Arc::new(lock)),
+            library_lock: Some(lock),
             portable_store: Some(opened.store),
             canonical_store: None,
             portable_recovery: recovery,
@@ -3301,7 +3357,8 @@ impl Controller {
             self.report_error(PORTABLE_RECOVERY_READ_ONLY.to_owned());
         } else {
             self.report_status(format!(
-                "Switched to the portable library at {}.",
+                "{} the portable library at {}.",
+                if same_root { "Reopened" } else { "Switched to" },
                 root.display()
             ));
         }
@@ -3322,6 +3379,9 @@ impl Controller {
         &mut self,
         library_root: &Path,
     ) -> Result<CreatedLibrary, CreateLibraryError> {
+        if self.shutdown {
+            return Err(CreateLibraryError::ShuttingDown);
+        }
         if self.is_scanning() {
             self.report_error(CreateLibraryError::ScanInProgress.to_string());
             return Err(CreateLibraryError::ScanInProgress);
@@ -3370,33 +3430,43 @@ impl Controller {
         &mut self,
         index_path: Option<PathBuf>,
     ) -> Result<(), SwitchError> {
+        if self.shutdown {
+            self.report_error(SwitchError::ShuttingDown.to_string());
+            return Err(SwitchError::ShuttingDown);
+        }
         if self.is_scanning() {
             self.report_error(SwitchError::ScanInProgress.to_string());
             return Err(SwitchError::ScanInProgress);
         }
-        if let (
-            StorageBackend::Legacy {
-                index_path: Some(current),
-            },
-            Some(candidate),
-        ) = (&self.storage, &index_path)
-            && same_library_path(current, candidate)
-        {
-            self.report_status("Already using that legacy library index.".to_owned());
-            return Ok(());
-        }
+        let same_current = match (&self.storage, &index_path) {
+            (
+                StorageBackend::Legacy {
+                    index_path: Some(current),
+                },
+                Some(candidate),
+            ) => same_library_path(current, candidate),
+            (StorageBackend::Legacy { index_path: None }, None) => true,
+            _ => false,
+        };
 
         // Acquire ownership before reading; scanning is refused above,
         // so the outgoing backend has no worker that could still write.
+        // A same-path reopen keeps the existing lease.
         let candidate_lock = match &index_path {
-            Some(path) => match LibraryLock::acquire_legacy_index(path) {
-                Ok(lock) => Some(Arc::new(lock)),
-                Err(err) => {
-                    let err = SwitchError::Lock(err);
-                    self.report_error(err.to_string());
-                    return Err(err);
+            Some(path) => {
+                if same_current && let Some(lock) = self.library_lock.clone() {
+                    Some(lock)
+                } else {
+                    match LibraryLock::acquire_legacy_index(path) {
+                        Ok(lock) => Some(Arc::new(lock)),
+                        Err(err) => {
+                            let err = SwitchError::Lock(err);
+                            self.report_error(err.to_string());
+                            return Err(err);
+                        }
+                    }
                 }
-            },
+            }
             None => None,
         };
         let library = match &index_path {
@@ -3435,7 +3505,14 @@ impl Controller {
             history_store: None,
             history_write_protected: false,
         });
-        self.report_status(format!("Switched to the legacy library index{shown}."));
+        self.report_status(format!(
+            "{} the legacy library index{shown}.",
+            if same_current {
+                "Reopened"
+            } else {
+                "Switched to"
+            }
+        ));
         if let Some(error) = queue_error {
             self.report_error(error);
         }
@@ -3465,6 +3542,9 @@ impl Controller {
             history_store,
             history_write_protected,
         } = seed;
+        self.outbox.clear();
+        self.last_error = None;
+        self.last_status = None;
         self.player.stop();
         self.engine.stop();
         self.engine_loaded = None;
@@ -3496,6 +3576,12 @@ impl Controller {
         self.preloaded_entry = None;
         self.play_session = None;
         *self.player.queue_mut() = queue;
+        self.library_session = self.library_session.checked_add(1).unwrap_or(1);
+        // Recovery is device-scoped, but its captured position/entry belong
+        // to the outgoing library instance. Rebind it to the new queue after
+        // installation; a later success may then load only the new library's
+        // current entry, never an old one.
+        self.restart_recovery_position();
 
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.outbox.push(ControllerEvent::QueueChanged);
@@ -5466,6 +5552,7 @@ impl Controller {
             return;
         }
         self.persist_queue();
+        self.library_session = self.library_session.checked_add(1).unwrap_or(1);
         self.shutdown = true;
         self.engine_loaded = None;
         self.engine_entry = None;
@@ -5512,6 +5599,12 @@ impl Controller {
         self.shuffle = state.shuffle;
         self.restored_position_ms = state.position_ms;
         self.restored_position_entry = self.player.queue().current_entry_id();
+        if let Some(recovery) = self.audio_recovery.as_mut()
+            && (recovery.active() || recovery.failed())
+        {
+            recovery.position_ms = state.position_ms;
+            recovery.position_entry = self.restored_position_entry;
+        }
         if self.player.queue().current_entry().is_some() {
             self.player.restore_paused();
         }
@@ -9960,9 +10053,12 @@ mod tests {
         let (b, _control_b) = boot_portable_at(&root_b).expect("open b");
         let canonical_a = fs::canonicalize(&root_a).expect("canonical a");
 
-        // Same library: friendly no-op. Different owned library: refused
-        // without changing the active backend.
-        a.switch_to_portable(&root_a).expect("same library no-op");
+        // Same library: reopened under a fresh session while retaining the
+        // lease. Different owned library: refused without changing the
+        // active backend.
+        let before_reopen = a.library_session();
+        a.switch_to_portable(&root_a).expect("same library reopen");
+        assert_eq!(a.library_session(), before_reopen + 1);
         let error = a.switch_to_portable(&root_b).expect_err("b is owned");
         assert!(
             matches!(
@@ -10797,10 +10893,12 @@ mod tests {
         let index_path = dir.path().join("state").join("library-index.json");
         controller.play_track(TrackId::new(2));
         assert_eq!(controller.player_state(), PlaybackState::Playing);
+        let active_session = controller.library_session();
 
         let assert_unchanged = |c: &Controller| {
             assert_eq!(c.storage_mode(), StorageMode::Legacy);
             assert_eq!(c.legacy_index_path(), Some(index_path.as_path()));
+            assert_eq!(c.library_session(), active_session);
             assert_eq!(track_ids(c), vec![1, 2]);
             assert_eq!(c.current_id(), Some(TrackId::new(2)));
             assert_eq!(c.player_state(), PlaybackState::Playing);
@@ -10866,6 +10964,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel::<ScanOutcome>();
         controller.scan_rx = Some(rx);
         assert!(controller.is_scanning());
+        let active_session = controller.library_session();
 
         let err = controller
             .switch_to_portable(&portable_root)
@@ -10882,6 +10981,7 @@ mod tests {
             !new_root.join(".flux").exists(),
             "a refused create+switch must not create anything"
         );
+        assert_eq!(controller.library_session(), active_session);
 
         // Hand the library back for a clean shutdown.
         controller.scan_rx = None;
@@ -12863,6 +12963,38 @@ mod tests {
         (root, source)
     }
 
+    fn import_request_for(controller: &Controller, source: &Path) -> crate::import::ImportRequest {
+        crate::import::ImportRequest {
+            sources: vec![source.to_path_buf()],
+            recursive: false,
+            storage: crate::import::ImportStorage::Copy,
+            library_root: controller
+                .canonical_root()
+                .or_else(|| controller.portable_root())
+                .expect("persistent library root")
+                .to_path_buf(),
+            existing_tracks: controller.tracks().to_vec(),
+            existing_artists: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_artist_id(*id).map(|artist| (*id, artist)))
+                .collect(),
+            existing_credits: controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_album_id(*id).map(|album| (*id, album)))
+                .collect(),
+            target_album: None,
+            generation: controller.generation(),
+            library_session: controller.library_session(),
+        }
+    }
+
     #[test]
     fn canonical_controller_imports_copies_and_reopens_with_stable_ids() {
         let dir = TempDir::new("canonical-open");
@@ -12951,6 +13083,7 @@ mod tests {
                 .collect(),
             target_album: None,
             generation: controller.generation(),
+            library_session: controller.library_session(),
         };
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -13008,6 +13141,7 @@ mod tests {
             existing_album_ids: Vec::new(),
             target_album: None,
             generation: controller.generation(),
+            library_session: controller.library_session(),
         };
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -13064,6 +13198,402 @@ mod tests {
         assert_eq!(controller.tracks()[0].0, id);
         assert!(controller.queue_len() >= 1);
         controller.shutdown();
+    }
+
+    #[test]
+    fn same_path_canonical_reopen_creates_a_fresh_session_and_restores_paused() {
+        let dir = TempDir::new("canonical-same-path-reopen");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], true).expect("import");
+        let id = controller.tracks()[0].0;
+        controller.play_track(id);
+        controller.stop();
+        let before_session = controller.library_session();
+        let before_entry = controller.current_queue_entry_id();
+        let queue_path = root.join("queue.flux");
+        let queue_before = fs::read(&queue_path).expect("queue before reopen");
+
+        controller
+            .switch_to_canonical(&root)
+            .expect("same-path reopen succeeds");
+        assert_eq!(
+            controller.library_session(),
+            before_session.checked_add(1).expect("session increments")
+        );
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(controller.tracks()[0].0, id);
+        assert_eq!(controller.current_queue_entry_id(), before_entry);
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert_eq!(controller.engine_loaded, None, "reopen must not autoplay");
+        assert_eq!(
+            fs::read(&queue_path).expect("queue after reopen"),
+            queue_before,
+            "reopening must not rewrite the old queue file"
+        );
+        let after_first_reopen = controller.library_session();
+        controller
+            .switch_to_canonical(&root)
+            .expect("repeated same-path reopen");
+        assert_eq!(controller.library_session(), after_first_reopen + 1);
+        assert_eq!(controller.tracks()[0].0, id);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn same_path_legacy_reopen_creates_a_fresh_session() {
+        let dir = TempDir::new("legacy-same-path-reopen");
+        let index = dir.path().join("state/library-index.json");
+        let (mut controller, _control) = boot_legacy_at(Some(index.clone()));
+        let before = controller.library_session();
+        controller
+            .switch_to_legacy_index(Some(index.clone()))
+            .expect("same-path legacy reopen");
+        assert_eq!(controller.library_session(), before + 1);
+        assert_eq!(controller.storage_mode(), StorageMode::Legacy);
+        assert_eq!(controller.legacy_index_path(), Some(index.as_path()));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn stale_import_plan_cannot_cross_a_switch_or_same_path_reopen() {
+        use crate::import::{PreparedImport, prepare_import_plan};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let dir = TempDir::new("import-plan-library-identity");
+        let (root_a, source) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let (mut controller, _control) = boot_canonical_at(&root_a);
+        controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("import a");
+        let plan_a = prepare_import_plan(
+            import_request_for(&controller, &source),
+            Arc::new(Mutex::new(crate::import::ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let source_a_session = controller.library_session();
+        assert_eq!(plan_a.library_session, source_a_session);
+
+        controller
+            .switch_to_canonical(&root_b)
+            .expect("switch to b");
+        assert_ne!(controller.library_session(), source_a_session);
+        assert!(
+            controller
+                .apply_import_plan(&plan_a, &PreparedImport::default())
+                .is_err(),
+            "an old-library import plan must not publish into the new library"
+        );
+        assert!(controller.tracks().is_empty());
+
+        controller
+            .switch_to_canonical(&root_a)
+            .expect("switch back to a");
+        let plan_before_reopen = prepare_import_plan(
+            import_request_for(&controller, &source),
+            Arc::new(Mutex::new(crate::import::ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let before_reopen_session = controller.library_session();
+        controller
+            .switch_to_canonical(&root_a)
+            .expect("same-path reopen");
+        assert_ne!(controller.library_session(), before_reopen_session);
+        assert!(
+            controller
+                .apply_import_plan(&plan_before_reopen, &PreparedImport::default())
+                .is_err(),
+            "a same-path reopen must invalidate the old plan"
+        );
+        assert_eq!(controller.tracks().len(), 1);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switching_from_paused_and_stopped_restores_only_the_target_queue() {
+        let dir = TempDir::new("switch-paused-stopped");
+        let (root_a, source) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let (mut controller, control) = boot_canonical_at(&root_a);
+        controller.import_files(&[source], true).expect("import");
+        let id = controller.tracks()[0].0;
+        let entry = controller.enqueue_track(id).expect("enqueue");
+        controller.play_queue_entry(entry).expect("play");
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+        controller.pause();
+        let paused_position = controller.position();
+
+        controller.switch_to_canonical(&root_b).expect("switch b");
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None);
+
+        controller
+            .switch_to_canonical(&root_a)
+            .expect("switch back a");
+        assert_eq!(controller.current_queue_entry_id(), Some(entry));
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert_eq!(controller.engine_loaded, None, "target must not autoplay");
+        assert!(
+            (controller.position().as_millis() as i64 - paused_position.as_millis() as i64).abs()
+                <= 2,
+            "the destination queue's paused position was not restored"
+        );
+
+        controller.stop();
+        controller
+            .switch_to_canonical(&root_b)
+            .expect("switch stopped");
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switching_during_recovery_never_restarts_old_playback() {
+        let dir = TempDir::new("switch-during-recovery");
+        let (root_a, source) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let (mut controller, control) = boot_canonical_at(&root_a);
+        controller.import_files(&[source], true).expect("import");
+        let id = controller.tracks()[0].0;
+        controller.play_track(id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated switch-time loss");
+        assert!(controller.audio_recovery_active());
+
+        controller
+            .switch_to_canonical(&root_b)
+            .expect("switch during recovery");
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None, "old audio must not resume");
+        assert_eq!(controller.position(), Duration::ZERO);
+        assert!(!control.is_running(), "old stream must stay released");
+        let recovered = last_recovery_control(&controls);
+        assert!(
+            recovered.captured().is_empty(),
+            "the replacement stream must not have played old audio"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switching_during_crossfade_cancels_the_old_transition() {
+        let dir = TempDir::new("switch-crossfade");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+        let b_path = write_dc_wav(&root, "b.wav", 88_200, 0.8);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        let b = id_of(&controller, &b_path);
+        controller.set_crossfade_ms(500);
+        controller.play_track(a);
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        let before_session = controller.library_session();
+        drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id() == Some(entry_b)
+        });
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        controller
+            .switch_to_canonical(&root_b)
+            .expect("switch during crossfade");
+        assert_ne!(controller.library_session(), before_session);
+        assert_eq!(controller.current_id(), None);
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.preloaded_entry, None);
+        assert_eq!(controller.engine_loaded, None);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switching_invalidates_preload_and_old_engine_events() {
+        let dir = TempDir::new("switch-stale-engine-events");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        let old_entry = controller.current_queue_entry_id().expect("old entry");
+        let old_session = controller.engine_session.expect("old session");
+        assert!(controller.preloaded_entry.is_some(), "successor preloaded");
+        drive(&mut controller, &control, |c, _| c.stream_info.is_some());
+        let old_info = controller.stream_info.expect("old stream facts");
+
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        controller
+            .switch_to_canonical(&root_b)
+            .expect("switch while preloaded");
+        assert_eq!(controller.preloaded_entry, None);
+        controller
+            .import_files(std::slice::from_ref(&fx.a), false)
+            .expect("import b");
+        let new_id = controller.tracks()[0].0;
+        let new_entry = controller.current_queue_entry_id().expect("new entry");
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+
+        let mut events = Vec::new();
+        controller.handle_engine_event(
+            EngineEvent::Transitioned {
+                session: old_session,
+                generation: 1,
+                from_id: a,
+                from_entry: old_entry,
+                to_id: new_id,
+                to_entry: new_entry,
+                boundary_frame: 0,
+                info: old_info,
+            },
+            &mut events,
+        );
+        controller.handle_engine_event(
+            EngineEvent::TrackEnded {
+                session: old_session,
+                entry: old_entry,
+                id: a,
+            },
+            &mut events,
+        );
+        assert_eq!(controller.current_id(), Some(new_id));
+        assert_eq!(controller.current_queue_entry_id(), Some(new_entry));
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert!(events.is_empty(), "stale engine event was published");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_switch_isolates_queue_and_catalogue_writes() {
+        let dir = TempDir::new("switch-byte-isolation");
+        let (root_a, source_a) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let (mut controller, control) = boot_canonical_at(&root_a);
+        controller
+            .import_files(&[source_a], true)
+            .expect("import a");
+        let a_id = controller.tracks()[0].0;
+        controller.play_track(a_id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(10)
+        });
+        controller.stop();
+        let queue_a = fs::read(root_a.join("queue.flux")).expect("a queue");
+        let catalog_a = fs::read(root_a.join("catalog.flux")).expect("a catalogue");
+
+        controller.switch_to_canonical(&root_b).expect("switch b");
+        let source_b = dir.path().join("B/Artist/Album/01 - Other.wav");
+        fs::create_dir_all(source_b.parent().expect("parent")).expect("dirs");
+        write_dc_wav(
+            source_b.parent().expect("parent"),
+            "01 - Other.wav",
+            4_410,
+            0.8,
+        );
+        controller
+            .import_files(&[source_b], true)
+            .expect("import b");
+        let b_id = controller.tracks()[0].0;
+        controller.play_track(b_id);
+        controller.stop();
+
+        assert_eq!(
+            fs::read(root_a.join("queue.flux")).expect("a queue"),
+            queue_a
+        );
+        assert_eq!(
+            fs::read(root_a.join("catalog.flux")).expect("a catalogue"),
+            catalog_a
+        );
+        assert_ne!(
+            fs::read(root_b.join("catalog.flux")).expect("b catalogue"),
+            catalog_a
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn switching_keeps_c2_protected_queue_files_byte_identical() {
+        let dir = TempDir::new("switch-c2-protection");
+        let (root_a, _source) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("ProtectedLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let queue_b = root_b.join("queue.flux");
+        let corrupt = b"{ not a queue";
+        fs::write(&queue_b, corrupt).expect("malformed queue");
+        let (mut controller, _control) = boot_canonical_at(&root_a);
+
+        controller
+            .switch_to_canonical(&root_b)
+            .expect("target opens with protected queue");
+        assert!(controller.queue_write_protected);
+        assert_eq!(fs::read(&queue_b).expect("queue b"), corrupt);
+
+        controller
+            .switch_to_canonical(&root_a)
+            .expect("switch away");
+        controller
+            .switch_to_canonical(&root_b)
+            .expect("switch back");
+        assert!(controller.queue_write_protected);
+        assert_eq!(fs::read(&queue_b).expect("queue b"), corrupt);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn shutdown_invalidates_the_library_session_and_refuses_switches() {
+        let dir = TempDir::new("shutdown-switch-session");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let before = controller.library_session();
+        controller.shutdown_in_place();
+        assert_ne!(controller.library_session(), before);
+        assert!(matches!(
+            controller.switch_to_canonical(&fx.root),
+            Err(SwitchError::ShuttingDown)
+        ));
+        assert!(matches!(
+            controller.switch_to_portable(&fx.root),
+            Err(SwitchError::ShuttingDown)
+        ));
+        let target = dir.path().join("must-not-be-created");
+        fs::create_dir_all(&target).expect("target dir");
+        assert!(matches!(
+            controller.switch_to_new_canonical_library(&target),
+            Err(CreateLibraryError::ShuttingDown)
+        ));
+        assert!(!target.join("library.flux").exists());
     }
 
     #[test]

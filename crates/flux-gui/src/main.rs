@@ -1936,7 +1936,7 @@ enum Message {
     EditorCreditRemove(usize),
     EditorReplacementChanged(String),
     EditorReplacementChoose,
-    EditorReplacementPicked(Result<Option<Vec<PathBuf>>, String>),
+    EditorReplacementPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     EditorPlanReplacement,
     EditorConfirmReplacement,
     EditorMoveDestination(Option<AlbumChoice>),
@@ -1974,10 +1974,10 @@ enum Message {
     AlbumMetadataSave,
     AlbumCoverChanged(String),
     AlbumCoverChoose,
-    AlbumCoverPicked(Result<Option<Vec<PathBuf>>, String>),
+    AlbumCoverPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     AlbumCoverApply,
     AlbumCoverRemove,
-    ArtworkLoaded(ArtworkKey, Result<ArtworkData, String>),
+    ArtworkLoaded(u64, ArtworkKey, Result<ArtworkData, String>),
     AlbumTrackMove(TrackId, isize),
     AlbumDeletePressed,
     AlbumDeleteConfirm,
@@ -1990,8 +1990,8 @@ enum Message {
     ImportNoop,
     ImportNativeFiles,
     ImportNativeFolder,
-    ImportNativeFilesPicked(Result<Option<Vec<PathBuf>>, String>),
-    ImportNativeFolderPicked(Result<Option<PathBuf>, String>),
+    ImportNativeFilesPicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    ImportNativeFolderPicked(u64, Result<Option<PathBuf>, String>),
     ImportBrowserOpenFiles,
     ImportBrowserOpenFolder,
     ImportBrowserUp,
@@ -2004,8 +2004,8 @@ enum Message {
     ImportBrowserPathChanged(String),
     ImportBrowserPathSubmit,
     ImportRecursiveToggled,
-    ImportPlanReady(Box<ImportPlan>),
-    ImportPrepared(Box<PreparedImport>),
+    ImportPlanReady(u64, Box<ImportPlan>),
+    ImportPrepared(u64, Box<PreparedImport>),
     ImportSelect(usize),
     ImportDecisionChanged(usize, ImportDecision),
     ImportBulkSkip,
@@ -2112,7 +2112,7 @@ enum Message {
     LyricsEditorCancel,
     LyricsEditorRemove,
     LyricsImportOpen,
-    LyricsImportPicked(Result<Option<Vec<PathBuf>>, String>),
+    LyricsImportPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     LyricsImportConfirm,
     LyricsImportCancel,
     LyricsExportPathChanged(String),
@@ -2152,6 +2152,40 @@ enum Message {
     WaveTick,
     WindowResized(f32),
     WindowCloseRequested(window::Id),
+}
+
+impl Message {
+    /// The library instance that initiated an asynchronous operation, when
+    /// the result is allowed to mutate library-derived UI state.
+    fn library_session(&self) -> Option<u64> {
+        match self {
+            Self::EditorReplacementPicked(session, _)
+            | Self::AlbumCoverPicked(session, _)
+            | Self::ArtworkLoaded(session, _, _)
+            | Self::ImportNativeFilesPicked(session, _)
+            | Self::ImportNativeFolderPicked(session, _)
+            | Self::ImportPlanReady(session, _)
+            | Self::ImportPrepared(session, _)
+            | Self::LyricsImportPicked(session, _) => Some(*session),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_library_session(mut self, session: u64) -> Self {
+        match &mut self {
+            Self::EditorReplacementPicked(current, _)
+            | Self::AlbumCoverPicked(current, _)
+            | Self::ArtworkLoaded(current, _, _)
+            | Self::ImportNativeFilesPicked(current, _)
+            | Self::ImportNativeFolderPicked(current, _)
+            | Self::ImportPlanReady(current, _)
+            | Self::ImportPrepared(current, _)
+            | Self::LyricsImportPicked(current, _) => *current = session,
+            _ => {}
+        }
+        self
+    }
 }
 
 impl FluxReady {
@@ -2258,7 +2292,13 @@ impl FluxReady {
     }
 
     fn after_switch(&mut self) {
+        self.close_import_manager();
+        self.batch_review = None;
+        self.deletion_manager = None;
+        self.album_transfer = None;
         self.search.clear();
+        self.selected_tracks.clear();
+        self.focused_track = None;
         self.pending_plan = None;
         self.migrated_dest = None;
         self.lifecycle_msg = None;
@@ -2270,11 +2310,27 @@ impl FluxReady {
         self.lyrics_follow_current = false;
         self.lyrics_editor = None;
         self.lyrics_import = None;
+        self.lyrics_export_pending = None;
+        self.lyrics_error = None;
         self.lyrics_cache.borrow_mut().clear();
         self.artist_selected = None;
         self.artist_name_input.clear();
         self.artist_rename_input.clear();
+        self.new_album_title.clear();
+        self.album_title_input.clear();
+        self.album_cover_input.clear();
+        self.album_delete_confirm = false;
+        self.album_cover_remove_confirm = false;
+        self.playlist_create_open = false;
+        self.playlist_create_name.clear();
+        self.playlist_name_input.clear();
+        self.playlist_delete_confirm = false;
+        self.playlist_clear_confirm = false;
+        self.playlist_remove_confirm = false;
+        self.playlist_drag = None;
+        self.playlist_error = None;
         self.last_reconcile = None;
+        self.search_cache.borrow_mut().generation = u64::MAX;
         let current = self.controller.current_queue_entry_id();
         self.queue_page = current
             .and_then(|entry| self.controller.queue_entry_index(entry))
@@ -2284,6 +2340,8 @@ impl FluxReady {
         self.artwork_loading.clear();
         *self.dashboard_cache.borrow_mut() = None;
         self.scope.reset();
+        self.show_setup = false;
+        self.external_drag_hover = false;
         self.select_view(LibraryView::Tracks);
     }
 
@@ -3034,14 +3092,16 @@ impl FluxReady {
                 .collect(),
             target_album: manager.target_album(),
             generation: self.controller.generation(),
+            library_session: self.controller.library_session(),
         };
         manager.reset_for_selection();
         manager.stage = ImportUiStage::Scanning;
         let progress = Arc::clone(&manager.progress);
         let cancel = Arc::clone(&manager.cancel);
+        let session = self.controller.library_session();
         Task::perform(
             async move { prepare_import_plan(request, progress, cancel) },
-            |plan| Message::ImportPlanReady(Box::new(plan)),
+            move |plan| Message::ImportPlanReady(session, Box::new(plan)),
         )
     }
 
@@ -3139,9 +3199,10 @@ impl FluxReady {
         manager.cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::clone(&manager.progress);
         let cancel = Arc::clone(&manager.cancel);
+        let session = self.controller.library_session();
         Task::perform(
             async move { prepare_import_files(&plan, progress, cancel) },
-            |prepared| Message::ImportPrepared(Box::new(prepared)),
+            move |prepared| Message::ImportPrepared(session, Box::new(prepared)),
         )
     }
 
@@ -3211,9 +3272,10 @@ impl FluxReady {
             .map(Path::to_path_buf)
             .or_else(home_directory);
         self.prepare_native_import_picker();
+        let session = self.controller.library_session();
         Task::perform(
             async move { flux_platform::pick_audio_files_in(start.as_deref()) },
-            Message::ImportNativeFilesPicked,
+            move |result| Message::ImportNativeFilesPicked(session, result),
         )
     }
 
@@ -3225,9 +3287,10 @@ impl FluxReady {
             .map(Path::to_path_buf)
             .or_else(home_directory);
         self.prepare_native_import_picker();
+        let session = self.controller.library_session();
         Task::perform(
             async move { flux_platform::pick_folder_in(start.as_deref()) },
-            Message::ImportNativeFolderPicked,
+            move |result| Message::ImportNativeFolderPicked(session, result),
         )
     }
 
@@ -3356,6 +3419,12 @@ impl FluxReady {
         if self.closed {
             return Task::none();
         }
+        if message
+            .library_session()
+            .is_some_and(|session| session != self.controller.library_session())
+        {
+            return Task::none();
+        }
         match message {
             Message::LibInputChanged(value) => self.lib_input = value,
             Message::EditTrack(id) => self.start_track_editor(id),
@@ -3414,12 +3483,13 @@ impl FluxReady {
                     .and_then(|editor| self.controller.track(editor.id))
                     .and_then(|track| track.source().path().parent().map(Path::to_path_buf))
                     .or_else(|| self.controller.canonical_root().map(Path::to_path_buf));
+                let session = self.controller.library_session();
                 return Task::perform(
                     async move { flux_platform::pick_audio_files_in(start.as_deref()) },
-                    Message::EditorReplacementPicked,
+                    move |result| Message::EditorReplacementPicked(session, result),
                 );
             }
-            Message::EditorReplacementPicked(result) => match result {
+            Message::EditorReplacementPicked(_, result) => match result {
                 Ok(Some(paths)) => {
                     if let Some(path) = paths.first()
                         && let Some(editor) = self.track_editor.as_mut()
@@ -3806,12 +3876,13 @@ impl FluxReady {
                     .and_then(|album| self.controller.album_cover_path(album))
                     .and_then(|path| path.parent().map(Path::to_path_buf))
                     .or_else(|| self.controller.canonical_root().map(Path::to_path_buf));
+                let session = self.controller.library_session();
                 return Task::perform(
                     async move { flux_platform::pick_image_files_in(start.as_deref()) },
-                    Message::AlbumCoverPicked,
+                    move |result| Message::AlbumCoverPicked(session, result),
                 );
             }
-            Message::AlbumCoverPicked(result) => match result {
+            Message::AlbumCoverPicked(_, result) => match result {
                 Ok(Some(paths)) => {
                     if let Some(path) = paths.first() {
                         self.album_cover_input = path.display().to_string();
@@ -3820,7 +3891,7 @@ impl FluxReady {
                 Ok(None) => {}
                 Err(error) => self.lifecycle_msg = Some(error),
             },
-            Message::ArtworkLoaded(key, result) => {
+            Message::ArtworkLoaded(_, key, result) => {
                 self.artwork_loading.remove(&key);
                 let still_current = self
                     .controller
@@ -3965,7 +4036,7 @@ impl FluxReady {
             Message::ImportNoop => {}
             Message::ImportNativeFiles => return self.native_files_task(),
             Message::ImportNativeFolder => return self.native_folder_task(),
-            Message::ImportNativeFilesPicked(result) => match result {
+            Message::ImportNativeFilesPicked(_, result) => match result {
                 Ok(Some(paths)) => {
                     if let Some(manager) = self.import_manager.as_mut() {
                         manager.browser = None;
@@ -3983,7 +4054,7 @@ impl FluxReady {
                     }
                 }
             },
-            Message::ImportNativeFolderPicked(result) => match result {
+            Message::ImportNativeFolderPicked(_, result) => match result {
                 Ok(Some(folder)) => {
                     if let Some(manager) = self.import_manager.as_mut() {
                         manager.browser = None;
@@ -4093,7 +4164,7 @@ impl FluxReady {
                     manager.recursive = !manager.recursive;
                 }
             }
-            Message::ImportPlanReady(plan) => {
+            Message::ImportPlanReady(_, plan) => {
                 let Some(manager) = self.import_manager.as_mut() else {
                     return Task::none();
                 };
@@ -4127,7 +4198,7 @@ impl FluxReady {
                     manager.select_candidate(0);
                 }
             }
-            Message::ImportPrepared(prepared) => self.apply_import_review(*prepared),
+            Message::ImportPrepared(_, prepared) => self.apply_import_review(*prepared),
             Message::ImportSelect(index) => {
                 if let Some(manager) = self.import_manager.as_mut() {
                     manager.select_candidate(index);
@@ -5172,7 +5243,7 @@ impl FluxReady {
             Message::LyricsEditorCancel => self.cancel_lyrics_editor(),
             Message::LyricsEditorRemove => self.remove_lyrics_from_editor(),
             Message::LyricsImportOpen => return self.begin_lyrics_import(),
-            Message::LyricsImportPicked(result) => match result {
+            Message::LyricsImportPicked(_, result) => match result {
                 Ok(Some(paths)) => {
                     if let Some(path) = paths.first() {
                         match std::fs::read_to_string(path) {
@@ -8468,9 +8539,10 @@ impl FluxReady {
                 continue;
             }
             let message_key = key.clone();
+            let session = self.controller.library_session();
             tasks.push(Task::perform(
                 async move { decode_artwork(&key) },
-                move |result| Message::ArtworkLoaded(message_key, result),
+                move |result| Message::ArtworkLoaded(session, message_key, result),
             ));
             if tasks.len() >= 6 {
                 break;
@@ -10224,9 +10296,10 @@ impl FluxReady {
             .track_lyrics_path(id)
             .and_then(|path| path.parent().map(Path::to_path_buf))
             .or_else(|| self.controller.canonical_root().map(Path::to_path_buf));
+        let session = self.controller.library_session();
         Task::perform(
             async move { flux_platform::pick_lyrics_files_in(start.as_deref()) },
-            Message::LyricsImportPicked,
+            move |result| Message::LyricsImportPicked(session, result),
         )
     }
 
@@ -13198,7 +13271,8 @@ mod tests {
     }
 
     fn send(gui: &mut FluxReady, message: Message) {
-        let _task = gui.update(message);
+        let session = gui.controller.library_session();
+        let _task = gui.update(message.with_library_session(session));
     }
 
     #[test]
@@ -13353,6 +13427,261 @@ mod tests {
         assert_eq!(gui.controller.storage_mode(), StorageMode::Legacy);
         assert!(gui.controller.last_error().is_some(), "failure is visible");
         assert!(!empty.join(".flux").exists(), "opening created nothing");
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn cancelled_library_selection_leaves_the_active_instance_unchanged() {
+        let dir = TempDir::new("gui-cancelled-switch");
+        let mut gui = gui(&dir);
+        let session = gui.controller.library_session();
+        let mode = gui.controller.storage_mode();
+        let root = gui.controller.canonical_root().map(Path::to_path_buf);
+        send(
+            &mut gui,
+            Message::LibInputChanged(dir.path().join("not-opened").display().to_string()),
+        );
+        assert_eq!(gui.controller.library_session(), session);
+        assert_eq!(gui.controller.storage_mode(), mode);
+        assert_eq!(gui.controller.canonical_root().map(Path::to_path_buf), root);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn async_results_from_the_previous_library_instance_are_dropped() {
+        let dir = TempDir::new("gui-stale-library-tasks");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("source/song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = gui.controller.tracks()[0].0;
+        let old_session = gui.controller.library_session();
+        let request = ImportRequest {
+            sources: vec![source.clone()],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: root.clone(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
+            target_album: None,
+            generation: gui.controller.generation(),
+            library_session: old_session,
+        };
+        let old_plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // Reopening the same path changes the in-memory library instance even
+        // though the path and entity IDs are unchanged.
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let current_session = gui.controller.library_session();
+        assert_ne!(current_session, old_session);
+        assert_eq!(gui.controller.tracks()[0].0, id);
+
+        send(&mut gui, Message::ImportOpen);
+        let _ = gui.update(Message::ImportPlanReady(old_session, Box::new(old_plan)));
+        let _ = gui.update(Message::ImportPrepared(old_session, Box::default()));
+        let manager = gui.import_manager.as_ref().expect("new manager");
+        assert!(manager.plan.is_none());
+        assert_eq!(manager.stage, ImportUiStage::Choose);
+        gui.import_manager.as_mut().expect("manager").sources =
+            vec![PathBuf::from("keep-current-selection")];
+        let _ = gui.update(Message::ImportNativeFilesPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-selection")])),
+        ));
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").sources,
+            vec![PathBuf::from("keep-current-selection")]
+        );
+
+        send(&mut gui, Message::EditTrack(id));
+        let editor_before = gui
+            .track_editor
+            .as_ref()
+            .expect("editor")
+            .replacement_source
+            .clone();
+        let _ = gui.update(Message::EditorReplacementPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-replacement.wav")])),
+        ));
+        assert_eq!(
+            gui.track_editor
+                .as_ref()
+                .expect("editor")
+                .replacement_source,
+            editor_before
+        );
+
+        gui.album_cover_input = "keep-cover".to_owned();
+        let _ = gui.update(Message::AlbumCoverPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-cover.png")])),
+        ));
+        assert_eq!(gui.album_cover_input, "keep-cover");
+
+        send(&mut gui, Message::LyricsSelect(id));
+        let _ = gui.update(Message::LyricsImportPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-lyrics.lrc")])),
+        ));
+        assert!(gui.lyrics_import.is_none());
+
+        let key = ArtworkKey {
+            album_id: AlbumId::new(1),
+            path: PathBuf::from("stale-cover.png"),
+            modified_ns: 0,
+            len: 0,
+        };
+        gui.artwork_loading.insert(key.clone());
+        let _ = gui.update(Message::ArtworkLoaded(
+            old_session,
+            key.clone(),
+            Err("stale artwork".to_owned()),
+        ));
+        assert!(
+            gui.artwork_loading.contains(&key),
+            "stale artwork result was processed"
+        );
+        let _ = gui.update(Message::ArtworkLoaded(
+            current_session,
+            key.clone(),
+            Err("current artwork".to_owned()),
+        ));
+        assert!(!gui.artwork_loading.contains(&key));
+
+        assert_eq!(gui.controller.tracks().len(), 1);
+        assert_eq!(gui.controller.tracks()[0].0, id);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn switch_clears_library_owned_ui_state_and_preserves_global_preferences() {
+        let dir = TempDir::new("gui-switch-state-isolation");
+        let root_a = dir.path().join("library-a");
+        let root_b = dir.path().join("library-b");
+        std::fs::create_dir_all(&root_a).expect("root a");
+        std::fs::create_dir_all(&root_b).expect("root b");
+        flux_app::create_canonical_library(&root_a).expect("canonical a");
+        flux_app::create_canonical_library(&root_b).expect("canonical b");
+        let source_a = dir.path().join("source/a.wav");
+        let source_b = dir.path().join("source/b.wav");
+        std::fs::create_dir_all(source_a.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source_a, minimal_wav()).expect("a");
+        let mut second = minimal_wav();
+        second.push(1);
+        std::fs::write(&source_b, second).expect("b");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root_a.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        gui.controller
+            .import_files(std::slice::from_ref(&source_a), false)
+            .expect("import a");
+        let old_id = gui.controller.tracks()[0].0;
+        let old_playlist = gui
+            .controller
+            .set_playlist(None, "Old library only", vec![old_id])
+            .expect("playlist");
+        gui.selected_tracks = vec![old_id];
+        gui.focused_track = Some(old_id);
+        gui.selected_group = Some("stale-album-selection".to_owned());
+        gui.selected_playlist = Some(old_playlist);
+        gui.collection = Some(SmartCollection::Favorites);
+        gui.filter_favorites = true;
+        gui.sort_tracks = TrackSort::Title;
+        gui.controller.set_volume(0.5);
+        gui.search = "old library".to_owned();
+        let _ = gui.search_snapshot();
+        let dashboard = gui.dashboard_summary();
+        *gui.dashboard_cache.borrow_mut() = Some(dashboard);
+        gui.batch_review = Some(BatchReview {
+            playlist_id: Some(old_playlist),
+            playlist_label: "Old".to_owned(),
+            expected_playlist_track_ids: None,
+            new_playlist_name: String::new(),
+            track_ids: vec![old_id],
+            error: None,
+        });
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::EditTrack(old_id));
+        send(&mut gui, Message::LyricsSelect(old_id));
+        gui.artwork_loading.insert(ArtworkKey {
+            album_id: AlbumId::new(1),
+            path: PathBuf::from("old-cover.png"),
+            modified_ns: 0,
+            len: 0,
+        });
+        let old_session = gui.controller.library_session();
+
+        send(
+            &mut gui,
+            Message::LibInputChanged(root_b.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        assert_ne!(gui.controller.library_session(), old_session);
+        assert_eq!(gui.controller.canonical_root(), Some(root_b.as_path()));
+        assert!(gui.controller.tracks().is_empty());
+        assert_eq!(gui.controller.current_queue_entry_id(), None);
+        assert_eq!(gui.controller.player_state(), PlaybackState::Stopped);
+        assert!(gui.controller.playlist(old_playlist).is_none());
+
+        assert!(gui.selected_tracks.is_empty());
+        assert_eq!(gui.focused_track, None);
+        assert_eq!(gui.selected_group, None);
+        assert_eq!(gui.selected_playlist, None);
+        assert_eq!(gui.collection, None);
+        assert!(gui.search.is_empty());
+        assert_eq!(gui.search_cache.borrow().generation, u64::MAX);
+        assert!(gui.track_editor.is_none());
+        assert!(gui.selected_lyrics.is_none());
+        assert!(gui.lyrics_import.is_none());
+        assert!(gui.lyrics_editor.is_none());
+        assert!(gui.import_manager.is_none());
+        assert!(gui.batch_review.is_none());
+        assert!(gui.artwork.is_empty());
+        assert!(gui.artwork_loading.is_empty());
+        assert!(gui.dashboard_cache.borrow().is_none());
+        assert!(gui.lyrics_cache.borrow().is_empty());
+
+        // Purely global preferences survive the switch.
+        assert!(gui.filter_favorites);
+        assert_eq!(gui.sort_tracks, TrackSort::Title);
+        assert!((gui.controller.volume() - 0.5).abs() < 1e-6);
+
+        // Both libraries use ID 1, but the active identity is the new one.
+        gui.controller
+            .import_files(std::slice::from_ref(&source_b), false)
+            .expect("import b");
+        let new_id = gui.controller.tracks()[0].0;
+        assert_eq!(new_id, old_id, "test requires overlapping TrackIds");
+        assert_eq!(
+            gui.controller.track(new_id).map(|track| track.title()),
+            Some("b")
+        );
+        assert_ne!(gui.controller.library_session(), old_session);
         gui.controller.shutdown();
     }
 
@@ -13647,12 +13976,13 @@ mod tests {
             existing_album_ids: Vec::new(),
             target_album: None,
             generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
         };
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
         let plan = prepare_import_plan(request, progress, cancel);
         send(&mut gui, Message::ImportOpen);
-        send(&mut gui, Message::ImportPlanReady(Box::new(plan)));
+        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
         let manager = gui.import_manager.as_ref().expect("manager open");
         assert_eq!(manager.stage, ImportUiStage::Review);
         assert_eq!(manager.selected, Some(0));
@@ -13682,7 +14012,7 @@ mod tests {
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
         let prepared = prepare_import_files(&plan, progress, cancel);
-        send(&mut gui, Message::ImportPrepared(Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
         let manager = gui.import_manager.as_ref().expect("manager");
         assert_eq!(manager.stage, ImportUiStage::Completed);
         let track = gui.controller.tracks()[0].1.clone();
@@ -13763,6 +14093,7 @@ mod tests {
                 .collect(),
             target_album: None,
             generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
         };
         let plan = prepare_import_plan(
             request,
@@ -13770,7 +14101,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         send(&mut gui, Message::ImportOpen);
-        send(&mut gui, Message::ImportPlanReady(Box::new(plan)));
+        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
         assert!(matches!(
             gui.import_manager
                 .as_ref()
@@ -13800,7 +14131,7 @@ mod tests {
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
         let manager = gui.import_manager.as_ref().expect("manager");
         assert_eq!(manager.stage, ImportUiStage::Completed);
         assert_eq!(
@@ -14647,6 +14978,7 @@ mod tests {
             existing_album_ids: Vec::new(),
             target_album: Some(target.clone()),
             generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
         };
         let plan = prepare_import_plan(
             request,
@@ -14662,13 +14994,16 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.album() == Some("Target Album"))
         );
-        send(&mut gui, Message::ImportPlanReady(Box::new(plan.clone())));
+        send(
+            &mut gui,
+            Message::ImportPlanReady(0, Box::new(plan.clone())),
+        );
         let prepared = prepare_import_files(
             &plan,
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
         assert_eq!(
             gui.import_manager.as_ref().expect("manager").stage,
             ImportUiStage::Completed
@@ -14712,20 +15047,24 @@ mod tests {
                 existing_album_ids: Vec::new(),
                 target_album: Some(stale_target),
                 generation: gui.controller.generation(),
+                library_session: gui.controller.library_session(),
             },
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
         send(
             &mut gui,
-            Message::ImportPlanReady(Box::new(stale_plan.clone())),
+            Message::ImportPlanReady(0, Box::new(stale_plan.clone())),
         );
         let stale_prepared = prepare_import_files(
             &stale_plan,
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(Box::new(stale_prepared)));
+        send(
+            &mut gui,
+            Message::ImportPrepared(0, Box::new(stale_prepared)),
+        );
         assert!(
             gui.controller.album_tracks(album).len() == 2,
             "stale import must not append"
@@ -14824,7 +15163,7 @@ mod tests {
             .to_path_buf();
 
         send(&mut gui, Message::EditTrack(id));
-        send(&mut gui, Message::EditorReplacementPicked(Ok(None)));
+        send(&mut gui, Message::EditorReplacementPicked(0, Ok(None)));
         assert!(gui.track_editor.as_ref().is_some_and(
             |editor| editor.replacement_source.is_empty() && editor.replacement_plan.is_none()
         ));
@@ -14832,7 +15171,7 @@ mod tests {
         std::fs::write(&invalid_replacement, b"invalid").expect("invalid replacement");
         send(
             &mut gui,
-            Message::EditorReplacementPicked(Ok(Some(vec![invalid_replacement]))),
+            Message::EditorReplacementPicked(0, Ok(Some(vec![invalid_replacement]))),
         );
         send(&mut gui, Message::EditorPlanReplacement);
         assert!(
@@ -14846,7 +15185,7 @@ mod tests {
         std::fs::write(&replacement, &replacement_bytes).expect("replacement");
         send(
             &mut gui,
-            Message::EditorReplacementPicked(Ok(Some(vec![replacement.clone()]))),
+            Message::EditorReplacementPicked(0, Ok(Some(vec![replacement.clone()]))),
         );
         assert!(
             gui.track_editor
@@ -14871,13 +15210,13 @@ mod tests {
         let album = gui.controller.track_album_id(id).expect("album");
         gui.view = LibraryView::Albums;
         gui.selected_group = Some(album_key_for_title(album, "Album"));
-        send(&mut gui, Message::AlbumCoverPicked(Ok(None)));
+        send(&mut gui, Message::AlbumCoverPicked(0, Ok(None)));
         assert!(gui.controller.album(album).expect("album").cover.is_none());
         let invalid = dir.path().join("cover.txt");
         std::fs::write(&invalid, b"not an image").expect("invalid cover");
         send(
             &mut gui,
-            Message::AlbumCoverPicked(Ok(Some(vec![invalid.display().to_string().into()]))),
+            Message::AlbumCoverPicked(0, Ok(Some(vec![invalid.display().to_string().into()]))),
         );
         send(&mut gui, Message::AlbumCoverApply);
         assert!(gui.controller.album(album).expect("album").cover.is_none());
@@ -14885,7 +15224,7 @@ mod tests {
         write_test_png(&cover, 64, 64);
         send(
             &mut gui,
-            Message::AlbumCoverPicked(Ok(Some(vec![cover.clone()]))),
+            Message::AlbumCoverPicked(0, Ok(Some(vec![cover.clone()]))),
         );
         send(&mut gui, Message::AlbumCoverApply);
         assert_eq!(
@@ -15878,7 +16217,7 @@ mod tests {
         std::fs::write(&import_path, "[00:01.000]Café\n[00:02.000]second\n").expect("import file");
         send(
             &mut gui,
-            Message::LyricsImportPicked(Ok(Some(vec![import_path.clone()]))),
+            Message::LyricsImportPicked(0, Ok(Some(vec![import_path.clone()]))),
         );
         assert!(gui.lyrics_import.is_some());
         assert!(
@@ -15927,7 +16266,7 @@ mod tests {
         std::fs::write(&second_import, "new plain").expect("second import");
         send(
             &mut gui,
-            Message::LyricsImportPicked(Ok(Some(vec![second_import]))),
+            Message::LyricsImportPicked(0, Ok(Some(vec![second_import]))),
         );
         send(&mut gui, Message::LyricsImportConfirm);
         assert!(gui.lyrics_import.is_some());
@@ -15940,7 +16279,7 @@ mod tests {
         std::fs::write(&invalid, "[00:99.00]bad").expect("invalid");
         send(
             &mut gui,
-            Message::LyricsImportPicked(Ok(Some(vec![invalid]))),
+            Message::LyricsImportPicked(0, Ok(Some(vec![invalid]))),
         );
         assert!(
             gui.lyrics_import

@@ -899,11 +899,16 @@ impl Tui {
     fn after_switch(&mut self) {
         self.cursor = 0;
         self.offset = 0;
+        self.mode = Mode::Normal;
+        self.input.clear();
         self.search.clear();
         self.pending_plan = None;
         self.migrated_dest = None;
         self.lifecycle_msg = None;
         self.last_reconcile = None;
+        self.lyrics_lines.clear();
+        self.lyrics_scroll = 0;
+        self.lyrics_title.clear();
     }
 
     /// After next/previous, put the cursor on the player's selection.
@@ -1543,11 +1548,24 @@ mod tests {
         assert_eq!(tui.controller.storage_mode(), StorageMode::Legacy);
         assert!(!root.join(".flux").exists());
 
-        // Full flow: C, type folder, Enter → created + switched.
+        // Full flow: C, type folder, Enter → created + switched. State tied
+        // to the old library is cleared, while the global filter survives.
+        let old_session = tui.controller.library_session();
+        tui.search = "old library".to_owned();
+        tui.input = "stale input".to_owned();
+        tui.lyrics_lines = vec!["old lyric".to_owned()];
+        tui.lyrics_title = "old title".to_owned();
+        tui.favorites_only = true;
         key(&mut tui, KeyCode::Char('C'));
         type_path(&mut tui, &root);
         assert_eq!(tui.mode, Mode::Normal);
         assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
+        assert_ne!(tui.controller.library_session(), old_session);
+        assert!(tui.search.is_empty());
+        assert!(tui.input.is_empty());
+        assert!(tui.lyrics_lines.is_empty());
+        assert!(tui.lyrics_title.is_empty());
+        assert!(tui.favorites_only);
         assert!(
             root.join("catalog.flux").exists(),
             "canonical catalogue created"
