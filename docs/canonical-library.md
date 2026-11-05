@@ -68,7 +68,15 @@ counters and are never reused.
 - `library.flux` identifies the library, schema version and catalogue file.
 - `catalog.flux` is authoritative for entity existence, ownership, album
   membership, canonical paths, counters, generation and the committed
-  transaction ID. It is published last and is the commit record.
+  transaction ID. It is published last and is the commit record. Every
+  catalogue-affecting transaction—including metadata-only artist, album, track,
+  cover and rating changes—publishes `catalog.flux` with the next generation and
+  its transaction ID, so the same recovery decision applies to all writes.
+- `next_track_id`, `next_artist_id`, `next_album_id` and `next_playlist_id` must
+  each be greater than the maximum ID present in their namespace. A counter at
+  `u64::MAX`, or any counter that would reuse a loaded ID, is rejected at open
+  before allocation. Valid retired-ID gaps remain legal; the counter only has to
+  exceed the largest live ID.
 - `artist.flux`, `album.flux`, `track.flux`, playlist files and `ratings.flux`
   are authoritative for their metadata. Redundant owner/album/credit values are
   validated against the catalogue; the catalogue wins for relationships and
@@ -1262,7 +1270,7 @@ Ownership transfer uses the canonical batch journal. The persisted states are:
 | `copying` | Destination resources are being staged inside the transaction directory. | Uncommitted: roll back; staging is discarded. |
 | `verified` | All staged copies passed size/content verification. | Uncommitted: roll back. |
 | `publishing` | Staged resources may be replacing entity files; catalogue is not yet authoritative. | Uncommitted unless the catalogue records this transaction ID: roll back. |
-| `committed` | The catalogue was atomically published and records this transaction ID. | Finish cleanup only if the catalogue records the ID; otherwise recovery-required. |
+| `committed` | The catalogue was atomically published and records this transaction ID. | Finish cleanup only if the catalogue records the ID. Legacy metadata-only journals from older builds may be completed when their `intended_generation` equals the active generation and their state is committed/cleaning/completed. |
 | `cleaning` | Obsolete source resources are being removed. | Same catalogue-ID check, then finish cleanup idempotently. |
 | `completed` | Cleanup finished; only journal removal remains. | Same catalogue-ID check, then finish cleanup/remove journal. |
 | `rolled_back` | Reserved for an explicitly recorded rollback. | Treated as uncommitted; rollback is idempotent and the journal is only then removed. |
@@ -1278,7 +1286,10 @@ valuable files.
 ### Persistence sequence
 
 1. Create `transactions/<txn>/`, synchronize the transactions directory, back up
-   every replaced target, and synchronize the transaction directory.
+   every replaced target, and synchronize the transaction directory. If setup
+   fails before a journal exists, remove only that newly created transaction
+   directory and report any cleanup failure together with the original error.
+   A partially or fully published journal is preserved as a recovery authority.
 2. Write `journal.flux` with `prepared`, using a synced temporary file, rename,
    and parent-directory sync.
 3. Stage every byte payload and audio/lyrics copy inside the transaction
@@ -1330,7 +1341,12 @@ Dedicated child test processes abort without unwinding at:
 - after metadata/resource publication before catalogue publication,
 - immediately after catalogue publication,
 - during post-commit cleanup,
+- before metadata-only journal finalization,
 - during recovery cleanup.
+
+Metadata-only transactions are additionally exercised across every journal
+stage, including committed and cleaning states, and verify that the catalogue
+records the transaction ID and advances exactly one generation.
 
 The parent reopens the same disposable library, verifies old/new authority,
 audio and lyrics bytes, TrackId/credits/ratings/playlists, then reopens again to
@@ -1341,10 +1357,12 @@ resumes it; journal and file remain until the successful retry.
 
 Test-only, deterministic boundaries are injected through a scoped
 `TransactionFailure` value; production has no user-facing control. The transfer
-matrix exercises all 18 points below with an abrupt interruption, then drops the
-library, reopens/recoveries twice, and checks the old-or-new authority, exact
+matrix exercises all 18 core points below with an abrupt interruption, then drops
+the library, reopens/recoveries twice, and checks the old-or-new authority, exact
 audio/lyrics bytes, owner, album, credits, ratings, playlists, TrackId and one
-physical audio copy:
+physical audio copy. Metadata-only tests additionally inject failure after the
+transaction directory is created, after backups are complete, and immediately
+before journal publication:
 
 1. before journal creation;
 2. after durable journal preparation;
@@ -1376,6 +1394,10 @@ directories after critical renames on Unix. It cannot promise stronger
 power-loss guarantees than the filesystem/device cache honors, nor atomic
 multi-file visibility across independent renames. The catalogue is the sole
 commit record, so those renames are reconciled by journal rollback/cleanup.
+In-process setup errors before journal publication remove only the current
+incomplete transaction directory. An abrupt process termination in that same
+pre-journal window can still leave a journal-less directory; it is preserved as
+ambiguous and requires explicit inspection rather than guessed deletion.
 Unsupported or read-only storage fails visibly; no automatic repair is attempted
 for a malformed journal. Catalog-only backup restoration remains disabled because
 it is not generation-consistent with per-entity files.

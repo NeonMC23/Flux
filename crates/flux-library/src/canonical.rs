@@ -35,9 +35,12 @@
 //! New canonical libraries are written through a transaction journal. A batch
 //! writes its journal first, installs files with same-directory temporary
 //! files and atomic renames, publishes `catalog.flux` last, marks the journal
-//! committed, and only then deletes its backups. Startup recovery either
-//! completes cleanup for a committed catalogue or restores the pre-batch
-//! bytes and removes files created by an uncommitted batch.
+//! committed, and only then deletes its backups. Metadata-only changes publish
+//! the catalogue too, so generation and transaction identity are durable for
+//! every catalogue-affecting write. Startup recovery either completes cleanup
+//! for a committed catalogue or restores the pre-batch bytes and removes files
+//! created by an uncommitted batch. Setup errors before journal publication
+//! remove only the current transaction directory.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -378,6 +381,12 @@ pub struct TrackRating {
 pub enum TransactionFailPoint {
     /// Before the transaction directory/journal exists.
     BeforeJournal,
+    /// Immediately after the current transaction directory is created.
+    AfterTransactionDirectory,
+    /// Immediately after all prior target files are backed up.
+    AfterBackups,
+    /// Immediately before the prepared journal is written.
+    BeforeJournalWrite,
     /// Immediately after the prepared journal is durably written.
     AfterJournal,
     /// Before staging an audio/metadata resource.
@@ -1219,6 +1228,30 @@ impl CanonicalLibrary {
                 "catalogue contains duplicate entity IDs".to_owned(),
             ));
         }
+        validate_next_counter(
+            "next_artist_id",
+            catalog.next_artist_id,
+            artist_paths.keys().map(|id| id.get()).max(),
+            "artist",
+        )?;
+        validate_next_counter(
+            "next_album_id",
+            catalog.next_album_id,
+            album_paths.keys().map(|id| id.get()).max(),
+            "album",
+        )?;
+        validate_next_counter(
+            "next_track_id",
+            catalog.next_track_id,
+            track_paths.keys().map(|id| id.get()).max(),
+            "track",
+        )?;
+        validate_next_counter(
+            "next_playlist_id",
+            catalog.next_playlist_id,
+            playlist_paths.keys().map(|id| id.get()).max(),
+            "playlist",
+        )?;
 
         let mut artists = BTreeMap::new();
         for (id, rel) in &artist_paths {
@@ -1574,6 +1607,40 @@ fn validate_catalog_header(catalog: &CatalogDto) -> Result<(), CanonicalError> {
 
 // ------------------------------------------------------- file writing ---
 
+fn validate_next_counter(
+    counter_name: &str,
+    next: u64,
+    max_existing: Option<u64>,
+    entity_name: &str,
+) -> Result<(), CanonicalError> {
+    if next == u64::MAX {
+        return Err(CanonicalError::Invalid(format!(
+            "{counter_name} is u64::MAX and leaves no room for a safe allocation"
+        )));
+    }
+    if let Some(max_existing) = max_existing
+        && next <= max_existing
+    {
+        return Err(CanonicalError::Invalid(format!(
+            "{counter_name} {next} is not greater than existing maximum {entity_name} ID {max_existing}; \
+             refusing to reuse an existing ID or managed path"
+        )));
+    }
+    Ok(())
+}
+
+fn advance_counter(counter: u64, entity_name: &str) -> Result<u64, CanonicalError> {
+    let next = counter
+        .checked_add(1)
+        .ok_or_else(|| CanonicalError::Invalid(format!("{entity_name} counter overflow")))?;
+    if next == u64::MAX {
+        return Err(CanonicalError::Invalid(format!(
+            "{entity_name} ID counter is exhausted before u64::MAX; refusing to create a counter state that cannot be reopened safely"
+        )));
+    }
+    Ok(next)
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CanonicalError> {
     let parent = path
         .parent()
@@ -1763,6 +1830,17 @@ fn recover_transactions(
             journal.state,
             JournalState::Committed | JournalState::Cleaning | JournalState::Completed
         ) {
+            // Older builds did not update catalog.flux for metadata-only
+            // commits. Such a journal used the current catalogue generation
+            // as its intended generation and never wrote a transaction ID.
+            // Its committed/cleaning/completed state means all metadata files
+            // were already published, so finish only its journal-owned cleanup.
+            if journal.operation == "metadata-write" && journal.intended_generation == generation {
+                cleanup_committed_paths(root, &journal)?;
+                let _ = fs::remove_dir_all(entry.path());
+                let _ = sync_directory(&dir);
+                continue;
+            }
             return Err(CanonicalError::Transaction {
                 file: name,
                 message: "journal claims a committed state but the active catalogue does not record this transaction; preserving all files for recovery"
@@ -1914,10 +1992,7 @@ fn resolve_import_artists(
                     *id
                 } else {
                     let id = ArtistId::new(catalog.next_artist_id);
-                    catalog.next_artist_id =
-                        catalog.next_artist_id.checked_add(1).ok_or_else(|| {
-                            CanonicalError::Invalid("artist counter overflow".to_owned())
-                        })?;
+                    catalog.next_artist_id = advance_counter(catalog.next_artist_id, "artist")?;
                     let rel = artist_rel(id);
                     catalog.artists.push(CatalogArtistDto {
                         id: id.get(),
@@ -2314,6 +2389,9 @@ struct PendingWrite {
 fn fail_point_name(point: TransactionFailPoint) -> &'static str {
     match point {
         TransactionFailPoint::BeforeJournal => "before-journal",
+        TransactionFailPoint::AfterTransactionDirectory => "after-transaction-directory",
+        TransactionFailPoint::AfterBackups => "after-backups",
+        TransactionFailPoint::BeforeJournalWrite => "before-journal-write",
         TransactionFailPoint::AfterJournal => "after-journal",
         TransactionFailPoint::BeforeStaging => "before-staging",
         TransactionFailPoint::DuringCopy => "during-copy",
@@ -2513,6 +2591,61 @@ impl CanonicalLibrary {
             .is_some_and(|failure| failure.point == point && failure.interrupt)
     }
 
+    fn create_transaction_directory(&self) -> Result<(String, PathBuf), CanonicalError> {
+        let transactions = self.root.join(TRANSACTIONS_DIR_NAME);
+        fs::create_dir_all(&transactions)?;
+        for _ in 0..128 {
+            let transaction_id = Self::next_transaction_id();
+            if self.catalog.transaction_id.as_deref() == Some(transaction_id.as_str()) {
+                continue;
+            }
+            let rel = transaction_rel(&transaction_id);
+            let dir = safe_join(&self.root, &rel)?;
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok((transaction_id, dir)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(CanonicalError::Invalid(
+            "could not allocate a unique transaction ID".to_owned(),
+        ))
+    }
+
+    fn cleanup_incomplete_transaction_setup(
+        &self,
+        txn_dir: &Path,
+        transaction_id: &str,
+        original: CanonicalError,
+    ) -> CanonicalError {
+        // A journal, even one whose durability sync reported an error, is a
+        // recovery authority. Never delete it based on an ambiguous setup
+        // failure.
+        if txn_dir.join("journal.flux").exists() {
+            return original;
+        }
+        let cleanup = (|| -> Result<(), CanonicalError> {
+            match fs::remove_dir_all(txn_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            sync_directory(&self.root.join(TRANSACTIONS_DIR_NAME))?;
+            Ok(())
+        })();
+        match cleanup {
+            Ok(()) => original,
+            Err(cleanup_error) => CanonicalError::Transaction {
+                file: transaction_id.to_owned(),
+                message: format!(
+                    "transaction setup failed before journal publication: {original}; \
+                     cleanup of the incomplete transaction directory {} failed: {cleanup_error}",
+                    txn_dir.display()
+                ),
+            },
+        }
+    }
+
     fn commit_writes(
         &mut self,
         new_catalog: Option<CatalogDto>,
@@ -2545,52 +2678,66 @@ impl CanonicalLibrary {
     ) -> Result<(), CanonicalError> {
         self.maybe_fail(TransactionFailPoint::BeforeJournal)?;
         self.ensure_no_pending_transactions()?;
-        let transaction_id = Self::next_transaction_id();
-        let txn_rel = transaction_rel(&transaction_id);
-        let txn_dir = safe_join(&self.root, &txn_rel)?;
-        fs::create_dir_all(&txn_dir)?;
-        sync_directory(&self.root.join(TRANSACTIONS_DIR_NAME))?;
-
-        let mut actions = Vec::with_capacity(writes.len());
-        for (index, write) in writes.iter().enumerate() {
-            reject_symlink_escape(&self.root, &write.target)?;
-            let target = safe_join(&self.root, &write.target)?;
-            let existed = target.exists();
-            let backup = if existed {
-                let name = format!("backup-{index}");
-                let backup_path = txn_dir.join(&name);
-                fs::copy(&target, &backup_path)?;
-                fs::File::open(&backup_path)?.sync_all()?;
-                Some(name)
-            } else {
-                None
-            };
-            actions.push(JournalActionDto {
-                target: write.target.display_lossy(),
-                existed,
-                backup,
-                staged_source: Some(format!("staging-{index}")),
-            });
-        }
-        sync_directory(&txn_dir)?;
-        let intended_generation = new_catalog
-            .as_ref()
-            .map_or(self.catalog.generation, |catalog| catalog.generation);
-        let mut journal = JournalDto {
-            schema_version: CANONICAL_SCHEMA_VERSION,
-            kind: JOURNAL_KIND.to_owned(),
-            transaction_id: transaction_id.clone(),
-            operation: if new_catalog.is_some() {
-                "catalogue-write".to_owned()
-            } else {
-                "metadata-write".to_owned()
-            },
-            state: JournalState::Prepared,
-            intended_generation,
-            actions,
-            cleanup: cleanup.iter().map(RelPath::display_lossy).collect(),
+        let next_generation =
+            self.catalog.generation.checked_add(1).ok_or_else(|| {
+                CanonicalError::Invalid("catalogue generation overflow".to_owned())
+            })?;
+        let operation = if new_catalog.is_some() {
+            "catalogue-write"
+        } else {
+            "metadata-write"
         };
-        write_journal(&self.root, &journal)?;
+        let (transaction_id, txn_dir) = self.create_transaction_directory()?;
+        let setup_result = (|| -> Result<JournalDto, CanonicalError> {
+            sync_directory(&self.root.join(TRANSACTIONS_DIR_NAME))?;
+            self.maybe_fail(TransactionFailPoint::AfterTransactionDirectory)?;
+            let mut actions = Vec::with_capacity(writes.len());
+            for (index, write) in writes.iter().enumerate() {
+                reject_symlink_escape(&self.root, &write.target)?;
+                let target = safe_join(&self.root, &write.target)?;
+                let existed = target.exists();
+                let backup = if existed {
+                    let name = format!("backup-{index}");
+                    let backup_path = txn_dir.join(&name);
+                    fs::copy(&target, &backup_path)?;
+                    fs::File::open(&backup_path)?.sync_all()?;
+                    Some(name)
+                } else {
+                    None
+                };
+                actions.push(JournalActionDto {
+                    target: write.target.display_lossy(),
+                    existed,
+                    backup,
+                    staged_source: Some(format!("staging-{index}")),
+                });
+            }
+            sync_directory(&txn_dir)?;
+            self.maybe_fail(TransactionFailPoint::AfterBackups)?;
+            let journal = JournalDto {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                kind: JOURNAL_KIND.to_owned(),
+                transaction_id: transaction_id.clone(),
+                operation: operation.to_owned(),
+                state: JournalState::Prepared,
+                intended_generation: next_generation,
+                actions,
+                cleanup: cleanup.iter().map(RelPath::display_lossy).collect(),
+            };
+            self.maybe_fail(TransactionFailPoint::BeforeJournalWrite)?;
+            write_journal(&self.root, &journal)?;
+            Ok(journal)
+        })();
+        let mut journal = match setup_result {
+            Ok(journal) => journal,
+            Err(err) => {
+                return Err(self.cleanup_incomplete_transaction_setup(
+                    &txn_dir,
+                    &transaction_id,
+                    err,
+                ));
+            }
+        };
         self.maybe_fail(TransactionFailPoint::AfterJournal)?;
 
         let mut interrupted = false;
@@ -2679,26 +2826,22 @@ impl CanonicalLibrary {
                 self.maybe_fail(TransactionFailPoint::DuringMetadataPublish)?;
             }
             self.maybe_fail(TransactionFailPoint::BeforeCatalogPublish)?;
-            if let Some(mut catalog) = new_catalog {
-                catalog.generation = self.catalog.generation.checked_add(1).ok_or_else(|| {
-                    CanonicalError::Invalid("catalogue generation overflow".to_owned())
-                })?;
-                catalog.transaction_id = Some(transaction_id.clone());
-                let catalog_path = self.root.join(CATALOG_FILE_NAME);
-                if catalog_path.exists() {
-                    let prior = fs::read(&catalog_path)?;
-                    let backup_name = format!("catalog-gen-{}.flux", self.catalog.generation);
-                    write_atomic(&self.root.join(BACKUPS_DIR_NAME).join(backup_name), &prior)?;
-                    write_atomic(&self.root.join(CATALOG_BACKUP_FILE_NAME), &prior)?;
-                }
-                let bytes = serde_json::to_vec_pretty(&catalog).map_err(|err| {
-                    CanonicalError::Malformed {
-                        file: CATALOG_FILE_NAME.to_owned(),
-                        message: err.to_string(),
-                    }
-                })?;
-                write_atomic(&catalog_path, &bytes)?;
+            let mut catalog = new_catalog.unwrap_or_else(|| self.catalog.clone());
+            catalog.generation = next_generation;
+            catalog.transaction_id = Some(transaction_id.clone());
+            let catalog_path = self.root.join(CATALOG_FILE_NAME);
+            if catalog_path.exists() {
+                let prior = fs::read(&catalog_path)?;
+                let backup_name = format!("catalog-gen-{}.flux", self.catalog.generation);
+                write_atomic(&self.root.join(BACKUPS_DIR_NAME).join(backup_name), &prior)?;
+                write_atomic(&self.root.join(CATALOG_BACKUP_FILE_NAME), &prior)?;
             }
+            let bytes =
+                serde_json::to_vec_pretty(&catalog).map_err(|err| CanonicalError::Malformed {
+                    file: CATALOG_FILE_NAME.to_owned(),
+                    message: err.to_string(),
+                })?;
+            write_atomic(&catalog_path, &bytes)?;
             self.maybe_fail(TransactionFailPoint::AfterCatalogPublish)?;
             journal.state = JournalState::Committed;
             write_journal(&self.root, &journal)?;
@@ -2785,10 +2928,7 @@ impl CanonicalLibrary {
                 .collect(),
         };
         let mut catalog = self.catalog.clone();
-        catalog.next_artist_id = catalog
-            .next_artist_id
-            .checked_add(1)
-            .ok_or_else(|| CanonicalError::Invalid("artist counter overflow".to_owned()))?;
+        catalog.next_artist_id = advance_counter(catalog.next_artist_id, "artist")?;
         catalog.artists.push(CatalogArtistDto {
             id: id.get(),
             path: rel.display_lossy(),
@@ -2870,10 +3010,7 @@ impl CanonicalLibrary {
             track_order: Vec::new(),
         };
         let mut catalog = self.catalog.clone();
-        catalog.next_album_id = catalog
-            .next_album_id
-            .checked_add(1)
-            .ok_or_else(|| CanonicalError::Invalid("album counter overflow".to_owned()))?;
+        catalog.next_album_id = advance_counter(catalog.next_album_id, "album")?;
         catalog.albums.push(CatalogAlbumDto {
             id: id.get(),
             artist_id: owner.get(),
@@ -3010,10 +3147,7 @@ impl CanonicalLibrary {
                         existing.id
                     } else {
                         let id = AlbumId::new(catalog.next_album_id);
-                        catalog.next_album_id =
-                            catalog.next_album_id.checked_add(1).ok_or_else(|| {
-                                CanonicalError::Invalid("album counter overflow".to_owned())
-                            })?;
+                        catalog.next_album_id = advance_counter(catalog.next_album_id, "album")?;
                         let rel = album_rel(owner, id);
                         catalog.albums.push(CatalogAlbumDto {
                             id: id.get(),
@@ -3040,10 +3174,7 @@ impl CanonicalLibrary {
                 CanonicalError::Invalid("import destination album disappeared".to_owned())
             })?;
             let track_id = TrackId::new(catalog.next_track_id);
-            catalog.next_track_id = catalog
-                .next_track_id
-                .checked_add(1)
-                .ok_or_else(|| CanonicalError::Invalid("track counter overflow".to_owned()))?;
+            catalog.next_track_id = advance_counter(catalog.next_track_id, "track")?;
             let audio = track_audio_rel(owner, album_id, track_id, &extension);
             let record = track_record_rel(owner, album_id, track_id);
             if safe_join(&self.root, &audio)?.exists() || safe_join(&self.root, &record)?.exists() {
@@ -3262,10 +3393,7 @@ impl CanonicalLibrary {
                 ));
             }
             let track_id = TrackId::new(catalog.next_track_id);
-            catalog.next_track_id = catalog
-                .next_track_id
-                .checked_add(1)
-                .ok_or_else(|| CanonicalError::Invalid("track counter overflow".to_owned()))?;
+            catalog.next_track_id = advance_counter(catalog.next_track_id, "track")?;
             let audio =
                 track_audio_rel(album.owner_artist_id, target.album_id, track_id, &extension);
             let record = track_record_rel(album.owner_artist_id, target.album_id, track_id);
@@ -3372,10 +3500,7 @@ impl CanonicalLibrary {
         } else {
             {
                 let id = ArtistId::new(catalog.next_artist_id);
-                catalog.next_artist_id = catalog
-                    .next_artist_id
-                    .checked_add(1)
-                    .ok_or_else(|| CanonicalError::Invalid("artist counter overflow".to_owned()))?;
+                catalog.next_artist_id = advance_counter(catalog.next_artist_id, "artist")?;
                 let rel = artist_rel(id);
                 catalog.artists.push(CatalogArtistDto {
                     id: id.get(),
@@ -3431,10 +3556,7 @@ impl CanonicalLibrary {
             ),
             None => {
                 let id = AlbumId::new(catalog.next_album_id);
-                catalog.next_album_id = catalog
-                    .next_album_id
-                    .checked_add(1)
-                    .ok_or_else(|| CanonicalError::Invalid("album counter overflow".to_owned()))?;
+                catalog.next_album_id = advance_counter(catalog.next_album_id, "album")?;
                 let rel = album_rel(artist_id, id);
                 catalog.albums.push(CatalogAlbumDto {
                     id: id.get(),
@@ -3457,10 +3579,7 @@ impl CanonicalLibrary {
         };
 
         let track_id = TrackId::new(catalog.next_track_id);
-        catalog.next_track_id = catalog
-            .next_track_id
-            .checked_add(1)
-            .ok_or_else(|| CanonicalError::Invalid("track counter overflow".to_owned()))?;
+        catalog.next_track_id = advance_counter(catalog.next_track_id, "track")?;
         let audio_rel = track_audio_rel(artist_id, album_id, track_id, &extension);
         let record_rel = track_record_rel(artist_id, album_id, track_id);
         catalog.tracks.push(CatalogTrackDto {
@@ -4382,10 +4501,7 @@ impl CanonicalLibrary {
                     "new playlist ID does not match the counter".to_owned(),
                 ));
             }
-            catalog.next_playlist_id = catalog
-                .next_playlist_id
-                .checked_add(1)
-                .ok_or_else(|| CanonicalError::Invalid("playlist counter overflow".to_owned()))?;
+            catalog.next_playlist_id = advance_counter(catalog.next_playlist_id, "playlist")?;
             catalog.playlists.push(CatalogPlaylistDto {
                 id: id.get(),
                 path: rel.display_lossy(),
@@ -4578,7 +4694,10 @@ mod tests {
     use flux_core::{ArtistId, TrackId};
 
     use super::{
-        CanonicalError, CanonicalImportedTrack, CanonicalLibrary, ContentFingerprint, ReleaseType,
+        AlbumId, CATALOG_FILE_NAME, CanonicalError, CanonicalImportAlbumRef,
+        CanonicalImportArtistRef, CanonicalImportTrackRequest, CanonicalImportedTrack,
+        CanonicalLibrary, ContentFingerprint, ReleaseType, TRANSACTIONS_DIR_NAME,
+        TransactionFailPoint, TransactionFailure,
     };
 
     struct TempDir(PathBuf);
@@ -4630,6 +4749,557 @@ mod tests {
                 duration_ms: Some(123_000),
             })
             .expect("import")
+    }
+
+    fn metadata_fixture(
+        name: &str,
+    ) -> (
+        TempDir,
+        PathBuf,
+        CanonicalLibrary,
+        ArtistId,
+        AlbumId,
+        TrackId,
+    ) {
+        let dir = TempDir::new(name);
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let track = import(&dir, &mut library, "one.wav");
+        let track_ref = library.track(track).expect("track");
+        let artist = track_ref.owner_artist_id;
+        let album = track_ref.album_id;
+        (dir, root, library, artist, album, track)
+    }
+
+    fn transaction_directory_count(root: &Path) -> usize {
+        let dir = root.join(TRANSACTIONS_DIR_NAME);
+        fs::read_dir(dir)
+            .expect("transactions directory")
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count()
+    }
+
+    fn rewrite_catalog(root: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
+        let path = root.join(CATALOG_FILE_NAME);
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("catalog")).expect("catalog json");
+        mutate(&mut catalog);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&catalog).expect("catalog bytes"),
+        )
+        .expect("write catalog");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MetadataStageOutcome {
+        SetupFailed,
+        RolledBack,
+        Committed,
+    }
+
+    #[test]
+    fn metadata_only_transactions_recover_at_every_journal_stage() {
+        use MetadataStageOutcome::{Committed, RolledBack, SetupFailed};
+
+        let cases = [
+            (TransactionFailPoint::BeforeJournal, SetupFailed),
+            (TransactionFailPoint::AfterTransactionDirectory, SetupFailed),
+            (TransactionFailPoint::AfterBackups, SetupFailed),
+            (TransactionFailPoint::BeforeJournalWrite, SetupFailed),
+            (TransactionFailPoint::AfterJournal, RolledBack),
+            (TransactionFailPoint::BeforeStaging, RolledBack),
+            (TransactionFailPoint::DuringCopy, RolledBack),
+            (TransactionFailPoint::AfterCopyBeforeVerify, RolledBack),
+            (TransactionFailPoint::AfterVerify, RolledBack),
+            (TransactionFailPoint::BeforeMetadataPublish, RolledBack),
+            (TransactionFailPoint::DuringMetadataPublish, RolledBack),
+            (TransactionFailPoint::BeforeCatalogPublish, RolledBack),
+            (TransactionFailPoint::AfterCatalogPublish, Committed),
+            (TransactionFailPoint::BeforeCleanup, Committed),
+            (TransactionFailPoint::AfterCleanup, Committed),
+            (TransactionFailPoint::BeforeJournalFinalize, Committed),
+        ];
+        for (point, outcome) in cases {
+            let (_dir, root, mut library, artist, _album, _track) =
+                metadata_fixture(&format!("metadata-stage-{point:?}"));
+            let generation = library.generation();
+            let prior_transaction = library.catalog.transaction_id.clone();
+            library.set_transaction_failure(Some(TransactionFailure {
+                point,
+                interrupt: true,
+                abort: false,
+            }));
+            let error = library
+                .rename_artist(artist, "Renamed")
+                .expect_err("failure point must interrupt the metadata transaction");
+            assert!(
+                error.to_string().contains("injected transaction failure"),
+                "{point:?}: {error}"
+            );
+            if matches!(outcome, SetupFailed) {
+                assert_eq!(
+                    transaction_directory_count(&root),
+                    0,
+                    "{point:?}: setup failure left a blocking transaction directory"
+                );
+            }
+            drop(library);
+
+            let reopened = CanonicalLibrary::open(&root)
+                .unwrap_or_else(|err| panic!("{point:?}: recovery failed: {err}"));
+            let expected_name = if matches!(outcome, Committed) {
+                "Renamed"
+            } else {
+                "Artist One"
+            };
+            assert_eq!(
+                reopened.artist(artist).map(|value| value.name.as_str()),
+                Some(expected_name),
+                "{point:?}: metadata was neither fully committed nor fully rolled back"
+            );
+            assert_eq!(
+                reopened.generation(),
+                if matches!(outcome, Committed) {
+                    generation + 1
+                } else {
+                    generation
+                },
+                "{point:?}: catalogue generation did not follow the commit point"
+            );
+            if matches!(outcome, Committed) {
+                assert!(
+                    reopened.catalog.transaction_id.is_some()
+                        && reopened.catalog.transaction_id != prior_transaction,
+                    "{point:?}: committed metadata transaction was not recorded in the catalogue"
+                );
+            } else {
+                assert_eq!(
+                    reopened.catalog.transaction_id, prior_transaction,
+                    "{point:?}: rolled-back metadata transaction replaced the catalogue commit identity"
+                );
+            }
+            assert_eq!(
+                transaction_directory_count(&root),
+                0,
+                "{point:?}: transaction directory was not finalized"
+            );
+            drop(reopened);
+            assert!(
+                CanonicalLibrary::open(&root).is_ok(),
+                "{point:?}: second recovery was not idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_only_cleanup_stage_recovers_and_advances_generation() {
+        let (dir, root, mut library, _artist, album, _track) =
+            metadata_fixture("metadata-cleanup-stage");
+        let first = dir.write("cover-one.png", b"first cover");
+        library
+            .set_cover(album, &first, "png")
+            .expect("first cover");
+        let generation = library.generation();
+        let second = dir.write("cover-two.jpg", b"second cover");
+        library.set_transaction_failure(Some(TransactionFailure {
+            point: TransactionFailPoint::DuringCleanup,
+            interrupt: true,
+            abort: false,
+        }));
+        library
+            .set_cover(album, &second, "jpg")
+            .expect_err("cleanup failure must interrupt the metadata transaction");
+        drop(library);
+
+        let reopened = CanonicalLibrary::open(&root).expect("cleanup recovery");
+        assert_eq!(
+            reopened.album(album).and_then(|album| album.cover.clone()),
+            Some("cover.jpg".to_owned())
+        );
+        assert_eq!(reopened.generation(), generation + 1);
+        let old_cover = root.join("artists/artist_000001/albums/album_000001/cover.png");
+        assert!(!old_cover.exists(), "old cover was not cleaned up");
+        assert_eq!(transaction_directory_count(&root), 0);
+        drop(reopened);
+        assert!(CanonicalLibrary::open(&root).is_ok());
+    }
+
+    #[test]
+    fn setup_failures_remove_only_the_current_transaction_directory() {
+        for point in [
+            TransactionFailPoint::BeforeJournal,
+            TransactionFailPoint::AfterTransactionDirectory,
+            TransactionFailPoint::AfterBackups,
+            TransactionFailPoint::BeforeJournalWrite,
+        ] {
+            let (_dir, root, mut library, artist, _album, _track) =
+                metadata_fixture(&format!("metadata-setup-{point:?}"));
+            let marker = root.join(TRANSACTIONS_DIR_NAME).join("unrelated.keep");
+            fs::write(&marker, b"keep").expect("marker");
+            let backup_marker = root.join("backups").join("unrelated.keep");
+            fs::write(&backup_marker, b"keep").expect("backup marker");
+            let catalog_before = fs::read(root.join(CATALOG_FILE_NAME)).expect("catalog");
+            let generation = library.generation();
+
+            library.set_transaction_failure(Some(TransactionFailure {
+                point,
+                interrupt: true,
+                abort: false,
+            }));
+            let error = library
+                .rename_artist(artist, "Should Not Commit")
+                .expect_err("setup failure must abort the transaction");
+            assert!(
+                error.to_string().contains("injected transaction failure"),
+                "{point:?}: {error}"
+            );
+            assert_eq!(
+                transaction_directory_count(&root),
+                0,
+                "{point:?}: partial transaction directory remained"
+            );
+            assert!(marker.is_file(), "{point:?}: unrelated marker removed");
+            assert!(
+                backup_marker.is_file(),
+                "{point:?}: unrelated backup removed"
+            );
+            assert_eq!(
+                fs::read(root.join(CATALOG_FILE_NAME)).expect("catalog"),
+                catalog_before,
+                "{point:?}: catalogue changed before the journal was durable"
+            );
+            assert_eq!(library.generation(), generation);
+
+            library.set_transaction_failure(None);
+            library
+                .rename_artist(artist, "Committed After Retry")
+                .expect("a later transaction must succeed");
+            assert_eq!(library.generation(), generation + 1);
+            assert!(marker.is_file());
+            assert!(backup_marker.is_file());
+        }
+    }
+
+    #[test]
+    fn setup_cleanup_preserves_a_partially_published_journal() {
+        let (_dir, root, library, _artist, _album, _track) =
+            metadata_fixture("metadata-setup-journal-preserve");
+        let txn = root.join(TRANSACTIONS_DIR_NAME).join("txn-partial-journal");
+        fs::create_dir(&txn).expect("transaction dir");
+        fs::write(txn.join("journal.flux"), br#"{"partial":true}"#).expect("partial journal");
+        let result = library.cleanup_incomplete_transaction_setup(
+            &txn,
+            "txn-partial-journal",
+            CanonicalError::Invalid("simulated setup failure".to_owned()),
+        );
+        assert!(result.to_string().contains("simulated setup failure"));
+        assert!(txn.join("journal.flux").is_file());
+        assert!(
+            txn.is_dir(),
+            "any published journal is preserved for recovery"
+        );
+        fs::remove_dir_all(&txn).expect("remove test transaction");
+    }
+
+    #[test]
+    fn setup_cleanup_removes_only_the_current_transaction_directory() {
+        let (_dir, root, library, _artist, _album, _track) =
+            metadata_fixture("metadata-setup-current-only");
+        let transactions = root.join(TRANSACTIONS_DIR_NAME);
+        let current = transactions.join("txn-current");
+        let other = transactions.join("txn-other");
+        fs::create_dir(&current).expect("current txn");
+        fs::create_dir(&other).expect("other txn");
+        fs::write(current.join("backup-0"), b"current backup").expect("current backup");
+        fs::write(other.join("valuable.bin"), b"other txn data").expect("other data");
+        let result = library.cleanup_incomplete_transaction_setup(
+            &current,
+            "txn-current",
+            CanonicalError::Invalid("simulated setup failure".to_owned()),
+        );
+        assert!(result.to_string().contains("simulated setup failure"));
+        assert!(!current.exists(), "current setup directory was not removed");
+        assert!(other.is_dir(), "another transaction directory was removed");
+        assert_eq!(
+            fs::read(other.join("valuable.bin")).expect("other data"),
+            b"other txn data"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_cleanup_failure_reports_both_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, root, library, _artist, _album, _track) =
+            metadata_fixture("metadata-setup-cleanup-failure");
+        let transactions = root.join(TRANSACTIONS_DIR_NAME);
+        let txn = transactions.join("txn-cleanup-failure");
+        fs::create_dir(&txn).expect("transaction dir");
+        fs::write(txn.join("backup-0"), b"backup").expect("backup");
+        let mode = fs::metadata(&transactions)
+            .expect("transactions metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        fs::set_permissions(&transactions, fs::Permissions::from_mode(0o555))
+            .expect("make transactions read-only");
+        let result = library.cleanup_incomplete_transaction_setup(
+            &txn,
+            "txn-cleanup-failure",
+            CanonicalError::Invalid("simulated setup failure".to_owned()),
+        );
+        fs::set_permissions(&transactions, fs::Permissions::from_mode(mode))
+            .expect("restore transactions permissions");
+        let message = result.to_string();
+        assert!(message.contains("simulated setup failure"), "{message}");
+        assert!(
+            message.contains("cleanup of the incomplete transaction directory"),
+            "{message}"
+        );
+        assert!(
+            txn.is_dir(),
+            "incomplete directory must be preserved on cleanup failure"
+        );
+        fs::remove_dir_all(&txn).expect("remove test transaction");
+    }
+
+    #[test]
+    fn counters_must_not_reuse_ids_and_corruption_fails_before_writing() {
+        #[derive(Clone, Copy, Debug)]
+        enum CounterMutation {
+            ReuseArtist,
+            ReuseAlbum,
+            ReuseTrack,
+            ReusePlaylist,
+            ZeroArtist,
+            MaxTrack,
+            DuplicateArtist,
+        }
+
+        let mutations = [
+            CounterMutation::ReuseArtist,
+            CounterMutation::ReuseAlbum,
+            CounterMutation::ReuseTrack,
+            CounterMutation::ReusePlaylist,
+            CounterMutation::ZeroArtist,
+            CounterMutation::MaxTrack,
+            CounterMutation::DuplicateArtist,
+        ];
+        for mutation in mutations {
+            let (dir, root, mut library, artist, album, track) =
+                metadata_fixture(&format!("counter-{mutation:?}"));
+            let playlist = library
+                .set_playlist(None, "Playlist", vec![track])
+                .expect("playlist");
+            drop(library);
+            rewrite_catalog(&root, |catalog| match mutation {
+                CounterMutation::ReuseArtist => {
+                    catalog["next_artist_id"] = serde_json::json!(artist.get());
+                }
+                CounterMutation::ReuseAlbum => {
+                    catalog["next_album_id"] = serde_json::json!(album.get());
+                }
+                CounterMutation::ReuseTrack => {
+                    catalog["next_track_id"] = serde_json::json!(track.get());
+                }
+                CounterMutation::ReusePlaylist => {
+                    catalog["next_playlist_id"] = serde_json::json!(playlist.get());
+                }
+                CounterMutation::ZeroArtist => {
+                    catalog["next_artist_id"] = serde_json::json!(0);
+                }
+                CounterMutation::MaxTrack => {
+                    catalog["next_track_id"] = serde_json::json!(u64::MAX);
+                }
+                CounterMutation::DuplicateArtist => {
+                    let duplicate = catalog["artists"][0].clone();
+                    catalog["artists"]
+                        .as_array_mut()
+                        .expect("artists array ")
+                        .push(duplicate);
+                }
+            });
+            let catalog_path = root.join(CATALOG_FILE_NAME);
+            let before = fs::read(&catalog_path).expect("catalog");
+            let error = CanonicalLibrary::open(&root)
+                .err()
+                .unwrap_or_else(|| panic!("{mutation:?}: corrupted counters must not open"));
+            let expected = match mutation {
+                CounterMutation::ReuseArtist => "next_artist_id",
+                CounterMutation::ReuseAlbum => "next_album_id",
+                CounterMutation::ReuseTrack => "next_track_id",
+                CounterMutation::ReusePlaylist => "next_playlist_id",
+                CounterMutation::ZeroArtist => "next_artist_id is 0",
+                CounterMutation::MaxTrack => "u64::MAX",
+                CounterMutation::DuplicateArtist => "appears more than once",
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "{mutation:?}: expected {expected:?} in actionable error, got: {error}"
+            );
+            assert_eq!(
+                fs::read(&catalog_path).expect("catalog"),
+                before,
+                "{mutation:?}: opening a corrupt catalogue must not write"
+            );
+            drop(dir);
+        }
+    }
+
+    #[test]
+    fn valid_counter_gaps_open_and_exhausted_allocation_fails_without_writing() {
+        let (_dir, root, library, _artist, _album, _track) = metadata_fixture("counter-valid-gaps");
+        drop(library);
+        rewrite_catalog(&root, |catalog| {
+            catalog["next_artist_id"] = serde_json::json!(100);
+            catalog["next_album_id"] = serde_json::json!(100);
+            catalog["next_track_id"] = serde_json::json!(100);
+            catalog["next_playlist_id"] = serde_json::json!(100);
+        });
+        let reopened = CanonicalLibrary::open(&root).expect("gapped counters open");
+        assert_eq!(reopened.next_artist_id(), 100);
+        assert_eq!(reopened.next_album_id(), 100);
+        assert_eq!(reopened.next_track_id(), 100);
+        assert_eq!(reopened.next_playlist_id(), 100);
+        drop(reopened);
+
+        rewrite_catalog(&root, |catalog| {
+            catalog["next_artist_id"] = serde_json::json!(u64::MAX - 1);
+        });
+        let mut reopened = CanonicalLibrary::open(&root).expect("boundary counter opens");
+        let generation = reopened.generation();
+        let before = fs::read(root.join(CATALOG_FILE_NAME)).expect("catalog");
+        let error = reopened
+            .create_artist("Exhausted", Vec::new())
+            .expect_err("allocation must refuse to create an unopenable counter state");
+        assert!(error.to_string().contains("exhausted"), "{error}");
+        assert_eq!(reopened.generation(), generation);
+        assert_eq!(
+            fs::read(root.join(CATALOG_FILE_NAME)).expect("catalog"),
+            before
+        );
+    }
+
+    #[test]
+    fn metadata_operations_advance_generation_and_stale_imports_fail() {
+        let (dir, _root, mut library, artist, album, track) =
+            metadata_fixture("metadata-generation");
+        let mut generation = library.generation();
+
+        library
+            .rename_artist(artist, "Renamed Artist")
+            .expect("artist rename");
+        generation += 1;
+        assert_eq!(library.generation(), generation);
+        library
+            .update_album_metadata(album, "Renamed Album", ReleaseType::Album)
+            .expect("album metadata");
+        generation += 1;
+        assert_eq!(library.generation(), generation);
+        library
+            .update_track_metadata(track, "Renamed Track", vec![artist], None, None, None)
+            .expect("track metadata");
+        generation += 1;
+        assert_eq!(library.generation(), generation);
+        let cover = dir.write("generation-cover.png", b"cover");
+        library.set_cover(album, &cover, "png").expect("cover");
+        generation += 1;
+        assert_eq!(library.generation(), generation);
+        library.set_rating(track, Some(5), true).expect("rating");
+        generation += 1;
+        assert_eq!(library.generation(), generation);
+        library
+            .set_album_track_order(album, vec![track])
+            .expect("track order");
+        generation += 1;
+        assert_eq!(library.generation(), generation);
+
+        let read_only_generation = library.generation();
+        let _ = library.artist(artist);
+        let _ = library.album(album);
+        let _ = library.track(track);
+        let _ = library.rating(track);
+        assert_eq!(
+            library.generation(),
+            read_only_generation,
+            "reads must not write"
+        );
+
+        let stale_generation = library.generation();
+        library
+            .rename_artist(artist, "Renamed Again")
+            .expect("second rename");
+        let source = dir.write("stale-import.wav", b"stale import source");
+        let request = CanonicalImportTrackRequest {
+            source: source.clone(),
+            title: "Stale Import".to_owned(),
+            credited_artists: vec![CanonicalImportArtistRef::Existing(artist)],
+            owner_index: 0,
+            album: CanonicalImportAlbumRef::Existing(album),
+            track_number: None,
+            disc_number: None,
+            duration_ms: None,
+            allow_duplicate_content: false,
+            expected_source_fingerprint: Some(
+                ContentFingerprint::of_file(&source).expect("fingerprint"),
+            ),
+        };
+        let error = library
+            .import_tracks_batch(stale_generation, vec![request])
+            .expect_err("metadata mutation must stale the import plan");
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert_eq!(
+            library.generation(),
+            stale_generation + 1,
+            "failed stale import must not mutate the catalogue"
+        );
+        let first_transaction = library.catalog.transaction_id.clone();
+        library
+            .rename_artist(artist, "Renamed A Third Time")
+            .expect("third rename");
+        assert_ne!(
+            library.catalog.transaction_id, first_transaction,
+            "consecutive transactions must not reuse the catalogue transaction ID"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_committed_journal_recovers_cleanup() {
+        let (_dir, root, library, _artist, _album, _track) =
+            metadata_fixture("legacy-metadata-journal");
+        let generation = library.generation();
+        drop(library);
+        let obsolete = root.join("legacy-obsolete.txt");
+        fs::write(&obsolete, b"obsolete").expect("obsolete");
+        let txn = "txn-legacy-metadata-commit";
+        let txn_dir = root.join(TRANSACTIONS_DIR_NAME).join(txn);
+        fs::create_dir_all(&txn_dir).expect("txn");
+        fs::write(
+            txn_dir.join("journal.flux"),
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "kind": "flux-transaction",
+                    "transaction_id": "{txn}",
+                    "operation": "metadata-write",
+                    "state": "committed",
+                    "intended_generation": {generation},
+                    "actions": [],
+                    "cleanup": ["legacy-obsolete.txt"]
+                }}"#
+            ),
+        )
+        .expect("journal");
+        let reopened = CanonicalLibrary::open(&root).expect("legacy metadata commit recovery");
+        assert!(
+            !obsolete.exists(),
+            "legacy journal cleanup was not completed"
+        );
+        assert!(!txn_dir.exists(), "legacy journal was not finalized");
+        assert_eq!(reopened.generation(), generation);
     }
 
     #[test]
@@ -5143,6 +5813,30 @@ impl CanonicalLibrary {
         catalog.next_playlist_id = catalog
             .next_playlist_id
             .max(seed.next_playlist_id.unwrap_or(1));
+        validate_next_counter(
+            "seed next_track_id",
+            catalog.next_track_id,
+            catalog.tracks.iter().map(|track| track.id).max(),
+            "track",
+        )?;
+        validate_next_counter(
+            "seed next_artist_id",
+            catalog.next_artist_id,
+            catalog.artists.iter().map(|artist| artist.id).max(),
+            "artist",
+        )?;
+        validate_next_counter(
+            "seed next_album_id",
+            catalog.next_album_id,
+            catalog.albums.iter().map(|album| album.id).max(),
+            "album",
+        )?;
+        validate_next_counter(
+            "seed next_playlist_id",
+            catalog.next_playlist_id,
+            catalog.playlists.iter().map(|playlist| playlist.id).max(),
+            "playlist",
+        )?;
         for album in albums.values() {
             for id in &album.track_order {
                 if !tracks.contains_key(id) {
@@ -7805,6 +8499,7 @@ mod process_crash_tests {
             "during-metadata-publish" => TransactionFailPoint::DuringMetadataPublish,
             "after-catalog-publish" => TransactionFailPoint::AfterCatalogPublish,
             "during-cleanup" => TransactionFailPoint::DuringCleanup,
+            "before-journal-finalize" => TransactionFailPoint::BeforeJournalFinalize,
             other => panic!("unknown child boundary {other}"),
         }
     }
@@ -7860,6 +8555,44 @@ mod process_crash_tests {
     }
 
     #[test]
+    fn child_metadata_crash_helper() {
+        let Ok(root) = std::env::var(CHILD_ROOT) else {
+            return;
+        };
+        let point = point_from_name(&std::env::var(CHILD_POINT).expect("child crash boundary"));
+        let root = PathBuf::from(root);
+        let mut library = CanonicalLibrary::create(&root).expect("create child library");
+        let artist = library
+            .create_artist("Before Metadata", Vec::new())
+            .expect("artist");
+        let source_dir = root.parent().expect("parent").join("child-metadata-source");
+        fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join("song.wav");
+        fs::write(&source, b"metadata child payload").expect("source");
+        library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Metadata Song".to_owned(),
+                artist_id: Some(artist),
+                artist_name: "Before Metadata".to_owned(),
+                credited_artist_ids: vec![artist],
+                album_title: Some("Metadata Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("track");
+        library.set_transaction_failure(Some(TransactionFailure {
+            point,
+            interrupt: true,
+            abort: true,
+        }));
+        let _ = library.rename_artist(artist, "After Metadata");
+        panic!("child did not terminate at {point:?}");
+    }
+
+    #[test]
     fn child_recovery_crash_helper() {
         let Ok(root) = std::env::var(CHILD_RECOVERY) else {
             return;
@@ -7897,6 +8630,21 @@ mod process_crash_tests {
             .stderr(Stdio::null())
             .status()
             .expect("spawn recovery child")
+    }
+
+    fn spawn_metadata(boundary: &str, root: &Path) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "canonical::process_crash_tests::child_metadata_crash_helper",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root)
+            .env(CHILD_POINT, boundary)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn metadata child")
     }
 
     fn assert_transfer_state(root: &Path, committed: bool) {
@@ -7976,6 +8724,49 @@ mod process_crash_tests {
                 "child must terminate abruptly at {boundary}, got {status:?}"
             );
             assert_transfer_state(&root, committed);
+        }
+    }
+
+    #[test]
+    fn actual_child_termination_at_metadata_boundaries_recovers() {
+        for (boundary, committed) in [
+            ("after-journal", false),
+            ("during-metadata-publish", false),
+            ("after-catalog-publish", true),
+            ("before-journal-finalize", true),
+        ] {
+            let dir = TempDir::new(&format!("child-metadata-{boundary}"));
+            let root = dir.path().join("FluxLibrary");
+            let status = spawn_metadata(boundary, &root);
+            assert!(
+                !status.success(),
+                "child must terminate abruptly at {boundary}, got {status:?}"
+            );
+            let reopened = CanonicalLibrary::open(&root)
+                .unwrap_or_else(|err| panic!("{boundary}: reopen failed: {err}"));
+            assert_eq!(
+                reopened
+                    .artist(flux_core::ArtistId::new(1))
+                    .map(|artist| artist.name.as_str()),
+                Some(if committed {
+                    "After Metadata"
+                } else {
+                    "Before Metadata"
+                }),
+                "{boundary}: metadata commit boundary was inconsistent"
+            );
+            assert_eq!(reopened.generation(), if committed { 4 } else { 3 });
+            assert_eq!(
+                fs::read_dir(root.join(TRANSACTIONS_DIR_NAME))
+                    .expect("transactions")
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .count(),
+                0,
+                "{boundary}: transaction directory was not finalized"
+            );
+            drop(reopened);
+            assert!(CanonicalLibrary::open(&root).is_ok());
         }
     }
 

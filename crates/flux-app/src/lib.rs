@@ -12357,6 +12357,69 @@ mod tests {
     }
 
     #[test]
+    fn metadata_mutation_invalidates_a_reviewed_canonical_import_plan() {
+        use crate::import::{
+            ImportDecision, ImportProgress, ImportRequest, ImportStorage, prepare_import_files,
+            prepare_import_plan,
+        };
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let dir = TempDir::new("canonical-import-stale-generation");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let source_before = fs::read(&source).expect("source");
+        let request = ImportRequest {
+            sources: vec![source.clone()],
+            recursive: false,
+            storage: ImportStorage::Reference,
+            library_root: root.clone(),
+            existing_tracks: controller.tracks().to_vec(),
+            existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
+            target_album: None,
+            generation: controller.generation(),
+        };
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut plan = prepare_import_plan(request, Arc::clone(&progress), cancel);
+        plan.set_storage(ImportStorage::Copy);
+        plan.candidates[0].set_decision(ImportDecision::ImportNew);
+        let planned_generation = plan.generation;
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::clone(&progress),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        controller
+            .create_artist("Mutation Before Import")
+            .expect("metadata mutation");
+        assert!(controller.generation() > planned_generation);
+        let report = controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("apply returns a per-item report");
+        assert_eq!(report.imported, 0);
+        assert_eq!(report.failed, 1);
+        assert!(
+            report.items[0].message.contains("stale"),
+            "{:?}",
+            report.items[0]
+        );
+        assert!(
+            controller.tracks().is_empty(),
+            "stale import must not publish a track"
+        );
+        assert_eq!(
+            fs::read(&source).expect("source"),
+            source_before,
+            "stale import must not modify the source"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn canonical_switching_resets_queue_and_preserves_each_library() {
         let dir = TempDir::new("canonical-switch");
         let (root_a, source) = canonical_track_fixture(&dir);
