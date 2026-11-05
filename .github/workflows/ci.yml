@@ -132,6 +132,6 @@ jobs:
       # Compile-only: binaries for x86_64-apple-darwin are not executed on
       # this ARM64 runner, so no test or run step is claimed here.
       - name: Check workspace for x86_64-apple-darwin
-        run: cargo check --workspace --locked --target x86_64-apple-darwin
+        run: cargo check --workspace --all-targets --locked --target x86_64-apple-darwin
       - name: Check CPAL features for x86_64-apple-darwin
         run: cargo check -p flux-audio -p flux-app -p flux-gui -p flux-tui --features cpal --all-targets --locked --target x86_64-apple-darwin

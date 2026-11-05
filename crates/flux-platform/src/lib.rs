@@ -35,9 +35,11 @@
 //!
 //! The picker functions are intentionally thin: they return selected paths or
 //! a typed cancellation/error and do not create, move, or inspect the chosen
-//! files. Linux behavior is exercised in this project's runtime environment;
-//! macOS and Windows command paths are compiled but were not runtime-tested
-//! here.
+//! files. Dialog output is parsed from raw newline-delimited bytes on Unix
+//! (preserving spaces, Unicode and non-UTF-8 names) instead of a lossy string
+//! round trip; Windows PowerShell dialogs force UTF-8 stdout. Linux behavior is
+//! exercised in this project's runtime environment; macOS and Windows command
+//! paths are compiled/CI-checked but were not runtime-tested here.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -281,6 +283,71 @@ fn linux_start(start: Option<&Path>) -> OsString {
         .unwrap_or_else(|| OsString::from("."))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn prefixed_os_argument(prefix: &str, value: &std::ffi::OsStr) -> OsString {
+    let mut argument = OsString::from(prefix);
+    argument.push(value);
+    argument
+}
+
+/// Parses newline-delimited dialog output without converting paths through a
+/// lossy display string. Only line terminators are removed: leading/trailing
+/// spaces are valid path characters and must be preserved.
+fn parse_path_list_stdout(stdout: &[u8]) -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                (!line.is_empty()).then(|| PathBuf::from(OsString::from_vec(line.to_vec())))
+            })
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8_lossy(stdout)
+            .split('\n')
+            .filter_map(|line| {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                (!line.is_empty()).then(|| PathBuf::from(line))
+            })
+            .collect()
+    }
+}
+
+fn parse_single_path_stdout(stdout: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = stdout;
+        if let Some(stripped) = bytes.strip_suffix(b"\n") {
+            bytes = stripped;
+        }
+        if let Some(stripped) = bytes.strip_suffix(b"\r") {
+            bytes = stripped;
+        }
+        (!bytes.is_empty()).then(|| PathBuf::from(OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        let text = String::from_utf8_lossy(stdout);
+        let mut text: &str = text.as_ref();
+        if let Some(stripped) = text.strip_suffix('\n') {
+            text = stripped;
+        }
+        if let Some(stripped) = text.strip_suffix('\r') {
+            text = stripped;
+        }
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn pick_linux_files(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>, String> {
     const FILTER: &str = "*.wav *.flac *.mp3 *.m4a *.m4b *.mp4 *.aac *.ogg *.oga *.opus *.aif *.aiff *.ape *.mpc *.spx *.wv";
@@ -306,7 +373,7 @@ fn pick_linux_files_filtered(
     zenity
         .arg("--file-selection")
         .arg(format!("--title={title}"))
-        .arg(format!("--filename={}", start.to_string_lossy()))
+        .arg(prefixed_os_argument("--filename=", &start))
         .arg(format!("--file-filter={description} | {filter}"))
         .arg("--file-filter=All files | *");
     if multiple {
@@ -343,17 +410,17 @@ fn pick_linux_folder(start: Option<&Path>) -> Result<Option<PathBuf>, String> {
         .arg("--file-selection")
         .arg("--directory")
         .arg("--title=Choose a music folder")
-        .arg(format!("--filename={}", start.to_string_lossy()))
+        .arg(prefixed_os_argument("--filename=", &start))
         .output();
     if let Ok(output) = zenity {
-        return parse_single_output(output).map(|path| path.map(PathBuf::from));
+        return parse_single_output(output);
     }
     let kdialog = std::process::Command::new("kdialog")
         .arg("--getexistingdirectory")
         .arg(&start)
         .output();
     match kdialog {
-        Ok(output) => parse_single_output(output).map(|path| path.map(PathBuf::from)),
+        Ok(output) => parse_single_output(output),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(
             "no native folder dialog is available (install zenity or kdialog, or use Flux Browser)"
                 .to_owned(),
@@ -390,12 +457,7 @@ fn parse_zenity_output(output: std::process::Output) -> Result<Option<Vec<PathBu
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let paths = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
+    let paths = parse_path_list_stdout(&output.stdout);
     if paths.is_empty() {
         Ok(None)
     } else {
@@ -403,19 +465,14 @@ fn parse_zenity_output(output: std::process::Output) -> Result<Option<Vec<PathBu
     }
 }
 
-fn parse_single_output(output: std::process::Output) -> Result<Option<String>, String> {
+fn parse_single_output(output: std::process::Output) -> Result<Option<PathBuf>, String> {
     if output.status.code() == Some(1) {
         return Ok(None);
     }
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value))
-    }
+    Ok(parse_single_path_stdout(&output.stdout))
 }
 
 #[cfg(target_os = "macos")]
@@ -447,17 +504,10 @@ end try"#
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
     if folder {
-        let value = text.trim();
-        return Ok((!value.is_empty()).then(|| vec![PathBuf::from(value)]));
+        return Ok(parse_single_path_stdout(&output.stdout).map(|path| vec![path]));
     }
-    let paths = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
+    let paths = parse_path_list_stdout(&output.stdout);
     Ok((!paths.is_empty()).then_some(paths))
 }
 
@@ -481,12 +531,7 @@ end try"#;
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let paths = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
+    let paths = parse_path_list_stdout(&output.stdout);
     Ok((!paths.is_empty()).then_some(paths))
 }
 
@@ -506,13 +551,13 @@ end try"#;
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok((!value.is_empty()).then(|| vec![PathBuf::from(value)]))
+    Ok(parse_single_path_stdout(&output.stdout).map(|path| vec![path]))
 }
 
 #[cfg(target_os = "windows")]
 fn pick_windows_text() -> Result<Option<Vec<PathBuf>>, String> {
-    let script = r#"Add-Type -AssemblyName System.Windows.Forms
+    let script = r#"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
 $d = New-Object System.Windows.Forms.OpenFileDialog
 $d.Multiselect = $false
 $d.Title = 'Import lyrics'
@@ -540,15 +585,15 @@ if ($d.ShowDialog() -eq 'OK') { $d.FileName }"#;
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok((!value.is_empty()).then(|| vec![PathBuf::from(value)]))
+    Ok(parse_single_path_stdout(&output.stdout).map(|path| vec![path]))
 }
 
 #[cfg(target_os = "windows")]
 fn pick_windows_images() -> Result<Option<Vec<PathBuf>>, String> {
     const IMAGE_FILTER: &str = "*.png;*.jpg;*.jpeg;*.webp";
     let script = format!(
-        r#"Add-Type -AssemblyName System.Windows.Forms
+        r#"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
 $d = New-Object System.Windows.Forms.OpenFileDialog
 $d.Multiselect = $false
 $d.Title = 'Choose album artwork'
@@ -577,12 +622,7 @@ if ($d.ShowDialog() -eq 'OK') {{ $d.FileNames }}"#
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let paths = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
+    let paths = parse_path_list_stdout(&output.stdout);
     Ok((!paths.is_empty()).then_some(paths))
 }
 
@@ -591,14 +631,16 @@ fn pick_windows(folder: bool) -> Result<Option<Vec<PathBuf>>, String> {
     const AUDIO_FILTER: &str = "*.wav;*.flac;*.mp3;*.m4a;*.m4b;*.mp4;*.aac;*.ogg;*.oga;*.opus;*.aif;*.aiff;*.ape;*.mpc;*.spx;*.wv";
     let script = if folder {
         format!(
-            r#"Add-Type -AssemblyName System.Windows.Forms
+            r#"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
 $d = New-Object System.Windows.Forms.FolderBrowserDialog
 $d.Description = 'Choose a music folder'
 if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.SelectedPath }}"#
         )
     } else {
         format!(
-            r#"Add-Type -AssemblyName System.Windows.Forms
+            r#"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
 $d = New-Object System.Windows.Forms.OpenFileDialog
 $d.Multiselect = $true
 $d.Title = 'Import music'
@@ -628,12 +670,7 @@ if ($d.ShowDialog() -eq 'OK') {{ $d.FileNames }}"#
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    let paths = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
+    let paths = parse_path_list_stdout(&output.stdout);
     Ok((!paths.is_empty()).then_some(paths))
 }
 
@@ -643,7 +680,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{Platform, app_dirs, resolve_dirs};
+    use super::{
+        Platform, app_dirs, parse_path_list_stdout, parse_single_path_stdout, prefixed_os_argument,
+        resolve_dirs,
+    };
 
     fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = pairs
@@ -738,6 +778,66 @@ mod tests {
             assert!(dirs.data_dir().ends_with("flux"));
             assert!(dirs.config_dir().ends_with("flux"));
         }
+    }
+
+    #[test]
+    fn dialog_output_preserves_spaces_unicode_and_line_endings() {
+        let paths = parse_path_list_stdout(
+            "/music/ leading song.flac\r\n/music/trailing .flac \n/música/曲.flac\n\n".as_bytes(),
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/music/ leading song.flac"),
+                PathBuf::from("/music/trailing .flac "),
+                PathBuf::from("/música/曲.flac"),
+            ]
+        );
+        assert!(paths[0].to_string_lossy().starts_with("/music/ "));
+        assert!(paths[1].to_string_lossy().ends_with(".flac "));
+        assert_eq!(
+            parse_single_path_stdout(b"/music/folder with space \r\n"),
+            Some(PathBuf::from("/music/folder with space "))
+        );
+    }
+
+    #[test]
+    fn dialog_start_argument_is_not_utf8_converted() {
+        let argument = prefixed_os_argument("--filename=", std::ffi::OsStr::new("/tmp/My Music"));
+        assert_eq!(
+            argument,
+            std::ffi::OsString::from("--filename=/tmp/My Music")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dialog_output_preserves_non_utf8_unix_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut stdout = b"/music/".to_vec();
+        stdout.push(0xff);
+        stdout.push(b'.');
+        stdout.extend_from_slice(b"flac\n");
+        let paths = parse_path_list_stdout(&stdout);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].as_os_str().as_bytes(), &stdout[..stdout.len() - 1]);
+
+        let mut raw = std::ffi::OsString::from("/tmp/");
+        use std::os::unix::ffi::OsStringExt;
+        raw.push(std::ffi::OsString::from_vec(vec![b'a', 0xff]));
+        let argument = prefixed_os_argument("--filename=", &raw);
+        assert_eq!(
+            argument.as_os_str().as_bytes(),
+            b"--filename=/tmp/a\xff".as_slice()
+        );
+        assert_eq!(
+            parse_single_path_stdout(b"/music/folder\nwith newline\n")
+                .expect("single folder path")
+                .as_os_str()
+                .as_bytes(),
+            b"/music/folder\nwith newline".as_slice()
+        );
     }
 
     #[test]

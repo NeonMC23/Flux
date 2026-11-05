@@ -22,7 +22,10 @@ use std::path::Path;
 ///
 /// This is deliberately the *only* replacement primitive the storage
 /// layers use. Higher layers own syncing the file beforehand and syncing
-/// the parent directory afterwards; neither is implied here.
+/// the parent directory afterwards; neither is implied here. On Windows
+/// `std` has no directory-fsync operation, so parent-directory durability
+/// is a documented no-op there; file content is flushed before replacement
+/// and the journal/backup ladders remain the recovery authority.
 pub(crate) fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
     fs::rename(temp, target)
 }

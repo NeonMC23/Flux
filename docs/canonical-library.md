@@ -176,6 +176,44 @@ playlists, batch actions and global filters remain GUI-only. The TUI never
 bypasses H2 deletion/repair safety, never deletes external audio, and does not
 treat an inaccessible path as missing.
 
+### Cross-platform storage and platform notes
+
+Canonical managed paths remain validated `/`-separated relative paths; `RelPath`
+rejects absolute paths, parent traversal, NUL, backslashes, colons and control
+characters so the same serialized path cannot become a drive/ADS escape on
+Windows. Portable legacy paths retain raw Unix bytes on Unix and become opaque
+rather than lossy when they cannot be represented on the current platform.
+Canonical resources themselves are UTF-8 path components by design.
+
+Legacy index and portable catalogue publication write and flush a sibling
+temporary file before replacing the target with one `fs::rename`. Unix renames
+are atomic and parent directories are synced. Windows `std::fs::rename` uses the
+standard replace-existing operation; `std` exposes no directory fsync there, so
+that durability step is a documented no-op and recovery relies on the flushed
+file plus journal/backup ladders. A failed replacement leaves the previous
+catalogue file in place. This limitation is not presented as Unix-equivalent
+crash durability.
+
+Windows/macOS case-insensitive portable path policy is the platform default;
+the store also exposes explicit sensitive/insensitive policy for tests and
+migration. Actual volume case-probing (notably case-sensitive APFS/NTFS
+directories) is not yet implemented and remains a risk.
+
+Native dialog output is parsed as newline-delimited raw bytes on Unix, preserving
+spaces, Unicode and non-UTF-8 filenames; Windows PowerShell output is forced to
+UTF-8 before parsing. GUI native audio-replacement and artwork pickers retain the
+selected `PathBuf` separately from the editable display text, so a non-UTF-8 Unix
+selection is not corrupted by a path-string round trip. TUI path input remains
+Unicode text by design.
+
+CI runs formatting/Clippy/license checks on Linux and native tests/builds for
+Linux x86_64/ARM64, Windows x86_64/ARM64 and macOS ARM64, with a compile-only
+macOS x86_64 cross-check. CPAL is compile-checked on all matrix entries; no CI
+runner supplies a physical audio device. The local CP1 audit executed on Linux
+only. Windows/macOS native dialogs, window managers, terminals, filesystems,
+locking behavior and hardware audio remain unverified unless a future CI runtime
+job explicitly reports them.
+
 ## Canonical layout
 
 ```text
@@ -661,6 +699,7 @@ from what remains structurally or physically unverified.
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
+| Cross-platform native picker path bytes, selected PathBuf retention, CI matrix metadata | Parser/selection behavior covered by deterministic Linux tests; Windows/macOS compile/test jobs defined in CI, not runtime-verified here |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -1853,3 +1892,20 @@ cleanup.
 32. TUI runtime validation covers deterministic key/Controller behavior plus a
     pseudo-terminal startup/help/quit probe. Real terminal multiplexers,
     accessibility tooling and remote-terminal latency were not exercised.
+33. Windows has no `std` directory-fsync facility; parent-directory durability
+    after catalogue replacement is a documented no-op there. File content is
+    flushed and replacement is atomic, but Windows power-loss durability is not
+    claimed equivalent to Unix.
+34. Portable path case policy defaults to insensitive on Windows/macOS. Actual
+    volume/directory case-sensitivity probing is not implemented, so a
+    case-sensitive APFS/NTFS directory may see a conservative duplicate policy.
+35. Native pickers preserve spaces and non-UTF-8 Unix bytes. Multi-selection
+    dialogs use newline as the record separator, so a selected filename containing
+    a literal newline cannot be represented safely there; the single-folder path
+    retains embedded newlines by treating the whole output (minus one trailing
+    terminator) as one path. UNC/Windows and macOS picker paths were
+    compile/CI-covered, not executed on this host.
+36. TUI raw-mode restoration is handled for normal exit, errors, panic unwind
+    and Ctrl-C. External uncatchable termination (SIGKILL, power loss, some
+    SIGTERM paths without a terminal-level reset helper) can leave a terminal in
+    an alternate-screen/raw state until the terminal is reset.

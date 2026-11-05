@@ -4863,6 +4863,31 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_relative_paths_are_normalized_and_drive_paths_are_rejected() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        assert_eq!(
+            RelPath::from_os_path(Path::new(r"Artist\Album\song.flac")),
+            Ok(RelPath::Utf8("Artist/Album/song.flac".to_owned()))
+        );
+        assert_eq!(
+            RelPath::from_os_path(Path::new(r"C:\Music\song.flac")),
+            Err(PathValidationError::Absolute)
+        );
+        assert_eq!(
+            RelPath::from_os_path(Path::new(r"\\server\share\song.flac")),
+            Err(PathValidationError::Absolute)
+        );
+        let unpaired = PathBuf::from(OsString::from_wide(&[0xD800]));
+        assert_eq!(
+            RelPath::from_os_path(&unpaired),
+            Err(PathValidationError::NonUtf8Component)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_non_utf8_paths_round_trip_byte_exact() {

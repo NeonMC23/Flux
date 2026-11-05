@@ -7561,7 +7561,7 @@ mod tests {
         CreateLibraryError, PlaybackMode, PortableOpenError, ResourceState, ScanOutcome,
         StorageMode, SwitchError, TrackMetadataEdit, create_canonical_library,
         create_portable_library, execute_legacy_migration, is_track_playable,
-        migrate_legacy_library, plan_legacy_migration,
+        migrate_legacy_library, plan_legacy_migration, same_library_path,
     };
 
     struct TempDir(PathBuf);
@@ -7856,6 +7856,28 @@ mod tests {
         }
         writer.finalize().expect("finalize");
         path
+    }
+
+    #[test]
+    fn library_path_equality_normalizes_existing_spellings_and_symlinks() {
+        let dir = TempDir::new("same-library-path");
+        let library = dir.path().join("Music Library");
+        fs::create_dir_all(&library).expect("library");
+        assert!(same_library_path(&library, &library));
+        assert!(same_library_path(&library, &library.join(".")));
+        assert!(!same_library_path(&library, &dir.path().join("Other")));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let alias = dir.path().join("Music Library Alias");
+            symlink(&library, &alias).expect("symlink");
+            assert!(
+                same_library_path(&library, &alias),
+                "case-preserving aliases must resolve to the same library"
+            );
+        }
     }
 
     /// The GUI's exact runtime shape — `play_track`, then a loop of

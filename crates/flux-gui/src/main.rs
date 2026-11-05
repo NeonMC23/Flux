@@ -1854,6 +1854,7 @@ struct TrackEditor {
     credits: Vec<ArtistId>,
     credit_artist: Option<ArtistId>,
     replacement_source: String,
+    replacement_picked: Option<PathBuf>,
     replacement_plan: Option<TrackAudioReplacementPlan>,
     deletion_plan: Option<TrackDeletionPlan>,
     move_destination: Option<AlbumChoice>,
@@ -2063,6 +2064,7 @@ struct FluxReady {
     album_title_input: String,
     album_type: ReleaseType,
     album_cover_input: String,
+    album_cover_picked: Option<PathBuf>,
     album_delete_confirm: bool,
     album_cover_remove_confirm: bool,
     artwork: BTreeMap<AlbumId, ArtworkEntry>,
@@ -2420,6 +2422,7 @@ impl FluxReady {
             album_title_input: String::new(),
             album_type: ReleaseType::Album,
             album_cover_input: String::new(),
+            album_cover_picked: None,
             album_delete_confirm: false,
             album_cover_remove_confirm: false,
             artwork: BTreeMap::new(),
@@ -2495,6 +2498,7 @@ impl FluxReady {
         self.new_album_title.clear();
         self.album_title_input.clear();
         self.album_cover_input.clear();
+        self.album_cover_picked = None;
         self.album_delete_confirm = false;
         self.album_cover_remove_confirm = false;
         self.playlist_create_open = false;
@@ -2717,6 +2721,7 @@ impl FluxReady {
         let Some(album_id) = self.selected_album_id() else {
             self.album_title_input.clear();
             self.album_cover_input.clear();
+            self.album_cover_picked = None;
             self.album_type = ReleaseType::Album;
             return;
         };
@@ -2726,6 +2731,7 @@ impl FluxReady {
         self.album_title_input = album.title;
         self.album_type = album.release_type;
         self.album_cover_input.clear();
+        self.album_cover_picked = None;
     }
 
     fn sync_deletion_defaults(&mut self) {
@@ -2829,6 +2835,7 @@ impl FluxReady {
             credits: self.controller.track_credits(id),
             credit_artist: None,
             replacement_source: String::new(),
+            replacement_picked: None,
             replacement_plan: None,
             deletion_plan: None,
             move_destination: None,
@@ -2905,8 +2912,11 @@ impl FluxReady {
             return;
         };
         let id = editor.id;
-        let path = PathBuf::from(editor.replacement_source.trim());
-        if editor.replacement_source.trim().is_empty() {
+        let path = editor
+            .replacement_picked
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(editor.replacement_source.trim()));
+        if path.as_os_str().is_empty() {
             if let Some(editor) = self.track_editor.as_mut() {
                 editor.error = Some("Enter the replacement audio file path.".to_owned());
             }
@@ -3770,6 +3780,7 @@ impl FluxReady {
             Message::EditorReplacementChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.replacement_source = value;
+                    editor.replacement_picked = None;
                     editor.replacement_plan = None;
                 }
             }
@@ -3792,6 +3803,7 @@ impl FluxReady {
                         && let Some(editor) = self.track_editor.as_mut()
                     {
                         editor.replacement_source = path.display().to_string();
+                        editor.replacement_picked = Some(path.clone());
                         editor.replacement_plan = None;
                     }
                 }
@@ -4173,7 +4185,10 @@ impl FluxReady {
                     Err(error) => self.lifecycle_msg = Some(error),
                 }
             }
-            Message::AlbumCoverChanged(value) => self.album_cover_input = value,
+            Message::AlbumCoverChanged(value) => {
+                self.album_cover_input = value;
+                self.album_cover_picked = None;
+            }
             Message::AlbumCoverChoose => {
                 let start = self
                     .selected_album_id()
@@ -4190,6 +4205,7 @@ impl FluxReady {
                 Ok(Some(paths)) => {
                     if let Some(path) = paths.first() {
                         self.album_cover_input = path.display().to_string();
+                        self.album_cover_picked = Some(path.clone());
                     }
                 }
                 Ok(None) => {}
@@ -4219,7 +4235,10 @@ impl FluxReady {
                 let Some(album) = self.selected_album_id() else {
                     return Task::none();
                 };
-                let path = PathBuf::from(self.album_cover_input.trim());
+                let path = self
+                    .album_cover_picked
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(self.album_cover_input.trim()));
                 if path.as_os_str().is_empty() {
                     self.lifecycle_msg = Some("Choose a cover image path.".to_owned());
                     return Task::none();
@@ -4234,6 +4253,7 @@ impl FluxReady {
                     Ok(()) => {
                         *self.dashboard_cache.borrow_mut() = None;
                         self.album_cover_input.clear();
+                        self.album_cover_picked = None;
                         self.artwork.remove(&album);
                         self.sync_album_editor();
                         self.lifecycle_msg = Some(format!("Updated cover for album {album}."));
@@ -13725,6 +13745,7 @@ mod tests {
             album_title_input: String::new(),
             album_type: ReleaseType::Album,
             album_cover_input: String::new(),
+            album_cover_picked: None,
             album_delete_confirm: false,
             album_cover_remove_confirm: false,
             artwork: BTreeMap::new(),
@@ -14284,6 +14305,7 @@ mod tests {
         });
         gui.window_width = 920.0;
         gui.queue_overlay_open = true;
+        gui.album_cover_picked = Some(PathBuf::from("stale-cover-picked.png"));
         let old_session = gui.controller.library_session();
 
         send(
@@ -14315,6 +14337,7 @@ mod tests {
         assert!(gui.artwork_loading.is_empty());
         assert!(gui.dashboard_cache.borrow().is_none());
         assert!(gui.lyrics_cache.borrow().is_empty());
+        assert!(gui.album_cover_picked.is_none());
         assert!(!gui.queue_overlay_open);
         assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
 
@@ -15463,6 +15486,110 @@ mod tests {
             gui.lifecycle_msg
                 .as_deref()
                 .is_some_and(|message| message.contains("Deleted track"))
+        );
+        gui.controller.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_picker_paths_preserve_non_utf8_names_for_replacement_and_artwork() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = TempDir::new("gui-native-non-utf8");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Native Path",
+            "Native Artist",
+            "Native Album",
+            ReleaseType::Album,
+            1,
+        );
+        let album = gui.controller.track_album_id(id).expect("album");
+
+        let mut replacement_name = b"replacement-".to_vec();
+        replacement_name.push(0xff);
+        replacement_name.extend_from_slice(b".wav");
+        let replacement = dir
+            .path()
+            .join(OsString::from_vec(replacement_name.clone()));
+        let mut replacement_bytes = minimal_wav();
+        replacement_bytes.push(9);
+        std::fs::write(&replacement, &replacement_bytes).expect("replacement");
+        send(&mut gui, Message::EditTrack(id));
+        if let Some(editor) = gui.track_editor.as_mut() {
+            editor.replacement_picked = Some(PathBuf::from("stale-picked-path"));
+        }
+        send(
+            &mut gui,
+            Message::EditorReplacementChanged("typed path".to_owned()),
+        );
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.replacement_picked.is_none())
+        );
+        send(
+            &mut gui,
+            Message::EditorReplacementPicked(0, Ok(Some(vec![replacement]))),
+        );
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.replacement_picked.is_some())
+        );
+        send(&mut gui, Message::EditorPlanReplacement);
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.replacement_plan.is_some()),
+            "the hidden non-UTF-8 path must survive review"
+        );
+        send(&mut gui, Message::EditorConfirmReplacement);
+        assert_eq!(
+            std::fs::read(gui.controller.track(id).expect("track").source().path())
+                .expect("managed replacement"),
+            replacement_bytes
+        );
+
+        let mut cover_name = b"cover-".to_vec();
+        cover_name.push(0xfe);
+        cover_name.extend_from_slice(b".png");
+        let cover = dir.path().join(OsString::from_vec(cover_name));
+        write_test_png(&cover, 64, 64);
+        gui.view = LibraryView::Albums;
+        gui.selected_group = Some(album_key_for_title(album, "Native Album"));
+        send(
+            &mut gui,
+            Message::AlbumCoverPicked(0, Ok(Some(vec![cover.clone()]))),
+        );
+        assert!(gui.album_cover_picked.is_some());
+        send(
+            &mut gui,
+            Message::AlbumCoverChanged("typed cover path".to_owned()),
+        );
+        assert!(gui.album_cover_picked.is_none());
+        send(
+            &mut gui,
+            Message::AlbumCoverPicked(0, Ok(Some(vec![cover]))),
+        );
+        send(&mut gui, Message::AlbumCoverApply);
+        assert!(
+            gui.controller.album(album).expect("album").cover.is_some(),
+            "the hidden non-UTF-8 cover path must survive publication"
+        );
+        assert_eq!(
+            gui.controller.album_cover_resource_state(album),
+            Some(ResourceState::Present)
         );
         gui.controller.shutdown();
     }
