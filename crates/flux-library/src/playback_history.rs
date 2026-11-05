@@ -2,7 +2,10 @@
 //!
 //! History is deliberately separate from the canonical catalogue and audio
 //! tags. It is not authoritative track metadata; it records only aggregated
-//! meaningful plays and the last-played time for stable TrackIds.
+//! meaningful plays and the last-played time for stable TrackIds. The current
+//! schema requires the `entries` collection; a missing/wrong-typed collection
+//! is corruption, never empty history. A missing/empty `kind` remains readable
+//! for legacy version-1 files, but an unknown non-empty kind is rejected.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,6 +20,8 @@ use crate::fs_ops::replace_file;
 
 /// The only playback-history schema version this build reads and writes.
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
+
+const HISTORY_KIND: &str = "flux-playback-history";
 
 /// Aggregated history for one stable track identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +169,12 @@ impl PlaybackHistoryStore {
                 supported: HISTORY_SCHEMA_VERSION,
             });
         }
+        if !file.kind.is_empty() && file.kind != HISTORY_KIND {
+            return Err(PlaybackHistoryError::Invalid(format!(
+                "playback history declares kind {:?}, expected {HISTORY_KIND:?}",
+                file.kind
+            )));
+        }
         let mut entries = BTreeMap::new();
         for entry in file.entries {
             let id = TrackId::new(entry.track_id);
@@ -194,7 +205,7 @@ impl PlaybackHistoryStore {
     pub fn save(&self, history: &PlaybackHistory) -> Result<(), PlaybackHistoryError> {
         let file = HistoryFile {
             version: HISTORY_SCHEMA_VERSION,
-            kind: "flux-playback-history".to_owned(),
+            kind: HISTORY_KIND.to_owned(),
             entries: history
                 .entries
                 .iter()
@@ -232,7 +243,6 @@ struct HistoryFile {
     version: u32,
     #[serde(default)]
     kind: String,
-    #[serde(default)]
     entries: Vec<HistoryEntryRecord>,
 }
 
@@ -301,6 +311,88 @@ mod tests {
         fs::write(&path, duplicate).expect("fixture");
         assert!(store.load().is_err());
         assert_eq!(fs::read_to_string(&path).expect("preserved"), duplicate);
+    }
+
+    #[test]
+    fn required_collection_and_entry_fields_fail_closed_without_rewriting() {
+        let dir = TempDir::new("history-required-fields");
+        let path = dir.path().join("history.flux");
+        let store = PlaybackHistoryStore::new(&path);
+        let cases = [
+            (
+                "missing entries",
+                br#"{"version":1,"kind":"flux-playback-history"}"#.to_vec(),
+            ),
+            (
+                "wrong entries type",
+                br#"{"version":1,"kind":"flux-playback-history","entries":{}}"#.to_vec(),
+            ),
+            (
+                "missing entry track_id",
+                br#"{"version":1,"kind":"flux-playback-history","entries":[{"play_count":1,"last_played_unix_ms":1}]}"#.to_vec(),
+            ),
+            (
+                "missing entry play_count",
+                br#"{"version":1,"kind":"flux-playback-history","entries":[{"track_id":1,"last_played_unix_ms":1}]}"#.to_vec(),
+            ),
+            (
+                "missing entry timestamp",
+                br#"{"version":1,"kind":"flux-playback-history","entries":[{"track_id":1,"play_count":1}]}"#.to_vec(),
+            ),
+            (
+                "zero track",
+                br#"{"version":1,"kind":"flux-playback-history","entries":[{"track_id":0,"play_count":1,"last_played_unix_ms":1}]}"#.to_vec(),
+            ),
+            (
+                "zero play count",
+                br#"{"version":1,"kind":"flux-playback-history","entries":[{"track_id":1,"play_count":0,"last_played_unix_ms":1}]}"#.to_vec(),
+            ),
+            (
+                "wrong kind",
+                br#"{"version":1,"kind":"some-other-kind","entries":[]}"#.to_vec(),
+            ),
+            (
+                "future schema",
+                format!(
+                    r#"{{"version":{},"kind":"flux-playback-history","entries":[]}}"#,
+                    HISTORY_SCHEMA_VERSION + 1
+                )
+                .into_bytes(),
+            ),
+            ("malformed", b"{not json".to_vec()),
+            ("truncated", br#"{"version":1,"kind":"flux-playback-history","entries":["#.to_vec()),
+        ];
+        for (name, bytes) in cases {
+            fs::write(&path, &bytes).expect("fixture");
+            let error = store
+                .load()
+                .expect_err(&format!("{name} must not load as empty history"));
+            assert!(!error.to_string().is_empty(), "{name}: empty error");
+            assert_eq!(
+                fs::read(&path).expect("preserved"),
+                bytes,
+                "{name}: failed load rewrote history"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_legacy_history_remain_supported() {
+        let dir = TempDir::new("history-empty-legacy");
+        let path = dir.path().join("history.flux");
+        let store = PlaybackHistoryStore::new(&path);
+        store
+            .save(&PlaybackHistory::default())
+            .expect("empty history save");
+        let loaded = store.load().expect("empty load").expect("exists");
+        assert!(loaded.is_empty());
+
+        let legacy =
+            br#"{"version":1,"entries":[{"track_id":3,"play_count":2,"last_played_unix_ms":99}]}"#;
+        fs::write(&path, legacy).expect("legacy fixture");
+        let loaded = store.load().expect("legacy load").expect("exists");
+        assert_eq!(loaded.entry(TrackId::new(3)).expect("entry").play_count, 2);
+        assert_eq!(fs::read(&path).expect("preserved"), legacy);
     }
 
     #[test]

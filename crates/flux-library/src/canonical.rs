@@ -667,7 +667,6 @@ struct PlaylistEntityDto {
 struct RatingsDto {
     schema_version: u32,
     kind: String,
-    #[serde(default)]
     entries: Vec<RatingEntryDto>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4694,10 +4693,10 @@ mod tests {
     use flux_core::{ArtistId, TrackId};
 
     use super::{
-        AlbumId, CATALOG_FILE_NAME, CanonicalError, CanonicalImportAlbumRef,
-        CanonicalImportArtistRef, CanonicalImportTrackRequest, CanonicalImportedTrack,
-        CanonicalLibrary, ContentFingerprint, ReleaseType, TRANSACTIONS_DIR_NAME,
-        TransactionFailPoint, TransactionFailure,
+        AlbumId, CANONICAL_SCHEMA_VERSION, CATALOG_FILE_NAME, CanonicalError,
+        CanonicalImportAlbumRef, CanonicalImportArtistRef, CanonicalImportTrackRequest,
+        CanonicalImportedTrack, CanonicalLibrary, ContentFingerprint, RATINGS_FILE_NAME,
+        ReleaseType, TRANSACTIONS_DIR_NAME, TrackRating, TransactionFailPoint, TransactionFailure,
     };
 
     struct TempDir(PathBuf);
@@ -5181,6 +5180,166 @@ mod tests {
             fs::read(root.join(CATALOG_FILE_NAME)).expect("catalog"),
             before
         );
+    }
+
+    #[test]
+    fn ratings_required_collection_and_fields_fail_closed_without_rewriting() {
+        #[derive(Clone, Copy, Debug)]
+        enum RatingMutation {
+            MissingEntries,
+            WrongEntriesType,
+            MissingTrackId,
+            MissingFavorite,
+            RatingTooHigh,
+            DuplicateTrack,
+            MissingTrack,
+            FutureVersion,
+            WrongKind,
+        }
+
+        let (_dir, root, mut library, _artist, _album, track) =
+            metadata_fixture("ratings-fail-closed");
+        library.set_rating(track, Some(4), true).expect("rating");
+        drop(library);
+        let ratings_path = root.join(RATINGS_FILE_NAME);
+        let base: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ratings_path).expect("ratings"))
+                .expect("ratings json");
+        let mutations = [
+            RatingMutation::MissingEntries,
+            RatingMutation::WrongEntriesType,
+            RatingMutation::MissingTrackId,
+            RatingMutation::MissingFavorite,
+            RatingMutation::RatingTooHigh,
+            RatingMutation::DuplicateTrack,
+            RatingMutation::MissingTrack,
+            RatingMutation::FutureVersion,
+            RatingMutation::WrongKind,
+        ];
+        for mutation in mutations {
+            let mut value = base.clone();
+            match mutation {
+                RatingMutation::MissingEntries => {
+                    value.as_object_mut().expect("object").remove("entries");
+                }
+                RatingMutation::WrongEntriesType => {
+                    value["entries"] = serde_json::json!({});
+                }
+                RatingMutation::MissingTrackId => {
+                    value["entries"][0]
+                        .as_object_mut()
+                        .expect("entry")
+                        .remove("track_id");
+                }
+                RatingMutation::MissingFavorite => {
+                    value["entries"][0]
+                        .as_object_mut()
+                        .expect("entry")
+                        .remove("favorite");
+                }
+                RatingMutation::RatingTooHigh => {
+                    value["entries"][0]["rating"] = serde_json::json!(6);
+                }
+                RatingMutation::DuplicateTrack => {
+                    let entry = value["entries"][0].clone();
+                    value["entries"]
+                        .as_array_mut()
+                        .expect("entries")
+                        .push(entry);
+                }
+                RatingMutation::MissingTrack => {
+                    value["entries"][0]["track_id"] = serde_json::json!(999_999);
+                }
+                RatingMutation::FutureVersion => {
+                    value["schema_version"] = serde_json::json!(CANONICAL_SCHEMA_VERSION + 1);
+                }
+                RatingMutation::WrongKind => {
+                    value["kind"] = serde_json::json!("flux-not-ratings");
+                }
+            }
+            let bytes = serde_json::to_vec_pretty(&value).expect("fixture bytes");
+            fs::write(&ratings_path, &bytes).expect("ratings fixture");
+            let error = CanonicalLibrary::open(&root)
+                .err()
+                .unwrap_or_else(|| panic!("{mutation:?}: invalid ratings must not open"));
+            assert!(!error.to_string().is_empty(), "{mutation:?}: empty error");
+            assert_eq!(
+                fs::read(&ratings_path).expect("preserved"),
+                bytes,
+                "{mutation:?}: failed open rewrote ratings.flux"
+            );
+        }
+
+        fs::write(&ratings_path, b"{not json").expect("malformed ratings");
+        let before = fs::read(&ratings_path).expect("ratings");
+        assert!(CanonicalLibrary::open(&root).is_err());
+        assert_eq!(fs::read(&ratings_path).expect("preserved"), before);
+
+        fs::write(
+            &ratings_path,
+            serde_json::to_vec_pretty(&base).expect("base bytes"),
+        )
+        .expect("restore ratings");
+        let reopened = CanonicalLibrary::open(&root).expect("valid ratings reopen");
+        assert_eq!(
+            reopened.rating(track),
+            Some(TrackRating {
+                rating: Some(4),
+                favorite: true
+            })
+        );
+    }
+
+    #[test]
+    fn unrelated_metadata_transaction_does_not_overwrite_invalid_ratings() {
+        let (_dir, root, mut library, artist, _album, track) =
+            metadata_fixture("ratings-unrelated-transaction");
+        library.set_rating(track, Some(3), false).expect("rating");
+        let ratings_path = root.join(RATINGS_FILE_NAME);
+        let valid_ratings = fs::read(&ratings_path).expect("ratings");
+        let mut corrupt: serde_json::Value =
+            serde_json::from_slice(&valid_ratings).expect("ratings json");
+        corrupt.as_object_mut().expect("object").remove("entries");
+        let corrupt_bytes = serde_json::to_vec_pretty(&corrupt).expect("corrupt bytes");
+        fs::write(&ratings_path, &corrupt_bytes).expect("corrupt ratings");
+
+        assert!(
+            library
+                .rename_artist(artist, "Renamed With Corrupt Ratings")
+                .is_err(),
+            "reopening must fail while ratings are invalid"
+        );
+        assert_eq!(
+            fs::read(&ratings_path).expect("ratings preserved"),
+            corrupt_bytes,
+            "the unrelated transaction rewrote or discarded invalid ratings"
+        );
+
+        fs::write(&ratings_path, valid_ratings).expect("restore ratings");
+        let reopened = CanonicalLibrary::open(&root).expect("recover valid ratings");
+        assert_eq!(
+            reopened.artist(artist).map(|value| value.name.as_str()),
+            Some("Renamed With Corrupt Ratings")
+        );
+        assert_eq!(
+            reopened.rating(track),
+            Some(TrackRating {
+                rating: Some(3),
+                favorite: false
+            })
+        );
+    }
+
+    #[test]
+    fn valid_empty_ratings_remain_valid() {
+        let (_dir, root, _library, _artist, _album, _track) =
+            metadata_fixture("ratings-empty-valid");
+        let ratings: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(RATINGS_FILE_NAME)).expect("ratings"))
+                .expect("ratings json");
+        assert_eq!(ratings["entries"].as_array().expect("entries").len(), 0);
+        let reopened = CanonicalLibrary::open(&root).expect("empty ratings open");
+        assert!(reopened.ratings.is_empty());
     }
 
     #[test]

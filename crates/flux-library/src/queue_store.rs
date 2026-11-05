@@ -7,8 +7,10 @@
 //!
 //! Loading validates the whole file before accepting anything. A malformed
 //! or unreadable file is an error, never an empty queue, and this module
-//! never writes during load. Saving uses a sibling temporary file, a file
-//! sync, and an atomic replacement of the old queue file.
+//! never writes during load. The current schema requires the `entries`
+//! collection; older files may omit only the later optional `auto_library`
+//! and `playback` fields. Saving uses a sibling temporary file, a file sync,
+//! and an atomic replacement of the old queue file.
 
 use std::fmt;
 use std::fs;
@@ -176,7 +178,6 @@ struct QueueFile {
     /// receive tracks added by later scans.
     #[serde(default)]
     auto_library: bool,
-    #[serde(default)]
     entries: Vec<QueueEntryRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     playback: Option<PersistedPlaybackRecord>,
@@ -396,6 +397,89 @@ mod tests {
         fs::write(&path, &invalid).expect("fixture");
         assert!(store.load().is_err(), "duplicate entry IDs are invalid");
         assert_eq!(fs::read(&path).expect("preserved"), invalid.as_bytes());
+    }
+
+    #[test]
+    fn required_collections_and_entry_fields_fail_closed_without_rewriting() {
+        let dir = TempDir::new("queue-required-fields");
+        let path = dir.path().join("queue.json");
+        let store = QueueStore::new(&path);
+        let cases = [
+            (
+                "missing entries",
+                serde_json::json!({
+                    "version": QUEUE_SCHEMA_VERSION,
+                    "next_entry_id": 1,
+                    "current_entry_id": null
+                }),
+            ),
+            (
+                "wrong entries type",
+                serde_json::json!({
+                    "version": QUEUE_SCHEMA_VERSION,
+                    "next_entry_id": 1,
+                    "current_entry_id": null,
+                    "entries": {}
+                }),
+            ),
+            (
+                "missing next_entry_id",
+                serde_json::json!({
+                    "version": QUEUE_SCHEMA_VERSION,
+                    "current_entry_id": null,
+                    "entries": []
+                }),
+            ),
+            (
+                "missing entry id",
+                serde_json::json!({
+                    "version": QUEUE_SCHEMA_VERSION,
+                    "next_entry_id": 2,
+                    "current_entry_id": 1,
+                    "entries": [{"track_id": 10}]
+                }),
+            ),
+            (
+                "missing entry track_id",
+                serde_json::json!({
+                    "version": QUEUE_SCHEMA_VERSION,
+                    "next_entry_id": 2,
+                    "current_entry_id": 1,
+                    "entries": [{"id": 1}]
+                }),
+            ),
+            (
+                "wrong entry id type",
+                serde_json::json!({
+                    "version": QUEUE_SCHEMA_VERSION,
+                    "next_entry_id": 2,
+                    "current_entry_id": 1,
+                    "entries": [{"id": "one", "track_id": 10}]
+                }),
+            ),
+            (
+                "future schema",
+                serde_json::json!({
+                    "version": QUEUE_SCHEMA_VERSION + 1,
+                    "next_entry_id": 1,
+                    "current_entry_id": null,
+                    "entries": []
+                }),
+            ),
+        ];
+        for (name, value) in cases {
+            let bytes = serde_json::to_vec_pretty(&value).expect("fixture bytes");
+            fs::write(&path, &bytes).expect("fixture");
+            let error = store
+                .load()
+                .expect_err(&format!("{name} must not load as a queue"));
+            assert!(!error.to_string().is_empty(), "{name}: empty error");
+            assert_eq!(
+                fs::read(&path).expect("preserved"),
+                bytes,
+                "{name}: failed load rewrote the queue file"
+            );
+        }
     }
 
     #[test]

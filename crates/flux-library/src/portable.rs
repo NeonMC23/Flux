@@ -39,8 +39,12 @@
 //! files that were fully written and finalized before it. Segment
 //! files left behind by an interrupted publication are unreferenced
 //! orphans — ignored on load and garbage-collected after a later
-//! successful commit (files referenced by either the current or the
-//! backup catalogue are always kept). Finalizing a segment whose exact
+//! successful commit. Garbage collection first fully validates the
+//! current catalogue and every segment it references, then fully
+//! validates the backup catalogue and its segments, and only then removes
+//! files referenced by neither. Any validation failure, missing required
+//! backup after generation 1, or current/backup library or generation
+//! inconsistency aborts deletion entirely. Finalizing a segment whose exact
 //! bytes are already in place (a retried commit after a crash) succeeds
 //! idempotently; a same-named file with *different* bytes — typically
 //! an orphan from a catalogue generation that was lost and recovered
@@ -1191,7 +1195,6 @@ struct CatalogDto {
     next_artist_id: u64,
     #[serde(default)]
     artists: Vec<ArtistDto>,
-    #[serde(default)]
     segments: Vec<SegmentDescriptorDto>,
 }
 
@@ -2667,8 +2670,10 @@ impl PortableStore {
         self.artists_changed = false;
         self.schema_upgrade_pending = false;
 
-        // 7. Garbage-collect unreferenced internal files (best effort).
-        self.collect_garbage();
+        // 7. Garbage-collect unreferenced internal files. Publication has
+        // already succeeded; a validation failure aborts deletion and leaves
+        // the published generation intact for inspection/retry.
+        let _ = self.collect_garbage();
         Ok(())
     }
 
@@ -2725,33 +2730,52 @@ impl PortableStore {
         }
     }
 
-    /// Removes `.flux/` files referenced by neither the current nor the
-    /// backup catalogue (orphaned segment generations and our own temp
-    /// files). Conservative: if the backup catalogue cannot be parsed,
-    /// GC is skipped entirely rather than risking recovery data. Never
-    /// touches anything outside the segment/temp patterns.
-    fn collect_garbage(&self) {
-        let mut referenced: HashSet<String> = HashSet::new();
-        for segment in &self.segments {
-            referenced.insert(segment_file_name(segment.id, segment.generation));
+    /// Removes `.flux/` files referenced by neither the fully validated
+    /// current catalogue nor its fully validated backup catalogue. Any
+    /// validation failure, missing required backup, or inconsistent
+    /// catalogue identity aborts before the first deletion. Never touches
+    /// anything outside the segment/temp patterns.
+    fn collect_garbage(&self) -> Result<(), PortableStoreError> {
+        if self.has_uncommitted_changes() {
+            return Err(PortableStoreError::InvalidStore(
+                "cannot garbage-collect while in-memory changes are unpublished".to_owned(),
+            ));
         }
+        let current = load_generation(&self.flux_dir, CATALOG_FILE_NAME, self.policy)?;
+        let mut referenced: HashSet<String> = current
+            .segments
+            .iter()
+            .map(|segment| segment_file_name(segment.id, segment.generation))
+            .collect();
+
         let backup_path = self.flux_dir.join(CATALOG_BACKUP_FILE_NAME);
         if backup_path.exists() {
-            match fs::read(&backup_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<CatalogDto>(&bytes).ok())
-            {
-                Some(catalog) => {
-                    for descriptor in catalog.segments {
-                        referenced.insert(descriptor.file);
-                    }
-                }
-                None => return,
+            let backup = load_generation(&self.flux_dir, CATALOG_BACKUP_FILE_NAME, self.policy)?;
+            if backup.catalog.library_id != current.catalog.library_id {
+                return Err(PortableStoreError::InvalidStore(
+                    "catalogue backup belongs to a different library".to_owned(),
+                ));
             }
+            if backup.catalog.generation > current.catalog.generation {
+                return Err(PortableStoreError::InvalidStore(format!(
+                    "catalogue backup generation {} is newer than current generation {}",
+                    backup.catalog.generation, current.catalog.generation
+                )));
+            }
+            referenced.extend(
+                backup
+                    .segments
+                    .iter()
+                    .map(|segment| segment_file_name(segment.id, segment.generation)),
+            );
+        } else if current.catalog.generation > 1 {
+            return Err(PortableStoreError::InvalidStore(format!(
+                "catalogue generation {} has no backup catalogue; refusing unsafe garbage collection",
+                current.catalog.generation
+            )));
         }
-        let Ok(entries) = fs::read_dir(&self.flux_dir) else {
-            return;
-        };
+
+        let entries = fs::read_dir(&self.flux_dir)?;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -2761,6 +2785,7 @@ impl PortableStore {
                 let _ = fs::remove_file(entry.path());
             }
         }
+        Ok(())
     }
 }
 
@@ -4137,6 +4162,21 @@ mod tests {
         names
     }
 
+    fn snapshot_flux_files(dir: &TempDir) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(flux_dir(dir))
+            .expect("read .flux dir")
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = fs::read(entry.path()).expect("read .flux file");
+                (name, bytes)
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
     fn catalog_value(dir: &TempDir) -> serde_json::Value {
         read_json(&flux_dir(dir).join(CATALOG_FILE_NAME))
     }
@@ -4724,6 +4764,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn loader_requires_the_segments_collection_and_valid_segment_content() {
+        let err = load_err_after("portable_missing_segments", 3, |dir| {
+            mutate_catalog(dir, |cat| {
+                cat.as_object_mut().expect("object").remove("segments");
+            });
+        });
+        assert!(
+            matches!(err, PortableStoreError::Malformed { .. }),
+            "missing segments must fail closed: {err}"
+        );
+
+        let err = load_err_after("portable_wrong_segments_type", 3, |dir| {
+            mutate_catalog(dir, |cat| cat["segments"] = serde_json::json!({}));
+        });
+        assert!(
+            matches!(err, PortableStoreError::Malformed { .. }),
+            "wrong segments type must fail closed: {err}"
+        );
+
+        let err = load_err_after("portable_corrupt_segment", 3, |dir| {
+            let name = segment_files(dir).into_iter().next().expect("segment");
+            fs::write(flux_dir(dir).join(name), b"{not valid segment").expect("corrupt segment");
+        });
+        assert!(
+            matches!(err, PortableStoreError::Malformed { .. }),
+            "corrupt segment content must fail closed: {err}"
+        );
+    }
+
     // ------------------------------------------------------------- paths ---
 
     #[test]
@@ -5120,6 +5190,180 @@ mod tests {
             flux_dir(&dir).join("notes.txt").exists(),
             "user file preserved"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum GcDamage {
+        MissingSegments,
+        WrongSegmentsType,
+        MalformedCurrent,
+        MissingSegment,
+        CorruptSegment,
+        InvalidBackup,
+        MissingBackup,
+        BackupMissingSegments,
+        BackupMissingSegment,
+        BackupCorruptSegment,
+        BackupDifferentLibrary,
+        BackupNewerGeneration,
+    }
+
+    #[test]
+    fn gc_aborts_without_deletion_on_any_untrusted_reference_set() {
+        for damage in [
+            GcDamage::MissingSegments,
+            GcDamage::WrongSegmentsType,
+            GcDamage::MalformedCurrent,
+            GcDamage::MissingSegment,
+            GcDamage::CorruptSegment,
+            GcDamage::InvalidBackup,
+            GcDamage::MissingBackup,
+            GcDamage::BackupMissingSegments,
+            GcDamage::BackupMissingSegment,
+            GcDamage::BackupCorruptSegment,
+            GcDamage::BackupDifferentLibrary,
+            GcDamage::BackupNewerGeneration,
+        ] {
+            let dir = TempDir::new(&format!("portable_gc_abort_{damage:?}"));
+            let mut store = seeded(&dir, 1);
+            if matches!(
+                damage,
+                GcDamage::BackupMissingSegment | GcDamage::BackupCorruptSegment
+            ) {
+                store
+                    .set_tags(TrackId::new(1), title_tags("second generation"))
+                    .expect("edit");
+                store
+                    .commit()
+                    .expect("second commit makes backup reference segments");
+            }
+            fs::write(
+                flux_dir(&dir).join("tracks-9999@9.flux"),
+                b"unreferenced but must survive aborted GC",
+            )
+            .expect("orphan");
+            fs::write(flux_dir(&dir).join("catalog.flux.tmp"), b"temporary").expect("temporary");
+            let catalog_path = flux_dir(&dir).join(CATALOG_FILE_NAME);
+            let backup_path = flux_dir(&dir).join(CATALOG_BACKUP_FILE_NAME);
+            match damage {
+                GcDamage::MissingSegments => {
+                    mutate_catalog(&dir, |cat| {
+                        cat.as_object_mut().expect("object").remove("segments");
+                    });
+                }
+                GcDamage::WrongSegmentsType => {
+                    mutate_catalog(&dir, |cat| cat["segments"] = serde_json::json!({}));
+                }
+                GcDamage::MalformedCurrent => {
+                    fs::write(&catalog_path, b"{not json").expect("malformed current");
+                }
+                GcDamage::MissingSegment => {
+                    let name = segment_files(&dir).into_iter().next().expect("segment");
+                    fs::remove_file(flux_dir(&dir).join(name)).expect("remove segment");
+                }
+                GcDamage::CorruptSegment => {
+                    let name = segment_files(&dir).into_iter().next().expect("segment");
+                    fs::write(flux_dir(&dir).join(name), b"{not json").expect("corrupt segment");
+                }
+                GcDamage::InvalidBackup => {
+                    fs::write(&backup_path, b"{not json").expect("invalid backup");
+                }
+                GcDamage::MissingBackup => {
+                    fs::remove_file(&backup_path).expect("remove backup");
+                }
+                GcDamage::BackupMissingSegments => {
+                    let mut backup = read_json(&backup_path);
+                    backup.as_object_mut().expect("object").remove("segments");
+                    write_json(&backup_path, &backup);
+                }
+                GcDamage::BackupMissingSegment | GcDamage::BackupCorruptSegment => {
+                    let backup = read_json(&backup_path);
+                    let segment = backup["segments"][0]["file"]
+                        .as_str()
+                        .expect("backup segment file");
+                    let path = flux_dir(&dir).join(segment);
+                    if matches!(damage, GcDamage::BackupMissingSegment) {
+                        fs::remove_file(path).expect("remove backup segment");
+                    } else {
+                        fs::write(path, b"{not json").expect("corrupt backup segment");
+                    }
+                }
+                GcDamage::BackupDifferentLibrary => {
+                    let current = catalog_value(&dir);
+                    let current_id = current["library_id"].as_str().expect("current library id");
+                    let different = if current_id == "00000000000000000000000000000000" {
+                        "11111111111111111111111111111111"
+                    } else {
+                        "00000000000000000000000000000000"
+                    };
+                    let mut backup = read_json(&backup_path);
+                    backup["library_id"] = serde_json::json!(different);
+                    write_json(&backup_path, &backup);
+                }
+                GcDamage::BackupNewerGeneration => {
+                    let current = catalog_value(&dir);
+                    let current_generation = current["generation"].as_u64().expect("generation");
+                    let mut backup = read_json(&backup_path);
+                    backup["generation"] = serde_json::json!(current_generation + 1);
+                    write_json(&backup_path, &backup);
+                }
+            }
+            let before = snapshot_flux_files(&dir);
+            let error = store
+                .collect_garbage()
+                .expect_err(&format!("{damage:?}: GC must abort"));
+            assert!(!error.to_string().is_empty(), "{damage:?}: empty error");
+            assert_eq!(
+                snapshot_flux_files(&dir),
+                before,
+                "{damage:?}: GC deleted or changed files before validation"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_accepts_a_valid_empty_first_generation_without_a_backup() {
+        let dir = TempDir::new("portable_gc_empty_first_generation");
+        let store = PortableStore::create(dir.path()).expect("create empty store");
+        let orphan = flux_dir(&dir).join("tracks-0001@1.flux");
+        let temp = flux_dir(&dir).join("catalog.flux.tmp");
+        fs::write(&orphan, b"orphan").expect("orphan");
+        fs::write(&temp, b"temp").expect("temp");
+        store.collect_garbage().expect("empty generation GC");
+        assert!(!orphan.exists());
+        assert!(!temp.exists());
+        drop(store);
+        let reopened = PortableStore::open(dir.path()).expect("reopen empty");
+        assert!(reopened.store.is_empty());
+    }
+
+    #[test]
+    fn gc_deletes_only_unreferenced_files_after_full_validation() {
+        let dir = TempDir::new("portable_gc_validated");
+        let store = seeded(&dir, 1);
+        let orphan = flux_dir(&dir).join("tracks-9999@1.flux");
+        let temp = flux_dir(&dir).join("catalog.flux.tmp");
+        let notes = flux_dir(&dir).join("notes.txt");
+        fs::write(&orphan, b"orphan segment").expect("orphan");
+        fs::write(&temp, b"temp").expect("temp");
+        fs::write(&notes, b"keep me").expect("notes");
+        let before = snapshot_flux_files(&dir);
+
+        store.collect_garbage().expect("validated GC");
+        let after = snapshot_flux_files(&dir);
+        let expected: Vec<(String, Vec<u8>)> = before
+            .into_iter()
+            .filter(|(name, _)| name != "tracks-9999@1.flux" && name != "catalog.flux.tmp")
+            .collect();
+        assert_eq!(
+            after, expected,
+            "GC changed referenced files or kept garbage"
+        );
+        assert!(!orphan.exists());
+        assert!(!temp.exists());
+        assert!(notes.is_file(), "unrelated file must be preserved");
+        drop(store);
+        PortableStore::open(dir.path()).expect("reopen after validated GC");
     }
 
     // ------------------------------------------------------------ recovery ---

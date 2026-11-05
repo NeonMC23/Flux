@@ -11432,6 +11432,59 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_queue_and_history_fail_closed_and_survive_shutdown() {
+        let dir = TempDir::new("queue-history-incomplete");
+        let root = dir.path().join("FluxLibrary");
+        create_canonical_library(&root).expect("create canonical library");
+        let queue_path = root.join("queue.flux");
+        let history_path = root.join("history.flux");
+        let queue_bytes = br#"{"version":1,"next_entry_id":1,"current_entry_id":null}"#;
+        let history_bytes = br#"{"version":1,"kind":"flux-playback-history"}"#;
+        fs::write(&queue_path, queue_bytes).expect("incomplete queue");
+        fs::write(&history_path, history_bytes).expect("incomplete history");
+
+        let (mut controller, _control) = boot_canonical_at(&root);
+        assert!(controller.queue_write_protected);
+        assert!(controller.history_write_protected);
+        let errors: Vec<String> = controller
+            .poll()
+            .into_iter()
+            .filter_map(|event| match event {
+                ControllerEvent::Error(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("playback queue")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("playback history")),
+            "{errors:?}"
+        );
+
+        // Explicit save attempts in the affected session must also respect
+        // the write-protection flags.
+        controller.persist_queue();
+        controller.persist_history();
+        controller.shutdown();
+        assert_eq!(
+            fs::read(&queue_path).expect("queue preserved"),
+            queue_bytes,
+            "shutdown overwrote an incomplete queue"
+        );
+        assert_eq!(
+            fs::read(&history_path).expect("history preserved"),
+            history_bytes,
+            "shutdown overwrote incomplete history"
+        );
+    }
+
+    #[test]
     fn malformed_queue_file_is_reported_preserved_and_never_overwritten() {
         let dir = TempDir::new("queue-malformed");
         let state = dir.path().join("state");

@@ -205,7 +205,11 @@ sorting keeps the same stable IDs selected. Navigating away cannot retarget a
 batch to different tracks because operations carry IDs and revalidate them.
 
 Batch favorites/unfavorites write all selected tracks in one ratings transaction
-and preserve existing rating values. Playlist actions open an explicit review
+and preserve existing rating values. `ratings.flux` requires its `entries`
+collection; missing/wrong-typed collections, duplicate entries, unknown tracks,
+invalid ratings and wrong versions/kinds reject canonical open and preserve the
+original file. A canonical transaction never rewrites invalid ratings as empty
+data. Playlist actions open an explicit review
 showing the affected count, target playlist and selected tracks. Creating a
 playlist from the selection or appending to an existing playlist uses one
 canonical playlist transaction; existing order is retained, selected tracks
@@ -300,9 +304,12 @@ For canonical libraries, the queue file persists ordered entries, stable
 entry IDs, current entry, repeat mode, shuffle flag, playback position and
 whether playback was active. Restoration always installs the queue paused and
 does not start audio implicitly. Position is applied only when the user presses
-Play. Queue files without the optional playback fields remain readable with
-defaults. Saves remain atomic and malformed files are preserved. Non-canonical
-legacy/portable backends retain their existing queue workflow.
+Play. Queue files without the optional `auto_library`/playback fields remain readable
+with defaults. The `entries` collection itself is required: a missing or
+wrong-typed collection is corruption, not a valid empty queue. Saves remain
+atomic, failed-load sources are preserved, and writes are disabled for that
+session. Non-canonical legacy/portable backends retain their existing queue
+workflow.
 
 ### Audio engine, gapless handoff and crossfade
 
@@ -944,9 +951,12 @@ atomic replace; it is not a second catalogue. A play is counted once per queue
 entry after accumulated playing time reaches `clamp(duration/2, 5s, 30s)` (30s
 when duration is unknown). Pause/resume does not add time, seek jumps over two
 seconds are ignored as listening evidence, and restarting within the same queue
-entry does not create another play. No historical plays are fabricated. Malformed
-history is preserved and history writes are disabled for that session. History
-survives TrackId-preserving metadata edits, moves and audio replacement.
+entry does not create another play. No historical plays are fabricated. The
+history `entries` collection is required in the current schema; missing or
+wrong-typed collections are preserved as corruption and history writes are
+disabled for that session. Legacy version-1 files without the optional `kind`
+field remain readable. History survives TrackId-preserving metadata edits, moves
+and audio replacement.
 
 Advanced sorting supports catalogue order, title, artist, album, track/disc,
 favorites, rating, play count, last played, date added and duration with an
