@@ -1000,6 +1000,59 @@ fn display_album(track: &Track) -> String {
     nonempty(track.album()).unwrap_or_else(|| "Unknown album".to_owned())
 }
 
+type HistoryEntityTotals = (Vec<(String, u64)>, Vec<(String, u64)>);
+
+/// Aggregates meaningful plays by stable artist/album identity for the compact
+/// dashboard breakdown. Display names are labels only; separate same-named
+/// entities are never merged. TrackIds not present in the active catalogue are
+/// ignored, so a switch/catalogue change cannot resurrect stale names.
+fn history_entity_breakdown(controller: &Controller) -> HistoryEntityTotals {
+    let mut artist_ids: BTreeMap<ArtistId, u64> = BTreeMap::new();
+    let mut album_ids: BTreeMap<AlbumId, u64> = BTreeMap::new();
+    let mut artist_names: BTreeMap<String, u64> = BTreeMap::new();
+    let mut album_names: BTreeMap<String, u64> = BTreeMap::new();
+    for (id, entry) in controller.playback_history().entries() {
+        let Some(track) = controller.track(id) else {
+            continue;
+        };
+        if let Some(artist) = controller.track_artist_id(id) {
+            let total = artist_ids.entry(artist).or_default();
+            *total = total.saturating_add(entry.play_count);
+        } else {
+            let total = artist_names.entry(display_artist(track)).or_default();
+            *total = total.saturating_add(entry.play_count);
+        }
+        if let Some(album) = controller.track_album_id(id) {
+            let total = album_ids.entry(album).or_default();
+            *total = total.saturating_add(entry.play_count);
+        } else {
+            let total = album_names.entry(display_album(track)).or_default();
+            *total = total.saturating_add(entry.play_count);
+        }
+    }
+    let mut artists = artist_names.into_iter().collect::<Vec<_>>();
+    artists.extend(artist_ids.into_iter().map(|(id, count)| {
+        let name = controller
+            .artist(id)
+            .map_or_else(|| format!("Artist {id}"), |artist| artist.name().to_owned());
+        (name, count)
+    }));
+    let mut albums = album_names.into_iter().collect::<Vec<_>>();
+    albums.extend(album_ids.into_iter().map(|(id, count)| {
+        let name = controller
+            .album(id)
+            .map_or_else(|| format!("Album {id}"), |album| album.title.clone());
+        (name, count)
+    }));
+    artists.sort_by(|(left_name, left), (right_name, right)| {
+        right.cmp(left).then_with(|| left_name.cmp(right_name))
+    });
+    albums.sort_by(|(left_name, left), (right_name, right)| {
+        right.cmp(left).then_with(|| left_name.cmp(right_name))
+    });
+    (artists, albums)
+}
+
 fn display_folder(track: &Track) -> String {
     track
         .source()
@@ -11246,33 +11299,7 @@ impl FluxReady {
     }
 
     fn most_played_breakdown(&self) -> Element<'_, Message> {
-        let mut artists: BTreeMap<String, u64> = BTreeMap::new();
-        let mut albums: BTreeMap<String, u64> = BTreeMap::new();
-        for (id, entry) in self.controller.playback_history().entries() {
-            let Some(track) = self.controller.track(id) else {
-                continue;
-            };
-            let artist = display_artist(track);
-            let album = display_album(track);
-            *artists.entry(artist).or_default() = artists
-                .get(&display_artist(track))
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(entry.play_count);
-            *albums.entry(album.clone()).or_default() = albums
-                .get(&album)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(entry.play_count);
-        }
-        let mut artists = artists.into_iter().collect::<Vec<_>>();
-        let mut albums = albums.into_iter().collect::<Vec<_>>();
-        artists.sort_by(|(left_name, left), (right_name, right)| {
-            right.cmp(left).then_with(|| left_name.cmp(right_name))
-        });
-        albums.sort_by(|(left_name, left), (right_name, right)| {
-            right.cmp(left).then_with(|| left_name.cmp(right_name))
-        });
+        let (artists, albums) = history_entity_breakdown(&self.controller);
         let artist_text = artists
             .iter()
             .take(5)
@@ -16385,6 +16412,109 @@ mod tests {
         assert_eq!(
             gui.smart_collection_ids(SmartCollection::Favorites),
             vec![one, three]
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn history_aggregates_drive_dashboard_collections_sorting_and_cache_invalidation() {
+        let dir = TempDir::new("gui-history-aggregates");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui1 = gui(&dir);
+        send(
+            &mut gui1,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui1, Message::OpenLibraryPressed);
+        let one = import_named_track(
+            &mut gui1,
+            &dir,
+            "One",
+            "Artist One",
+            "Album One",
+            ReleaseType::Album,
+            1,
+        );
+        let two = import_named_track(
+            &mut gui1,
+            &dir,
+            "Two",
+            "Artist Two",
+            "Album Two",
+            ReleaseType::Album,
+            2,
+        );
+        gui1.controller.shutdown();
+        std::fs::write(
+            root.join("history.flux"),
+            format!(
+                "{{\"version\":1,\"kind\":\"flux-playback-history\",\"entries\":[\
+                 {{\"track_id\":{},\"play_count\":2,\"last_played_unix_ms\":2000}},\
+                 {{\"track_id\":{},\"play_count\":1,\"last_played_unix_ms\":3000}}]}}",
+                one.get(),
+                two.get(),
+            ),
+        )
+        .expect("fixture history");
+
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let summary = gui.dashboard_summary();
+        assert_eq!(summary.recently_played, vec![two, one]);
+        assert_eq!(summary.most_played, vec![one, two]);
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::RecentlyPlayed),
+            vec![two, one]
+        );
+        assert_eq!(
+            gui.smart_collection_ids(SmartCollection::MostPlayed),
+            vec![one, two]
+        );
+        let (artists, albums) = history_entity_breakdown(&gui.controller);
+        assert_eq!(
+            artists,
+            vec![("Artist One".to_owned(), 2), ("Artist Two".to_owned(), 1)]
+        );
+        assert_eq!(
+            albums,
+            vec![("Album One".to_owned(), 2), ("Album Two".to_owned(), 1)]
+        );
+
+        gui.sort_tracks = TrackSort::PlayCount;
+        gui.sort_descending = false;
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![two, one]
+        );
+        gui.sort_descending = true;
+        assert_eq!(
+            gui.filtered_tracks()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![one, two]
+        );
+
+        let mut stale_summary = summary.clone();
+        stale_summary.history_generation = stale_summary.history_generation.wrapping_add(1);
+        stale_summary.total_tracks = 999;
+        *gui.dashboard_cache.borrow_mut() = Some(stale_summary);
+        let refreshed = gui.dashboard_summary();
+        assert_eq!(
+            refreshed.total_tracks, 2,
+            "dashboard cache ignored history generation"
+        );
+        assert_eq!(
+            refreshed.history_generation,
+            gui.controller.history_generation()
         );
         gui.controller.shutdown();
     }

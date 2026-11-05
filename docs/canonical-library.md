@@ -527,9 +527,11 @@ Playback position remains source-relative: the engine subtracts the active
 source's output-frame start from consumed frames. Preparation and buffered
 decode never advance visible position. Pause freezes consumption; seeking
 targets the current audible source and invalidates an unpromoted handoff.
-Meaningful-play history is keyed by queue entry and is reset only when the
-Controller accepts a transition, so preloading creates no play and duplicate
-tracks count as distinct occurrences.
+Meaningful-play history is keyed by contiguous queue-entry playback. A
+transition finalizes the outgoing entry at the engine's exact handoff source
+position and starts the incoming entry at zero; preloading alone creates no
+play, same-entry Repeat One does not create another, and duplicate tracks count
+as distinct queue-entry occurrences.
 
 If no prepared successor exists when EOF is reached, the old path remains:
 `TrackEnded` fires only after the ring drains, then the Controller advances and
@@ -562,6 +564,7 @@ from what remains structurally or physically unverified.
 | Queue authorization, duplicate `QueueEntryId`, transition identity | Confirmed by Controller/engine tests |
 | Entry-bound position, restore/seek/transition persistence, idempotent shutdown | Confirmed by deterministic Controller/GUI tests; no physical GUI-close or hardware-unplug validation |
 | Library-session isolation, same-path reopen, stale async results, switch-time playback/state reset | Confirmed by deterministic Controller/GUI/TUI tests with disposable libraries; no filesystem-watcher or physical GUI-interaction validation |
+| Meaningful-listening accounting, seek/pause/recovery/transition attribution, history persistence and dashboard aggregates | Confirmed by deterministic Controller/GUI tests with injected positions and transitions; no acoustic measurement or physical-device timing validation |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -588,7 +591,9 @@ Confirmed fixes from this audit:
   already passed its initial session check could still inherit the old seek
   target; the worker now resets position only when that Load is still the
   newest request and rechecks the session before publishing a seek's final
-  target.
+  target. Stop now carries its own session too: a Stop queued before a newer
+  Load/Seek still stops the pipeline but cannot overwrite the newer immediate
+  seek baseline with zero.
 - Non-finite decoded samples could propagate through interpolation and
   crossfade into the output backend. `FormatConverter` now converts
   NaN/infinity to zero at the conversion boundary while preserving finite
@@ -1014,16 +1019,38 @@ is preserved through metadata edits, moves, audio replacement and album transfer
 Meaningful playback history is derived application state in a per-canonical-
 library `history.flux`, separate from the catalogue and audio tags. It stores an
 aggregated play count and last-played Unix milliseconds per stable TrackId using
-atomic replace; it is not a second catalogue. A play is counted once per queue
-entry after accumulated playing time reaches `clamp(duration/2, 5s, 30s)` (30s
-when duration is unknown). Pause/resume does not add time, seek jumps over two
-seconds are ignored as listening evidence, and restarting within the same queue
-entry does not create another play. No historical plays are fabricated. The
-history `entries` collection is required in the current schema; missing or
-wrong-typed collections are preserved as corruption and history writes are
-disabled for that session. Legacy version-1 files without the optional `kind`
-field remain readable. History survives TrackId-preserving metadata edits, moves
-and audio replacement.
+atomic replace; it is not a second catalogue. A play is counted once per
+contiguous queue-entry playback after accumulated **delivered-audio** position
+advances reach `clamp(duration/2, 5s, 30s)` (30s when duration is unknown). The
+decoded stream duration is preferred once known, then catalogue duration.
+Pause/resume does not add time; stopped, recovering, unavailable, gated or
+prebuffering playback cannot advance the authoritative position and therefore
+adds no time. Repeated polling at the same position adds nothing; a backwards or
+out-of-order position update never re-credits the same interval. An explicit
+seek establishes a new baseline so skipped audio is never listening evidence;
+a non-seek jump over two seconds is also ignored.
+
+A new contiguous attempt on a different QueueEntryId, or returning to an entry
+after another entry played, can count independently. Stopping/restarting the
+same queue entry, or Repeat One looping that same entry, does not create another
+play; the loop baselines at zero while preserving the already-recorded state.
+Natural gapless/crossfade transitions finalize the outgoing entry using the
+engine-reported source position at the handoff boundary, then reset accounting
+for the incoming entry. Crossfade overlap is therefore not double-counted and
+preload alone creates no play.
+
+A failed history save leaves the previous file intact, reports the error, keeps
+the single in-memory aggregate for the session, and retries the full aggregate
+on the next save/shutdown without counting again. Shutdown and library switch
+finalize the latest legitimate evidence into the outgoing library before
+replacing or releasing it. Dashboard artist/album play breakdowns aggregate by
+stable entity identity but display current names; orphaned history TrackIds are
+ignored. No historical plays are fabricated. The history
+`entries` collection is required in the current schema; missing or wrong-typed
+collections are preserved as corruption and history writes are disabled for
+that session. Legacy version-1 files without the optional `kind` field remain
+readable. History survives TrackId-preserving metadata edits, moves and audio
+replacement.
 
 Advanced sorting supports catalogue order, title, artist, album, track/disc,
 favorites, rating, play count, last played, date added and duration with an

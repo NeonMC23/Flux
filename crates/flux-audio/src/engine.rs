@@ -219,6 +219,8 @@ pub enum EngineEvent {
         to_entry: QueueEntryId,
         /// Monotonic output-frame boundary since the generation began.
         boundary_frame: u64,
+        /// Source-relative position of the outgoing source at the boundary.
+        from_position: Duration,
         /// Decoded facts for the new source.
         info: StreamInfo,
     },
@@ -272,7 +274,9 @@ enum Command {
     CancelPreload,
     Play,
     Pause,
-    Stop,
+    Stop {
+        session: u64,
+    },
     Shutdown,
 }
 
@@ -862,11 +866,19 @@ impl EngineHandle {
 
     /// Stops playback and unloads the current track.
     pub fn stop(&self) {
+        let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            session != 0,
+            "playback session identifier exhausted after 2^64 requests"
+        );
+        self.shared
+            .requested_session
+            .store(session, Ordering::Release);
         self.shared.position_locked.store(true, Ordering::Release);
         self.shared.base_frames.store(0, Ordering::Release);
         self.shared.played_frames.store(0, Ordering::Release);
         self.shared.source_start_frame.store(0, Ordering::Release);
-        let _ = self.commands.send(Command::Stop);
+        let _ = self.commands.send(Command::Stop { session });
     }
 
     /// Seeks the loaded track to `position`.
@@ -1874,10 +1886,16 @@ fn run_worker<F>(
                         }
                     }
                 }
-                Command::Stop => {
+                Command::Stop { session } => {
                     current_generation = shared.bump_generation();
-                    shared.base_frames.store(0, Ordering::Release);
-                    shared.played_frames.store(0, Ordering::Release);
+                    // A newer Load/Seek may already own the immediate
+                    // position while this Stop waited in the channel. Still
+                    // stop the pipeline, but do not overwrite that newer
+                    // baseline.
+                    if shared.requested_session.load(Ordering::Acquire) == session {
+                        shared.base_frames.store(0, Ordering::Release);
+                        shared.played_frames.store(0, Ordering::Release);
+                    }
                     current_session = 0;
                     last_load_failed = false;
                     decoder = None;
@@ -2164,6 +2182,13 @@ fn run_worker<F>(
                 // This avoids a visible position window between two
                 // stores: position remains base + played - source_start.
                 let base = shared.base_frames.load(Ordering::Acquire);
+                let prior_source_start = shared.source_start_frame.load(Ordering::Acquire);
+                let from_position_frames = base
+                    .saturating_add(transition.boundary_frame)
+                    .saturating_sub(prior_source_start);
+                let from_position = Duration::from_secs_f64(
+                    from_position_frames as f64 / f64::from(config.sample_rate),
+                );
                 shared.source_start_frame.store(
                     transition.boundary_frame.saturating_add(base),
                     Ordering::Release,
@@ -2176,6 +2201,7 @@ fn run_worker<F>(
                     to_id: transition.to_id,
                     to_entry: transition.to_entry,
                     boundary_frame: transition.boundary_frame,
+                    from_position,
                     info: transition.info,
                 });
             }
@@ -3519,6 +3545,7 @@ mod tests {
                     to_id,
                     to_entry,
                     boundary_frame,
+                    from_position,
                     info,
                 } => Some((
                     *got_session,
@@ -3528,6 +3555,7 @@ mod tests {
                     *to_id,
                     *to_entry,
                     *boundary_frame,
+                    *from_position,
                     info.sample_rate,
                 )),
                 _ => None,
@@ -3536,7 +3564,15 @@ mod tests {
         assert_eq!(
             transition,
             (
-                session, generation, id_a, entry_a, id_b, entry_b, 1_000, 44_100,
+                session,
+                generation,
+                id_a,
+                entry_a,
+                id_b,
+                entry_b,
+                1_000,
+                Duration::from_secs_f64(1_000.0 / 44_100.0),
+                44_100,
             )
         );
         assert!(
@@ -5355,6 +5391,40 @@ mod tests {
         assert!(
             (engine.position().as_millis() as i64 - 50).abs() <= 2,
             "an older queued seek overwrote the newest position: {:?}",
+            engine.position()
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn seek_after_stop_keeps_the_new_immediate_baseline() {
+        let dir = TempDir::new("stop-then-seek-position");
+        let path = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.4);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.load(TrackId::new(1), path);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        start_playing(&engine, &control);
+        control.drain_frames(4_096);
+
+        engine.stop();
+        engine.load(
+            TrackId::new(1),
+            write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8),
+        );
+        let _ = engine.seek(Duration::from_millis(100));
+        assert!(
+            (engine.position().as_millis() as i64 - 100).abs() <= 2,
+            "immediate post-stop seek position was {:?}",
+            engine.position()
+        );
+        for _ in 0..30 {
+            control.drain_frames(0);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            (engine.position().as_millis() as i64 - 100).abs() <= 2,
+            "a queued Stop overwrote the newer seek baseline: {:?}",
             engine.position()
         );
         engine.shutdown();

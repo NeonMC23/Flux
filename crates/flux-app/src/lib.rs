@@ -1291,7 +1291,13 @@ fn accumulate_play_session(
         session.last_position_ms = position_ms;
         return false;
     }
-    let delta = position_ms.saturating_sub(session.last_position_ms);
+    if position_ms < session.last_position_ms {
+        // An out-of-order/corrected position must not re-credit audio that
+        // was already observed. Explicit seeks establish a new baseline
+        // outside this function and are allowed to move backwards.
+        return !session.recorded && session.listened_ms >= threshold_ms;
+    }
+    let delta = position_ms - session.last_position_ms;
     if delta > 0 && delta <= 2_000 {
         session.listened_ms = session.listened_ms.saturating_add(delta);
     }
@@ -2116,6 +2122,7 @@ impl Controller {
         if start_index >= tracks.len() {
             return Err("Playlist start position is out of range.".to_owned());
         }
+        self.update_playback_history();
         let start_entry = {
             let queue = self.player.queue_mut();
             queue.clear();
@@ -2131,6 +2138,7 @@ impl Controller {
         self.queue_auto_library = false;
         self.after_queue_change();
         self.sync_engine(true);
+        self.reset_play_session_for_current(0);
         self.report_status(format!(
             "Playing playlist {id}{}.",
             if shuffle { " shuffled" } else { "" }
@@ -2526,6 +2534,7 @@ impl Controller {
         }
 
         let target = position.min(duration);
+        self.update_playback_history();
         if self
             .audio_recovery
             .as_ref()
@@ -2537,6 +2546,7 @@ impl Controller {
                 recovery.position_ms = position_ms;
                 recovery.position_entry = entry;
             }
+            self.set_play_session_baseline(position_ms);
             self.clear_restored_position();
             self.persist_queue();
             return Ok(target);
@@ -2555,6 +2565,7 @@ impl Controller {
         }
         let session = self.engine.seek(target);
         self.engine_session = Some(session);
+        self.set_play_session_baseline(target.as_millis().min(u128::from(u64::MAX)) as u64);
         self.clear_restored_position();
         if self.player.state() == PlaybackState::Playing && !had_loaded_track {
             self.engine.play();
@@ -2783,7 +2794,9 @@ impl Controller {
         if recovery.active() {
             return;
         }
-        let (position_ms, entry) = if recovery.phase == AudioRecoveryPhase::Idle {
+        let phase = recovery.phase;
+        self.update_playback_history();
+        let (position_ms, entry) = if phase == AudioRecoveryPhase::Idle {
             (
                 self.position_for_current_entry()
                     .as_millis()
@@ -2791,6 +2804,7 @@ impl Controller {
                 self.current_queue_entry_id(),
             )
         } else {
+            let recovery = self.audio_recovery.as_ref().expect("recovery exists");
             (recovery.position_ms, recovery.position_entry)
         };
         if let Some(recovery) = self.audio_recovery.as_mut() {
@@ -3542,6 +3556,10 @@ impl Controller {
             history_store,
             history_write_protected,
         } = seed;
+        // Finalize the outgoing library's legitimate evidence and persist it
+        // to the outgoing history store before replacing the instance.
+        self.update_playback_history();
+        self.persist_history();
         self.outbox.clear();
         self.last_error = None;
         self.last_status = None;
@@ -4920,6 +4938,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.update_playback_history();
         let Some(title) = self.track(id).map(|track| track.title().to_owned()) else {
             self.report_error("That track is no longer in the library.".to_owned());
             return;
@@ -4946,6 +4965,11 @@ impl Controller {
         self.restart_recovery_position();
         self.retry_audio_recovery_if_failed();
         self.sync_engine(true);
+        if before_entry != self.current_queue_entry_id() {
+            self.reset_play_session_for_current(0);
+        } else {
+            self.set_play_session_baseline(0);
+        }
     }
 
     /// Plays one specific queue entry, including a particular duplicate.
@@ -4953,6 +4977,7 @@ impl Controller {
         if self.shutdown {
             return Err("Playback is shutting down.".to_owned());
         }
+        self.update_playback_history();
         if self.player.queue().entry(entry).is_none() {
             let message = format!("Queue entry {entry} is no longer in the queue.");
             self.report_error(message.clone());
@@ -4968,6 +4993,11 @@ impl Controller {
         self.restart_recovery_position();
         self.retry_audio_recovery_if_failed();
         self.sync_engine(true);
+        if before != self.current_queue_entry_id() {
+            self.reset_play_session_for_current(0);
+        } else {
+            self.set_play_session_baseline(0);
+        }
         Ok(())
     }
 
@@ -5006,6 +5036,7 @@ impl Controller {
     /// entry (or the new last entry); removing any other entry leaves the
     /// current track and playback state untouched.
     pub fn remove_queue_entry(&mut self, entry: QueueEntryId) -> Result<bool, String> {
+        self.update_playback_history();
         let was_current = self.current_queue_entry_id() == Some(entry);
         let Some(removed) = self.player.queue_mut().remove_entry(entry) else {
             return Ok(false);
@@ -5018,6 +5049,7 @@ impl Controller {
             self.engine_session = None;
             self.engine_loaded_session = None;
             self.stream_info = None;
+            self.reset_play_session_for_current(0);
             self.outbox.push(ControllerEvent::PlaybackChanged);
         }
         self.queue_auto_library = false;
@@ -5088,6 +5120,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.update_playback_history();
         match self.player.play() {
             Ok(()) => {
                 let retried = self.retry_audio_recovery_if_failed();
@@ -5113,6 +5146,7 @@ impl Controller {
                     let session = self.engine.seek(position);
                     self.engine_session = Some(session);
                     self.engine.play();
+                    self.set_play_session_baseline(self.restored_position_ms);
                     self.clear_restored_position();
                 } else {
                     self.clear_restored_position();
@@ -5128,6 +5162,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.update_playback_history();
         self.player.pause();
         self.persist_queue();
         self.sync_engine(false);
@@ -5150,6 +5185,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.update_playback_history();
         self.player.stop();
         self.persist_queue();
         self.sync_engine(false);
@@ -5161,6 +5197,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.update_playback_history();
         let before = self.current_queue_entry_id();
         if self.shuffle {
             self.sync_shuffle_order();
@@ -5177,6 +5214,11 @@ impl Controller {
             self.after_queue_change();
         }
         self.sync_engine(true);
+        if before != self.current_queue_entry_id() {
+            self.reset_play_session_for_current(0);
+        } else if self.player.state() == PlaybackState::Playing {
+            self.set_play_session_baseline(0);
+        }
     }
 
     /// Skips to the previous entry. After three seconds of playback this
@@ -5185,6 +5227,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.update_playback_history();
         if self.position() >= Duration::from_secs(3)
             && self.current_id().is_some()
             && self.seek(Duration::ZERO).is_ok()
@@ -5205,6 +5248,11 @@ impl Controller {
             self.after_queue_change();
         }
         self.sync_engine(true);
+        if before != self.current_queue_entry_id() {
+            self.reset_play_session_for_current(0);
+        } else if self.player.state() == PlaybackState::Playing {
+            self.set_play_session_baseline(0);
+        }
     }
 
     fn rebuild_shuffle_order(&mut self) {
@@ -5551,6 +5599,8 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.update_playback_history();
+        self.persist_history();
         self.persist_queue();
         self.library_session = self.library_session.checked_add(1).unwrap_or(1);
         self.shutdown = true;
@@ -5643,11 +5693,18 @@ impl Controller {
     /// Updates the meaningful-play accumulator from the actual engine clock.
     /// Seeking and pause/resume boundaries do not manufacture plays.
     fn update_playback_history(&mut self) {
+        let position_ms = self.position().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.update_playback_history_at(position_ms);
+    }
+
+    /// Finalizes/advances the accumulator at an explicit source position.
+    /// The engine's transition event supplies the outgoing source position so
+    /// the final interval is credited to the entry that actually played it.
+    fn update_playback_history_at(&mut self, position_ms: u64) {
         let Some(entry) = self.player.queue().current_entry() else {
             self.play_session = None;
             return;
         };
-        let position_ms = self.position().as_millis().min(u128::from(u64::MAX)) as u64;
         let same_entry = self
             .play_session
             .as_ref()
@@ -5668,20 +5725,12 @@ impl Controller {
             return;
         }
         let track_id = entry.track();
-        let duration_ms = self
-            .track(track_id)
-            .and_then(Track::duration)
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+        let duration_ms = self.playback_duration_ms(entry.id(), track_id);
         let threshold = meaningful_play_threshold(duration_ms);
-        let mut record = false;
-        if let Some(session) = self.play_session.as_mut() {
-            record = accumulate_play_session(
-                session,
-                position_ms,
-                self.player.state() == PlaybackState::Playing,
-                threshold,
-            );
-        }
+        let record = self
+            .play_session
+            .as_mut()
+            .is_some_and(|session| accumulate_play_session(session, position_ms, true, threshold));
         if record {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5692,6 +5741,45 @@ impl Controller {
             self.history_generation = self.history_generation.wrapping_add(1);
             self.persist_history();
             self.outbox.push(ControllerEvent::HistoryChanged);
+        }
+    }
+
+    fn playback_duration_ms(&self, entry: QueueEntryId, track_id: TrackId) -> Option<u64> {
+        if self.engine_loaded == Some(track_id)
+            && self.engine_entry == Some(entry)
+            && let Some(duration) = self.stream_info.and_then(|info| info.duration)
+        {
+            return Some(duration.as_millis().min(u128::from(u64::MAX)) as u64);
+        }
+        self.track(track_id)
+            .and_then(Track::duration)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+    }
+
+    /// Starts a fresh accounting attempt for the current queue entry at the
+    /// supplied legitimate playback baseline.
+    fn reset_play_session_for_current(&mut self, position_ms: u64) {
+        self.play_session = self.current_queue_entry_id().map(|entry| PlaySession {
+            entry,
+            listened_ms: 0,
+            last_position_ms: position_ms,
+            recorded: false,
+        });
+    }
+
+    /// Moves the current entry's listening baseline without discarding
+    /// accumulated evidence or the one-recorded flag. Used after an explicit
+    /// seek so skipped audio never becomes listening evidence.
+    fn set_play_session_baseline(&mut self, position_ms: u64) {
+        let Some(entry) = self.current_queue_entry_id() else {
+            self.play_session = None;
+            return;
+        };
+        match self.play_session.as_mut() {
+            Some(session) if session.entry == entry => {
+                session.last_position_ms = position_ms;
+            }
+            _ => self.reset_play_session_for_current(position_ms),
         }
     }
 
@@ -5823,10 +5911,20 @@ impl Controller {
                 to_id,
                 to_entry,
                 boundary_frame: _,
+                from_position,
                 info,
             } => {
                 if self.engine_session != Some(session) {
                     return;
+                }
+                // Credit the outgoing source through the exact handoff
+                // boundary before the model switches to the incoming entry.
+                if self.engine_loaded == Some(from_id)
+                    && self.engine_entry == Some(from_entry)
+                    && self.current_queue_entry_id() == Some(from_entry)
+                {
+                    let from_ms = from_position.as_millis().min(u128::from(u64::MAX)) as u64;
+                    self.update_playback_history_at(from_ms);
                 }
                 let model_matches = self.player.current_track() == Some(from_id)
                     && self.current_queue_entry_id() == Some(from_entry)
@@ -5869,6 +5967,11 @@ impl Controller {
                 self.engine_entry = Some(to_entry);
                 self.stream_info = Some(info);
                 self.preloaded_entry = None;
+                if to_entry != from_entry {
+                    self.reset_play_session_for_current(0);
+                } else {
+                    self.set_play_session_baseline(0);
+                }
                 self.after_queue_change();
                 events.push(ControllerEvent::PlaybackChanged);
             }
@@ -5882,9 +5985,11 @@ impl Controller {
                 {
                     // Fallback path: no prepared successor existed at
                     // end-of-stream, so the ring drained and the next
-                    // entry now requires an explicit load. Discard the
-                    // completed engine position before persisting the next
-                    // (or stopped) selection.
+                    // entry now requires an explicit load. Finalize the
+                    // outgoing accounting at the last delivered position,
+                    // then discard the completed engine position before
+                    // persisting the next (or stopped) selection.
+                    self.update_playback_history();
                     self.engine.stop();
                     self.engine_loaded = None;
                     self.engine_entry = None;
@@ -5906,6 +6011,11 @@ impl Controller {
                         self.after_queue_change();
                     }
                     self.sync_engine(true);
+                    if before != self.current_queue_entry_id() {
+                        self.reset_play_session_for_current(0);
+                    } else if self.player.state() == PlaybackState::Playing {
+                        self.set_play_session_baseline(0);
+                    }
                     events.push(ControllerEvent::PlaybackChanged);
                 }
             }
@@ -5938,6 +6048,7 @@ impl Controller {
                     }
                     None => format!("Audio error: {error}"),
                 };
+                self.update_playback_history();
                 self.player.stop();
                 self.engine.stop();
                 self.engine_loaded = None;
@@ -7359,6 +7470,28 @@ mod tests {
         seen
     }
 
+    /// Primes the current play session just below its meaningful threshold so
+    /// a deterministic test can cross it with a normal short frame drain.
+    fn prime_forced_listening(controller: &mut Controller) -> u64 {
+        prime_forced_listening_with_reserve(controller, 1)
+    }
+
+    fn prime_forced_listening_with_reserve(controller: &mut Controller, reserve_ms: u64) -> u64 {
+        let _ = controller.poll();
+        let entry = controller
+            .current_queue_entry_id()
+            .expect("current queue entry");
+        let track = controller.current_id().expect("current track");
+        let position_ms = controller.position().as_millis().min(u128::from(u64::MAX)) as u64;
+        let duration = controller.playback_duration_ms(entry, track);
+        let threshold = super::meaningful_play_threshold(duration);
+        let session = controller.play_session.as_mut().expect("play session");
+        session.listened_ms = threshold.saturating_sub(reserve_ms.max(1));
+        session.last_position_ms = position_ms;
+        session.recorded = false;
+        threshold
+    }
+
     /// Frame-driven convergence for long deterministic simulations. Drains
     /// only when the engine reports a full read window, yielding/sleeping
     /// briefly when the worker needs to catch up. This is not a real-time
@@ -8652,6 +8785,7 @@ mod tests {
                 to_id: b,
                 to_entry: entry_b,
                 boundary_frame: 1_000,
+                from_position: Duration::from_millis(1_000),
                 info,
             },
             &mut events,
@@ -8673,6 +8807,7 @@ mod tests {
                 to_id: b,
                 to_entry: entry_b,
                 boundary_frame: 1_000,
+                from_position: Duration::from_millis(1_000),
                 info,
             },
             &mut events,
@@ -11546,7 +11681,11 @@ mod tests {
             .seek(Duration::from_millis(100))
             .expect("middle seek");
         assert_eq!(target, Duration::from_millis(100));
-        assert!((controller.position().as_millis() as i64 - 100).abs() <= 2);
+        assert!(
+            (controller.position().as_millis() as i64 - 100).abs() <= 2,
+            "immediate seek position was {:?}",
+            controller.position()
+        );
         assert_eq!(controller.player_state(), PlaybackState::Playing);
         assert_eq!(controller.current_queue_entry_id(), current);
 
@@ -11556,7 +11695,11 @@ mod tests {
             .expect("clamped seek");
         assert_eq!(target, total);
         assert_eq!(controller.player_state(), PlaybackState::Paused);
-        assert!((controller.position().as_millis() as i64 - total.as_millis() as i64).abs() <= 2);
+        assert!(
+            (controller.position().as_millis() as i64 - total.as_millis() as i64).abs() <= 2,
+            "paused seek position was {:?}, expected {total:?}",
+            controller.position()
+        );
         assert_eq!(controller.current_queue_entry_id(), current);
 
         controller.stop();
@@ -13387,6 +13530,11 @@ mod tests {
         assert_eq!(controller.player_state(), PlaybackState::Stopped);
         assert_eq!(controller.engine_loaded, None, "old audio must not resume");
         assert_eq!(controller.position(), Duration::ZERO);
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            0,
+            "old recovery success counted a play in the new library"
+        );
         assert!(!control.is_running(), "old stream must stay released");
         let recovered = last_recovery_control(&controls);
         assert!(
@@ -13473,6 +13621,7 @@ mod tests {
                 to_id: new_id,
                 to_entry: new_entry,
                 boundary_frame: 0,
+                from_position: Duration::ZERO,
                 info: old_info,
             },
             &mut events,
@@ -13488,6 +13637,11 @@ mod tests {
         assert_eq!(controller.current_id(), Some(new_id));
         assert_eq!(controller.current_queue_entry_id(), Some(new_entry));
         assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            0,
+            "stale old-session event supplied listening evidence"
+        );
         assert!(events.is_empty(), "stale engine event was published");
         controller.shutdown();
     }
@@ -14076,7 +14230,11 @@ mod tests {
 
     #[test]
     fn meaningful_play_threshold_and_session_accumulation_are_deterministic() {
+        assert_eq!(super::meaningful_play_threshold(Some(0)), 5_000);
         assert_eq!(super::meaningful_play_threshold(Some(4_000)), 5_000);
+        assert_eq!(super::meaningful_play_threshold(Some(10_000)), 5_000);
+        assert_eq!(super::meaningful_play_threshold(Some(20_000)), 10_000);
+        assert_eq!(super::meaningful_play_threshold(Some(60_000)), 30_000);
         assert_eq!(super::meaningful_play_threshold(Some(120_000)), 30_000);
         assert_eq!(super::meaningful_play_threshold(None), 30_000);
         let mut session = super::PlaySession {
@@ -14135,6 +14293,755 @@ mod tests {
             true,
             2_000
         ));
+        let listened = session.listened_ms;
+        let high_water = session.last_position_ms;
+        assert!(!super::accumulate_play_session(
+            &mut session,
+            high_water.saturating_sub(25),
+            true,
+            2_000
+        ));
+        assert_eq!(session.listened_ms, listened);
+        assert_eq!(
+            session.last_position_ms, high_water,
+            "out-of-order position lowered the listening baseline"
+        );
+    }
+
+    #[test]
+    fn meaningful_history_counts_once_and_pause_stop_polling_do_not_duplicate() {
+        let dir = TempDir::new("history-once");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        controller.play_track(id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(5)
+        });
+        let before = controller.playback_history().total_plays();
+        let history_generation = controller.history_generation();
+        let threshold = prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        assert_eq!(controller.playback_history().total_plays(), before + 1);
+        assert_eq!(controller.track_play_count(id), 1);
+        assert_eq!(
+            controller.history_generation(),
+            history_generation.wrapping_add(1),
+            "a successful play did not invalidate derived history caches"
+        );
+
+        for _ in 0..6 {
+            control.drain_frames(512);
+            let _ = controller.poll();
+        }
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            before + 1,
+            "repeated polling duplicated a play"
+        );
+        assert_eq!(
+            controller.history_generation(),
+            history_generation.wrapping_add(1),
+            "repeated polling invalidated history caches again"
+        );
+
+        controller.pause();
+        let paused_listened = controller
+            .play_session
+            .as_ref()
+            .expect("paused session")
+            .listened_ms;
+        for _ in 0..6 {
+            control.drain_frames(512);
+            let _ = controller.poll();
+        }
+        assert_eq!(
+            controller
+                .play_session
+                .as_ref()
+                .expect("paused session")
+                .listened_ms,
+            paused_listened,
+            "paused time was credited as listening"
+        );
+        assert_eq!(controller.track_play_count(id), 1);
+
+        controller.play();
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(5)
+        });
+        assert_eq!(
+            controller.track_play_count(id),
+            1,
+            "resuming the same queue entry created another play"
+        );
+
+        controller.stop();
+        let stopped_listened = controller
+            .play_session
+            .as_ref()
+            .expect("stopped session")
+            .listened_ms;
+        for _ in 0..6 {
+            control.drain_frames(512);
+            let _ = controller.poll();
+        }
+        assert_eq!(
+            controller
+                .play_session
+                .as_ref()
+                .expect("stopped session")
+                .listened_ms,
+            stopped_listened,
+            "stopped time was credited as listening"
+        );
+        controller.play();
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(5)
+        });
+        assert_eq!(
+            controller.track_play_count(id),
+            1,
+            "restarting within the same queue entry created another play"
+        );
+        assert!(
+            controller
+                .play_session
+                .as_ref()
+                .is_some_and(|session| session.listened_ms >= threshold)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn zero_delivered_frames_accumulate_zero_listening_time() {
+        let dir = TempDir::new("history-no-delivery");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        for _ in 0..8 {
+            control.drain_frames(0);
+            let _ = controller.poll();
+        }
+        assert_eq!(controller.position(), Duration::ZERO);
+        let session = controller.play_session.as_ref().expect("session");
+        assert_eq!(session.listened_ms, 0);
+        assert_eq!(controller.playback_history().total_plays(), 0);
+
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(10)
+        });
+        assert!(
+            controller
+                .play_session
+                .as_ref()
+                .is_some_and(|session| session.listened_ms > 0)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn explicit_seek_does_not_credit_skipped_audio() {
+        let dir = TempDir::new("history-seek");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let path = write_dc_wav(&root, "long.wav", 220_500, 0.4);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let id = id_of(&controller, &path);
+        controller.play_track(id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(10)
+        });
+        let entry = controller.current_queue_entry_id().expect("entry");
+        let duration_ms = controller
+            .playback_duration_ms(entry, id)
+            .expect("decoded duration");
+        assert!(
+            (4_900..=5_100).contains(&duration_ms),
+            "decoded duration was not used: {duration_ms}"
+        );
+        let threshold = prime_forced_listening_with_reserve(&mut controller, 100);
+        let before_listened = controller
+            .play_session
+            .as_ref()
+            .expect("session")
+            .listened_ms;
+        controller
+            .seek(Duration::from_millis(1_000))
+            .expect("seek within track");
+        drive(&mut controller, &control, |c, _| {
+            c.position() >= Duration::from_millis(1_005)
+        });
+        let after_listened = controller
+            .play_session
+            .as_ref()
+            .expect("session")
+            .listened_ms;
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            0,
+            "a 1-second seek supplied listening evidence"
+        );
+        assert!(after_listened < threshold);
+        assert!(
+            after_listened.saturating_sub(before_listened) < 100,
+            "seek jump was credited as listening: {before_listened} -> {after_listened}"
+        );
+        let before_large_seek = after_listened;
+        controller
+            .seek(Duration::from_millis(4_000))
+            .expect("large seek");
+        drive(&mut controller, &control, |c, _| {
+            c.position() >= Duration::from_millis(4_005)
+        });
+        let after_large_seek = controller
+            .play_session
+            .as_ref()
+            .expect("session")
+            .listened_ms;
+        assert_eq!(controller.playback_history().total_plays(), 0);
+        assert!(
+            after_large_seek.saturating_sub(before_large_seek) < 100,
+            "large seek jump supplied listening evidence"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn distinct_entries_and_revisits_count_independently_without_same_entry_duplication() {
+        let dir = TempDir::new("history-entry-identity");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let path = write_dc_wav(&root, "long.wav", 220_500, 0.4);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let id = id_of(&controller, &path);
+        let first = controller.enqueue_track(id).expect("first entry");
+        let duplicate = controller.enqueue_track(id).expect("duplicate entry");
+        assert_ne!(first, duplicate);
+        controller.play_queue_entry(first).expect("play first");
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        assert_eq!(controller.track_play_count(id), 1);
+
+        controller
+            .play_queue_entry(duplicate)
+            .expect("play duplicate");
+        drive(&mut controller, &control, |c, _| {
+            c.player_state() == PlaybackState::Playing && c.position() > Duration::from_millis(2)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        assert_eq!(
+            controller.track_play_count(id),
+            2,
+            "distinct QueueEntryIds must count independently"
+        );
+
+        controller
+            .play_queue_entry(first)
+            .expect("revisit first entry");
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        assert_eq!(
+            controller.track_play_count(id),
+            3,
+            "a new contiguous attempt on the same entry after another entry should count"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn gapless_and_crossfade_transitions_finalize_outgoing_and_reset_incoming() {
+        for (name, crossfade_ms) in [("gapless", 0), ("crossfade", 500)] {
+            let dir = TempDir::new(&format!("history-transition-{name}"));
+            let root = dir.path().join("music");
+            fs::create_dir_all(&root).expect("music dir");
+            let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+            let b_path = write_dc_wav(&root, "b.wav", 88_200, 0.8);
+            let (mut controller, control) = boot(&dir);
+            scanned(&mut controller, &control, root);
+            let a = id_of(&controller, &a_path);
+            let b = id_of(&controller, &b_path);
+            controller.set_crossfade_ms(crossfade_ms);
+            controller.play_track(a);
+            let entry_b = controller
+                .queue_entries()
+                .iter()
+                .find(|entry| entry.track() == b)
+                .map(|entry| entry.id())
+                .expect("b queued");
+            drive(&mut controller, &control, |c, _| {
+                c.position() > Duration::from_millis(5)
+            });
+            let before = controller.playback_history().total_plays();
+            prime_forced_listening(&mut controller);
+            drive(&mut controller, &control, |c, _| {
+                c.current_queue_entry_id() == Some(entry_b)
+            });
+            assert_eq!(
+                controller.playback_history().total_plays(),
+                before + 1,
+                "{name}: outgoing evidence was not finalized at the boundary"
+            );
+            assert_eq!(controller.track_play_count(a), 1);
+            assert_eq!(
+                controller.track_play_count(b),
+                0,
+                "{name}: incoming entry inherited a play"
+            );
+            let session = controller.play_session.as_ref().expect("incoming session");
+            assert_eq!(session.entry, entry_b);
+            assert!(!session.recorded);
+            assert!(session.listened_ms < 250);
+
+            drive(&mut controller, &control, |c, _| {
+                c.position() > Duration::from_millis(20)
+            });
+            assert_eq!(controller.track_play_count(a), 1);
+            assert_eq!(
+                controller.track_play_count(b),
+                0,
+                "{name}: crossfade/gapless overlap double-counted a play"
+            );
+            controller.shutdown();
+        }
+    }
+
+    #[test]
+    fn removing_an_entry_before_threshold_discards_its_partial_evidence() {
+        let dir = TempDir::new("history-remove-entry");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(5)
+        });
+        let entry = controller.current_queue_entry_id().expect("entry");
+        prime_forced_listening(&mut controller);
+        controller
+            .remove_queue_entry(entry)
+            .expect("remove current entry");
+        for _ in 0..4 {
+            control.drain_frames(512);
+            let _ = controller.poll();
+        }
+        assert_eq!(controller.track_play_count(a), 0);
+        assert_eq!(controller.playback_history().total_plays(), 0);
+        assert!(
+            controller
+                .play_session
+                .as_ref()
+                .is_none_or(|session| { session.entry != entry || session.listened_ms < 5_000 })
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn explicit_skip_before_threshold_does_not_count_either_entry() {
+        let dir = TempDir::new("history-skip-short");
+        let root = two_track_dir(&dir, "music");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root.clone());
+        let a = id_of(&controller, &root.join("a.wav"));
+        let b = id_of(&controller, &root.join("b.wav"));
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+        controller.next();
+        drive(&mut controller, &control, |c, _| {
+            c.current_id() == Some(b) && c.position() > Duration::from_millis(20)
+        });
+        assert_eq!(controller.track_play_count(a), 0);
+        assert_eq!(controller.track_play_count(b), 0);
+        assert_eq!(controller.playback_history().total_plays(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn fallback_track_end_finalizes_the_outgoing_before_stopping() {
+        let dir = TempDir::new("history-fallback-end");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let path = write_dc_wav(&root, "only.wav", 88_200, 0.4);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let id = id_of(&controller, &path);
+        controller.play_track(id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(5)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.player_state() == PlaybackState::Stopped
+        });
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            before + 1,
+            "fallback TrackEnded lost the final legitimate evidence"
+        );
+        assert_eq!(controller.track_play_count(id), 1);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn recovery_outage_is_not_credited_and_playback_resumes_accounting() {
+        let dir = TempDir::new("history-recovery");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        controller.play_track(id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(5)
+        });
+        prime_forced_listening(&mut controller);
+        let listened_before = controller
+            .play_session
+            .as_ref()
+            .expect("session")
+            .listened_ms;
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated history loss");
+        for _ in 0..4 {
+            let _ = controller.poll();
+        }
+        assert_eq!(
+            controller
+                .play_session
+                .as_ref()
+                .expect("recovery session")
+                .listened_ms,
+            listened_before,
+            "recovery outage was credited as listening"
+        );
+        assert_eq!(controller.playback_history().total_plays(), 0);
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            0,
+            "recovery completion duplicated listening evidence"
+        );
+        let recovered = last_recovery_control(&controls);
+        drive(&mut controller, &recovered, |c, _| {
+            c.playback_history().total_plays() > 0
+        });
+        assert_eq!(controller.track_play_count(id), 1);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn successful_history_persists_and_shutdown_finalizes_a_pending_play() {
+        let dir = TempDir::new("history-persist");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        let history_path = root.join("history.flux");
+        let first_entry = controller.enqueue_track(id).expect("first entry");
+        controller.play_queue_entry(first_entry).expect("play");
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        let persisted = flux_library::PlaybackHistoryStore::new(&history_path)
+            .load()
+            .expect("history loads")
+            .expect("history exists");
+        assert_eq!(persisted.total_plays(), 1);
+        controller.persist_history();
+        assert_eq!(
+            flux_library::PlaybackHistoryStore::new(&history_path)
+                .load()
+                .expect("history loads")
+                .expect("history exists")
+                .total_plays(),
+            1,
+            "repeated persistence incremented a play"
+        );
+
+        // A second distinct entry is primed right at the threshold and left
+        // for shutdown to finalize.
+        let second_entry = controller.enqueue_track(id).expect("second entry");
+        controller
+            .play_queue_entry(second_entry)
+            .expect("play second entry");
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let threshold = prime_forced_listening(&mut controller);
+        let position = controller.position().as_millis() as u64;
+        {
+            let session = controller.play_session.as_mut().expect("session");
+            session.listened_ms = threshold;
+            session.last_position_ms = position;
+            session.recorded = false;
+        }
+        assert_eq!(
+            flux_library::PlaybackHistoryStore::new(&history_path)
+                .load()
+                .expect("history loads")
+                .expect("history exists")
+                .total_plays(),
+            1,
+            "pending play was written before shutdown"
+        );
+        controller.shutdown();
+        let final_history = flux_library::PlaybackHistoryStore::new(&history_path)
+            .load()
+            .expect("final history")
+            .expect("final history exists");
+        assert_eq!(final_history.total_plays(), 2);
+        let final_entry = final_history.entry(id).expect("track");
+        assert_eq!(final_entry.play_count, 2);
+        assert!(final_entry.last_played_unix_ms > 0);
+
+        let (reopened, _control) = boot_canonical_at(&root);
+        assert_eq!(reopened.track_play_count(id), 2);
+        assert_eq!(
+            reopened.track_last_played_unix_ms(id),
+            Some(final_entry.last_played_unix_ms)
+        );
+        assert_eq!(reopened.playback_history().total_plays(), 2);
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn failed_history_write_keeps_one_in_memory_play_and_retries_without_duplication() {
+        let dir = TempDir::new("history-write-failure");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        controller.play_track(id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let real_history = root.join("history.flux");
+        let blocked_parent = dir.path().join("blocked-history");
+        fs::write(&blocked_parent, b"not a directory").expect("blocked parent");
+        controller.history_store = Some(flux_library::PlaybackHistoryStore::new(
+            blocked_parent.join("history.flux"),
+        ));
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        assert_eq!(controller.track_play_count(id), 1);
+        assert!(
+            !real_history.exists(),
+            "failed write unexpectedly created a history file"
+        );
+        controller.persist_history();
+        assert_eq!(controller.track_play_count(id), 1);
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|error| error.contains("playback history"))
+        );
+
+        controller.history_store = Some(flux_library::PlaybackHistoryStore::new(
+            real_history.clone(),
+        ));
+        controller.persist_history();
+        assert_eq!(
+            flux_library::PlaybackHistoryStore::new(&real_history)
+                .load()
+                .expect("history loads")
+                .expect("history exists")
+                .total_plays(),
+            1
+        );
+        controller.persist_history();
+        assert_eq!(
+            flux_library::PlaybackHistoryStore::new(&real_history)
+                .load()
+                .expect("history loads")
+                .expect("history exists")
+                .total_plays(),
+            1,
+            "retry duplicated the in-memory play"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn history_remains_bound_to_its_originating_library_across_switches() {
+        let dir = TempDir::new("history-switch-isolation");
+        let (root_a, source_a) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let source_b = dir.path().join("B/Artist/Album/01 - Other.wav");
+        fs::create_dir_all(source_b.parent().expect("parent")).expect("dirs");
+        write_dc_wav(
+            source_b.parent().expect("parent"),
+            "01 - Other.wav",
+            4_410,
+            0.8,
+        );
+        let (mut controller, control) = boot_canonical_at(&root_a);
+        controller
+            .import_files(std::slice::from_ref(&source_a), false)
+            .expect("import a");
+        let a_id = controller.tracks()[0].0;
+        controller.play_track(a_id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        let history_a = root_a.join("history.flux");
+        assert_eq!(
+            flux_library::PlaybackHistoryStore::new(&history_a)
+                .load()
+                .expect("a history loads")
+                .expect("a history exists")
+                .total_plays(),
+            1
+        );
+
+        // A pending threshold on a second entry is finalized to the outgoing
+        // library at the switch boundary.
+        let second_entry = controller.enqueue_track(a_id).expect("second entry");
+        controller
+            .play_queue_entry(second_entry)
+            .expect("play second entry");
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let threshold = prime_forced_listening(&mut controller);
+        let position = controller.position().as_millis() as u64;
+        {
+            let session = controller.play_session.as_mut().expect("session");
+            session.listened_ms = threshold;
+            session.last_position_ms = position;
+            session.recorded = false;
+        }
+        controller.switch_to_canonical(&root_b).expect("switch b");
+        let a_bytes = fs::read(&history_a).expect("a history");
+        assert_eq!(
+            flux_library::PlaybackHistoryStore::new(&history_a)
+                .load()
+                .expect("a history loads")
+                .expect("a history exists")
+                .total_plays(),
+            2,
+            "switch did not persist the outgoing pending play"
+        );
+        assert!(
+            flux_library::PlaybackHistoryStore::new(root_b.join("history.flux"))
+                .load()
+                .expect("b history loads")
+                .is_none(),
+            "new library inherited old history"
+        );
+        controller
+            .import_files(std::slice::from_ref(&source_b), false)
+            .expect("import b");
+        let b_id = controller.tracks()[0].0;
+        controller.play_track(b_id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        assert_eq!(
+            fs::read(&history_a).expect("a history"),
+            a_bytes,
+            "new-library accounting modified the old history file"
+        );
+        assert_eq!(
+            flux_library::PlaybackHistoryStore::new(root_b.join("history.flux"))
+                .load()
+                .expect("b history loads")
+                .expect("b history exists")
+                .total_plays(),
+            1
+        );
+
+        controller.switch_to_canonical(&root_a).expect("switch a");
+        assert_eq!(controller.track_play_count(a_id), 2);
+        assert_eq!(controller.playback_history().total_plays(), 2);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn repeat_one_keeps_one_play_for_the_same_queue_entry() {
+        let dir = TempDir::new("history-repeat-one");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let path = write_dc_wav(&root, "loop.wav", 22_050, 0.4);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let id = id_of(&controller, &path);
+        controller.set_playback_mode(PlaybackMode::RepeatOne);
+        controller.play_track(id);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(5)
+        });
+        let before = controller.playback_history().total_plays();
+        prime_forced_listening(&mut controller);
+        drive(&mut controller, &control, |c, _| {
+            c.playback_history().total_plays() > before
+        });
+        let transitions = controller.audio_diagnostics().gapless_transitions;
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().gapless_transitions > transitions
+        });
+        assert_eq!(
+            controller.track_play_count(id),
+            1,
+            "Repeat One created a second play for the same queue entry"
+        );
+        controller.shutdown();
     }
 
     #[test]

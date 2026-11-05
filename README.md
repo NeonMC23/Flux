@@ -96,6 +96,10 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   Recently Added, Recently Played, Most Played, Without Lyrics, Synchronized
   Lyrics and Without Artwork views. Play counts/history begin only after this
   feature is introduced and are stored separately from canonical metadata.
+  Only delivered playback advances listening time; paused, gated, recovering
+  and seek-skipped intervals are excluded, transitions finalize the outgoing
+  entry at the handoff boundary, and one contiguous queue-entry attempt can
+  count at most one play.
   Selection actions can set/unset favorites or create/append canonical
   playlists after an explicit review. A dedicated Playlists section supports
   empty or selection-based creation, rename, detail browsing, duplicate-safe
