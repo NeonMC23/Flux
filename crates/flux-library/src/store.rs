@@ -11,18 +11,16 @@
 //! - Loading validates before accepting anything: unsupported schema
 //!   versions, duplicate IDs, duplicate paths, and impossible counters
 //!   are typed errors ([`StoreError`]), never panics.
-//! - Saving writes to a sibling `<name>.tmp` file, flushes it, then
-//!   renames over the target. `fs::rename` replaces an existing file on
-//!   Unix and Windows, so a failed save leaves the previous index in
-//!   place; the old index is never deleted to make room. The parent
-//!   directory is not synced, so durability of the rename across a
-//!   power loss is not guaranteed (a rescan can rebuild the index, but
-//!   the ID counter's history would be lost). A crash before the rename
-//!   can leave a harmless `.tmp` file behind, which the next save
-//!   overwrites.
+//! - Saving uses the shared atomic-write primitive: a uniquely named sibling
+//!   temporary file is flushed, renamed over the target, and its parent
+//!   directory is synced on Unix. `fs::rename` replaces an existing file on
+//!   Unix and Windows, so a failed save leaves the previous index in place;
+//!   the old index is never deleted to make room. A failed write/replacement
+//!   removes the temporary file. Windows has no standard directory fsync, so
+//!   that final durability step is the documented platform no-op.
 //! - The caller supplies the path (typically under a `flux-platform`
 //!   data directory) and is responsible for the parent directory
-//!   existing; this module never picks locations itself.
+//!   existing; this module never picks locations itself or creates parents.
 //! - Paths are stored as UTF-8 text. On Unix, non-UTF-8 file names are
 //!   preserved losslessly as raw bytes; on other platforms such (already
 //!   pathological) names degrade to lossy text.
@@ -30,7 +28,6 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,7 +35,7 @@ use flux_core::{Track, TrackId, TrackSource};
 use serde::{Deserialize, Serialize};
 
 use crate::Library;
-use crate::fs_ops::replace_file;
+use crate::write_atomic;
 
 /// The only index schema version this build can read and write.
 pub const INDEX_VERSION: u32 = 1;
@@ -198,23 +195,7 @@ impl Library {
                 .collect(),
         };
         let bytes = serde_json::to_vec_pretty(&index)?;
-
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_name);
-
-        let write_result = (|| -> Result<(), StoreError> {
-            let mut file = fs::File::create(&tmp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            replace_file(&tmp_path, path)?;
-            Ok(())
-        })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&tmp_path);
-        }
-        write_result
+        write_atomic(path, &bytes).map_err(StoreError::Io)
     }
 
     /// Loads a library index written by [`save_to_path`](Self::save_to_path),
@@ -510,6 +491,16 @@ mod tests {
         assert!(
             !dir.path().join("index.json.tmp").exists(),
             "temp file is cleaned up by rename"
+        );
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("read temp dir")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("index.json.tmp.")),
+            "no shared-writer staging file remains"
         );
     }
 

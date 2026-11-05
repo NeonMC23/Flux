@@ -1,16 +1,17 @@
 //! Shared, versioned user settings.
 //!
 //! Crossfade configuration is intentionally a small JSON document in the
-//! platform configuration directory. Missing or empty files use defaults;
-//! malformed files are preserved and protected from automatic overwrite,
-//! matching the queue/history persistence convention. Unknown fields are
-//! retained when a known setting is saved.
+//! platform configuration directory. Missing or empty files, and older
+//! versions without a recognized field, use defaults; malformed files,
+//! invalid version fields, and files from a newer schema are preserved and
+//! protected from automatic overwrite. Unknown fields are retained when a
+//! known setting is saved, and publication uses the shared atomic writer.
 
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use flux_library::write_atomic;
 use serde_json::{Map, Value};
 
 /// Current settings schema version written by this build.
@@ -132,6 +133,25 @@ impl SettingsStore {
             );
             return Self::protected(path, defaults, warning);
         };
+        if let Some(version_value) = root.get("version") {
+            let Some(version) = version_value.as_u64() else {
+                let warning = format!(
+                    "Settings at {} have an invalid schema version field; defaults are \
+                     in use and the file will not be overwritten.",
+                    path.display()
+                );
+                return Self::protected(path, defaults, warning);
+            };
+            if version > SETTINGS_SCHEMA_VERSION {
+                let warning = format!(
+                    "Settings at {} use newer schema version {version} (this build supports \
+                     {SETTINGS_SCHEMA_VERSION}); defaults are in use and the file will not \
+                     be overwritten.",
+                    path.display()
+                );
+                return Self::protected(path, defaults, warning);
+            }
+        }
         let crossfade = recover_crossfade(root.get("crossfade"));
         LoadedSettings {
             store: Self {
@@ -206,26 +226,15 @@ impl SettingsStore {
         crossfade_object.insert("enabled".to_owned(), Value::Bool(crossfade.enabled));
         crossfade_object.insert("duration_ms".to_owned(), Value::from(crossfade.duration_ms));
         let document = Value::Object(root);
-        let bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
 
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
             fs::create_dir_all(parent).map_err(SettingsError::Io)?;
         }
-        let mut temp_name = self.path.as_os_str().to_owned();
-        temp_name.push(".tmp");
-        let temp = PathBuf::from(temp_name);
-        let write_result = (|| -> std::io::Result<()> {
-            let mut file = fs::File::create(&temp)?;
-            file.write_all(&bytes)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp, &self.path)
-        })();
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temp);
-            return Err(SettingsError::Io(error));
-        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
         self.document = document;
         Ok(())
     }
@@ -447,6 +456,53 @@ mod tests {
     }
 
     #[test]
+    fn newer_settings_schema_is_preserved_and_write_protected() {
+        let dir = TempDir::new("newer-schema");
+        let path = dir.path().join("settings.json");
+        let original =
+            br#"{"version":2,"crossfade":{"enabled":true,"duration_ms":1000},"future":{"x":1}}"#;
+        fs::write(&path, original).expect("settings");
+        let mut loaded = SettingsStore::load(&path);
+        assert_eq!(loaded.crossfade, defaults());
+        assert!(loaded.store.write_protected());
+        assert!(
+            loaded
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("newer schema version 2")),
+            "{:?}",
+            loaded.warning
+        );
+        assert!(matches!(
+            loaded.store.save(CrossfadeSettings {
+                enabled: true,
+                duration_ms: 2_000
+            }),
+            Err(SettingsError::Protected(_))
+        ));
+        assert_eq!(fs::read(&path).expect("preserved"), original.as_slice());
+    }
+
+    #[test]
+    fn non_numeric_settings_version_is_preserved_and_write_protected() {
+        let dir = TempDir::new("invalid-version");
+        let path = dir.path().join("settings.json");
+        let original = br#"{"version":"2","crossfade":{"enabled":true}}"#;
+        fs::write(&path, original).expect("settings");
+        let loaded = SettingsStore::load(&path);
+        assert!(loaded.store.write_protected());
+        assert!(
+            loaded
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("invalid schema version")),
+            "{:?}",
+            loaded.warning
+        );
+        assert_eq!(fs::read(&path).expect("preserved"), original.as_slice());
+    }
+
+    #[test]
     fn malformed_settings_are_preserved_and_write_protected() {
         let dir = TempDir::new("malformed");
         let path = dir.path().join("settings.json");
@@ -480,5 +536,15 @@ mod tests {
         assert!(matches!(result, Err(SettingsError::Io(_))));
         assert!(path.is_dir(), "previous target remains");
         assert!(!dir.path().join("settings.json.tmp").exists());
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("read temp dir")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.tmp.")),
+            "no shared-writer staging file remains"
+        );
     }
 }

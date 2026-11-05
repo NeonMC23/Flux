@@ -10,13 +10,12 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use flux_core::TrackId;
 use serde::{Deserialize, Serialize};
 
-use crate::fs_ops::replace_file;
+use crate::write_atomic;
 
 /// The only playback-history schema version this build reads and writes.
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
@@ -225,22 +224,7 @@ impl PlaybackHistoryStore {
         let bytes = serde_json::to_vec_pretty(&file).map_err(PlaybackHistoryError::Serialize)?;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
-        let mut temp_name = self.path.as_os_str().to_os_string();
-        temp_name.push(".tmp");
-        let temp = PathBuf::from(temp_name);
-        let result = (|| -> Result<(), PlaybackHistoryError> {
-            let mut output = fs::File::create(&temp)?;
-            output.write_all(&bytes)?;
-            output.sync_all()?;
-            drop(output);
-            replace_file(&temp, &self.path)?;
-            sync_parent(&self.path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        write_atomic(&self.path, &bytes).map_err(PlaybackHistoryError::Io)
     }
 }
 
@@ -257,22 +241,6 @@ struct HistoryEntryRecord {
     track_id: u64,
     play_count: u64,
     last_played_unix_ms: u64,
-}
-
-fn sync_parent(path: &Path) -> Result<(), PlaybackHistoryError> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::File::open(parent)?.sync_all()?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -302,6 +270,16 @@ mod tests {
             300
         );
         assert!(!path.with_extension("flux.tmp").exists());
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("read temp dir")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("history.flux.tmp.")),
+            "no shared-writer staging file remains"
+        );
     }
 
     #[test]
@@ -317,6 +295,22 @@ mod tests {
         assert_eq!(history.entry(TrackId::new(2)).expect("entry").play_count, 1);
         assert_eq!(history.total_plays(), 1);
         assert!(history.remove(TrackId::new(1)).is_none());
+    }
+
+    #[test]
+    fn unsupported_history_schema_is_rejected_without_rewriting() {
+        let dir = TempDir::new("history-version");
+        let path = dir.path().join("history.flux");
+        let original = br#"{"version":999,"kind":"flux-playback-history","entries":[]}"#;
+        fs::write(&path, original).expect("fixture");
+        let error = PlaybackHistoryStore::new(&path)
+            .load()
+            .expect_err("future schema");
+        assert!(matches!(
+            error,
+            PlaybackHistoryError::UnsupportedVersion { found: 999, .. }
+        ));
+        assert_eq!(fs::read(&path).expect("preserved"), original.as_slice());
     }
 
     #[test]

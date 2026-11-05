@@ -56,6 +56,7 @@ use flux_core::{Track, TrackId};
 pub mod canonical;
 pub mod canonical_migrate;
 mod fs_ops;
+pub use fs_ops::write_atomic;
 pub mod library_lock;
 pub mod migrate;
 pub mod playback_history;

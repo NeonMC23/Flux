@@ -15727,6 +15727,66 @@ mod tests {
     }
 
     #[test]
+    fn failed_queue_write_keeps_the_in_memory_queue_and_retries_on_next_save() {
+        let dir = TempDir::new("queue-write-failure");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        let real_queue = root.join("queue.flux");
+        let _ = fs::remove_file(&real_queue);
+        let blocked_parent = dir.path().join("blocked-queue");
+        fs::write(&blocked_parent, b"not a directory").expect("blocked parent");
+        controller.queue_store = Some(flux_library::QueueStore::new(
+            blocked_parent.join("queue.flux"),
+        ));
+        let blocked_queue = blocked_parent.join("queue.flux");
+        controller.enqueue_track(id).expect("in-memory enqueue");
+        assert_eq!(
+            controller.queue_store.as_ref().map(|store| store.path()),
+            Some(blocked_queue.as_path()),
+            "test setup retains the failing store"
+        );
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|error| error.contains("playback queue")),
+            "{:?}",
+            controller.last_error()
+        );
+        assert!(!real_queue.exists(), "failed write must not publish");
+
+        controller.queue_store = Some(flux_library::QueueStore::new(real_queue.clone()));
+        controller.persist_queue();
+        let loaded = flux_library::QueueStore::new(&real_queue)
+            .load()
+            .expect("queue loads")
+            .expect("queue exists");
+        assert_eq!(loaded.queue.entries(), controller.player.queue().entries());
+        assert_eq!(
+            loaded.queue.current_entry_id(),
+            controller.current_queue_entry_id()
+        );
+        assert_eq!(
+            loaded.queue.next_entry_id(),
+            controller.player.queue().next_entry_id()
+        );
+        controller.persist_queue();
+        let loaded_again = flux_library::QueueStore::new(&real_queue)
+            .load()
+            .expect("queue reloads")
+            .expect("queue exists");
+        assert_eq!(
+            loaded_again.queue.entries(),
+            controller.player.queue().entries(),
+            "retry must not duplicate queue entries"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn failed_history_write_keeps_one_in_memory_play_and_retries_without_duplication() {
         let dir = TempDir::new("history-write-failure");
         let (root, source) = canonical_track_fixture(&dir);

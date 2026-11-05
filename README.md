@@ -243,13 +243,24 @@ background staging for very large migrations is still future work.
 
 - **Canonical library.** `library.flux` identifies the library, `catalog.flux`
   is the authoritative committed catalogue, stable IDs are never reused,
-  per-entity metadata lives in `.flux` files, and `transactions/` records
-  recovery state. Queue state is stored at `<library>/queue.flux` and carries
-  stable TrackIds, not paths. A malformed queue file is reported and preserved
-  (queue writes disabled for that session) rather than replaced.
+  per-entity metadata lives in `.flux` files, ratings/playlists are catalogue
+  entities, and `transactions/` records recovery state. Queue state is stored at
+  `<library>/queue.flux` and carries stable TrackIds, not paths. Listening
+  history is derived application state in `<library>/history.flux`. Malformed
+  queue/history files are reported and preserved (their writes are disabled for
+  that session) rather than replaced.
 - **Legacy/portable sources.** `library-index.json` and the schema-v3 `.flux`
   catalogue are read only by the explicit migration workflow. The front-ends no
   longer switch to or write them as normal runtime backends.
+- **Shared preferences.** Crossfade settings live in
+  `<config>/flux/settings.json`. Unknown fields are preserved across known
+  updates; malformed, invalid-version, or newer-schema files are preserved and
+  write-protected.
+- **Atomic publication.** Legacy indexes, queue, history and settings all use the
+  shared `flux-library` atomic writer: unique sibling temporary file, file
+  flush, atomic replacement, Unix parent-directory sync, and failure cleanup.
+  Canonical journals and portable generations retain their specialized
+  journal/backup/no-overwrite protocols.
 - **Stable identities and credits:** track, artist, album and playlist IDs and
   counters persist. A track stores ordered credits plus one physical owner;
   featuring artists appear in their own discographies without duplicate audio.

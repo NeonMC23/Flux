@@ -14,13 +14,12 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use flux_core::{Queue, QueueEntry, QueueEntryId, RepeatMode, TrackId};
 use serde::{Deserialize, Serialize};
 
-use crate::fs_ops::replace_file;
+use crate::write_atomic;
 
 /// The only queue-file schema version this build reads and writes.
 pub const QUEUE_SCHEMA_VERSION: u32 = 1;
@@ -148,23 +147,7 @@ impl QueueStore {
 
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
-        let mut temp_name = self.path.as_os_str().to_os_string();
-        temp_name.push(".tmp");
-        let temp = PathBuf::from(temp_name);
-
-        let result = (|| -> Result<(), QueueStoreError> {
-            let mut output = fs::File::create(&temp)?;
-            output.write_all(&bytes)?;
-            output.sync_all()?;
-            drop(output);
-            replace_file(&temp, &self.path)?;
-            sync_parent(&self.path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        write_atomic(&self.path, &bytes).map_err(QueueStoreError::Io)
     }
 }
 
@@ -283,29 +266,13 @@ impl From<std::io::Error> for QueueStoreError {
     }
 }
 
-fn sync_parent(path: &Path) -> Result<(), QueueStoreError> {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::File::open(parent)?.sync_all()?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use flux_core::{Queue, RepeatMode, TrackId};
 
-    use super::{QUEUE_SCHEMA_VERSION, QueueStore};
+    use super::{QUEUE_SCHEMA_VERSION, QueueStore, QueueStoreError};
     use crate::test_support::TempDir;
 
     fn queue_with_duplicates() -> Queue {
@@ -372,6 +339,20 @@ mod tests {
         let dir = TempDir::new("queue-missing");
         let store = QueueStore::new(dir.path().join("queue.json"));
         assert!(store.load().expect("missing is fine").is_none());
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_rejected_without_rewriting() {
+        let dir = TempDir::new("queue-version");
+        let path = dir.path().join("queue.json");
+        let original = br#"{"version":999,"next_entry_id":1,"current_entry_id":null,"entries":[]}"#;
+        fs::write(&path, original).expect("fixture");
+        let error = QueueStore::new(&path).load().expect_err("future schema");
+        assert!(matches!(
+            error,
+            QueueStoreError::UnsupportedVersion { found: 999, .. }
+        ));
+        assert_eq!(fs::read(&path).expect("preserved"), original.as_slice());
     }
 
     #[test]
@@ -537,6 +518,16 @@ mod tests {
         assert_eq!(loaded.queue, second);
         assert!(!loaded.auto_library);
         assert!(!path.with_extension("json.tmp").exists());
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("read temp dir")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("queue.json.tmp.")),
+            "no shared-writer staging file remains"
+        );
     }
 
     #[test]

@@ -700,6 +700,7 @@ from what remains structurally or physically unverified.
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
 | Cross-platform native picker path bytes, selected PathBuf retention, CI matrix metadata | Parser/selection behavior covered by deterministic Linux tests; Windows/macOS compile/test jobs defined in CI, not runtime-verified here |
+| Shared atomic publication, unique staging names, concurrent writer integrity, settings/queue/history schema protection | Confirmed by deterministic filesystem/settings/store tests; simulated failures don't prove power-loss behavior |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -1605,6 +1606,82 @@ automatically removed.
 The TUI intentionally exposes no single-track deletion or audio/artwork repair
 shortcut; it reports missing/inaccessible audio and directs destructive repair
 decisions to the GUI review workflow.
+
+## Persistence ownership and shared atomic publication
+
+Persistence remains deliberately split by authority and failure domain rather
+than merged into one database or cross-file transaction:
+
+| State | Owner | Authority | Format/version | Publication and recovery |
+|---|---|---|---|---|
+| `library.flux` manifest, `catalog.flux`, artist/album/track/playlist records, `ratings.flux` | `flux-library::canonical` | Authoritative catalogue | Canonical schema 1 JSON entity files | C1 journal, generation/counter validation, backups and startup recovery |
+| `transactions/`, `backups/`, `catalog.flux.bak` | `flux-library::canonical` | Recovery metadata / historical copy | Canonical journal schema 1 | Journal-owned staging, rollback/roll-forward, cleanup recovery |
+| Managed audio/artwork/lyrics files | `flux-library::canonical` resources | Authoritative only through catalogue references | Media/image/LRC bytes | Staged and verified in canonical transactions; unreferenced cleanup only after commit |
+| `<library>/queue.flux` | `flux-app` policy + `flux-library::queue_store` | Independent application state | Queue schema 1 | Shared atomic writer; malformed file preserved and queue writes disabled |
+| `history.flux` | `flux-app` policy + `flux-library::playback_history` | Derived aggregate for live canonical TrackIds | History schema 1 | Shared atomic writer; malformed file preserved and history writes disabled |
+| `<config>/flux/settings.json` | `flux-app::settings` | Shared application preference | Settings schema 1 | Shared atomic writer; malformed, invalid-version or newer-schema files preserved and write-protected |
+| Legacy `library-index.json` | `flux-library::store` | Legacy compatibility/migration source | Index schema 1 | Shared atomic writer; caller supplies existing parent; malformed/unsupported versions fail closed |
+| Portable `.flux` catalogue/segments | `flux-library::portable` | Portable compatibility catalogue | Portable schema 3, readable from 2 | Generation-qualified no-overwrite finalize, backup ladder, recovery/write-protection |
+| Explicit migration plans/staging | `flux-app` + `flux-library::canonical_migrate` | Planned destination only | In-memory plan + isolated staging directory | Plan-first validation, same-parent activation rename, source never modified |
+
+The Controller selects queue paths by backend: `<canonical-root>/queue.flux`,
+`<portable-root>/.flux/queue/queue.json`, or a legacy path derived from the
+locked index identity. Playback history is persisted only for canonical
+libraries (`<canonical-root>/history.flux`); legacy/portable sessions keep
+history in memory.
+
+Queue and history are intentionally **not** part of the canonical catalogue
+transaction. Queue load preserves entries whose TrackId is absent from the
+current library so they are visible as missing rather than silently rewritten;
+normal deletion removes their queue/history references after the catalogue
+commit. A crash between those independent writes can leave a missing queue
+entry or a hidden history aggregate, but cannot invalidate `catalog.flux`.
+History consumers ignore TrackIds no longer present in the live catalogue.
+Portable recovery state and migration state likewise never become alternate
+canonical authorities.
+
+M1 consolidates the atomic publication used by legacy index, queue, history and
+settings into one `flux_library::write_atomic` primitive:
+
+- writes a uniquely named sibling temporary file to avoid concurrent writers
+  truncating the same staging name;
+- flushes the file, atomically replaces the target, and syncs the parent
+  directory on Unix;
+- removes its own temporary file on write/replace failure;
+- leaves the previous target untouched on failure before replacement;
+- reports a parent-sync failure after replacement rather than pretending the
+  rename did not happen.
+
+Canonical transaction journals and portable generation files retain their
+specialized publication/recovery protocols. They have journal-owned staging,
+backup, idempotent-finalize and no-overwrite rules that are not interchangeable
+with ordinary last-writer-wins application files. This is an intentional
+boundary, not remaining duplicated generic write code.
+
+Settings now rejects a non-numeric version field or any version newer than this
+build's schema, preserving the file and disabling writes for the session. Older
+settings with a missing/version-0 schema remain readable with defaults. No
+persisted format, file name, schema version, migration rule, or canonical
+transaction behavior was changed by M1.
+
+### Persistence limitations
+
+- Queue/history are independently persisted from the catalogue; there is no
+  cross-file atomic commit. UI/controller code must keep treating missing
+  TrackIds as unavailable rather than fabricating catalogue entries. A failed
+  queue/history save keeps the live in-memory state and retries on the next
+  mutation or shutdown; it never publishes a partial file.
+- Settings can be saved by GUI and TUI processes concurrently. The shared
+  writer prevents staging-file corruption, but cross-process updates remain
+  last-writer-wins; there is no settings merge protocol.
+- Windows parent-directory fsync remains a platform no-op; file content is
+  flushed and replacement is atomic, but Unix-equivalent power-loss durability
+  is not claimed.
+- A hard crash can leave an unreferenced uniquely named `.tmp.<pid>.<counter>`
+  file. It is never loaded as state or treated as authoritative; automatic
+  stale-temp collection is not implemented.
+- Portable schema-2 files remain readable, and portable case-policy/volume
+  probing limitations from CP1 are unchanged.
 
 ## Transaction state machine and recovery
 
