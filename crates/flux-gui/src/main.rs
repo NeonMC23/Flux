@@ -19,13 +19,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use flux_app::{
-    AlbumId, Artist, AudioStatus, Availability, CROSSFADE_MAX_MS, CandidateStatus,
-    CanonicalMigrationPlan, Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision,
-    ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
-    LyricLine, LyricsDocument, LyricsKind, PlaybackMode, PlaylistId, PreparedImport,
-    ReconcileReport, RelPath, ReleaseType, ResourceState, StorageMode, TrackAudioReplacementPlan,
-    TrackDeletionPlan, TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW,
-    format_duration, is_track_playable, prepare_import_files, prepare_import_plan,
+    AlbumId, Artist, AudioStatus, CROSSFADE_MAX_MS, CandidateStatus, CanonicalMigrationPlan,
+    Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision, ImportItemState, ImportPlan,
+    ImportProgress, ImportRequest, ImportStage, ImportStorage, LyricLine, LyricsDocument,
+    LyricsKind, PlaybackMode, PlaylistId, PreparedImport, ReconcileReport, RelPath, ReleaseType,
+    ResourceState, StorageMode, TrackAudioReplacementPlan, TrackDeletionPlan, TrackMetadataEdit,
+    TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration, is_track_playable,
+    prepare_import_files, prepare_import_plan,
 };
 use flux_core::{APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, Track, TrackId};
 use iced::ContentFit;
@@ -65,6 +65,7 @@ const GROUP_PAGE_SIZE: usize = 100;
 const SEARCH_RESULT_LIMIT: usize = 20;
 const PLAYLIST_PAGE_SIZE: usize = 150;
 const QUEUE_PAGE_SIZE: usize = 8;
+const QUEUE_INLINE_MIN_WIDTH: f32 = 1_080.0;
 const QUEUE_ROW_HEIGHT: f32 = 38.0;
 const PLAYLIST_ROW_HEIGHT: f32 = 40.0;
 const WAVE_TICK: Duration = Duration::from_millis(16);
@@ -799,6 +800,8 @@ fn new_browser(mode: BrowserMode, start: PathBuf) -> FileBrowser {
         selected: HashSet::new(),
         path_input: String::new(),
         error: None,
+        omitted: 0,
+        symlinks_skipped: 0,
     };
     refresh_import_browser_data(&mut browser);
     browser
@@ -811,6 +814,8 @@ fn refresh_browser(browser: &mut FileBrowser) {
 fn refresh_import_browser_data(browser: &mut FileBrowser) {
     browser.path_input = browser.current.display().to_string();
     browser.error = None;
+    browser.omitted = 0;
+    browser.symlinks_skipped = 0;
     let entries = match std::fs::read_dir(&browser.current) {
         Ok(entries) => entries,
         Err(err) => {
@@ -820,12 +825,24 @@ fn refresh_import_browser_data(browser: &mut FileBrowser) {
         }
     };
     let mut rows = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                browser.omitted += 1;
+                continue;
+            }
+        };
         let path = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                browser.omitted += 1;
+                continue;
+            }
         };
         if metadata.file_type().is_symlink() {
+            browser.symlinks_skipped += 1;
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1370,6 +1387,104 @@ impl LibraryView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePlacement {
+    Hidden,
+    Inline,
+    Overlay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackResourceBadge {
+    Missing,
+    Inaccessible,
+}
+
+fn resource_badge(state: Option<ResourceState>) -> Option<TrackResourceBadge> {
+    match state {
+        Some(ResourceState::Missing) => Some(TrackResourceBadge::Missing),
+        Some(ResourceState::Unavailable(_)) => Some(TrackResourceBadge::Inaccessible),
+        Some(ResourceState::Present) | None => None,
+    }
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut shortened = value.chars().take(max_chars - 1).collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
+fn track_list_empty_copy(
+    view: LibraryView,
+    filters_active: bool,
+    grouped: bool,
+) -> (&'static str, &'static str) {
+    if filters_active {
+        return (
+            "No tracks match the current filters.",
+            "Reset filters or choose another view.",
+        );
+    }
+    match view {
+        LibraryView::RecentlyAdded => (
+            "No recently added tracks yet.",
+            "Imported tracks with a recorded creation time appear here.",
+        ),
+        LibraryView::RecentlyPlayed => (
+            "No listening history yet.",
+            "Play a track through the shared controller to build local history.",
+        ),
+        LibraryView::MostPlayed => (
+            "No listening history yet.",
+            "Play a track to establish its local play count.",
+        ),
+        LibraryView::Collections => (
+            "No tracks match this Smart Collection.",
+            "Try another collection or adjust ratings, lyrics and artwork.",
+        ),
+        _ if grouped => (
+            "No tracks in this group.",
+            "Choose another group or return to the library.",
+        ),
+        _ => (
+            "No tracks in this collection.",
+            "Choose another view or import music.",
+        ),
+    }
+}
+
+fn import_has_committed_success(report: &ImportApplyReport) -> bool {
+    report.imported > 0 || report.updated > 0
+}
+
+fn browser_omission_notice(omitted: usize, symlinks_skipped: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if omitted > 0 {
+        parts.push(format!(
+            "{omitted} entr{} disappeared or could not be inspected and {} omitted; refresh before selecting.",
+            if omitted == 1 { "y" } else { "ies" },
+            if omitted == 1 { "was" } else { "were" },
+        ));
+    }
+    if symlinks_skipped > 0 {
+        parts.push(format!(
+            "{symlinks_skipped} symbolic link{} not followed.",
+            if symlinks_skipped == 1 {
+                " was"
+            } else {
+                "s were"
+            },
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 #[derive(Debug, Clone, Default)]
 struct SearchCache {
     query: String,
@@ -1780,6 +1895,8 @@ struct FileBrowser {
     selected: HashSet<PathBuf>,
     path_input: String,
     error: Option<String>,
+    omitted: usize,
+    symlinks_skipped: usize,
 }
 
 #[derive(Debug)]
@@ -1966,6 +2083,7 @@ struct FluxReady {
     crossfade_preview: Option<u64>,
     show_setup: bool,
     queue_visible: bool,
+    queue_overlay_open: bool,
     window_width: f32,
     closed: bool,
 }
@@ -2322,6 +2440,7 @@ impl FluxReady {
             crossfade_preview: None,
             show_setup,
             queue_visible: true,
+            queue_overlay_open: false,
             window_width: 1_180.0,
             closed: false,
         }
@@ -3361,7 +3480,7 @@ impl FluxReady {
         manager.progress_view.message = "Writing catalogue changes…".to_owned();
         match self.controller.apply_import_plan(&plan, &prepared) {
             Ok(report) => {
-                let failed = report.failed > 0 && report.imported == 0;
+                let failed = report.failed > 0 && !import_has_committed_success(&report);
                 if failed {
                     manager.error = report
                         .items
@@ -3534,6 +3653,7 @@ impl FluxReady {
         self.collection = None;
         self.playlist_entry_selection.clear();
         self.playlist_drag = None;
+        self.queue_overlay_open = false;
         self.selected_lyrics = None;
         self.lyrics_follow_current = false;
         self.lyrics_editor = None;
@@ -3542,6 +3662,49 @@ impl FluxReady {
         self.page = 0;
         self.crossfade_preview = None;
         self.show_setup = false;
+    }
+
+    fn queue_placement(&self) -> QueuePlacement {
+        if self.window_width >= QUEUE_INLINE_MIN_WIDTH {
+            if self.queue_visible {
+                QueuePlacement::Inline
+            } else {
+                QueuePlacement::Hidden
+            }
+        } else if self.queue_overlay_open {
+            QueuePlacement::Overlay
+        } else {
+            QueuePlacement::Hidden
+        }
+    }
+
+    fn toggle_queue(&mut self) {
+        self.cancel_queue_drag();
+        if self.window_width >= QUEUE_INLINE_MIN_WIDTH {
+            self.queue_visible = !self.queue_visible;
+            self.queue_overlay_open = false;
+        } else {
+            self.queue_overlay_open = !self.queue_overlay_open;
+        }
+    }
+
+    fn active_library_path(&self) -> Option<&Path> {
+        self.controller
+            .canonical_root()
+            .or_else(|| self.controller.portable_root())
+            .or_else(|| self.controller.legacy_index_path())
+    }
+
+    fn active_library_label(&self) -> String {
+        let Some(path) = self.active_library_path() else {
+            return "Session-only library".to_owned();
+        };
+        path.file_name()
+            .filter(|name| !name.is_empty())
+            .map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
     }
 
     fn toggle_setup(&mut self) {
@@ -5518,10 +5681,7 @@ impl FluxReady {
                 self.show_setup = false;
             }
             Message::ToggleSetup => self.toggle_setup(),
-            Message::ToggleQueue => {
-                self.cancel_queue_drag();
-                self.queue_visible = !self.queue_visible;
-            }
+            Message::ToggleQueue => self.toggle_queue(),
             Message::PagePrev => {
                 self.page = self.page.saturating_sub(1);
                 if self.selected_playlist.is_some() {
@@ -5680,6 +5840,7 @@ impl FluxReady {
                     Key::Character("n") => self.controller.next(),
                     Key::Character("p") => self.controller.previous(),
                     Key::Character("s") => self.controller.stop(),
+                    Key::Character("q") => self.toggle_queue(),
                     Key::Character("e") => {
                         if let Some(id) = self.controller.current_id() {
                             self.start_track_editor(id);
@@ -5787,6 +5948,9 @@ impl FluxReady {
                 self.cancel_queue_drag();
                 self.seek_preview = None;
                 self.window_width = width;
+                if width >= QUEUE_INLINE_MIN_WIDTH {
+                    self.queue_overlay_open = false;
+                }
             }
             Message::WindowCloseRequested(id) => {
                 self.closed = true;
@@ -5801,15 +5965,22 @@ impl FluxReady {
     // -------------------------------------------------------------- view ---
 
     fn view(&self) -> Element<'_, Message> {
-        let queue_visible = self.queue_visible && self.window_width >= 1_080.0;
+        let queue_placement = self.queue_placement();
         let mut body = row![self.sidebar(), rule(), self.central()]
             .height(Length::Fill)
             .width(Length::Fill);
-        if queue_visible {
-            body = body.push(rule()).push(self.queue_panel());
+        if queue_placement == QueuePlacement::Inline {
+            body = body.push(rule()).push(self.queue_panel(false));
         }
 
-        let base: Element<'_, Message> = body.into();
+        let body: Element<'_, Message> = body.into();
+        let base: Element<'_, Message> = if queue_placement == QueuePlacement::Overlay {
+            stack([body, self.queue_overlay()])
+                .height(Length::Fill)
+                .into()
+        } else {
+            body
+        };
         let body: Element<'_, Message> = if self.lyrics_import.is_some() {
             stack([base, self.lyrics_import_overlay()])
                 .height(Length::Fill)
@@ -6986,6 +7157,10 @@ impl FluxReady {
         ]
         .spacing(6);
 
+        if let Some(notice) = browser_omission_notice(browser.omitted, browser.symlinks_skipped) {
+            body = body.push(text(notice).size(9).color(DANGER));
+        }
+
         let mut rows = column![].spacing(2);
         for entry in &browser.entries {
             if entry.is_dir {
@@ -7923,16 +8098,35 @@ impl FluxReady {
                     ImportItemState::Failed => ("failed", DANGER),
                     _ => ("pending", MUTED),
                 };
+                let source = manager
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.candidates.get(item.index))
+                    .map_or_else(
+                        || "Source unavailable".to_owned(),
+                        |candidate| candidate.source_path().display().to_string(),
+                    );
+                let detail = match (item.track_id, item.message.trim()) {
+                    (Some(id), "") => format!("Track {id}"),
+                    (Some(id), message) => format!("Track {id} · {message}"),
+                    (None, "") => "No detail was recorded.".to_owned(),
+                    (None, message) => message.to_owned(),
+                };
+                let source_label = tooltip(
+                    text(truncate_label(&source, 96)).size(10).color(TEXT),
+                    container(text(source).size(9).color(TEXT))
+                        .padding([4, 7])
+                        .style(tooltip_style),
+                    tooltip::Position::Top,
+                )
+                .gap(6)
+                .delay(Duration::from_millis(350));
                 body = body.push(
                     row![
                         text(state).size(9).color(color).width(Length::Fixed(56.0)),
-                        text(match item.track_id {
-                            Some(id) => format!("Track {id}"),
-                            None => item.message.clone(),
-                        })
-                        .size(10)
-                        .color(MUTED)
-                        .width(Length::Fill),
+                        column![source_label, text(detail).size(9).color(MUTED)]
+                            .spacing(1)
+                            .width(Length::Fill),
                     ]
                     .spacing(8),
                 );
@@ -8023,109 +8217,150 @@ impl FluxReady {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let mut nav = column![
-            brand,
-            iced::widget::Space::new().height(20),
-            text("LIBRARY").size(9).color(MUTED),
-        ]
-        .spacing(6);
+        let count_for = |view: LibraryView| -> String {
+            if view == LibraryView::Settings {
+                return String::new();
+            }
+            match view {
+                LibraryView::Tracks => counts.0,
+                LibraryView::Artists => counts.1,
+                LibraryView::Albums => counts.2,
+                LibraryView::Folders => counts.3,
+                LibraryView::Playlists => counts.4,
+                LibraryView::Lyrics => counts.5,
+                LibraryView::Dashboard => self.controller.tracks().len(),
+                LibraryView::Collections => SmartCollection::ALL.len(),
+                LibraryView::RecentlyAdded => self
+                    .controller
+                    .tracks()
+                    .iter()
+                    .filter(|(id, _)| {
+                        self.controller
+                            .track_created_unix_ms(*id)
+                            .is_some_and(|created| created > 0)
+                    })
+                    .count(),
+                LibraryView::RecentlyPlayed | LibraryView::MostPlayed => {
+                    self.controller.playback_history().len()
+                }
+                LibraryView::Settings => 0,
+            }
+            .to_string()
+        };
 
-        for view in [
-            LibraryView::Tracks,
-            LibraryView::Artists,
-            LibraryView::Albums,
-            LibraryView::Folders,
-            LibraryView::Playlists,
-            LibraryView::Lyrics,
-            LibraryView::Dashboard,
-            LibraryView::Collections,
-            LibraryView::RecentlyAdded,
-            LibraryView::RecentlyPlayed,
-            LibraryView::MostPlayed,
-            LibraryView::Settings,
-        ] {
-            nav = nav.push(
-                button(
-                    row![
-                        text(view.label()).size(13),
-                        iced::widget::Space::new().width(Length::Fill),
-                        text(if view == LibraryView::Settings {
-                            String::new()
-                        } else {
-                            match view {
-                                LibraryView::Tracks => counts.0,
-                                LibraryView::Artists => counts.1,
-                                LibraryView::Albums => counts.2,
-                                LibraryView::Folders => counts.3,
-                                LibraryView::Playlists => counts.4,
-                                LibraryView::Lyrics => counts.5,
-                                LibraryView::Dashboard => self.controller.tracks().len(),
-                                LibraryView::Collections => SmartCollection::ALL.len(),
-                                LibraryView::RecentlyAdded => self
-                                    .controller
-                                    .tracks()
-                                    .iter()
-                                    .filter(|(id, _)| {
-                                        self.controller
-                                            .track_created_unix_ms(*id)
-                                            .is_some_and(|created| created > 0)
-                                    })
-                                    .count(),
-                                LibraryView::RecentlyPlayed | LibraryView::MostPlayed => {
-                                    self.controller.playback_history().len()
-                                }
-                                LibraryView::Settings => 0,
-                            }
-                            .to_string()
-                        })
-                        .size(9)
-                        .color(MUTED),
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding([8, 10])
-                .style(nav_style(self.view == view && !self.show_setup))
-                .on_press(Message::SelectView(view)),
-            );
+        let sections: [(&str, &[LibraryView]); 3] = [
+            (
+                "LIBRARY",
+                &[
+                    LibraryView::Tracks,
+                    LibraryView::Artists,
+                    LibraryView::Albums,
+                    LibraryView::Folders,
+                ],
+            ),
+            (
+                "CURATED",
+                &[
+                    LibraryView::Playlists,
+                    LibraryView::Collections,
+                    LibraryView::RecentlyAdded,
+                    LibraryView::RecentlyPlayed,
+                    LibraryView::MostPlayed,
+                ],
+            ),
+            (
+                "TOOLS",
+                &[
+                    LibraryView::Lyrics,
+                    LibraryView::Dashboard,
+                    LibraryView::Settings,
+                ],
+            ),
+        ];
+        let mut nav_items = column![].spacing(2);
+        for (index, (heading, views)) in sections.iter().enumerate() {
+            if index > 0 {
+                nav_items = nav_items.push(iced::widget::Space::new().height(4));
+            }
+            nav_items =
+                nav_items.push(container(text(*heading).size(8).color(MUTED)).padding([3, 8]));
+            for view in *views {
+                nav_items = nav_items.push(
+                    button(
+                        row![
+                            text(view.label()).size(12),
+                            iced::widget::Space::new().width(Length::Fill),
+                            text(count_for(*view)).size(9).color(MUTED),
+                        ]
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([5, 8])
+                    .style(nav_style(self.view == *view && !self.show_setup))
+                    .on_press(Message::SelectView(*view)),
+                );
+            }
         }
 
-        nav = nav.push(iced::widget::Space::new().height(12));
-        nav = nav.push(
+        let library_state = match self.controller.storage_mode() {
+            StorageMode::Legacy => "App index",
+            StorageMode::Portable => "Portable (migration source)",
+            StorageMode::Canonical => "Canonical library",
+        };
+        let library_label = format!(
+            "{library_state} · {}",
+            truncate_label(&self.active_library_label(), 16)
+        );
+        let library_detail = self.active_library_path().map_or_else(
+            || "No persistent root".to_owned(),
+            |path| path.display().to_string(),
+        );
+        let library_label = tooltip(
+            text(library_label).size(9).color(TEXT),
+            container(text(library_detail).size(9).color(TEXT))
+                .padding([4, 7])
+                .style(tooltip_style),
+            tooltip::Position::Top,
+        )
+        .gap(6)
+        .delay(Duration::from_millis(350));
+
+        let mut nav = column![
+            brand,
+            iced::widget::Space::new().height(16),
             button(text("Import music").size(12))
                 .width(Length::Fill)
                 .padding([8, 10])
                 .style(accent_button_style)
                 .on_press(Message::ImportOpen),
-        );
-        nav = nav.push(iced::widget::Space::new().height(6));
-        nav = nav.push(
+            iced::widget::Space::new().height(5),
             button(text("Library setup").size(12))
                 .width(Length::Fill)
                 .padding([8, 10])
                 .style(nav_style(self.show_setup))
                 .on_press(Message::ToggleSetup),
-        );
-        nav = nav.push(iced::widget::Space::new().height(Length::Fill));
-        nav = nav.push(text("SPACE PLAY · N/P SKIP").size(8).color(MUTED));
-        nav = nav.push(text("←/→ SEEK · SHIFT ±30S").size(8).color(MUTED));
+            iced::widget::Space::new().height(10),
+        ]
+        .spacing(0);
+        nav = nav.push(scrollable(nav_items).height(Length::Fill));
+        nav = nav.push(iced::widget::Space::new().height(8));
+        nav = nav.push(text("SPACE PLAY · N/P SKIP · Q QUEUE").size(8).color(MUTED));
         nav = nav.push(
-            text("1-4 VIEWS · K SETTINGS · / SEARCH")
+            text("←/→ SEEK · SHIFT ±30S · / SEARCH")
+                .size(8)
+                .color(MUTED),
+        );
+        nav = nav.push(
+            text("1-0 VIEWS · K SETTINGS · L SETUP")
                 .size(8)
                 .color(MUTED),
         );
         nav = nav.push(iced::widget::Space::new().height(10));
-
-        let library_state = match self.controller.storage_mode() {
-            StorageMode::Legacy => "App index",
-            StorageMode::Portable => "Portable library (migration source)",
-            StorageMode::Canonical => "Canonical library",
-        };
-        nav = nav.push(text("LIBRARY SOURCE").size(8).color(MUTED));
-        nav = nav.push(text(library_state).size(10).color(TEXT));
+        nav = nav.push(text("ACTIVE LIBRARY").size(8).color(MUTED));
+        nav = nav.push(library_label);
 
         container(nav)
-            .width(Length::Fixed(190.0))
+            .width(Length::Fixed(200.0))
             .height(Length::Fill)
             .padding(14)
             .style(sidebar_style)
@@ -8298,6 +8533,9 @@ impl FluxReady {
                 ),
             )
         };
+        let compact = self.window_width < QUEUE_INLINE_MIN_WIDTH;
+        let title = truncate_label(&title, if compact { 46 } else { 80 });
+        let subtitle = truncate_label(&subtitle, if compact { 72 } else { 120 });
 
         let mut bar = row![].spacing(10).align_y(Alignment::Center);
         if self.selected_group.is_some() && !self.show_setup {
@@ -8320,9 +8558,9 @@ impl FluxReady {
                 text(title).size(24).color(TEXT),
                 text(subtitle).size(11).color(MUTED)
             ]
-            .spacing(2),
+            .spacing(2)
+            .width(Length::Fill),
         );
-        bar = bar.push(iced::widget::Space::new().width(Length::Fill));
 
         if !self.show_setup && self.track_editor.is_none() {
             bar = bar.push(
@@ -8330,7 +8568,7 @@ impl FluxReady {
                     .id(iced::widget::Id::new("flux-search"))
                     .on_input(Message::SearchChanged)
                     .style(input_style)
-                    .width(Length::Fixed(250.0)),
+                    .width(Length::Fixed(if compact { 190.0 } else { 250.0 })),
             );
             if !self.search.trim().is_empty() {
                 bar = bar.push(
@@ -8349,10 +8587,10 @@ impl FluxReady {
                     .on_press(Message::LyricsOpenCurrent),
             );
         }
-        if self.window_width >= 1_080.0 && self.track_editor.is_none() {
+        if self.track_editor.is_none() {
             bar = bar.push(
                 button(text("Queue").size(11))
-                    .style(nav_style(self.queue_visible))
+                    .style(nav_style(self.queue_placement() != QueuePlacement::Hidden))
                     .padding([6, 10])
                     .on_press(Message::ToggleQueue),
             );
@@ -9916,10 +10154,7 @@ impl FluxReady {
                 let Some(track) = self.controller.track(*id) else {
                     continue;
                 };
-                let missing = matches!(
-                    self.controller.track_availability(*id),
-                    Some(Availability::Missing)
-                );
+                let resource = resource_badge(self.controller.track_audio_resource_state(*id));
                 list = list.push(
                     row![
                         track_row(
@@ -9929,7 +10164,7 @@ impl FluxReady {
                             &self.credit_display(*id),
                             TrackRowState {
                                 current,
-                                missing,
+                                resource,
                                 editable,
                                 checked: self.selected_tracks.contains(id),
                                 focused: self.focused_track == Some(*id),
@@ -10257,6 +10492,7 @@ impl FluxReady {
                 current,
                 self.playlist_entry_selection.contains(&position),
                 dragged == Some(position),
+                resource_badge(self.controller.track_audio_resource_state(track_id)),
             ));
         }
         rows = rows.push(queue_gap_line(target_gap == Some(end)));
@@ -11971,6 +12207,18 @@ impl FluxReady {
                 let Some(track) = self.controller.track(*track_id) else {
                     continue;
                 };
+                let resource =
+                    resource_badge(self.controller.track_audio_resource_state(*track_id));
+                let mut title_row = row![text(track.title()).size(12).color(TEXT)].spacing(6);
+                match resource {
+                    Some(TrackResourceBadge::Missing) => {
+                        title_row = title_row.push(text("missing").size(8).color(DANGER));
+                    }
+                    Some(TrackResourceBadge::Inaccessible) => {
+                        title_row = title_row.push(text("inaccessible").size(8).color(DANGER));
+                    }
+                    None => {}
+                }
                 list = list.push(
                     container(
                         row![
@@ -11979,7 +12227,7 @@ impl FluxReady {
                                 .color(MUTED)
                                 .width(Length::Fixed(24.0)),
                             column![
-                                text(track.title()).size(12).color(TEXT),
+                                title_row,
                                 text(self.credit_display(*track_id)).size(9).color(MUTED),
                             ]
                             .spacing(1)
@@ -12034,17 +12282,15 @@ impl FluxReady {
         }
         let total = rows.len();
         if total == 0 {
-            let message = if self.search.trim().is_empty() {
-                "No tracks in this collection."
-            } else {
-                "No tracks match the current search."
-            };
+            let (message, hint) = track_list_empty_copy(
+                self.view,
+                self.filters_active(),
+                self.selected_group.is_some(),
+            );
             return container(
                 column![
                     text(message).size(15).color(TEXT),
-                    text("Clear the search or choose another view.")
-                        .size(11)
-                        .color(MUTED),
+                    text(hint).size(11).color(MUTED),
                 ]
                 .spacing(6)
                 .align_x(Alignment::Center),
@@ -12087,10 +12333,7 @@ impl FluxReady {
 
         let mut list = column![].spacing(1);
         for (offset, (id, track)) in rows[start..end].iter().enumerate() {
-            let missing = matches!(
-                self.controller.track_availability(*id),
-                Some(Availability::Missing)
-            );
+            let resource = resource_badge(self.controller.track_audio_resource_state(*id));
             list = list.push(track_row(
                 start + offset + 1,
                 *id,
@@ -12098,7 +12341,7 @@ impl FluxReady {
                 &self.credit_display(*id),
                 TrackRowState {
                     current,
-                    missing,
+                    resource,
                     editable,
                     checked: self.selected_tracks.contains(id),
                     focused: self.focused_track == Some(*id),
@@ -12515,7 +12758,37 @@ impl FluxReady {
         scrollable(setup).height(Length::Fill).into()
     }
 
-    fn queue_panel(&self) -> Element<'_, Message> {
+    fn queue_overlay(&self) -> Element<'_, Message> {
+        let backdrop = mouse_area(
+            container(
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(modal_backdrop_style),
+        )
+        .on_press(Message::ToggleQueue);
+        stack([
+            backdrop.into(),
+            container(
+                row![
+                    iced::widget::Space::new().width(Length::Fill),
+                    self.queue_panel(true),
+                ]
+                .height(Length::Fill),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        ])
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn queue_panel(&self, overlay: bool) -> Element<'_, Message> {
         let current_entry = self.controller.current_queue_entry();
         let current = current_entry.and_then(|entry| self.controller.track(entry.track()));
         let (title, subtitle) = match (current_entry, current) {
@@ -12535,8 +12808,19 @@ impl FluxReady {
 
         let current_album =
             current_entry.and_then(|entry| self.controller.track_album_id(entry.track()));
+        let mut heading =
+            row![text("NOW PLAYING").size(9).color(ACCENT)].align_y(Alignment::Center);
+        if overlay {
+            heading = heading.push(iced::widget::Space::new().width(Length::Fill));
+            heading = heading.push(
+                button(text("Close").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::ToggleQueue),
+            );
+        }
         let mut panel = column![
-            text("NOW PLAYING").size(9).color(ACCENT),
+            heading,
             container(self.album_artwork(current_album, 176.0, ContentFit::Cover))
                 .width(Length::Fill)
                 .center_x(Length::Fill),
@@ -12591,6 +12875,7 @@ impl FluxReady {
                     current_entry_id,
                     dragged == Some(entry.id()),
                     self.controller.track(entry.track()),
+                    resource_badge(self.controller.track_audio_resource_state(entry.track())),
                 ));
             }
             rows = rows.push(queue_gap_line(target_gap == Some(end)));
@@ -12912,7 +13197,7 @@ fn setup_card<'a>(
 #[derive(Debug, Clone, Copy)]
 struct TrackRowState {
     current: Option<TrackId>,
-    missing: bool,
+    resource: Option<TrackResourceBadge>,
     editable: bool,
     checked: bool,
     focused: bool,
@@ -12940,8 +13225,14 @@ fn track_row<'a>(
     let mut title = row![text(track.title()).size(13).color(title_color)]
         .spacing(8)
         .align_y(Alignment::Center);
-    if state.missing {
-        title = title.push(text("missing").size(9).color(DANGER));
+    match state.resource {
+        Some(TrackResourceBadge::Missing) => {
+            title = title.push(text("missing").size(9).color(DANGER));
+        }
+        Some(TrackResourceBadge::Inaccessible) => {
+            title = title.push(text("inaccessible").size(9).color(DANGER));
+        }
+        None => {}
     }
     if !playable {
         title = title.push(text("indexed, not playable").size(9).color(MUTED));
@@ -13041,6 +13332,7 @@ fn playlist_entry_row<'a>(
     current: Option<TrackId>,
     checked: bool,
     dragging: bool,
+    resource: Option<TrackResourceBadge>,
 ) -> Element<'a, Message> {
     let is_current = current == Some(track_id);
     let duration = track.duration().map(format_duration).unwrap_or_default();
@@ -13076,6 +13368,16 @@ fn playlist_entry_row<'a>(
             position + 1
         })
     };
+    let mut title_row = row![text(track.title()).size(12).color(title_color)].spacing(6);
+    match resource {
+        Some(TrackResourceBadge::Missing) => {
+            title_row = title_row.push(text("missing").size(8).color(DANGER));
+        }
+        Some(TrackResourceBadge::Inaccessible) => {
+            title_row = title_row.push(text("inaccessible").size(8).color(DANGER));
+        }
+        None => {}
+    }
     mouse_area(
         row![
             text("≡").size(11).color(MUTED),
@@ -13085,12 +13387,9 @@ fn playlist_entry_row<'a>(
                 .color(MUTED)
                 .width(Length::Fixed(24.0)),
             play,
-            column![
-                text(track.title()).size(12).color(title_color),
-                text(display_artist(track)).size(9).color(MUTED),
-            ]
-            .spacing(1)
-            .width(Length::FillPortion(5)),
+            column![title_row, text(display_artist(track)).size(9).color(MUTED),]
+                .spacing(1)
+                .width(Length::FillPortion(5)),
             text(display_album(track))
                 .size(9)
                 .color(MUTED)
@@ -13124,16 +13423,18 @@ fn queue_row<'a>(
     current: Option<QueueEntryId>,
     dragging: bool,
     track: Option<&'a Track>,
+    resource: Option<TrackResourceBadge>,
 ) -> Element<'a, Message> {
     let is_current = current == Some(entry.id());
     let playable = track.is_some_and(is_track_playable);
     let (title, subtitle, duration) = match track {
         Some(track) => (
             track.title().to_owned(),
-            if playable {
-                display_artist(track)
-            } else {
-                "Indexed, not playable".to_owned()
+            match resource {
+                Some(TrackResourceBadge::Missing) => "Missing managed audio".to_owned(),
+                Some(TrackResourceBadge::Inaccessible) => "Inaccessible audio".to_owned(),
+                None if playable => display_artist(track),
+                None => "Indexed, not playable".to_owned(),
             },
             track.duration().map(format_duration).unwrap_or_default(),
         ),
@@ -13444,6 +13745,7 @@ mod tests {
             crossfade_preview: None,
             show_setup: false,
             queue_visible: true,
+            queue_overlay_open: false,
             window_width: 1_180.0,
             closed: false,
         }
@@ -13569,6 +13871,162 @@ mod tests {
     }
 
     #[test]
+    fn navigation_labels_queue_placement_and_resource_badges_are_responsive() {
+        let dir = TempDir::new("gui-responsive-navigation");
+        let mut gui = gui(&dir);
+        assert_eq!(gui.queue_placement(), QueuePlacement::Inline);
+        gui.window_width = 920.0;
+        assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("q".into()), Modifiers::default()),
+        );
+        assert_eq!(gui.queue_placement(), QueuePlacement::Overlay);
+        assert!(gui.queue_visible, "wide-window preference remains intact");
+        let _ = gui.view();
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("q".into()), Modifiers::default()),
+        );
+        assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
+        assert!(gui.queue_visible);
+
+        gui.window_width = QUEUE_INLINE_MIN_WIDTH;
+        assert_eq!(gui.queue_placement(), QueuePlacement::Inline);
+        gui.queue_visible = false;
+        assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
+        gui.queue_visible = true;
+        let _ = gui.view();
+        gui.window_width = 920.0;
+        assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
+        let _ = gui.view();
+        send(&mut gui, Message::ToggleQueue);
+        assert_eq!(gui.queue_placement(), QueuePlacement::Overlay);
+        send(&mut gui, Message::WindowResized(1_080.0));
+        assert_eq!(gui.queue_placement(), QueuePlacement::Inline);
+        assert!(!gui.queue_overlay_open);
+        gui.window_width = 920.0;
+        assert_eq!(gui.active_library_label(), "library-index.json");
+        assert!(gui.active_library_path().is_some());
+        send(&mut gui, Message::ToggleQueue);
+        assert_eq!(gui.queue_placement(), QueuePlacement::Overlay);
+        send(&mut gui, Message::SelectView(LibraryView::Playlists));
+        assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
+        gui.search = "stale query".to_owned();
+        gui.selected_group = Some("stale".to_owned());
+        send(&mut gui, Message::SelectView(LibraryView::Artists));
+        assert_eq!(gui.view, LibraryView::Artists);
+        assert!(gui.search.is_empty());
+        assert!(gui.selected_group.is_none());
+
+        assert_eq!(truncate_label("short", 8), "short");
+        assert_eq!(truncate_label("abcdefghij", 6), "abcde…");
+        assert_eq!(truncate_label("ééééé", 3), "éé…");
+        assert_eq!(truncate_label("anything", 0), "");
+        assert_eq!(
+            resource_badge(Some(ResourceState::Missing)),
+            Some(TrackResourceBadge::Missing)
+        );
+        assert_eq!(
+            resource_badge(Some(ResourceState::Unavailable(
+                "permission denied".to_owned()
+            ))),
+            Some(TrackResourceBadge::Inaccessible)
+        );
+        assert_eq!(resource_badge(Some(ResourceState::Present)), None);
+        assert_eq!(resource_badge(None), None);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn empty_track_copy_distinguishes_filters_history_collections_and_groups() {
+        assert_eq!(
+            track_list_empty_copy(LibraryView::Tracks, true, false).0,
+            "No tracks match the current filters."
+        );
+        assert_eq!(
+            track_list_empty_copy(LibraryView::RecentlyAdded, false, false).0,
+            "No recently added tracks yet."
+        );
+        assert_eq!(
+            track_list_empty_copy(LibraryView::RecentlyPlayed, false, false).0,
+            "No listening history yet."
+        );
+        assert_eq!(
+            track_list_empty_copy(LibraryView::MostPlayed, false, false).0,
+            "No listening history yet."
+        );
+        assert_eq!(
+            track_list_empty_copy(LibraryView::Collections, false, false).0,
+            "No tracks match this Smart Collection."
+        );
+        assert_eq!(
+            track_list_empty_copy(LibraryView::Artists, false, true).0,
+            "No tracks in this group."
+        );
+        assert_eq!(
+            track_list_empty_copy(LibraryView::Tracks, false, false).0,
+            "No tracks in this collection."
+        );
+    }
+
+    #[test]
+    fn import_partial_success_and_browser_omissions_are_reported() {
+        let partial = ImportApplyReport {
+            imported: 0,
+            updated: 1,
+            skipped: 0,
+            failed: 1,
+            items: Vec::new(),
+        };
+        assert!(import_has_committed_success(&partial));
+        let failed = ImportApplyReport {
+            imported: 0,
+            updated: 0,
+            skipped: 1,
+            failed: 1,
+            items: Vec::new(),
+        };
+        assert!(!import_has_committed_success(&failed));
+
+        let notice = browser_omission_notice(1, 1).expect("notice");
+        assert!(notice.contains("1 entry disappeared"), "{notice}");
+        assert!(notice.contains("was omitted"), "{notice}");
+        assert!(
+            notice.contains("1 symbolic link was not followed"),
+            "{notice}"
+        );
+        let notice = browser_omission_notice(2, 2).expect("notice");
+        assert!(notice.contains("2 entries disappeared"), "{notice}");
+        assert!(notice.contains("were omitted"), "{notice}");
+        assert!(
+            notice.contains("2 symbolic links were not followed"),
+            "{notice}"
+        );
+        assert_eq!(browser_omission_notice(0, 0), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let dir = TempDir::new("gui-browser-omissions");
+            let folder = dir.path().join("browse");
+            std::fs::create_dir_all(&folder).expect("folder");
+            let song = folder.join("song.wav");
+            std::fs::write(&song, minimal_wav()).expect("song");
+            symlink(&song, folder.join("linked.wav")).expect("symlink");
+            let browser = new_browser(BrowserMode::Files, folder);
+            assert_eq!(browser.entries.len(), 1);
+            assert_eq!(browser.symlinks_skipped, 1);
+            assert_eq!(browser.omitted, 0);
+            assert!(
+                browser_omission_notice(browser.omitted, browser.symlinks_skipped)
+                    .is_some_and(|notice| notice.contains("symbolic link"))
+            );
+        }
+    }
+
+    #[test]
     fn create_library_message_creates_and_switches() {
         let dir = TempDir::new("create-switch");
         let root = dir.path().join("library");
@@ -13596,6 +14054,8 @@ mod tests {
             "canonical manifest exists"
         );
         assert!(!root.join(".flux").exists(), "no legacy portable store");
+        assert_eq!(gui.active_library_label(), "library");
+        assert!(gui.active_library_path().is_some());
         gui.controller.shutdown();
     }
 
@@ -13822,6 +14282,8 @@ mod tests {
             modified_ns: 0,
             len: 0,
         });
+        gui.window_width = 920.0;
+        gui.queue_overlay_open = true;
         let old_session = gui.controller.library_session();
 
         send(
@@ -13853,6 +14315,8 @@ mod tests {
         assert!(gui.artwork_loading.is_empty());
         assert!(gui.dashboard_cache.borrow().is_none());
         assert!(gui.lyrics_cache.borrow().is_empty());
+        assert!(!gui.queue_overlay_open);
+        assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
 
         // Purely global preferences survive the switch.
         assert!(gui.filter_favorites);

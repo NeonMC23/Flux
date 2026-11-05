@@ -84,6 +84,50 @@ root may leave its documented temporary leftovers there after the switch.
   decoder behind Iced's optional image widget; enabling that existing optional
   integration adds no separate image framework or network access.
 
+## GUI navigation and workflow feedback
+
+The GUI remains a presentation layer over the shared Controller. Its sidebar is
+grouped into **Library** (Tracks, Artists, Albums, Folders), **Curated**
+(Playlists, Smart Collections, Recently Added, Recently Played, Most Played) and
+**Tools** (Lyrics, Dashboard, Settings). The item list scrolls independently at
+the minimum window height, while Import, Library setup and the keyboard hints
+remain fixed. The footer shows the storage mode, the active library's final path
+component and the full path on hover, so multiple canonical libraries are
+distinguishable without opening setup.
+
+Keyboard navigation remains `1`–`0` for the primary views, `K` for Settings,
+`L` for Library setup, `Q` to toggle the queue and `/` to focus search. The
+sidebar hint reflects these keys rather than advertising a shorter subset.
+
+At widths of 1080 px or more the queue is an inline right-hand panel. On narrower
+windows the Queue button and `Q` open the same Controller-backed queue as an
+overlay with an explicit Close action, so queue inspection/removal does not
+disappear at the 920 px minimum width. Playback and queue state still come only
+from the Controller; the overlay is presentation state.
+
+Track, search, album and playlist rows label a definitively absent managed file
+as `missing` and an uninspectable/invalid path as `inaccessible`; queue rows use
+the same distinction in their subtitle. The album editor and TUI retain the more
+detailed reason text; rows deliberately stay compact. Empty states
+distinguish an empty library, empty album, filter yield, history-backed views,
+Smart Collection yield, artist/album group and ordinary track list. Top-bar
+entity titles/subtitles are bounded on compact windows, with the full active
+library path available through the sidebar tooltip.
+
+Import Manager result rows pair each outcome with the reviewed source path (full
+path on hover), the resulting TrackId when present, and the Controller's failure
+or skip detail. A report with at least one imported or updated track is shown as
+completed even when other items failed; the failed rows remain visible and are
+never hidden by an optimistic all-or-nothing state. Flux Browser counts entries
+that vanish or cannot be inspected during listing and displays an explicit
+omission warning; symbolic links are counted separately and never followed.
+The warning is advisory: selected paths are still revalidated by the H1
+planning/preparation pipeline.
+
+Status, lifecycle messages, import progress and destructive-action results stay
+in the existing GUI surfaces. No new notification framework or network service
+was introduced.
+
 ## Canonical layout
 
 ```text
@@ -567,6 +611,7 @@ from what remains structurally or physically unverified.
 | Meaningful-listening accounting, seek/pause/recovery/transition attribution, history persistence and dashboard aggregates | Confirmed by deterministic Controller/GUI tests with injected positions and transitions; no acoustic measurement or physical-device timing validation |
 | Import discovery, decode validation, partial preparation, cancellation and folder traversal | Confirmed by deterministic filesystem/import tests; real native dialogs and cross-platform traversal remain unverified |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
+| GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -1191,9 +1236,11 @@ through discovery, preparation and application.
 
 Folder import walks selected directories recursively when the GUI **Include
 subfolders** toggle is enabled (the TUI folder import is recursive). Symbolic
-links are never followed, `.flux` store directories are skipped, overlapping
-selections are canonicalized and imported once, and directory-entry or nested
-directory read errors are reported without discarding valid sibling files.
+links are never followed; Flux Browser reports skipped links and entries that
+vanish during listing instead of dropping them silently. `.flux` store
+directories are skipped, overlapping selections are canonicalized and imported
+once, and directory-entry or nested directory read errors are reported without
+discarding valid sibling files.
 An empty or all-unsupported selection reports an explicit discovery issue.
 Unsupported files in mixed directories are listed individually.
 
@@ -1733,3 +1780,13 @@ cleanup.
 25. Multi-entry queue removal and a dedicated queue clear action are not exposed
     in the GUI; individual removal/reorder and queue population from track/
     playlist actions remain available.
+26. The GUI provides only its custom dark Flux theme. No light-theme variant or
+    screen-reader/accessibility audit is implemented or claimed.
+27. Responsive queue placement, label truncation, empty-state copy and browser
+    omission reporting are covered with deterministic GUI helpers/state tests.
+    Full interactive resize, focus traversal and window-manager behavior were
+    not manually exercised in this stage.
+28. Flux Browser reports listing omissions it can observe and links it refuses
+    to follow, but a path that disappears before enumeration cannot be named;
+    refresh and the authoritative H1 planning/preparation checks remain the
+    safety boundary.

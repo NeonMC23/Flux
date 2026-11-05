@@ -81,13 +81,21 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   session; failed opens leave the active library untouched, and scans must
   finish before switching. Stale import, artwork, lyrics and file-picker
   results are dropped, and the previous library's selection, queue, editor,
-  caches and pending playback are cleared while global preferences remain. Use
-  **Import music** for the review-first copy-only Import Manager: native file
-  or folder picker, Flux Browser, drag-and-drop, name-inferred editable review,
-  duplicate decisions, and real progress/cancel. Click a track to play it; use
-  the transport row for pause/stop/skip/repeat/volume. The search box performs
-  a grouped, case-insensitive global search over canonical artists, albums and
-  tracks with direct navigation. Track rows expose favorite and rating controls;
+  caches and pending playback are cleared while global preferences remain. The
+  sidebar groups **Library**, **Curated** and **Tools** destinations in a
+  scrollable list at small window heights, and shows the active library's
+  storage mode, folder name and full path on hover. Use **Import music** for the
+  review-first copy-only Import Manager: native file or folder picker, Flux
+  Browser, drag-and-drop, name-inferred editable review, duplicate decisions,
+  and real progress/cancel. Final result rows identify each reviewed source path
+  and retain per-item failure details; Flux Browser warns when entries vanish or
+  symbolic links are skipped instead of silently omitting them. Click a track to
+  play it; use the transport row for pause/stop/skip/repeat/volume. The queue is
+  inline on wide windows and opens as a closable overlay on narrower ones via
+  **Queue** or `Q`, so it remains available at the minimum width. The search box
+  performs a grouped, case-insensitive global search over canonical artists,
+  albums and tracks with direct navigation. Track rows expose favorite and
+  rating controls and label missing versus inaccessible audio distinctly;
   track views support favorites/lyrics/artwork/release/rating filters,
   ascending/descending deterministic sorting by title/artist/album/track/rating/
   date-added/duration/play-count/last-played, and multi-selection by stable
