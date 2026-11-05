@@ -14987,10 +14987,12 @@ mod tests {
                 .as_ref()
                 .is_some_and(|editor| editor.deletion_plan.is_some())
         );
+        *gui.dashboard_cache.borrow_mut() = Some(DashboardSummary::default());
         send(&mut gui, Message::EditorConfirmDeletion);
         assert!(gui.controller.track(id).is_none());
         assert!(gui.controller.album(album).is_some());
         assert!(gui.track_editor.is_none());
+        assert!(gui.dashboard_cache.borrow().is_none());
         assert!(gui.selected_tracks.is_empty());
         assert_eq!(gui.focused_track, None);
         assert!(

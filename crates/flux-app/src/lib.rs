@@ -14336,6 +14336,42 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_or_shutdown_deletion_and_repair_plans_never_mutate_the_library() {
+        let dir = TempDir::new("canonical-cancel-repair");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let deletion = controller.plan_track_deletion(id).expect("delete plan");
+        fs::remove_file(&audio).expect("make audio missing");
+        let replacement = write_dc_wav(dir.path(), "replacement.wav", 4_410, 0.3);
+        let repair = controller
+            .plan_track_audio_replacement(id, &replacement)
+            .expect("repair plan");
+        assert!(controller.track(id).is_some());
+        assert_eq!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Missing)
+        );
+
+        controller.shutdown_in_place();
+        assert!(controller.delete_track(&deletion).is_err());
+        assert!(controller.execute_track_audio_replacement(&repair).is_err());
+        drop(controller);
+        let reopened =
+            flux_library::canonical::CanonicalLibrary::open(&root).expect("reopen library");
+        let track = reopened.track(id).expect("track retained");
+        assert_eq!(track.title, "Song");
+        assert!(!reopened.track_available(id));
+    }
+
+    #[test]
     fn deletion_and_repair_plans_are_bound_to_the_library_session() {
         let dir = TempDir::new("canonical-repair-session");
         let (root_a, source_a) = canonical_track_fixture(&dir);
