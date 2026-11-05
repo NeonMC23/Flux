@@ -366,25 +366,26 @@ impl Queue {
     /// end). Removing other tracks only shifts the index of the unchanged
     /// current entry.
     pub fn remove(&mut self, id: TrackId) -> usize {
-        let Some(current) = self.current else {
-            return 0;
-        };
         let current_index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == current)
-            .unwrap_or(0);
-        let removed_before = self.entries[..current_index]
-            .iter()
-            .filter(|entry| entry.track == id)
-            .count();
-        let current_removed = self.entries[current_index].track == id;
+            .current
+            .and_then(|current| self.entries.iter().position(|entry| entry.id == current));
+        let (removed_before, current_removed) = current_index.map_or((0, false), |index| {
+            (
+                self.entries[..index]
+                    .iter()
+                    .filter(|entry| entry.track == id)
+                    .count(),
+                self.entries[index].track == id,
+            )
+        });
         let old_len = self.entries.len();
         self.entries.retain(|entry| entry.track != id);
         let removed = old_len - self.entries.len();
         if self.entries.is_empty() {
             self.current = None;
-        } else if current_removed {
+        } else if let Some(current_index) = current_index
+            && current_removed
+        {
             let shifted = current_index - removed_before;
             self.current = self
                 .entries
@@ -733,6 +734,15 @@ mod tests {
         assert_eq!(queue.remove(TrackId::new(3)), 1);
         assert_eq!(queue.remove(TrackId::new(2)), 1);
         assert!(queue.is_empty());
+        assert_eq!(queue.current(), None);
+    }
+
+    #[test]
+    fn remove_all_occurrences_works_without_a_current_selection() {
+        let (mut queue, _) = queue_of(&[1, 2, 1, 3]);
+        queue.current = None;
+        assert_eq!(queue.remove(TrackId::new(1)), 2);
+        assert_eq!(tracks(&queue), vec![2, 3]);
         assert_eq!(queue.current(), None);
     }
 

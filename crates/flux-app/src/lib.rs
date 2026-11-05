@@ -107,8 +107,12 @@ pub use flux_library::canonical::{
     AlbumId, AlbumTransferPlan, AlbumTransferReport, AlbumTransferTrack, ArtistDeletionAlbum,
     ArtistDeletionDecision, ArtistDeletionDestination, ArtistDeletionPlan, ArtistDeletionReport,
     ArtistDeletionTrack, CanonicalImportedTrack, OwnershipDestination, OwnershipTransferPlan,
-    OwnershipTransferReport, PlaylistId, ReleaseType, TrackAudioReplacementPlan,
-    TrackAudioReplacementReport, TrackMetadataUpdatePlan, TrackMovePlan, TrackMoveReport,
+    OwnershipTransferReport, PlaylistId, ReleaseType, TrackAudioReplacementReport,
+    TrackDeletionReport, TrackMetadataUpdatePlan, TrackMovePlan, TrackMoveReport,
+};
+use flux_library::canonical::{
+    TrackAudioReplacementPlan as StoreTrackAudioReplacementPlan,
+    TrackDeletionPlan as StoreTrackDeletionPlan,
 };
 pub use flux_library::canonical_migrate::{
     CanonicalMigrationError, CanonicalMigrationIssue, CanonicalMigrationPlan,
@@ -331,6 +335,125 @@ impl ImportReport {
     #[must_use]
     pub fn considered(&self) -> usize {
         self.added + self.updated + self.deduplicated + self.issues.len()
+    }
+}
+
+/// Runtime state of one referenced library resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceState {
+    /// The referenced regular file exists.
+    Present,
+    /// The path definitively does not exist.
+    Missing,
+    /// The path exists but cannot be used, or inspection failed for a reason
+    /// other than absence. This is never treated as proof of permanent loss.
+    Unavailable(String),
+}
+
+fn validate_cover_signature(source: &Path, extension: &str) -> Result<(), String> {
+    use std::io::Read;
+
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    let mut header = [0u8; 12];
+    let read = std::fs::File::open(source)
+        .and_then(|mut file| file.read(&mut header))
+        .map_err(|error| format!("cover file cannot be read: {error}"))?;
+    let valid = match extension.as_str() {
+        "png" => read >= 8 && header[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        "jpg" | "jpeg" => read >= 3 && header[..3] == [0xff, 0xd8, 0xff],
+        "webp" => read >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP",
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("cover content does not match a supported PNG, JPEG or WebP image".to_owned())
+    }
+}
+
+fn resource_state(path: &Path) -> ResourceState {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => ResourceState::Present,
+        Ok(_) => ResourceState::Unavailable("the referenced path is not a regular file".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ResourceState::Missing,
+        Err(error) => ResourceState::Unavailable(error.to_string()),
+    }
+}
+
+/// Session-bound review plan for one managed-audio replacement or missing
+/// audio repair.
+#[derive(Debug, Clone)]
+pub struct TrackAudioReplacementPlan {
+    /// Canonical store plan.
+    pub inner: StoreTrackAudioReplacementPlan,
+    /// Active library instance that produced this plan.
+    pub library_session: u64,
+}
+
+impl TrackAudioReplacementPlan {
+    /// Target TrackId.
+    #[must_use]
+    pub fn track_id(&self) -> TrackId {
+        self.inner.track_id
+    }
+
+    /// Replacement source file.
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.inner.source
+    }
+
+    /// New managed audio path.
+    #[must_use]
+    pub fn destination_audio_path(&self) -> &flux_library::RelPath {
+        &self.inner.destination_audio_path
+    }
+
+    /// Whether this plan repairs a missing managed audio file.
+    #[must_use]
+    pub fn restores_missing_audio(&self) -> bool {
+        self.inner.current_fingerprint.is_none()
+    }
+}
+
+/// Session-bound review plan for deleting one track.
+#[derive(Debug, Clone)]
+pub struct TrackDeletionPlan {
+    /// Canonical store plan.
+    pub inner: StoreTrackDeletionPlan,
+    /// Active library instance that produced this plan.
+    pub library_session: u64,
+}
+
+impl TrackDeletionPlan {
+    /// Target TrackId.
+    #[must_use]
+    pub fn track_id(&self) -> TrackId {
+        self.inner.track_id
+    }
+
+    /// Captured title.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.inner.title
+    }
+
+    /// Album retained by deletion.
+    #[must_use]
+    pub fn album_id(&self) -> AlbumId {
+        self.inner.album_id
+    }
+
+    /// Whether managed audio exists now.
+    #[must_use]
+    pub fn audio_present(&self) -> bool {
+        self.inner.audio_present
+    }
+
+    /// Playlists that reference the track.
+    #[must_use]
+    pub fn playlists(&self) -> &[String] {
+        &self.inner.playlists
     }
 }
 
@@ -2383,6 +2506,28 @@ impl Controller {
             .map(|track| track.availability())
     }
 
+    /// Distinguishes present, definitely missing, and inaccessible/invalid
+    /// audio paths. `None` means the TrackId is not in the active library.
+    #[must_use]
+    pub fn track_audio_resource_state(&self, id: TrackId) -> Option<ResourceState> {
+        let path = self.track(id)?.source().path();
+        Some(resource_state(path))
+    }
+
+    /// Distinguishes present, definitely missing, and inaccessible/invalid
+    /// managed cover paths. `None` means the album has no cover reference.
+    #[must_use]
+    pub fn album_cover_resource_state(&self, id: AlbumId) -> Option<ResourceState> {
+        Some(resource_state(&self.album_cover_path(id)?))
+    }
+
+    /// Distinguishes present, definitely missing, and inaccessible/invalid
+    /// managed lyrics paths. `None` means the track has no lyrics reference.
+    #[must_use]
+    pub fn track_lyrics_resource_state(&self, id: TrackId) -> Option<ResourceState> {
+        Some(resource_state(&self.track_lyrics_path(id)?))
+    }
+
     /// The playback model's state.
     #[must_use]
     pub fn player_state(&self) -> PlaybackState {
@@ -3858,6 +4003,7 @@ impl Controller {
             .extension()
             .and_then(|extension| extension.to_str())
             .ok_or_else(|| "cover file has no extension".to_owned())?;
+        validate_cover_signature(source, extension)?;
         let Some(store) = self.canonical_store.as_mut() else {
             return Err("Artwork requires a canonical library.".to_owned());
         };
@@ -4502,9 +4648,21 @@ impl Controller {
         let Some(store) = self.canonical_store.as_ref() else {
             return Err("Audio replacement requires a canonical library.".to_owned());
         };
-        store
+        if let Some(ResourceState::Unavailable(reason)) = self.track_audio_resource_state(id) {
+            return Err(format!(
+                "The current audio resource exists but cannot be inspected ({reason}); repair its permissions or relink it instead of overwriting it."
+            ));
+        }
+        if let Err(error) = flux_audio::decode::open_decoder(source) {
+            return Err(format!("Replacement audio cannot be decoded: {error}"));
+        }
+        let inner = store
             .plan_track_audio_replacement(id, source)
-            .map_err(|err| format!("Could not prepare the replacement: {err}"))
+            .map_err(|err| format!("Could not prepare the replacement: {err}"))?;
+        Ok(TrackAudioReplacementPlan {
+            inner,
+            library_session: self.library_session,
+        })
     }
 
     /// Executes a reviewed audio replacement through the canonical journal.
@@ -4512,6 +4670,11 @@ impl Controller {
         &mut self,
         plan: &TrackAudioReplacementPlan,
     ) -> Result<TrackAudioReplacementReport, String> {
+        if plan.library_session != self.library_session {
+            return Err(
+                "That replacement belongs to a different library session; re-plan.".to_owned(),
+            );
+        }
         if let Err(message) = self.portable_maintenance_guard() {
             self.report_error(message.clone());
             return Err(message);
@@ -4520,15 +4683,103 @@ impl Controller {
             return Err("Audio replacement requires a canonical library.".to_owned());
         };
         let report = store
-            .execute_track_audio_replacement(plan)
+            .execute_track_audio_replacement(&plan.inner)
             .map_err(|err| format!("Could not replace audio: {err}"))?;
         self.refresh_from_canonical();
         self.sync_default_queue();
         self.outbox.push(ControllerEvent::LibraryChanged);
-        self.report_status(format!(
-            "Replaced managed audio for track {}; TrackId and references preserved.",
-            report.track_id
-        ));
+        self.report_status(if report.restored_missing_audio {
+            format!(
+                "Repaired missing managed audio for track {}; TrackId and references preserved.",
+                report.track_id
+            )
+        } else {
+            format!(
+                "Replaced managed audio for track {}; TrackId and references preserved.",
+                report.track_id
+            )
+        });
+        Ok(report)
+    }
+
+    /// Builds a session-bound review plan for deleting one track.
+    pub fn plan_track_deletion(&self, id: TrackId) -> Result<TrackDeletionPlan, String> {
+        let Some(store) = self.canonical_store.as_ref() else {
+            return Err("Track deletion requires a canonical library.".to_owned());
+        };
+        let inner = store
+            .plan_track_deletion(id)
+            .map_err(|err| format!("Could not prepare track deletion: {err}"))?;
+        Ok(TrackDeletionPlan {
+            inner,
+            library_session: self.library_session,
+        })
+    }
+
+    /// Deletes one track while retaining its album and artist. Managed audio,
+    /// record and lyrics are cleaned only after the catalogue commit; cleanup
+    /// failures are reported without rolling back the authoritative deletion.
+    pub fn delete_track(
+        &mut self,
+        plan: &TrackDeletionPlan,
+    ) -> Result<TrackDeletionReport, String> {
+        if plan.library_session != self.library_session {
+            return Err(
+                "That deletion belongs to a different library session; re-plan.".to_owned(),
+            );
+        }
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let track_id = plan.track_id();
+        self.update_playback_history();
+        let current_deleted = self.current_id() == Some(track_id);
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Track deletion requires a canonical library.".to_owned());
+        };
+        let report = store
+            .delete_track(&plan.inner)
+            .map_err(|err| format!("Could not delete track: {err}"))?;
+        self.refresh_from_canonical();
+
+        if self.playback_history.remove(track_id).is_some() {
+            self.history_generation = self.history_generation.wrapping_add(1);
+            self.persist_history();
+            self.outbox.push(ControllerEvent::HistoryChanged);
+        }
+
+        let removed_entries = self.player.queue_mut().remove(track_id);
+        if current_deleted {
+            self.player.stop();
+            self.engine.stop();
+            self.engine_loaded = None;
+            self.engine_entry = None;
+            self.engine_session = None;
+            self.engine_loaded_session = None;
+            self.stream_info = None;
+            self.preloaded_entry = None;
+        }
+        if current_deleted || removed_entries > 0 {
+            self.after_queue_change();
+            if current_deleted {
+                self.reset_play_session_for_current(0);
+            }
+        }
+        self.sync_default_queue();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        if report.cleanup_errors.is_empty() {
+            self.report_status(format!(
+                "Deleted track {} from the library; its album and artist were retained.",
+                report.track_id
+            ));
+        } else {
+            self.report_error(format!(
+                "Track {} was deleted, but managed-resource cleanup needs attention: {}",
+                report.track_id,
+                report.cleanup_errors.join("; ")
+            ));
+        }
         Ok(report)
     }
 
@@ -7307,9 +7558,10 @@ mod tests {
 
     use super::{
         AudioDiagnostics, AudioRecoveryFactory, AudioStatus, Controller, ControllerEvent,
-        CreateLibraryError, PlaybackMode, PortableOpenError, ScanOutcome, StorageMode, SwitchError,
-        TrackMetadataEdit, create_canonical_library, create_portable_library,
-        execute_legacy_migration, is_track_playable, migrate_legacy_library, plan_legacy_migration,
+        CreateLibraryError, PlaybackMode, PortableOpenError, ResourceState, ScanOutcome,
+        StorageMode, SwitchError, TrackMetadataEdit, create_canonical_library,
+        create_portable_library, execute_legacy_migration, is_track_playable,
+        migrate_legacy_library, plan_legacy_migration,
     };
 
     struct TempDir(PathBuf);
@@ -13866,6 +14118,462 @@ mod tests {
     }
 
     #[test]
+    fn canonical_single_track_deletion_preserves_unrelated_state_and_cleans_managed_files() {
+        let dir = TempDir::new("canonical-delete-track");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("first import");
+        let first = controller.tracks()[0].0;
+        let album = controller.track_album_id(first).expect("album");
+        let artist = controller.track_artist_id(first).expect("artist");
+        let second_source = write_dc_wav(
+            source.parent().expect("album dir"),
+            "02 - Second.wav",
+            4_410,
+            -0.4,
+        );
+        controller
+            .import_files(&[second_source], false)
+            .expect("second import");
+        let second = controller
+            .tracks()
+            .iter()
+            .find(|(id, _)| *id != first)
+            .map(|(id, _)| *id)
+            .expect("second track");
+        assert_eq!(controller.track_album_id(second), Some(album));
+        controller
+            .set_lyrics(first, Some("[00:01.00]first lyrics"))
+            .expect("lyrics");
+        controller
+            .set_lyrics(second, Some("[00:02.00]second lyrics"))
+            .expect("second lyrics");
+        controller.set_rating(first, Some(4), true).expect("rating");
+        controller
+            .set_rating(second, Some(5), false)
+            .expect("second rating");
+        let playlist = controller
+            .set_playlist(None, "Keep", vec![first, second])
+            .expect("playlist");
+        controller.playback_history.record(first, 1_000);
+        controller.playback_history.record(second, 2_000);
+        controller.persist_history();
+        let first_audio = controller
+            .track(first)
+            .expect("first")
+            .source()
+            .path()
+            .to_path_buf();
+        let first_lyrics = controller.track_lyrics_path(first).expect("first lyrics");
+        let second_audio = controller
+            .track(second)
+            .expect("second")
+            .source()
+            .path()
+            .to_path_buf();
+
+        controller.play_track(first);
+        let second_entry = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == second)
+            .map(|entry| entry.id())
+            .expect("second queue entry");
+        controller.enqueue_track(first).expect("duplicate first");
+        let plan = controller.plan_track_deletion(first).expect("delete plan");
+        assert!(plan.audio_present());
+        assert_eq!(plan.album_id(), album);
+        assert_eq!(plan.playlists(), &["Keep".to_owned()]);
+        let report = controller.delete_track(&plan).expect("delete first");
+
+        assert!(report.cleanup_errors.is_empty(), "{report:?}");
+        assert!(controller.track(first).is_none());
+        assert!(controller.track(second).is_some());
+        assert!(controller.artist(artist).is_some());
+        assert_eq!(
+            controller.album(album).expect("album").track_order,
+            vec![second]
+        );
+        assert_eq!(
+            controller.playlist(playlist).expect("playlist").track_ids,
+            vec![second]
+        );
+        assert!(controller.rating(first).is_none());
+        assert!(controller.rating(second).is_some());
+        assert_eq!(controller.track_play_count(first), 0);
+        assert_eq!(controller.track_play_count(second), 1);
+        assert!(
+            controller
+                .queue_entries()
+                .iter()
+                .all(|entry| entry.track() != first)
+        );
+        assert_eq!(controller.current_queue_entry_id(), Some(second_entry));
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None);
+        assert!(!first_audio.exists());
+        assert!(!first_lyrics.exists());
+        assert!(second_audio.is_file());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn deleting_the_only_track_keeps_the_empty_album_and_artist() {
+        let dir = TempDir::new("canonical-delete-only-track");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let album = controller.track_album_id(id).expect("album");
+        let artist = controller.track_artist_id(id).expect("artist");
+        let audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let plan = controller.plan_track_deletion(id).expect("plan");
+        controller.delete_track(&plan).expect("delete");
+        assert!(controller.track(id).is_none());
+        assert!(controller.artist(artist).is_some());
+        let album = controller.album(album).expect("empty album retained");
+        assert!(album.track_order.is_empty());
+        assert!(controller.current_queue_entry_id().is_none());
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert!(!audio.exists());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn deleting_a_noncurrent_or_paused_track_keeps_playback_authority_consistent() {
+        let dir = TempDir::new("canonical-delete-playback-states");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("first import");
+        let first = controller.tracks()[0].0;
+        let second_source = write_dc_wav(
+            source.parent().expect("album dir"),
+            "02 - Second.wav",
+            4_410,
+            -0.4,
+        );
+        controller
+            .import_files(&[second_source], false)
+            .expect("second import");
+        let second = controller
+            .tracks()
+            .iter()
+            .find(|(id, _)| *id != first)
+            .map(|(id, _)| *id)
+            .expect("second");
+        controller.play_track(first);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(2)
+        });
+        let current = controller.current_queue_entry_id();
+        let plan = controller
+            .plan_track_deletion(second)
+            .expect("delete queued");
+        controller.delete_track(&plan).expect("delete noncurrent");
+        assert_eq!(controller.current_id(), Some(first));
+        assert_eq!(controller.current_queue_entry_id(), current);
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.engine_loaded, Some(first));
+        assert!(
+            controller
+                .queue_entries()
+                .iter()
+                .all(|entry| entry.track() != second)
+        );
+
+        controller.pause();
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert!(controller.current_queue_entry_id().is_some());
+        let plan = controller
+            .plan_track_deletion(first)
+            .expect("delete paused");
+        controller
+            .delete_track(&plan)
+            .expect("delete current paused");
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn deletion_reports_cleanup_failure_after_catalogue_commit() {
+        let dir = TempDir::new("canonical-delete-cleanup");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let album = controller.track_album_id(id).expect("album");
+        let audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        fs::remove_file(&audio).expect("remove audio");
+        fs::create_dir_all(&audio).expect("replace audio with directory");
+        let plan = controller.plan_track_deletion(id).expect("plan");
+        let report = controller.delete_track(&plan).expect("catalogue delete");
+        assert!(!report.cleanup_errors.is_empty());
+        assert!(controller.track(id).is_none());
+        assert!(controller.album(album).is_some());
+        assert!(audio.is_dir(), "ambiguous resource must be preserved");
+        assert!(
+            controller
+                .last_error()
+                .is_some_and(|error| error.contains("cleanup needs attention"))
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn deletion_and_repair_plans_are_bound_to_the_library_session() {
+        let dir = TempDir::new("canonical-repair-session");
+        let (root_a, source_a) = canonical_track_fixture(&dir);
+        let root_b = dir.path().join("OtherLibrary");
+        create_canonical_library(&root_b).expect("second library");
+        let (mut controller, _control) = boot_canonical_at(&root_a);
+        controller.import_files(&[source_a], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let deletion = controller.plan_track_deletion(id).expect("delete plan");
+        fs::remove_file(&audio).expect("make audio missing");
+        let replacement = write_dc_wav(dir.path(), "repair.wav", 4_410, 0.3);
+        let repair = controller
+            .plan_track_audio_replacement(id, &replacement)
+            .expect("repair plan");
+        assert!(repair.restores_missing_audio());
+
+        controller.switch_to_canonical(&root_b).expect("switch");
+        assert!(
+            controller.delete_track(&deletion).is_err(),
+            "old-library deletion plan was accepted"
+        );
+        assert!(
+            controller.execute_track_audio_replacement(&repair).is_err(),
+            "old-library repair plan was accepted"
+        );
+        controller
+            .switch_to_canonical(&root_a)
+            .expect("switch back");
+        assert!(controller.track(id).is_some());
+        controller
+            .switch_to_canonical(&root_a)
+            .expect("same-path reopen");
+        assert!(controller.delete_track(&deletion).is_err());
+        assert!(controller.execute_track_audio_replacement(&repair).is_err());
+        assert!(controller.track(id).is_some());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn missing_audio_repair_preserves_metadata_and_rejects_invalid_sources() {
+        let dir = TempDir::new("canonical-repair-missing");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let album = controller.track_album_id(id);
+        let artist = controller.track_artist_id(id);
+        controller
+            .set_lyrics(id, Some("[00:01.00]preserved"))
+            .expect("lyrics");
+        controller.set_rating(id, Some(4), true).expect("rating");
+        let playlist = controller
+            .set_playlist(None, "Keep", vec![id])
+            .expect("playlist");
+        let audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        fs::remove_file(&audio).expect("make audio missing");
+        assert_eq!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Missing)
+        );
+        let invalid = write_dc_wav(dir.path(), "invalid-source.wav", 4_410, 0.2);
+        fs::write(&invalid, b"not audio").expect("invalid");
+        assert!(
+            controller
+                .plan_track_audio_replacement(id, &invalid)
+                .is_err()
+        );
+        let replacement = write_dc_wav(dir.path(), "repaired.wav", 4_410, 0.7);
+        let plan = controller
+            .plan_track_audio_replacement(id, &replacement)
+            .expect("repair plan");
+        assert!(plan.restores_missing_audio());
+        let report = controller
+            .execute_track_audio_replacement(&plan)
+            .expect("repair");
+        assert!(report.restored_missing_audio);
+        assert!(controller.track(id).is_some());
+        assert_eq!(controller.track_album_id(id), album);
+        assert_eq!(controller.track_artist_id(id), artist);
+        assert_eq!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Present)
+        );
+        assert_eq!(
+            controller.track_lyrics(id).as_deref(),
+            Some("[00:01.00]preserved")
+        );
+        assert_eq!(
+            controller
+                .rating(id)
+                .map(|rating| (rating.rating, rating.favorite)),
+            Some((Some(4), true))
+        );
+        assert_eq!(
+            controller.playlist(playlist).expect("playlist").track_ids,
+            vec![id]
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn missing_lyrics_and_artwork_references_can_be_repaired_explicitly() {
+        let dir = TempDir::new("repair-lyrics-artwork");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let album = controller.track_album_id(id).expect("album");
+        controller.set_rating(id, Some(3), true).expect("rating");
+        controller
+            .set_lyrics(id, Some("[00:01.00]original"))
+            .expect("lyrics");
+        let lyrics_path = controller.track_lyrics_path(id).expect("lyrics path");
+        fs::remove_file(&lyrics_path).expect("remove lyrics");
+        assert_eq!(
+            controller.track_lyrics_resource_state(id),
+            Some(ResourceState::Missing)
+        );
+        controller
+            .save_lyrics_checked(id, None, Some("[00:02.00]repaired"))
+            .expect("repair lyrics");
+        assert_eq!(
+            controller.track_lyrics_resource_state(id),
+            Some(ResourceState::Present)
+        );
+        assert_eq!(
+            controller.track_lyrics(id).as_deref(),
+            Some("[00:02.00]repaired")
+        );
+
+        let invalid_cover = dir.path().join("invalid.png");
+        fs::write(&invalid_cover, b"not an image").expect("invalid cover");
+        assert!(controller.set_album_cover(album, &invalid_cover).is_err());
+        let cover_one = dir.path().join("cover-one.png");
+        fs::write(&cover_one, b"\x89PNG\r\n\x1a\ncover-one").expect("cover");
+        controller
+            .set_album_cover(album, &cover_one)
+            .expect("cover");
+        let managed_cover = controller.album_cover_path(album).expect("managed cover");
+        fs::remove_file(&managed_cover).expect("remove cover");
+        assert_eq!(
+            controller.album_cover_resource_state(album),
+            Some(ResourceState::Missing)
+        );
+        let cover_two = dir.path().join("cover-two.png");
+        fs::write(&cover_two, b"\x89PNG\r\n\x1a\ncover-two").expect("cover two");
+        controller
+            .set_album_cover(album, &cover_two)
+            .expect("repair cover");
+        assert_eq!(
+            controller.album_cover_resource_state(album),
+            Some(ResourceState::Present)
+        );
+        assert_eq!(
+            controller
+                .rating(id)
+                .map(|rating| (rating.rating, rating.favorite)),
+            Some((Some(3), true))
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn resource_states_distinguish_missing_and_inaccessible_paths() {
+        let dir = TempDir::new("resource-state");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        assert_eq!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Present)
+        );
+        let audio = controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        fs::remove_file(&audio).expect("remove audio");
+        assert_eq!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Missing)
+        );
+        fs::create_dir_all(&audio).expect("invalid resource path");
+        assert!(matches!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Unavailable(_))
+        ));
+        fs::remove_dir_all(&audio).expect("restore absence");
+        assert_eq!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Missing)
+        );
+        fs::write(&audio, b"restored bytes").expect("restore audio path");
+        assert_eq!(
+            controller.track_audio_resource_state(id),
+            Some(ResourceState::Present)
+        );
+        fs::remove_file(&audio).expect("leave audio absent");
+        let album = controller.track_album_id(id).expect("album");
+        let cover = dir.path().join("cover.png");
+        fs::write(&cover, b"\x89PNG\r\n\x1a\ncover").expect("cover");
+        controller
+            .set_album_cover(album, &cover)
+            .expect("cover set");
+        assert_eq!(
+            controller.album_cover_resource_state(album),
+            Some(ResourceState::Present)
+        );
+        fs::remove_file(controller.album_cover_path(album).expect("cover path"))
+            .expect("remove cover");
+        assert_eq!(
+            controller.album_cover_resource_state(album),
+            Some(ResourceState::Missing)
+        );
+        controller.set_lyrics(id, Some("lyrics")).expect("lyrics");
+        let lyrics = controller.track_lyrics_path(id).expect("lyrics path");
+        fs::remove_file(&lyrics).expect("remove lyrics");
+        assert_eq!(
+            controller.track_lyrics_resource_state(id),
+            Some(ResourceState::Missing)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn canonical_missing_audio_is_reported_without_losing_identity() {
         let dir = TempDir::new("canonical-missing");
         let (root, source) = canonical_track_fixture(&dir);
@@ -14279,7 +14987,7 @@ mod tests {
         assert!(controller.album_tracks(album).is_empty());
         assert_eq!(controller.albums_owned_by(artist), vec![album]);
         let cover = dir.path().join("cover.png");
-        write_dc_wav(cover.parent().expect("parent"), "cover.png", 2, 0.0);
+        fs::write(&cover, b"\x89PNG\r\n\x1a\ncover").expect("cover");
         controller.set_album_cover(album, &cover).expect("cover");
         controller
             .update_album_metadata(album, "Renamed Album", super::ReleaseType::Ep)
@@ -15190,8 +15898,7 @@ mod tests {
         controller.execute_track_move(&plan).expect("move");
         assert_eq!(controller.track_created_unix_ms(id), created);
 
-        let replacement = dir.path().join("timestamp-replacement.wav");
-        fs::write(&replacement, b"different-audio").expect("replacement");
+        let replacement = write_dc_wav(dir.path(), "timestamp-replacement.wav", 4_410, -0.4);
         let plan = controller
             .plan_track_audio_replacement(id, &replacement)
             .expect("replacement plan");

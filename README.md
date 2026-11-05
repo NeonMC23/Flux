@@ -138,13 +138,19 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   ordered credits, reviewed album moves (source album remains, even when empty)
   and reviewed managed-audio replacement: new audio is staged and verified, the
   old audio stays until the catalogue commit, and the user source file is never
-  modified. Missing managed audio stays listed with a `missing` marker. *Refresh & validate* reopens the canonical
-  catalogue and validates its resource paths.
-  Album artwork is rendered from the canonical managed cover (PNG/JPEG/WebP)
-  asynchronously with bounded dimensions and a fallback glyph. Native pickers
-  cover general import, album-target import, audio replacement and artwork
-  selection; every selection still enters the existing review/confirmation
-  flow. Cancellation leaves the workflow unchanged.
+  modified. Missing managed audio stays listed with a `missing` marker and can
+  be repaired through the reviewed replacement flow, preserving TrackId and all
+  references; inaccessible paths are reported and never silently overwritten.
+  The same editor offers a separately reviewed single-track deletion that stops
+  playback if needed, removes duplicate queue entries, playlist references,
+  ratings, history and managed track resources, while retaining the album and
+  artist. *Refresh & validate* reopens the canonical catalogue and validates its
+  resource paths. Album artwork is rendered from the canonical managed cover
+  (PNG/JPEG/WebP) asynchronously with bounded dimensions and a fallback glyph;
+  missing covers can be replaced or removed explicitly, with image validation
+  before publication. Native pickers cover general import, album-target import,
+  audio replacement and artwork selection; every selection still enters the
+  existing review/confirmation flow. Cancellation leaves the workflow unchanged.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, `o` recursively imports a
   folder (type the path; per-path errors and a startup-import summary remain
@@ -160,8 +166,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   management, lyrics editing/import/export/karaoke and batch playlist/favorite
   actions require the GUI.
 
-  Track moves and
-  managed-audio replacement also require the GUI Track-editor review. `D` shows the selected track's album ownership; `E` lists
+  Track moves, managed-audio repair/replacement, artwork repair and
+  single-track deletion also require the GUI review workflow. `D` shows the selected track's album ownership; `E` lists
   every catalogue album, including empty albums, with owner, track count and
   cover availability. `T` refuses ownership transfer and destructive artist deletion,
   directing the user to the GUI review/confirmation workflow. For the

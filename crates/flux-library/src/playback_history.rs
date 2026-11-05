@@ -55,6 +55,12 @@ impl PlaybackHistory {
         self.entries.get(&id).cloned()
     }
 
+    /// Removes one deleted track's aggregate. Stable TrackIds are never
+    /// reused, so this cannot transfer history to a different catalogue entry.
+    pub fn remove(&mut self, id: TrackId) -> Option<PlayHistoryEntry> {
+        self.entries.remove(&id)
+    }
+
     /// All entries in stable track-ID order.
     pub fn entries(&self) -> impl Iterator<Item = (TrackId, PlayHistoryEntry)> + '_ {
         self.entries.iter().map(|(id, entry)| (*id, entry.clone()))
@@ -296,6 +302,21 @@ mod tests {
             300
         );
         assert!(!path.with_extension("flux.tmp").exists());
+    }
+
+    #[test]
+    fn removing_a_track_does_not_disturb_other_history() {
+        let mut history = PlaybackHistory::default();
+        history.record(TrackId::new(1), 10);
+        history.record(TrackId::new(2), 20);
+        assert_eq!(
+            history.remove(TrackId::new(1)).expect("entry").play_count,
+            1
+        );
+        assert!(history.entry(TrackId::new(1)).is_none());
+        assert_eq!(history.entry(TrackId::new(2)).expect("entry").play_count, 1);
+        assert_eq!(history.total_plays(), 1);
+        assert!(history.remove(TrackId::new(1)).is_none());
     }
 
     #[test]

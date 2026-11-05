@@ -1044,11 +1044,10 @@ impl Tui {
             if !is_track_playable(track) {
                 text.push_str("  [indexed — not playable yet]");
             }
-            if matches!(
-                self.controller.track_availability(*id),
-                Some(flux_app::Availability::Missing)
-            ) {
-                text.push_str("  [missing]");
+            match self.controller.track_audio_resource_state(*id) {
+                Some(flux_app::ResourceState::Missing) => text.push_str("  [missing]"),
+                Some(flux_app::ResourceState::Unavailable(_)) => text.push_str("  [inaccessible]"),
+                _ => {}
             }
             let duration = track.duration().map(format_duration).unwrap_or_default();
             let text = pad_with_right(&text, &duration, width);

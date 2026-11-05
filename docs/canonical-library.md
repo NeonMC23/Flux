@@ -566,6 +566,7 @@ from what remains structurally or physically unverified.
 | Library-session isolation, same-path reopen, stale async results, switch-time playback/state reset | Confirmed by deterministic Controller/GUI/TUI tests with disposable libraries; no filesystem-watcher or physical GUI-interaction validation |
 | Meaningful-listening accounting, seek/pause/recovery/transition attribution, history persistence and dashboard aggregates | Confirmed by deterministic Controller/GUI tests with injected positions and transitions; no acoustic measurement or physical-device timing validation |
 | Import discovery, decode validation, partial preparation, cancellation and folder traversal | Confirmed by deterministic filesystem/import tests; real native dialogs and cross-platform traversal remain unverified |
+| Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -1400,6 +1401,75 @@ The multi-item deletion path runs the same 18-point injected interruption matrix
 plus real child-process aborts at after-journal, metadata publication,
 post-catalogue commit and cleanup. Recovery is verified as complete-old or
 complete-new, never a partially deleted artist; a second recovery is idempotent.
+
+### Missing resources, repair and single-track deletion
+
+Resource state is derived on demand and distinguishes `Present`, `Missing`
+(definitive absence) and `Unavailable` (permission failure, invalid path, or
+another inspection error). Canonical catalogue references are never rewritten
+because a check failed. Audio, managed lyrics and managed cover paths expose
+these states through Controller APIs; the GUI and TUI show missing audio
+separately from inaccessible paths. Portable availability remains its existing
+persisted Present/Missing compatibility field.
+
+Missing managed audio is repaired through the existing reviewed audio-replacement
+workflow in the GUI Track editor. The plan is bound to the current library
+session and catalogue generation, validates the replacement with the decoder,
+rejects identical/current source content and inaccessible current resources,
+and installs a new managed file while preserving TrackId, album, owner, credits,
+track numbers, duration metadata, ratings, history, lyrics, playlists, queue
+entries and artwork. The previously missing path is left absent; if it reappears
+after review the plan is rejected instead of overwriting it.
+
+Managed artwork repair uses the existing album editor and image picker. The GUI
+fully decodes and bounds-check PNG/JPEG/WebP before publication; the Controller
+also verifies the file signature, and the canonical store enforces extension,
+size and atomic replacement. A missing cover is replaced by the album's managed
+cover path; unrelated albums/tracks and the album identity are preserved. The
+artwork cache is invalidated after success, and failure/cancellation leaves the
+previous cover reference intact. Album cover references can still be explicitly
+removed with the existing confirmation.
+
+Lyrics repair reuses the LRC/TXT editor/import flow. Missing managed lyrics are
+reported as such; saving validates and parses the replacement text, preserves
+the LRC format and synchronization, uses the existing checked-save guard against
+stale text, and invalidates the lyrics cache. Failed parsing or writes keep the
+previous reference/content. Imported or restored lyrics remain separate from
+audio tags.
+
+Single-track deletion is a GUI-only reviewed operation using a session- and
+generation-bound plan. Confirmed deletion removes exactly one TrackId and:
+
+- rewrites album track order, retaining the album even when empty;
+- retains the artist even with no owned tracks;
+- removes that track's rating and all playlist references while preserving
+  every other playlist entry and order;
+- removes all queue entries for that TrackId, including duplicates, while
+  preserving unrelated QueueEntryIds/order;
+- stops playback and clears the engine/preload ledger when the current track is
+  deleted; otherwise current playback continues;
+- removes that track's `history.flux` aggregate and invalidates history,
+  dashboard and Smart Collection caches without transferring counts to another
+  TrackId;
+- removes managed audio, track record and managed lyrics only after the
+  catalogue commit, with a reference check before each physical removal;
+- preserves managed album artwork and unrelated/shared resources;
+- advances the catalogue generation while retaining retired-ID and
+  next-allocation guarantees.
+
+Canonical audio is Flux-managed and lives inside the library. External audio
+files are never candidates for this canonical deletion path; portable/legacy
+single-track deletion is not exposed. If a managed resource is inaccessible, is
+a directory, or cleanup otherwise fails after the catalogue commit, the deletion
+remains authoritative, the ambiguous file is left in place, and the Controller
+reports the cleanup failure. Cleanup is best-effort and not journaled after the
+catalogue commit, so an interrupted process after commit can leave unreferenced
+managed files for later manual cleanup. Empty album/artist directories are not
+automatically removed.
+
+The TUI intentionally exposes no single-track deletion or audio/artwork repair
+shortcut; it reports missing/inaccessible audio and directs destructive repair
+decisions to the GUI review workflow.
 
 ## Transaction state machine and recovery
 

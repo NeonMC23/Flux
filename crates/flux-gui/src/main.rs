@@ -23,9 +23,9 @@ use flux_app::{
     CanonicalMigrationPlan, Controller, ImportAlbumTarget, ImportApplyReport, ImportDecision,
     ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
     LyricLine, LyricsDocument, LyricsKind, PlaybackMode, PlaylistId, PreparedImport,
-    ReconcileReport, RelPath, ReleaseType, StorageMode, TrackAudioReplacementPlan,
-    TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration,
-    is_track_playable, prepare_import_files, prepare_import_plan,
+    ReconcileReport, RelPath, ReleaseType, ResourceState, StorageMode, TrackAudioReplacementPlan,
+    TrackDeletionPlan, TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW,
+    format_duration, is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, Track, TrackId};
 use iced::ContentFit;
@@ -1740,6 +1740,7 @@ struct TrackEditor {
     credit_artist: Option<ArtistId>,
     replacement_source: String,
     replacement_plan: Option<TrackAudioReplacementPlan>,
+    deletion_plan: Option<TrackDeletionPlan>,
     move_destination: Option<AlbumChoice>,
     move_position: String,
     move_plan: Option<TrackMovePlan>,
@@ -1992,6 +1993,9 @@ enum Message {
     EditorReplacementPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     EditorPlanReplacement,
     EditorConfirmReplacement,
+    EditorPlanDeletion,
+    EditorConfirmDeletion,
+    EditorCancelDeletion,
     EditorMoveDestination(Option<AlbumChoice>),
     EditorMovePositionChanged(String),
     EditorPlanMove,
@@ -2707,6 +2711,7 @@ impl FluxReady {
             credit_artist: None,
             replacement_source: String::new(),
             replacement_plan: None,
+            deletion_plan: None,
             move_destination: None,
             move_position: "1".to_owned(),
             move_plan: None,
@@ -2823,6 +2828,82 @@ impl FluxReady {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.replacement_plan = None;
                     editor.error = Some(format!("{error} Review the replacement again."));
+                }
+            }
+        }
+    }
+
+    fn plan_editor_deletion(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let id = editor.id;
+        match self.controller.plan_track_deletion(id) {
+            Ok(plan) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.deletion_plan = Some(plan);
+                    editor.error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.deletion_plan = None;
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn confirm_editor_deletion(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let Some(plan) = editor.deletion_plan.clone() else {
+            return;
+        };
+        let id = plan.track_id();
+        match self.controller.delete_track(&plan) {
+            Ok(report) => {
+                self.selected_tracks.retain(|track| *track != id);
+                if self.focused_track == Some(id) {
+                    self.focused_track = None;
+                }
+                if self.selected_lyrics == Some(id) {
+                    self.selected_lyrics = None;
+                    self.lyrics_editor = None;
+                    self.lyrics_import = None;
+                }
+                self.lyrics_cache.borrow_mut().remove(&id);
+                self.track_editor = None;
+                self.batch_review = None;
+                self.album_transfer = None;
+                self.deletion_manager = None;
+                self.seek_preview = None;
+                self.last_queue_current = self.controller.current_queue_entry_id();
+                self.queue_page = self
+                    .last_queue_current
+                    .and_then(|entry| self.controller.queue_entry_index(entry))
+                    .map_or(0, |index| index / QUEUE_PAGE_SIZE);
+                self.scope.reset();
+                *self.dashboard_cache.borrow_mut() = None;
+                self.invalidate_search_cache();
+                self.lifecycle_msg = Some(if report.cleanup_errors.is_empty() {
+                    format!(
+                        "Deleted track {} from the library; album and artist retained.",
+                        report.track_id
+                    )
+                } else {
+                    format!(
+                        "Deleted track {} from the catalogue. Managed-resource cleanup needs attention: {}",
+                        report.track_id,
+                        report.cleanup_errors.join("; ")
+                    )
+                });
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.deletion_plan = None;
+                    editor.error = Some(error);
                 }
             }
         }
@@ -3562,6 +3643,13 @@ impl FluxReady {
             },
             Message::EditorPlanReplacement => self.plan_editor_replacement(),
             Message::EditorConfirmReplacement => self.confirm_editor_replacement(),
+            Message::EditorPlanDeletion => self.plan_editor_deletion(),
+            Message::EditorConfirmDeletion => self.confirm_editor_deletion(),
+            Message::EditorCancelDeletion => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.deletion_plan = None;
+                }
+            }
             Message::EditorMoveDestination(choice) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.move_destination = choice;
@@ -3971,6 +4059,12 @@ impl FluxReady {
                 let path = PathBuf::from(self.album_cover_input.trim());
                 if path.as_os_str().is_empty() {
                     self.lifecycle_msg = Some("Choose a cover image path.".to_owned());
+                    return Task::none();
+                }
+                if let Err(error) = decode_artwork(&artwork_key(album, path.clone())) {
+                    self.lifecycle_msg = Some(format!(
+                        "Cover not assigned; the image was rejected: {error}"
+                    ));
                     return Task::none();
                 }
                 match self.controller.set_album_cover(album, &path) {
@@ -8619,10 +8713,8 @@ impl FluxReady {
             .track(editor.id)
             .map(|track| track.source().path().display().to_string())
             .unwrap_or_else(|| "track no longer in the library".to_owned());
-        let missing = matches!(
-            self.controller.track_availability(editor.id),
-            Some(Availability::Missing)
-        );
+        let audio_state = self.controller.track_audio_resource_state(editor.id);
+        let missing = matches!(audio_state, Some(ResourceState::Missing));
 
         let artist_row = row![
             pick_list(choices, selected, |choice| Message::EditorArtistChanged(
@@ -8673,9 +8765,17 @@ impl FluxReady {
         .spacing(6);
         if missing {
             body = body.push(
-                text("This file is currently missing. Metadata can still be edited; playback will fail until it is relinked or restored.")
+                text("This managed audio file is missing. Metadata can still be edited; use Choose replacement / Review replacement below to repair it while preserving the TrackId and all references.")
                     .size(10)
                     .color(DANGER),
+            );
+        } else if let Some(ResourceState::Unavailable(reason)) = &audio_state {
+            body = body.push(
+                text(format!(
+                    "This audio path exists but cannot be used ({reason}). Flux will not overwrite or delete an inaccessible resource; repair permissions or relink it first."
+                ))
+                .size(10)
+                .color(DANGER),
             );
         }
         body = body.push(
@@ -8826,10 +8926,15 @@ impl FluxReady {
         if let Some(plan) = &editor.replacement_plan {
             body = body.push(
                 text(format!(
-                    "REVIEWED: Track {} · source {} · new managed path {} · old audio fingerprinted and preserved until commit",
-                    plan.track_id,
-                    plan.source.display(),
-                    plan.destination_audio_path.display_lossy()
+                    "REVIEWED: Track {} · source {} · new managed path {} · {}",
+                    plan.track_id(),
+                    plan.source().display(),
+                    plan.destination_audio_path().display_lossy(),
+                    if plan.restores_missing_audio() {
+                        "missing managed audio will be repaired; TrackId and references preserved"
+                    } else {
+                        "old audio fingerprinted and preserved until commit"
+                    }
                 ))
                 .size(9)
                 .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
@@ -8839,6 +8944,58 @@ impl FluxReady {
                 text("Replacement is unavailable until a source is reviewed. No preview writes to the library.")
                     .size(9)
                     .color(MUTED),
+            );
+        }
+        body = body.push(text("DELETE THIS TRACK").size(9).color(DANGER));
+        body = body.push(
+            text("Removes this TrackId, its managed audio, metadata record, lyrics, rating and queue entries. The album and artist are retained even when empty. Other tracks and playlist order are preserved. This is not a bulk delete.")
+                .size(10)
+                .color(MUTED),
+        );
+        if let Some(plan) = &editor.deletion_plan {
+            body = body.push(
+                text(format!(
+                    "REVIEWED DELETE: {} · album {} retained · {} · {}{}",
+                    plan.title(),
+                    plan.album_id(),
+                    if plan.audio_present() {
+                        "managed audio will be deleted after the catalogue commit"
+                    } else {
+                        "managed audio is already missing; no audio file will be removed"
+                    },
+                    if plan.playlists().is_empty() {
+                        "no playlist references".to_owned()
+                    } else {
+                        format!("playlists updated: {}", plan.playlists().join(", "))
+                    },
+                    if matches!(audio_state, Some(ResourceState::Unavailable(_))) {
+                        " · inaccessible files are kept and reported"
+                    } else {
+                        ""
+                    }
+                ))
+                .size(9)
+                .color(DANGER),
+            );
+            body = body.push(
+                row![
+                    button(text("Cancel deletion review").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorCancelDeletion),
+                    button(text("Confirm delete track").size(10))
+                        .style(danger_button_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorConfirmDeletion),
+                ]
+                .spacing(8),
+            );
+        } else {
+            body = body.push(
+                button(text("Review track deletion…").size(10))
+                    .style(danger_button_style)
+                    .padding([6, 9])
+                    .on_press(Message::EditorPlanDeletion),
             );
         }
         body = body.push(text("MOVE TO ANOTHER ALBUM").size(9).color(ACCENT));
@@ -11754,16 +11911,20 @@ impl FluxReady {
             .padding(10)
             .style(card_style),
         );
-        if self
-            .controller
-            .album_cover_path(album_id)
-            .is_some_and(|path| !path.is_file())
-        {
-            body = body.push(
-                text("The catalogue references a cover file that is missing or unreadable. Assign a new cover or remove the reference.")
+        match self.controller.album_cover_resource_state(album_id) {
+            Some(ResourceState::Missing) => body = body.push(
+                text("The catalogue references a cover file that is missing. Assign a new image or remove the reference.")
                     .size(10)
                     .color(DANGER),
-            );
+            ),
+            Some(ResourceState::Unavailable(reason)) => body = body.push(
+                text(format!(
+                    "The catalogue references a cover file that cannot be inspected ({reason}). Flux will not overwrite or remove an inaccessible resource; repair permissions first."
+                ))
+                .size(10)
+                .color(DANGER),
+            ),
+            _ => {}
         }
         if let Some(batch) = self.batch_action_bar() {
             body = body.push(batch);
@@ -14797,6 +14958,138 @@ mod tests {
     }
 
     #[test]
+    fn gui_track_editor_reviews_and_deletes_one_track() {
+        let dir = TempDir::new("gui-delete-track");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Delete Me",
+            "Delete Artist",
+            "Delete Album",
+            ReleaseType::Album,
+            1,
+        );
+        let album = gui.controller.track_album_id(id).expect("album");
+        send(&mut gui, Message::EditTrack(id));
+        gui.selected_tracks = vec![id];
+        gui.focused_track = Some(id);
+        send(&mut gui, Message::EditorPlanDeletion);
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.deletion_plan.is_some())
+        );
+        send(&mut gui, Message::EditorConfirmDeletion);
+        assert!(gui.controller.track(id).is_none());
+        assert!(gui.controller.album(album).is_some());
+        assert!(gui.track_editor.is_none());
+        assert!(gui.selected_tracks.is_empty());
+        assert_eq!(gui.focused_track, None);
+        assert!(
+            gui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("Deleted track"))
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn gui_repairs_missing_audio_and_rejects_invalid_cover_images() {
+        let dir = TempDir::new("gui-repair-resources");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Repair Me",
+            "Repair Artist",
+            "Repair Album",
+            ReleaseType::Album,
+            1,
+        );
+        let album = gui.controller.track_album_id(id).expect("album");
+        let audio = gui
+            .controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        std::fs::remove_file(&audio).expect("remove managed audio");
+        send(&mut gui, Message::EditTrack(id));
+        let replacement = dir.path().join("replacement.wav");
+        let mut replacement_bytes = minimal_wav();
+        replacement_bytes.push(9);
+        std::fs::write(&replacement, replacement_bytes).expect("replacement");
+        send(
+            &mut gui,
+            Message::EditorReplacementChanged(replacement.display().to_string()),
+        );
+        send(&mut gui, Message::EditorPlanReplacement);
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .and_then(|editor| editor.replacement_plan.as_ref())
+                .is_some_and(|plan| plan.restores_missing_audio())
+        );
+        send(&mut gui, Message::EditorConfirmReplacement);
+        assert!(gui.controller.track(id).is_some());
+        assert_eq!(
+            gui.controller.track_audio_resource_state(id),
+            Some(ResourceState::Present)
+        );
+        assert_eq!(gui.controller.track_album_id(id), Some(album));
+
+        gui.view = LibraryView::Albums;
+        gui.selected_group = Some(album_key_for_title(album, "Repair Album"));
+        let invalid = dir.path().join("invalid.png");
+        std::fs::write(&invalid, b"not an image").expect("invalid cover");
+        gui.album_cover_input = invalid.display().to_string();
+        send(&mut gui, Message::AlbumCoverApply);
+        assert!(gui.controller.album(album).expect("album").cover.is_none());
+        assert!(
+            gui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("rejected"))
+        );
+
+        let valid = dir.path().join("valid-cover.png");
+        write_test_png(&valid, 64, 64);
+        gui.album_cover_input = valid.display().to_string();
+        send(&mut gui, Message::AlbumCoverApply);
+        assert!(gui.controller.album(album).expect("album").cover.is_some());
+        let managed = gui.controller.album_cover_path(album).expect("cover path");
+        std::fs::remove_file(managed).expect("remove cover");
+        assert_eq!(
+            gui.controller.album_cover_resource_state(album),
+            Some(ResourceState::Missing)
+        );
+        let repaired = dir.path().join("repaired-cover.png");
+        write_test_png(&repaired, 32, 32);
+        gui.album_cover_input = repaired.display().to_string();
+        send(&mut gui, Message::AlbumCoverApply);
+        assert_eq!(
+            gui.controller.album_cover_resource_state(album),
+            Some(ResourceState::Present)
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn gui_empty_album_create_metadata_cover_delete_and_reorder() {
         let dir = TempDir::new("gui-album-lifecycle");
         let root = dir.path().join("library");
@@ -14848,7 +15141,7 @@ mod tests {
             Some(ReleaseType::Ep)
         );
         let cover = dir.path().join("cover.png");
-        std::fs::write(&cover, b"not decoded cover bytes").expect("cover");
+        write_test_png(&cover, 64, 64);
         send(
             &mut gui,
             Message::AlbumCoverChanged(cover.display().to_string()),
@@ -14959,7 +15252,7 @@ mod tests {
             .create_album(artist, "Target Album", ReleaseType::Album)
             .expect("album");
         let cover = dir.path().join("cover.png");
-        std::fs::write(&cover, b"cover bytes").expect("cover");
+        std::fs::write(&cover, b"\x89PNG\r\n\x1a\ncover").expect("cover");
         gui.controller
             .set_album_cover(album, &cover)
             .expect("cover");

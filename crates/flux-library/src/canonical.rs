@@ -2525,8 +2525,9 @@ pub struct TrackAudioReplacementPlan {
     pub expected_duration_ms: Option<u64>,
     /// Existing managed audio path.
     pub current_audio_path: RelPath,
-    /// Existing managed audio fingerprint.
-    pub current_fingerprint: ContentFingerprint,
+    /// Existing managed audio fingerprint; `None` means the file is missing
+    /// and this plan repairs that missing resource.
+    pub current_fingerprint: Option<ContentFingerprint>,
     /// Replacement source file, preserved by the operation.
     pub source: PathBuf,
     /// Replacement source fingerprint.
@@ -2548,6 +2549,49 @@ pub struct TrackAudioReplacementReport {
     pub audio_path: RelPath,
     /// New managed audio fingerprint.
     pub fingerprint: ContentFingerprint,
+    /// Whether this operation repaired a previously missing managed audio file.
+    pub restored_missing_audio: bool,
+}
+
+/// Immutable review plan for deleting one catalogue track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackDeletionPlan {
+    /// Target track.
+    pub track_id: TrackId,
+    /// Captured title for review/confirmation text.
+    pub title: String,
+    /// Album identity, retained even if it becomes empty.
+    pub album_id: AlbumId,
+    /// Physical owner, retained even if it has no tracks left.
+    pub owner_artist_id: ArtistId,
+    /// Managed audio path at review.
+    pub audio_path: RelPath,
+    /// Whether managed audio existed at review.
+    pub audio_present: bool,
+    /// Managed audio fingerprint when the file was present and readable.
+    pub audio_fingerprint: Option<ContentFingerprint>,
+    /// Managed track record path.
+    pub record_path: RelPath,
+    /// Managed lyrics path, when recorded.
+    pub lyrics_path: Option<RelPath>,
+    /// Playlist names referencing this track at review.
+    pub playlists: Vec<String>,
+    /// Catalogue generation at review.
+    pub generation: u64,
+}
+
+/// Result of one committed single-track deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackDeletionReport {
+    /// Deleted TrackId.
+    pub track_id: TrackId,
+    /// Album retained (possibly empty).
+    pub album_id: AlbumId,
+    /// Whether catalogue audio existed and was requested for physical cleanup.
+    pub audio_was_present: bool,
+    /// Post-commit managed-resource cleanup failures. The catalogue deletion is
+    /// still authoritative when this is non-empty.
+    pub cleanup_errors: Vec<String>,
 }
 
 impl CanonicalLibrary {
@@ -4087,11 +4131,7 @@ impl CanonicalLibrary {
                 CanonicalError::Invalid("track record path is missing".to_owned())
             })?;
         let current_audio_abs = safe_join(&self.root, &current_audio_path)?;
-        if !current_audio_abs.is_file() {
-            return Err(CanonicalError::Invalid(
-                "current managed audio is missing; use relink recovery first".to_owned(),
-            ));
-        }
+        let current_present = current_audio_abs.is_file();
         if !source.is_file() {
             return Err(CanonicalError::Invalid(
                 "replacement source is not a readable file".to_owned(),
@@ -4107,7 +4147,9 @@ impl CanonicalLibrary {
                 "replacement source is not a supported audio file".to_owned(),
             ));
         }
-        if fs::canonicalize(&current_audio_abs).ok() == fs::canonicalize(source).ok() {
+        if current_present
+            && fs::canonicalize(&current_audio_abs).ok() == fs::canonicalize(source).ok()
+        {
             return Err(CanonicalError::Invalid(
                 "replacement source is the current managed audio".to_owned(),
             ));
@@ -4122,9 +4164,11 @@ impl CanonicalLibrary {
                 "replacement extension is not a safe canonical suffix".to_owned(),
             ));
         }
-        let current_fingerprint = ContentFingerprint::of_file(&current_audio_abs)?;
+        let current_fingerprint = current_present
+            .then(|| ContentFingerprint::of_file(&current_audio_abs))
+            .transpose()?;
         let source_fingerprint = ContentFingerprint::of_file(source)?;
-        if current_fingerprint == source_fingerprint {
+        if current_fingerprint == Some(source_fingerprint) {
             return Err(CanonicalError::Invalid(
                 "replacement source has identical audio content".to_owned(),
             ));
@@ -4196,10 +4240,22 @@ impl CanonicalLibrary {
             ));
         }
         let current_audio_abs = safe_join(&self.root, &plan.current_audio_path)?;
-        if ContentFingerprint::of_file(&current_audio_abs)? != plan.current_fingerprint {
-            return Err(CanonicalError::Invalid(
-                "current managed audio changed since replacement preview; re-plan".to_owned(),
-            ));
+        match plan.current_fingerprint {
+            Some(expected) => {
+                if ContentFingerprint::of_file(&current_audio_abs)? != expected {
+                    return Err(CanonicalError::Invalid(
+                        "current managed audio changed since replacement preview; re-plan"
+                            .to_owned(),
+                    ));
+                }
+            }
+            None => {
+                if current_audio_abs.is_file() {
+                    return Err(CanonicalError::Invalid(
+                        "missing managed audio reappeared since preview; re-plan".to_owned(),
+                    ));
+                }
+            }
         }
         if ContentFingerprint::of_file(&plan.source)? != plan.source_fingerprint {
             return Err(CanonicalError::Invalid(
@@ -4255,7 +4311,240 @@ impl CanonicalLibrary {
             track_id: track.id,
             audio_path: plan.destination_audio_path.clone(),
             fingerprint: plan.source_fingerprint,
+            restored_missing_audio: plan.current_fingerprint.is_none(),
         })
+    }
+
+    /// Builds a read-only review plan for deleting exactly one track. The
+    /// album, artist and all unrelated identities/resources are retained.
+    pub fn plan_track_deletion(
+        &self,
+        track_id: TrackId,
+    ) -> Result<TrackDeletionPlan, CanonicalError> {
+        let track = self.tracks.get(&track_id).ok_or_else(|| {
+            CanonicalError::Invalid(format!("track {track_id} is not in the library"))
+        })?;
+        let audio_path = self
+            .track_paths
+            .get(&track_id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("track audio path is missing".to_owned()))?;
+        let record_path =
+            self.track_records.get(&track_id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid("track record path is missing".to_owned())
+            })?;
+        let audio_abs = safe_join(&self.root, &audio_path)?;
+        let audio_present = audio_abs.is_file();
+        let audio_fingerprint = if audio_present {
+            ContentFingerprint::of_file(&audio_abs).ok()
+        } else {
+            None
+        };
+        let lyrics_path = plan_track_lyrics_rel(&record_path, track.lyrics.as_deref());
+        let mut playlists = self
+            .playlists
+            .values()
+            .filter(|playlist| playlist.track_ids.contains(&track_id))
+            .map(|playlist| playlist.name.clone())
+            .collect::<Vec<_>>();
+        playlists.sort();
+        Ok(TrackDeletionPlan {
+            track_id,
+            title: track.title.clone(),
+            album_id: track.album_id,
+            owner_artist_id: track.owner_artist_id,
+            audio_path,
+            audio_present,
+            audio_fingerprint,
+            record_path,
+            lyrics_path,
+            playlists,
+            generation: self.catalog.generation,
+        })
+    }
+
+    /// Deletes one catalogue track atomically, retaining its album and artist.
+    /// Managed audio/record/lyrics cleanup runs only after the catalogue commit
+    /// point and reports failures without rolling the committed deletion back.
+    pub fn delete_track(
+        &mut self,
+        plan: &TrackDeletionPlan,
+    ) -> Result<TrackDeletionReport, CanonicalError> {
+        self.ensure_writable()?;
+        self.ensure_no_pending_transactions()?;
+        if plan.generation != self.catalog.generation {
+            return Err(CanonicalError::Invalid(
+                "track deletion plan is stale: catalogue generation changed; re-plan".to_owned(),
+            ));
+        }
+        let track = self.tracks.get(&plan.track_id).cloned().ok_or_else(|| {
+            CanonicalError::Invalid("track disappeared since deletion review".to_owned())
+        })?;
+        if track.title != plan.title
+            || track.album_id != plan.album_id
+            || track.owner_artist_id != plan.owner_artist_id
+            || self.track_paths.get(&track.id) != Some(&plan.audio_path)
+            || self.track_records.get(&track.id) != Some(&plan.record_path)
+        {
+            return Err(CanonicalError::Invalid(
+                "track changed since deletion review; re-plan".to_owned(),
+            ));
+        }
+        let audio_abs = safe_join(&self.root, &plan.audio_path)?;
+        match (plan.audio_present, plan.audio_fingerprint) {
+            (true, Some(expected)) => {
+                if !audio_abs.is_file() || ContentFingerprint::of_file(&audio_abs)? != expected {
+                    return Err(CanonicalError::Invalid(
+                        "managed audio changed since deletion review; re-plan".to_owned(),
+                    ));
+                }
+            }
+            (true, None) => {
+                if !audio_abs.is_file() {
+                    return Err(CanonicalError::Invalid(
+                        "managed audio disappeared since deletion review; re-plan".to_owned(),
+                    ));
+                }
+            }
+            (false, _) => {
+                if audio_abs.is_file() {
+                    return Err(CanonicalError::Invalid(
+                        "previously missing managed audio reappeared; re-plan deletion".to_owned(),
+                    ));
+                }
+            }
+        }
+        if plan_track_lyrics_rel(&plan.record_path, track.lyrics.as_deref()) != plan.lyrics_path {
+            return Err(CanonicalError::Invalid(
+                "track lyrics reference changed since deletion review; re-plan".to_owned(),
+            ));
+        }
+
+        let mut catalog = self.catalog.clone();
+        let mut albums = self.albums.clone();
+        let mut ratings = self.ratings.clone();
+        let mut playlists = self.playlists.clone();
+        let mut writes = Vec::new();
+
+        let album = albums.get_mut(&track.album_id).ok_or_else(|| {
+            CanonicalError::Invalid("track album disappeared during deletion".to_owned())
+        })?;
+        album.track_order.retain(|track_id| *track_id != track.id);
+        let album_dto = AlbumEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ALBUM_KIND.to_owned(),
+            id: album.id.get(),
+            owner_artist_id: album.owner_artist_id.get(),
+            title: album.title.clone(),
+            release_type: album.release_type,
+            cover: album.cover.clone(),
+            track_order: album.track_order.iter().map(|id| id.get()).collect(),
+        };
+        push_entity_write(
+            &mut writes,
+            &album_rel(album.owner_artist_id, album.id),
+            "album.flux",
+            &album_dto,
+        )?;
+
+        for playlist in playlists.values_mut() {
+            playlist.track_ids.retain(|track_id| *track_id != track.id);
+        }
+        for playlist in playlists.values() {
+            if self.playlists.get(&playlist.id) != Some(playlist) {
+                let dto = PlaylistEntityDto {
+                    schema_version: CANONICAL_SCHEMA_VERSION,
+                    kind: PLAYLIST_KIND.to_owned(),
+                    id: playlist.id.get(),
+                    name: playlist.name.clone(),
+                    track_ids: playlist.track_ids.iter().map(|id| id.get()).collect(),
+                };
+                push_file_write(&mut writes, &playlist_rel(playlist.id), &dto)?;
+            }
+        }
+        ratings.remove(&track.id);
+        let ratings_dto = RatingsDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: RATINGS_KIND.to_owned(),
+            entries: ratings
+                .iter()
+                .map(|(track_id, rating)| RatingEntryDto {
+                    track_id: track_id.get(),
+                    rating: rating.rating,
+                    favorite: rating.favorite,
+                })
+                .collect(),
+        };
+        let ratings_bytes =
+            serde_json::to_vec_pretty(&ratings_dto).map_err(|err| CanonicalError::Malformed {
+                file: RATINGS_FILE_NAME.to_owned(),
+                message: err.to_string(),
+            })?;
+        writes.push(PendingWrite {
+            target: RelPath::from_utf8(RATINGS_FILE_NAME)?,
+            bytes: Some(ratings_bytes),
+            copy_from: None,
+            expected: None,
+        });
+        catalog.tracks.retain(|entry| entry.id != track.id.get());
+        self.commit_writes_with_cleanup(Some(catalog), writes, Vec::new())?;
+        self.reopen_after()?;
+
+        let mut cleanup_errors = Vec::new();
+        for path in [
+            Some(plan.audio_path.clone()),
+            Some(plan.record_path.clone()),
+            plan.lyrics_path.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(error) = self.cleanup_unreferenced_track_resource(&path) {
+                cleanup_errors.push(error);
+            }
+        }
+        Ok(TrackDeletionReport {
+            track_id: track.id,
+            album_id: track.album_id,
+            audio_was_present: plan.audio_present,
+            cleanup_errors,
+        })
+    }
+
+    fn cleanup_unreferenced_track_resource(&self, target: &RelPath) -> Result<(), String> {
+        let text = target.display_lossy();
+        if self
+            .catalog
+            .tracks
+            .iter()
+            .any(|track| track.audio_path == text || track.record_path == text)
+        {
+            return Err(format!(
+                "kept managed resource still referenced by the catalogue: {text}"
+            ));
+        }
+        if self.tracks.values().any(|track| {
+            self.track_records
+                .get(&track.id)
+                .and_then(|record| plan_track_lyrics_rel(record, track.lyrics.as_deref()))
+                .is_some_and(|lyrics| lyrics == *target)
+        }) {
+            return Err(format!(
+                "kept managed lyrics still referenced by another track: {text}"
+            ));
+        }
+        reject_symlink_escape(&self.root, target).map_err(|error| error.to_string())?;
+        let path = safe_join(&self.root, target).map_err(|error| error.to_string())?;
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent).map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+        }
     }
 
     /// Updates track metadata. Owner/album are intentionally not changed by
@@ -8977,6 +9266,313 @@ mod process_crash_tests {
     }
 }
 
+#[cfg(test)]
+mod track_deletion_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempDir;
+
+    struct Fixture {
+        _dir: TempDir,
+        library: CanonicalLibrary,
+        track: TrackId,
+        a: ArtistId,
+        b: ArtistId,
+        old_audio: std::path::PathBuf,
+        old_record: std::path::PathBuf,
+        old_lyrics: std::path::PathBuf,
+        playlist: PlaylistId,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let dir = TempDir::new(name);
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let b = library.create_artist("B", Vec::new()).expect("B");
+        let source = dir.write("source/song.wav", b"track deletion payload");
+        let track = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Source".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import");
+        library
+            .set_lyrics(track, Some("[00:00.00]lyrics"))
+            .expect("lyrics");
+        library.set_rating(track, Some(4), true).expect("rating");
+        let playlist = library
+            .set_playlist(None, "Keep", vec![track])
+            .expect("playlist");
+        let old_audio = library.track_audio_path(track).expect("audio");
+        let old_record = library.track_record_path(track).expect("record");
+        let old_lyrics = library.track_lyrics_path(track).expect("lyrics");
+        Fixture {
+            _dir: dir,
+            library,
+            track,
+            a,
+            b,
+            old_audio,
+            old_record,
+            old_lyrics,
+            playlist,
+        }
+    }
+
+    #[test]
+    fn single_track_deletion_preserves_unrelated_entities_and_resources() {
+        let mut fx = fixture("delete-one-track");
+        let second_source = fx._dir.write("source/second.wav", b"second payload");
+        let second = fx
+            .library
+            .import_track(CanonicalImportedTrack {
+                source: second_source,
+                title: "Second".to_owned(),
+                artist_id: Some(fx.a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![fx.a, fx.b],
+                album_title: Some("Source".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: Some(2),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("second track");
+        fx.library
+            .set_lyrics(second, Some("[00:01.00]second lyrics"))
+            .expect("second lyrics");
+        fx.library
+            .set_rating(second, Some(5), false)
+            .expect("second rating");
+        fx.library
+            .set_playlist(Some(fx.playlist), "Keep", vec![fx.track, second])
+            .expect("playlist both");
+        let second_audio = fx.library.track_audio_path(second).expect("second audio");
+        let second_record = fx.library.track_record_path(second).expect("second record");
+        let second_lyrics = fx.library.track_lyrics_path(second).expect("second lyrics");
+        let album_id = fx.library.track(fx.track).expect("track").album_id;
+        let cover = fx._dir.write("cover.png", b"album cover");
+        fx.library
+            .set_cover(album_id, &cover, "png")
+            .expect("album cover");
+        let managed_cover = fx
+            .library
+            .album_cover_path(album_id)
+            .expect("managed cover");
+        let next_track_id = fx.library.catalog.next_track_id;
+        let generation = fx.library.catalog.generation;
+
+        let plan = fx
+            .library
+            .plan_track_deletion(fx.track)
+            .expect("delete plan");
+        let report = fx.library.delete_track(&plan).expect("delete track");
+        assert!(report.cleanup_errors.is_empty(), "{report:?}");
+        assert_eq!(report.track_id, fx.track);
+        assert!(fx.library.track(fx.track).is_none());
+        assert!(fx.library.track(second).is_some());
+        assert!(fx.library.album(album_id).is_some());
+        assert!(fx.library.artist(fx.a).is_some());
+        assert!(fx.library.artist(fx.b).is_some());
+        assert_eq!(
+            fx.library.album(album_id).expect("album").track_order,
+            vec![second]
+        );
+        assert!(fx.library.rating(fx.track).is_none());
+        assert!(fx.library.rating(second).is_some());
+        assert_eq!(
+            fx.library
+                .playlist(fx.playlist)
+                .expect("playlist")
+                .track_ids,
+            vec![second]
+        );
+        assert_eq!(fx.library.catalog.next_track_id, next_track_id);
+        assert_eq!(fx.library.catalog.generation, generation + 1);
+        assert!(fx.library.album(album_id).expect("album").cover.is_some());
+        assert!(managed_cover.is_file(), "shared album artwork was removed");
+        assert!(!fx.old_audio.exists());
+        assert!(!fx.old_record.exists());
+        assert!(!fx.old_lyrics.exists());
+        assert!(second_audio.is_file());
+        assert!(second_record.is_file());
+        assert!(second_lyrics.is_file());
+        assert_eq!(
+            fs::read_to_string(fx.library.track_lyrics_path(second).expect("second lyrics"))
+                .expect("second lyrics text"),
+            "[00:01.00]second lyrics"
+        );
+    }
+
+    #[test]
+    fn deleting_the_only_track_keeps_empty_album_and_artists() {
+        let mut fx = fixture("delete-only-track");
+        let album_id = fx.library.track(fx.track).expect("track").album_id;
+        let next_track_id = fx.library.catalog.next_track_id;
+        let plan = fx
+            .library
+            .plan_track_deletion(fx.track)
+            .expect("delete plan");
+        let report = fx.library.delete_track(&plan).expect("delete track");
+        assert!(report.cleanup_errors.is_empty(), "{report:?}");
+        assert!(fx.library.track(fx.track).is_none());
+        let album = fx.library.album(album_id).expect("empty album retained");
+        assert!(album.track_order.is_empty());
+        assert!(fx.library.artist(fx.a).is_some());
+        assert!(fx.library.artist(fx.b).is_some());
+        assert!(fx.library.rating(fx.track).is_none());
+        assert!(
+            fx.library
+                .playlist(fx.playlist)
+                .expect("playlist retained")
+                .track_ids
+                .is_empty()
+        );
+        assert_eq!(fx.library.catalog.next_track_id, next_track_id);
+        assert!(!fx.old_audio.exists());
+        assert!(!fx.old_record.exists());
+        assert!(!fx.old_lyrics.exists());
+    }
+
+    #[test]
+    fn missing_audio_replacement_repairs_managed_resource_and_preserves_references() {
+        let mut fx = fixture("repair-missing-audio");
+        let old_audio = fx.old_audio.clone();
+        let old_record = fx.old_record.clone();
+        let old_lyrics = fx.old_lyrics.clone();
+        fs::remove_file(&old_audio).expect("make audio missing");
+        let replacement = fx._dir.write("replacement/new.wav", b"replacement payload");
+        let plan = fx
+            .library
+            .plan_track_audio_replacement(fx.track, &replacement)
+            .expect("repair plan");
+        assert_eq!(plan.current_fingerprint, None);
+        assert_eq!(
+            fx.library
+                .rating(fx.track)
+                .map(|rating| (rating.rating, rating.favorite)),
+            Some((Some(4), true))
+        );
+        let report = fx
+            .library
+            .execute_track_audio_replacement(&plan)
+            .expect("repair audio");
+        assert!(report.restored_missing_audio);
+        assert!(fx.library.track_available(fx.track));
+        assert_eq!(
+            fs::read(fx.library.track_audio_path(fx.track).expect("audio")).expect("new audio"),
+            b"replacement payload"
+        );
+        assert!(!old_audio.exists());
+        assert!(old_record.is_file());
+        assert!(old_lyrics.is_file());
+        assert_eq!(
+            fs::read_to_string(fx.library.track_lyrics_path(fx.track).expect("lyrics path"))
+                .expect("lyrics text"),
+            "[00:00.00]lyrics"
+        );
+        assert_eq!(
+            fx.library
+                .playlist(fx.playlist)
+                .expect("playlist")
+                .track_ids,
+            vec![fx.track]
+        );
+        assert_eq!(
+            fx.library.track(fx.track).expect("track").title,
+            "Song".to_owned()
+        );
+    }
+
+    #[test]
+    fn missing_audio_repair_is_rejected_if_the_old_file_reappears() {
+        let mut fx = fixture("repair-reappeared");
+        fs::remove_file(&fx.old_audio).expect("make audio missing");
+        let replacement = fx._dir.write("replacement/new.wav", b"replacement payload");
+        let plan = fx
+            .library
+            .plan_track_audio_replacement(fx.track, &replacement)
+            .expect("repair plan");
+        fs::write(&fx.old_audio, b"reappeared payload").expect("reappear");
+        assert!(
+            fx.library.execute_track_audio_replacement(&plan).is_err(),
+            "a reappeared old file must invalidate the repair plan"
+        );
+        assert_eq!(
+            fs::read(fx.library.track_audio_path(fx.track).expect("audio")).expect("audio"),
+            b"reappeared payload"
+        );
+    }
+
+    #[test]
+    fn deletion_transaction_failure_before_commit_preserves_the_track_and_references() {
+        let mut fx = fixture("delete-before-commit");
+        let album_id = fx.library.track(fx.track).expect("track").album_id;
+        let plan = fx
+            .library
+            .plan_track_deletion(fx.track)
+            .expect("delete plan");
+        fx.library.set_transaction_failure(Some(TransactionFailure {
+            point: TransactionFailPoint::BeforeCatalogPublish,
+            interrupt: true,
+            abort: false,
+        }));
+        let error = fx
+            .library
+            .delete_track(&plan)
+            .expect_err("injected failure");
+        assert!(error.to_string().contains("injected"), "{error}");
+        let root = fx.library.root.clone();
+        drop(fx.library);
+        let reopened = CanonicalLibrary::open(&root).expect("recovery");
+        assert!(reopened.track(fx.track).is_some());
+        assert!(reopened.album(album_id).is_some());
+        assert!(reopened.rating(fx.track).is_some());
+        assert_eq!(
+            reopened.playlist(fx.playlist).expect("playlist").track_ids,
+            vec![fx.track]
+        );
+        assert!(fs::read_to_string(reopened.track_lyrics_path(fx.track).expect("lyrics")).is_ok());
+        assert!(fx.old_audio.is_file());
+        assert!(fx.old_record.is_file());
+    }
+
+    #[test]
+    fn deletion_cleanup_failure_is_reported_after_catalogue_commit() {
+        let mut fx = fixture("delete-cleanup-failure");
+        fs::remove_file(&fx.old_audio).expect("remove old audio");
+        fs::create_dir_all(&fx.old_audio).expect("replace audio with directory");
+        fx._dir.write("keep.txt", b"not touched");
+        let album_id = fx.library.track(fx.track).expect("track").album_id;
+        let plan = fx
+            .library
+            .plan_track_deletion(fx.track)
+            .expect("delete plan");
+        assert!(!plan.audio_present);
+        let report = fx.library.delete_track(&plan).expect("catalogue delete");
+        assert!(
+            report
+                .cleanup_errors
+                .iter()
+                .any(|error| error.contains("could not remove")),
+            "{report:?}"
+        );
+        assert!(fx.library.track(fx.track).is_none());
+        assert!(fx.library.album(album_id).is_some());
+        assert!(fx.old_audio.is_dir(), "ambiguous resource was not deleted");
+        assert!(!fx.old_record.exists());
+    }
+}
 #[cfg(test)]
 mod filesystem_edge_tests {
     use std::fs;
