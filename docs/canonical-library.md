@@ -304,12 +304,25 @@ For canonical libraries, the queue file persists ordered entries, stable
 entry IDs, current entry, repeat mode, shuffle flag, playback position and
 whether playback was active. Restoration always installs the queue paused and
 does not start audio implicitly. Position is applied only when the user presses
-Play. Queue files without the optional `auto_library`/playback fields remain readable
-with defaults. The `entries` collection itself is required: a missing or
-wrong-typed collection is corruption, not a valid empty queue. Saves remain
-atomic, failed-load sources are preserved, and writes are disabled for that
-session. Non-canonical legacy/portable backends retain their existing queue
-workflow.
+Play. A restored position is tagged with the persisted current queue entry and
+is discarded when the selection changes, so duplicate TrackIds represented by
+different `QueueEntryId`s cannot inherit each other's position. Likewise, an
+engine position is reported and persisted only while the engine ledger still
+names the current entry. Queue files without the optional
+`auto_library`/playback fields remain readable with defaults. The `entries`
+collection itself is required: a missing or wrong-typed collection is
+corruption, not a valid empty queue. Saves remain atomic, failed-load sources
+are preserved, and writes are disabled for that session. Non-canonical
+legacy/portable backends retain their existing queue workflow.
+
+The GUI close path saves the catalogue/index, writes one coherent queue and
+position snapshot, and shuts the Controller down in place. Shutdown is
+idempotent: playback commands issued after it begins are rejected, late GUI
+messages are ignored, the final write precedes engine destruction, and pending
+recovery/scan/engine workers are joined by the existing lifecycle. Shutdown
+does not promise that a backend can forcibly terminate a stream faster than its
+own close call, and no physical GUI-close or hardware-unplug behaviour is
+claimed by the headless tests.
 
 ### Audio engine, gapless handoff and crossfade
 
@@ -499,6 +512,7 @@ from what remains structurally or physically unverified.
 |---|---|
 | Decoder lifecycle, prepared cancellation, gapless/crossfade handoff | Confirmed by deterministic engine tests |
 | Queue authorization, duplicate `QueueEntryId`, transition identity | Confirmed by Controller/engine tests |
+| Entry-bound position, restore/seek/transition persistence, idempotent shutdown | Confirmed by deterministic Controller/GUI tests; no physical GUI-close or hardware-unplug validation |
 | Command burst handling and preload scheduling | Confirmed defect fixed; regression tested |
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
@@ -521,7 +535,11 @@ Confirmed fixes from this audit:
   seek after the second command was issued but before the worker processed
   it. The newest requested load/seek session is published atomically, older
   seeks are ignored, and position is locked to the new base until the
-  callback flushes/acknowledges the generation.
+  callback flushes/acknowledges the generation. A Load racing a Seek that had
+  already passed its initial session check could still inherit the old seek
+  target; the worker now resets position only when that Load is still the
+  newest request and rechecks the session before publishing a seek's final
+  target.
 - Non-finite decoded samples could propagate through interpolation and
   crossfade into the output backend. `FormatConverter` now converts
   NaN/infinity to zero at the conversion boundary while preserving finite

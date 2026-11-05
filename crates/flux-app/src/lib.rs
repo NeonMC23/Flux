@@ -1157,6 +1157,10 @@ pub struct Controller {
     /// older attempt (even for the same track) cannot affect the
     /// current one.
     engine_session: Option<u64>,
+    /// Load session for the currently loaded source. Unlike `engine_session`,
+    /// this is not replaced by a later Seek, so the Loaded event can still be
+    /// correlated after a load+seek command sequence.
+    engine_loaded_session: Option<u64>,
     /// Stream facts for `engine_loaded`, once the engine confirms it.
     stream_info: Option<StreamInfo>,
     volume: f32,
@@ -1184,8 +1188,11 @@ pub struct Controller {
     shuffle: bool,
     /// Stable shuffle order for the current queue cycle.
     shuffle_order: Vec<QueueEntryId>,
-    /// Position restored from persistence, applied on the next play.
+    /// Position restored from persistence, applied on the next play only
+    /// while the same queue entry is still selected.
     restored_position_ms: u64,
+    /// Queue entry that owns `restored_position_ms`.
+    restored_position_entry: Option<QueueEntryId>,
     /// Queue entry whose decoder is currently prepared for the next transition.
     preloaded_entry: Option<(QueueEntryId, TrackId)>,
     /// Session-local meaningful-play accumulator.
@@ -1218,6 +1225,8 @@ pub struct Controller {
     /// Configured duration retained even while crossfade is disabled.
     crossfade_duration_ms: u64,
     scan_rx: Option<Receiver<ScanOutcome>>,
+    /// Set by the idempotent shutdown path; rejects later playback mutations.
+    shutdown: bool,
     outbox: Vec<ControllerEvent>,
     last_error: Option<String>,
     last_status: Option<String>,
@@ -1547,6 +1556,7 @@ impl Controller {
             engine_loaded: None,
             engine_entry: None,
             engine_session: None,
+            engine_loaded_session: None,
             stream_info: None,
             volume: 1.0,
             storage,
@@ -1563,6 +1573,7 @@ impl Controller {
             shuffle: false,
             shuffle_order: Vec::new(),
             restored_position_ms: 0,
+            restored_position_entry: None,
             preloaded_entry: None,
             play_session: None,
             library_lock,
@@ -1572,6 +1583,7 @@ impl Controller {
             portable_recovery,
             roots,
             scan_rx: None,
+            shutdown: false,
             outbox: Vec::new(),
             last_error: None,
             last_status: None,
@@ -2066,6 +2078,9 @@ impl Controller {
         start_index: usize,
         shuffle: bool,
     ) -> Result<(), String> {
+        if self.shutdown {
+            return Err("Playback is shutting down.".to_owned());
+        }
         let mut start_index = start_index;
         let playlist = self
             .canonical_store
@@ -2403,16 +2418,46 @@ impl Controller {
         self.player.repeat_mode()
     }
 
-    /// Elapsed playback position of the loaded track (from the engine;
-    /// zero when nothing is loaded).
+    /// Elapsed playback position of the loaded track, bound to the current
+    /// queue entry. Zero when the engine/restore snapshot belongs to a
+    /// different entry.
     #[must_use]
     pub fn position(&self) -> Duration {
+        self.position_for_current_entry()
+    }
+
+    fn position_for_current_entry(&self) -> Duration {
+        let current = self.current_queue_entry_id();
         if let Some(recovery) = self.audio_recovery.as_ref()
             && (recovery.active() || recovery.failed())
         {
-            return Duration::from_millis(recovery.position_ms);
+            return if recovery.position_entry == current {
+                Duration::from_millis(recovery.position_ms)
+            } else {
+                Duration::ZERO
+            };
         }
-        self.engine.position()
+        if self.engine_loaded.is_some() && self.engine_entry == current {
+            return self.engine.position();
+        }
+        if self.player.state() != PlaybackState::Stopped
+            && self.restored_position_entry == current
+            && self.restored_position_ms > 0
+        {
+            return Duration::from_millis(self.restored_position_ms);
+        }
+        Duration::ZERO
+    }
+
+    fn clear_restored_position(&mut self) {
+        self.restored_position_ms = 0;
+        self.restored_position_entry = None;
+    }
+
+    fn sync_restored_position_entry(&mut self) {
+        if self.restored_position_entry != self.current_queue_entry_id() {
+            self.clear_restored_position();
+        }
     }
 
     /// Local, lock-free audio pipeline diagnostics. This is a snapshot;
@@ -2449,6 +2494,9 @@ impl Controller {
     /// preserved. A no-op with a clear error when no track or duration is
     /// known. Returns the effective clamped position.
     pub fn seek(&mut self, position: Duration) -> Result<Duration, String> {
+        if self.shutdown {
+            return Err("Playback is shutting down.".to_owned());
+        }
         let Some(id) = self.current_id() else {
             let message = "Nothing is selected to seek.".to_owned();
             self.report_error(message.clone());
@@ -2477,7 +2525,7 @@ impl Controller {
                 recovery.position_ms = position_ms;
                 recovery.position_entry = entry;
             }
-            self.restored_position_ms = 0;
+            self.clear_restored_position();
             self.persist_queue();
             return Ok(target);
         }
@@ -2495,6 +2543,7 @@ impl Controller {
         }
         let session = self.engine.seek(target);
         self.engine_session = Some(session);
+        self.clear_restored_position();
         if self.player.state() == PlaybackState::Playing && !had_loaded_track {
             self.engine.play();
         }
@@ -2723,24 +2772,24 @@ impl Controller {
             return;
         }
         let (position_ms, entry) = if recovery.phase == AudioRecoveryPhase::Idle {
-            let engine_position =
-                self.engine.position().as_millis().min(u128::from(u64::MAX)) as u64;
-            let position_ms = if self.engine_loaded.is_some() {
-                engine_position
-            } else {
-                engine_position.max(self.restored_position_ms)
-            };
-            (position_ms, self.current_queue_entry_id())
+            (
+                self.position_for_current_entry()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+                self.current_queue_entry_id(),
+            )
         } else {
             (recovery.position_ms, recovery.position_entry)
         };
         if let Some(recovery) = self.audio_recovery.as_mut() {
             recovery.begin(reason.clone(), position_ms, entry);
         }
+        self.clear_restored_position();
         self.audio = AudioStatus::Recovering(reason.clone());
         self.engine_loaded = None;
         self.engine_entry = None;
         self.engine_session = None;
+        self.engine_loaded_session = None;
         self.stream_info = None;
         self.preloaded_entry = None;
         // Release the invalid stream immediately. The placeholder keeps the
@@ -2875,6 +2924,7 @@ impl Controller {
         self.engine_loaded = None;
         self.engine_entry = None;
         self.engine_session = None;
+        self.engine_loaded_session = None;
         self.stream_info = None;
         self.preloaded_entry = None;
         self.persist_queue();
@@ -2912,9 +2962,10 @@ impl Controller {
         self.engine_loaded = None;
         self.engine_entry = None;
         self.engine_session = None;
+        self.engine_loaded_session = None;
         self.stream_info = None;
         self.preloaded_entry = None;
-        self.restored_position_ms = 0;
+        self.clear_restored_position();
 
         if self.player_state() != PlaybackState::Stopped
             && let Some(id) = self.current_id()
@@ -3419,6 +3470,7 @@ impl Controller {
         self.engine_loaded = None;
         self.engine_entry = None;
         self.engine_session = None;
+        self.engine_loaded_session = None;
         self.stream_info = None;
 
         self.tracks = snapshot(&library);
@@ -3440,6 +3492,7 @@ impl Controller {
         self.shuffle = false;
         self.shuffle_order.clear();
         self.restored_position_ms = 0;
+        self.restored_position_entry = None;
         self.preloaded_entry = None;
         self.play_session = None;
         *self.player.queue_mut() = queue;
@@ -4076,6 +4129,7 @@ impl Controller {
             self.engine_loaded = None;
             self.engine_entry = None;
             self.engine_session = None;
+            self.engine_loaded_session = None;
             self.stream_info = None;
         }
         self.refresh_from_canonical();
@@ -4777,6 +4831,9 @@ impl Controller {
     /// is appended to the queue and selected. The queue order is not
     /// otherwise changed, and the entry is persisted when possible.
     pub fn play_track(&mut self, id: TrackId) {
+        if self.shutdown {
+            return;
+        }
         let Some(title) = self.track(id).map(|track| track.title().to_owned()) else {
             self.report_error("That track is no longer in the library.".to_owned());
             return;
@@ -4807,6 +4864,9 @@ impl Controller {
 
     /// Plays one specific queue entry, including a particular duplicate.
     pub fn play_queue_entry(&mut self, entry: QueueEntryId) -> Result<(), String> {
+        if self.shutdown {
+            return Err("Playback is shutting down.".to_owned());
+        }
         if self.player.queue().entry(entry).is_none() {
             let message = format!("Queue entry {entry} is no longer in the queue.");
             self.report_error(message.clone());
@@ -4870,6 +4930,7 @@ impl Controller {
             self.engine_loaded = None;
             self.engine_entry = None;
             self.engine_session = None;
+            self.engine_loaded_session = None;
             self.stream_info = None;
             self.outbox.push(ControllerEvent::PlaybackChanged);
         }
@@ -4938,6 +4999,9 @@ impl Controller {
 
     /// Starts or resumes playback of the current selection.
     pub fn play(&mut self) {
+        if self.shutdown {
+            return;
+        }
         match self.player.play() {
             Ok(()) => {
                 let retried = self.retry_audio_recovery_if_failed();
@@ -4950,7 +5014,9 @@ impl Controller {
                     }
                     return;
                 }
+                let current_entry = self.current_queue_entry_id();
                 if self.restored_position_ms > 0
+                    && self.restored_position_entry == current_entry
                     && let Some(id) = self.player.current_track()
                 {
                     let position = Duration::from_millis(self.restored_position_ms);
@@ -4961,8 +5027,9 @@ impl Controller {
                     let session = self.engine.seek(position);
                     self.engine_session = Some(session);
                     self.engine.play();
-                    self.restored_position_ms = 0;
+                    self.clear_restored_position();
                 } else {
+                    self.clear_restored_position();
                     self.sync_engine(false);
                 }
             }
@@ -4972,6 +5039,9 @@ impl Controller {
 
     /// Pauses playback (no-op unless playing).
     pub fn pause(&mut self) {
+        if self.shutdown {
+            return;
+        }
         self.player.pause();
         self.persist_queue();
         self.sync_engine(false);
@@ -4979,6 +5049,9 @@ impl Controller {
 
     /// Toggles between playing and paused (from stopped: plays).
     pub fn toggle_play_pause(&mut self) {
+        if self.shutdown {
+            return;
+        }
         if self.player.state() == PlaybackState::Playing {
             self.pause();
         } else {
@@ -4988,6 +5061,9 @@ impl Controller {
 
     /// Stops playback. The selection is retained.
     pub fn stop(&mut self) {
+        if self.shutdown {
+            return;
+        }
         self.player.stop();
         self.persist_queue();
         self.sync_engine(false);
@@ -4996,6 +5072,9 @@ impl Controller {
     /// Skips to the next track; at the end of the queue (repeat off)
     /// playback stops. While paused, the new track is loaded paused.
     pub fn next(&mut self) {
+        if self.shutdown {
+            return;
+        }
         let before = self.current_queue_entry_id();
         if self.shuffle {
             self.sync_shuffle_order();
@@ -5017,6 +5096,9 @@ impl Controller {
     /// Skips to the previous entry. After three seconds of playback this
     /// restarts the current track instead, matching common player behavior.
     pub fn previous(&mut self) {
+        if self.shutdown {
+            return;
+        }
         if self.position() >= Duration::from_secs(3)
             && self.current_id().is_some()
             && self.seek(Duration::ZERO).is_ok()
@@ -5370,10 +5452,28 @@ impl Controller {
         Ok(backup)
     }
 
-    /// Clean shutdown: waits for any running scan to finish (its save
-    /// included), then stops the audio engine and joins its worker.
+    /// Clean shutdown: persists the latest coherent queue/position snapshot,
+    /// waits for any running scan to finish (its save included), then stops
+    /// the audio engine and joins its worker. Idempotent.
     pub fn shutdown(mut self) {
+        self.shutdown_in_place();
+    }
+
+    /// In-place clean shutdown for owners that cannot move the controller
+    /// (notably the GUI event loop). Repeated calls are no-ops.
+    pub fn shutdown_in_place(&mut self) {
+        if self.shutdown {
+            return;
+        }
         self.persist_queue();
+        self.shutdown = true;
+        self.engine_loaded = None;
+        self.engine_entry = None;
+        self.engine_session = None;
+        self.engine_loaded_session = None;
+        self.stream_info = None;
+        self.preloaded_entry = None;
+        self.audio = AudioStatus::DeviceUnavailable("the playback engine has shut down".to_owned());
         if let Some(recovery) = self.audio_recovery.take() {
             drop(recovery);
         }
@@ -5385,7 +5485,15 @@ impl Controller {
                 self.portable_store = Some(*store);
             }
         }
-        self.engine.shutdown();
+        let (placeholder, _control) = EngineHandle::spawn_null(48_000, 2);
+        let engine = std::mem::replace(&mut self.engine, placeholder);
+        engine.shutdown();
+    }
+
+    /// Whether shutdown has begun or completed.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown
     }
 
     // ------------------------------------------------------------ poll ---
@@ -5403,6 +5511,7 @@ impl Controller {
         self.player.set_repeat_mode(state.repeat_mode);
         self.shuffle = state.shuffle;
         self.restored_position_ms = state.position_ms;
+        self.restored_position_entry = self.player.queue().current_entry_id();
         if self.player.queue().current_entry().is_some() {
             self.player.restore_paused();
         }
@@ -5424,7 +5533,7 @@ impl Controller {
     }
 
     fn persist_history(&mut self) {
-        if self.history_write_protected {
+        if self.shutdown || self.history_write_protected {
             return;
         }
         let Some(store) = &self.history_store else {
@@ -5494,6 +5603,9 @@ impl Controller {
     }
 
     pub fn poll(&mut self) -> Vec<ControllerEvent> {
+        if self.shutdown {
+            return Vec::new();
+        }
         let mut events = std::mem::take(&mut self.outbox);
 
         // `Done` is boxed because a `ScanOutcome` carries the whole
@@ -5591,10 +5703,14 @@ impl Controller {
                 entry,
                 info,
             } => {
-                if self.engine_session == Some(session)
+                let session_matches = self.engine_loaded_session == Some(session)
+                    || (self.engine_loaded_session.is_none()
+                        && self.engine_session == Some(session));
+                if session_matches
                     && self.engine_loaded == Some(id)
                     && self.engine_entry == Some(entry)
                 {
+                    self.engine_loaded_session = Some(session);
                     self.stream_info = Some(info);
                     events.push(ControllerEvent::PlaybackChanged);
                 }
@@ -5639,6 +5755,7 @@ impl Controller {
                     self.engine_loaded = None;
                     self.engine_entry = None;
                     self.engine_session = None;
+                    self.engine_loaded_session = None;
                     self.stream_info = None;
                     self.preloaded_entry = None;
                     self.sync_engine(true);
@@ -5672,7 +5789,16 @@ impl Controller {
                 {
                     // Fallback path: no prepared successor existed at
                     // end-of-stream, so the ring drained and the next
-                    // entry now requires an explicit load.
+                    // entry now requires an explicit load. Discard the
+                    // completed engine position before persisting the next
+                    // (or stopped) selection.
+                    self.engine.stop();
+                    self.engine_loaded = None;
+                    self.engine_entry = None;
+                    self.engine_session = None;
+                    self.engine_loaded_session = None;
+                    self.stream_info = None;
+                    self.preloaded_entry = None;
                     let before = self.current_queue_entry_id();
                     if self.shuffle {
                         if self.advance_shuffle_on_end().is_none() {
@@ -5724,6 +5850,7 @@ impl Controller {
                 self.engine_loaded = None;
                 self.engine_entry = None;
                 self.engine_session = None;
+                self.engine_loaded_session = None;
                 self.stream_info = None;
                 self.preloaded_entry = None;
                 if output_failure {
@@ -5748,6 +5875,7 @@ impl Controller {
     /// or a protected/recovered catalogue leaves the original file
     /// untouched.
     fn after_queue_change(&mut self) {
+        self.sync_restored_position_entry();
         self.sync_recovery_selection();
         self.sync_shuffle_order();
         self.persist_queue();
@@ -5756,13 +5884,16 @@ impl Controller {
     }
 
     fn persist_queue(&mut self) {
-        if !self.queue_persistence_allowed() {
+        if self.shutdown || !self.queue_persistence_allowed() {
             return;
         }
         let Some(store) = &self.queue_store else {
             return;
         };
-        let position_ms = self.position().as_millis().min(u128::from(u64::MAX)) as u64;
+        let position_ms = self
+            .position_for_current_entry()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         let playback = flux_library::PersistedPlaybackState {
             repeat_mode: self.player.repeat_mode(),
             shuffle: self.shuffle,
@@ -5825,6 +5956,7 @@ impl Controller {
     }
 
     fn restart_recovery_position(&mut self) {
+        self.clear_restored_position();
         let entry = self.current_queue_entry_id();
         if let Some(recovery) = self.audio_recovery.as_mut()
             && (recovery.active() || recovery.failed())
@@ -5835,6 +5967,9 @@ impl Controller {
     }
 
     fn sync_engine(&mut self, force_reload: bool) {
+        if self.shutdown {
+            return;
+        }
         if self.audio_recovery_active() {
             self.preloaded_entry = None;
             return;
@@ -5845,6 +5980,10 @@ impl Controller {
                     self.engine.stop();
                     self.engine_loaded = None;
                     self.engine_entry = None;
+                    self.engine_session = None;
+                    self.engine_loaded_session = None;
+                    self.stream_info = None;
+                    self.preloaded_entry = None;
                     return;
                 };
                 if self.engine_loaded == Some(id)
@@ -5871,6 +6010,11 @@ impl Controller {
                 None => {
                     self.engine.stop();
                     self.engine_loaded = None;
+                    self.engine_entry = None;
+                    self.engine_session = None;
+                    self.engine_loaded_session = None;
+                    self.stream_info = None;
+                    self.preloaded_entry = None;
                 }
             },
             PlaybackState::Stopped => {
@@ -5878,6 +6022,7 @@ impl Controller {
                 self.engine_loaded = None;
                 self.engine_entry = None;
                 self.engine_session = None;
+                self.engine_loaded_session = None;
                 self.stream_info = None;
             }
         }
@@ -5941,6 +6086,9 @@ impl Controller {
     /// format) are returned for the caller to surface; decode/IO
     /// failures arrive asynchronously as engine error events.
     fn load_into_engine(&mut self, id: TrackId, autoplay: bool) -> Result<(), String> {
+        if self.shutdown {
+            return Err("Playback is shutting down.".to_owned());
+        }
         if self.audio_recovery_active() {
             return Err(
                 "Audio output is recovering; try again when the device is ready.".to_owned(),
@@ -5972,6 +6120,7 @@ impl Controller {
         self.engine_loaded = Some(id);
         self.engine_entry = Some(entry);
         self.engine_session = Some(session);
+        self.engine_loaded_session = Some(session);
         self.stream_info = None;
         if autoplay {
             self.engine.play();
@@ -5987,8 +6136,10 @@ impl Controller {
         self.engine_loaded = None;
         self.engine_entry = None;
         self.engine_session = None;
+        self.engine_loaded_session = None;
         self.stream_info = None;
         self.preloaded_entry = None;
+        self.clear_restored_position();
         self.report_error(message);
     }
 
@@ -7068,6 +7219,13 @@ mod tests {
             .join("library-index.json.queue.json")
     }
 
+    fn persisted_queue(dir: &TempDir) -> flux_library::LoadedQueue {
+        QueueStore::new(legacy_queue_file(dir))
+            .load()
+            .expect("queue loads")
+            .expect("queue file exists")
+    }
+
     fn portable_queue_file(root: &Path) -> PathBuf {
         root.join(".flux").join("queue").join("queue.json")
     }
@@ -8004,6 +8162,7 @@ mod tests {
         controller.player.restore_paused();
         controller.restored_position_ms = 100;
         let entry = controller.current_queue_entry_id();
+        controller.restored_position_entry = entry;
 
         let (factory, release, _controls) = blocking_recovery_factory(44_100, 1);
         controller.enable_test_audio_recovery(factory);
@@ -8013,9 +8172,39 @@ mod tests {
         assert_eq!(controller.player_state(), PlaybackState::Paused);
         assert_eq!(controller.current_queue_entry_id(), entry);
         assert_eq!(controller.restored_position_ms, 0);
+        assert_eq!(controller.restored_position_entry, None);
         assert!(
             (controller.position().as_millis() as i64 - 100).abs() <= 2,
             "restored position was not applied: {}",
+            controller.position().as_millis()
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn seek_during_recovery_restores_the_latest_position() {
+        let dir = TempDir::new("audio-recovery-seek");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+        let entry = controller.current_queue_entry_id();
+        let (factory, release, _controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated seek-time loss");
+        controller
+            .seek(Duration::from_millis(200))
+            .expect("seek during recovery");
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        assert!(
+            (controller.position().as_millis() as i64 - 200).abs() <= 2,
+            "recovery restored an obsolete position: {}",
             controller.position().as_millis()
         );
         controller.shutdown();
@@ -8087,6 +8276,65 @@ mod tests {
         assert!(
             recovered.captured().iter().all(|sample| *sample == 0.0),
             "recovery restarted playback after an explicit stop"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn queue_replacement_during_recovery_restores_the_new_current_entry() {
+        let dir = TempDir::new("audio-recovery-queue-replacement");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated replacement loss");
+        let replacement_entry = {
+            let queue = controller.player.queue_mut();
+            queue.clear();
+            let entry = queue.push(b);
+            controller
+                .player
+                .play_entry(entry)
+                .expect("select replacement");
+            entry
+        };
+        controller.after_queue_change();
+        assert_eq!(
+            controller.player_state(),
+            PlaybackState::Playing,
+            "queue replacement must preserve the explicit play intent"
+        );
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        assert_eq!(controller.current_queue_entry_id(), Some(replacement_entry));
+        assert_eq!(controller.current_id(), Some(b));
+        assert_eq!(controller.engine_loaded, Some(b));
+        assert_eq!(controller.engine_entry, Some(replacement_entry));
+        assert!(
+            controller.position() < Duration::from_millis(5),
+            "an obsolete entry position survived queue replacement"
+        );
+        let recovered = last_recovery_control(&controls);
+        drive(&mut controller, &recovered, |_, _| {
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        });
+        assert!(
+            recovered
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
         );
         controller.shutdown();
     }
@@ -8587,6 +8835,12 @@ mod tests {
             0,
             "a short transition must not manufacture a meaningful play"
         );
+        let transitioned = persisted_queue(&dir);
+        assert_eq!(transitioned.queue.current_entry_id(), Some(entry_b));
+        assert!(
+            transitioned.playback.expect("playback state").position_ms < 1_000,
+            "transition persisted the previous entry's position"
+        );
 
         // Let the second short track end; it still must not cross the
         // meaningful-play threshold.
@@ -8597,6 +8851,11 @@ mod tests {
         assert_eq!(controller.current_queue_entry_id(), Some(entry_b));
         assert_ne!(entry_a, entry_b);
         controller.shutdown();
+        let ended = persisted_queue(&dir);
+        assert_eq!(ended.queue.current_entry_id(), Some(entry_b));
+        let playback = ended.playback.expect("playback state");
+        assert_eq!(playback.position_ms, 0, "track end leaked into resume");
+        assert!(!playback.was_playing);
     }
 
     #[test]
@@ -8894,6 +9153,9 @@ mod tests {
             controller.position() < Duration::from_secs(1),
             "the incoming position starts at the crossfade boundary"
         );
+        let transitioned = persisted_queue(&dir);
+        assert_eq!(transitioned.queue.current_entry_id(), Some(entry_b));
+        assert!(transitioned.playback.expect("playback state").position_ms < 1_000);
         assert_eq!(controller.playback_history().total_plays(), 0);
         controller.shutdown();
     }
@@ -10984,6 +11246,28 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_preloaded_entry_invalidates_its_authorization() {
+        let dir = TempDir::new("queue-remove-preload");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        controller.play_track(a);
+        let current = controller.current_queue_entry_id().expect("current");
+        let preloaded = controller.preloaded_entry.expect("successor preloaded");
+        assert_eq!(preloaded.1, b);
+        controller
+            .remove_queue_entry(preloaded.0)
+            .expect("remove preloaded");
+        assert_eq!(controller.current_queue_entry_id(), Some(current));
+        assert_ne!(controller.preloaded_entry, Some(preloaded));
+        assert_eq!(controller.engine_loaded, Some(a));
+        assert_eq!(controller.engine_entry, Some(current));
+        controller.shutdown();
+    }
+
+    #[test]
     fn queue_mutations_preserve_current_and_duplicate_identity() {
         let dir = TempDir::new("queue-mutations");
         let fx = fixtures(&dir);
@@ -11079,6 +11363,9 @@ mod tests {
             "a structural edit disables auto-follow"
         );
         assert_eq!(loaded.queue.current_entry_id(), replacement);
+        let playback = loaded.playback.expect("playback state");
+        assert_eq!(playback.position_ms, 0);
+        assert!(!playback.was_playing);
         assert_eq!(
             loaded
                 .queue
@@ -11388,6 +11675,294 @@ mod tests {
             .expect("queue exists");
         assert_eq!(loaded.queue.current_entry_id(), Some(duplicate));
         controller.shutdown();
+    }
+
+    #[test]
+    fn restored_position_is_entry_bound_and_applied_once() {
+        let dir = TempDir::new("restored-position-entry");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        controller.play_track(a);
+        let entry_a = controller.current_queue_entry_id().expect("a current");
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        controller.stop();
+        controller.player.restore_paused();
+        controller.restored_position_ms = 100;
+        controller.restored_position_entry = Some(entry_a);
+        controller.play();
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(101)
+        });
+        assert!(
+            (100..200).contains(&controller.position().as_millis()),
+            "restored position was not applied to its entry: {}",
+            controller.position().as_millis()
+        );
+        assert_eq!(controller.restored_position_ms, 0);
+        assert_eq!(controller.restored_position_entry, None);
+
+        controller.stop();
+        controller.player.restore_paused();
+        controller.restored_position_ms = 100;
+        controller.restored_position_entry = Some(entry_a);
+        controller
+            .player
+            .queue_mut()
+            .set_current_entry(entry_b)
+            .expect("select b");
+        controller.play();
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_b));
+        assert!(
+            controller.position() < Duration::from_millis(5),
+            "a restored position leaked to another queue entry: pos={} restored={:?}/{} loaded={:?} entry={:?} session={:?} loaded_session={:?}",
+            controller.position().as_millis(),
+            controller.restored_position_entry,
+            controller.restored_position_ms,
+            controller.engine_loaded,
+            controller.engine_entry,
+            controller.engine_session,
+            controller.engine_loaded_session,
+        );
+        assert_eq!(controller.restored_position_entry, None);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn pause_and_selection_persist_a_coherent_entry_position_snapshot() {
+        let dir = TempDir::new("coherent-position-snapshot");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        let b = id_of(&controller, &fx.b);
+        controller.play_track(a);
+        let entry_a = controller.current_queue_entry_id().expect("a current");
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("b queued");
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+        controller.pause();
+        let paused_position = controller.position();
+        let snapshot = persisted_queue(&dir);
+        assert_eq!(snapshot.queue.current_entry_id(), Some(entry_a));
+        assert_eq!(
+            snapshot.playback.expect("playback state").position_ms,
+            paused_position.as_millis() as u64
+        );
+
+        controller.restored_position_ms = 5_000;
+        controller.restored_position_entry = Some(entry_a);
+        controller.play_track(b);
+        assert_eq!(controller.current_queue_entry_id(), Some(entry_b));
+        assert_eq!(controller.restored_position_entry, None);
+        let snapshot = persisted_queue(&dir);
+        assert_eq!(snapshot.queue.current_entry_id(), Some(entry_b));
+        assert_eq!(
+            snapshot.playback.expect("playback state").position_ms,
+            0,
+            "the previous entry's position was persisted for the new entry"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn seek_after_load_keeps_loaded_stream_facts_and_session_correlation() {
+        let dir = TempDir::new("seek-after-load-session");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        let load_session = controller.engine_session.expect("load session");
+        controller
+            .seek(Duration::from_millis(50))
+            .expect("seek immediately after load");
+        let _ = drive(&mut controller, &control, |c, _| c.stream_info.is_some());
+        assert_eq!(controller.engine_loaded, Some(a));
+        assert_eq!(controller.engine_loaded_session, Some(load_session));
+        assert!(
+            controller.stream_info.is_some(),
+            "the Loaded event was lost when Seek replaced the active session"
+        );
+        assert_eq!(
+            controller.engine_session,
+            Some(load_session + 1),
+            "seek must establish a new active command session"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn seek_then_shutdown_persists_the_latest_seek_position() {
+        let dir = TempDir::new("seek-shutdown-position");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        let entry = controller.current_queue_entry_id().expect("current entry");
+        controller.seek(Duration::from_millis(100)).expect("seek");
+        controller.shutdown();
+        let snapshot = persisted_queue(&dir);
+        assert_eq!(snapshot.queue.current_entry_id(), Some(entry));
+        let playback = snapshot.playback.expect("playback state");
+        assert!((playback.position_ms as i64 - 100).abs() <= 2);
+        assert!(playback.was_playing);
+    }
+
+    #[test]
+    fn pause_then_shutdown_preserves_the_frozen_position() {
+        let dir = TempDir::new("pause-shutdown-position");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+        controller.pause();
+        let entry = controller.current_queue_entry_id();
+        let position = controller.position();
+        controller.shutdown();
+        let snapshot = persisted_queue(&dir);
+        assert_eq!(snapshot.queue.current_entry_id(), entry);
+        let playback = snapshot.playback.expect("playback state");
+        assert_eq!(playback.position_ms, position.as_millis() as u64);
+        assert!(!playback.was_playing);
+    }
+
+    #[test]
+    fn stop_then_shutdown_persists_a_stopped_snapshot() {
+        let dir = TempDir::new("stop-shutdown-position");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+        controller.stop();
+        let entry = controller.current_queue_entry_id();
+        controller.shutdown();
+        let snapshot = persisted_queue(&dir);
+        assert_eq!(snapshot.queue.current_entry_id(), entry);
+        let playback = snapshot.playback.expect("playback state");
+        assert_eq!(playback.position_ms, 0);
+        assert!(!playback.was_playing);
+    }
+
+    #[test]
+    fn natural_completion_does_not_persist_the_track_end_as_resume_position() {
+        let dir = TempDir::new("natural-completion-position");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.player.queue_mut().clear();
+        let entry = controller.player.queue_mut().push(a);
+        controller.after_queue_change();
+        controller.play_track(a);
+        let events = drive(&mut controller, &control, |c, _| {
+            c.player_state() == PlaybackState::Stopped
+        });
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ControllerEvent::PlaybackChanged)),
+            "natural completion should be visible: {events:?}"
+        );
+        controller.shutdown();
+        let snapshot = persisted_queue(&dir);
+        assert_eq!(snapshot.queue.current_entry_id(), Some(entry));
+        let playback = snapshot.playback.expect("playback state");
+        assert_eq!(
+            playback.position_ms, 0,
+            "track-end position leaked into resume"
+        );
+        assert!(!playback.was_playing);
+    }
+
+    #[test]
+    fn shutdown_during_preload_stops_the_worker_and_persists_coherently() {
+        let dir = TempDir::new("shutdown-preload");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20) && c.preloaded_entry.is_some()
+        });
+        let entry = controller.current_queue_entry_id();
+        let position = controller.position();
+        controller.shutdown_in_place();
+        assert!(controller.is_shutdown());
+        assert!(!control.is_running(), "the backend stream was not stopped");
+        let snapshot = persisted_queue(&dir);
+        assert_eq!(snapshot.queue.current_entry_id(), entry);
+        let playback = snapshot.playback.expect("playback state");
+        assert!(
+            (playback.position_ms as i64 - position.as_millis() as i64).abs() <= 2,
+            "shutdown persisted a stale position"
+        );
+    }
+
+    #[test]
+    fn shutdown_in_place_is_idempotent_and_rejects_post_shutdown_mutations() {
+        let dir = TempDir::new("shutdown-idempotent");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(20)
+        });
+        controller.shutdown_in_place();
+        assert!(controller.is_shutdown());
+        assert!(!controller.audio_status().is_ready());
+        let queue_path = legacy_queue_file(&dir);
+        let queue_after_shutdown = fs::read(&queue_path).expect("queue after shutdown");
+        let state = controller.player_state();
+        let entry = controller.current_queue_entry_id();
+        let queue_len = controller.queue_len();
+        let position = controller.position();
+        controller.play();
+        controller.pause();
+        controller.stop();
+        controller.next();
+        controller.previous();
+        controller.play_track(a);
+        if let Some(entry) = entry {
+            assert!(controller.play_queue_entry(entry).is_err());
+        }
+        assert_eq!(controller.player_state(), state);
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        assert_eq!(controller.queue_len(), queue_len);
+        assert_eq!(controller.position(), position);
+        assert_eq!(
+            fs::read(&queue_path).expect("queue unchanged"),
+            queue_after_shutdown,
+            "post-shutdown commands persisted state"
+        );
+        assert!(controller.poll().is_empty());
+        controller.shutdown_in_place();
+        assert!(controller.is_shutdown());
     }
 
     #[test]

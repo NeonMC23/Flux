@@ -108,8 +108,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   stable shuffle cycle that does not mutate playlist order. Previous restarts
   the current track after three seconds and otherwise moves backward. Queue
   order, current entry, mode, shuffle flag and position persist for canonical
-  libraries and restore paused. The engine preloads the next queue entry and
-  performs natural handoffs inside the audio pipeline at the exact
+  libraries and restore paused. Restored and engine positions are bound to the
+  stable queue entry, so changing selection cannot carry a position onto a
+  duplicate entry or another track. Closing the GUI saves the index and a
+  coherent queue snapshot before an idempotent Controller shutdown. The engine
+  preloads the next queue entry and performs natural handoffs inside the audio
+  pipeline at the exact
   source-frame boundary, without restarting the output stream. An optional
   equal-power crossfade of 0–5000 ms can overlap the outgoing and incoming
   sources; zero retains gapless playback. Crossfade is off by default and is

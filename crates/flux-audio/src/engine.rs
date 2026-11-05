@@ -1488,6 +1488,16 @@ fn run_worker<F>(
                 } => {
                     current_session = session;
                     current_generation = shared.bump_generation();
+                    // A load is the newest position request unless a later
+                    // seek/load has already superseded it. Reset only then:
+                    // a newer Seek may have set its target immediately while
+                    // this older Load waited in the channel.
+                    if shared.requested_session.load(Ordering::Acquire) == session {
+                        shared.position_locked.store(true, Ordering::Release);
+                        shared.base_frames.store(0, Ordering::Release);
+                        shared.played_frames.store(0, Ordering::Release);
+                        shared.source_start_frame.store(0, Ordering::Release);
+                    }
                     decoder = None;
                     current = None;
                     incoming = None;
@@ -1664,6 +1674,12 @@ fn run_worker<F>(
                     } else {
                         target_output_frames
                     };
+                    // A newer load/seek may have arrived while the decoder
+                    // was opening and skipping. Let that request own the
+                    // position instead of publishing this stale target.
+                    if session != shared.requested_session.load(Ordering::Acquire) {
+                        continue 'worker;
+                    }
                     shared
                         .base_frames
                         .store(actual_target_frames, Ordering::Release);
@@ -5341,6 +5357,40 @@ mod tests {
             "an older queued seek overwrote the newest position: {:?}",
             engine.position()
         );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn load_supersedes_an_in_flight_seek_position() {
+        let dir = TempDir::new("load-after-seek");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.4);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.load(TrackId::new(1), a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.play();
+        start_playing(&engine, &control);
+        control.drain_frames(4_096);
+
+        let _ = engine.seek(Duration::from_millis(100));
+        engine.load(TrackId::new(2), b);
+        let events = collect_events_until(&engine, |event| {
+            matches!(
+                event,
+                EngineEvent::Loaded { id, .. } if *id == TrackId::new(2)
+            )
+        });
+        assert!(matches!(
+            events.last(),
+            Some(EngineEvent::Loaded { id, .. }) if *id == TrackId::new(2)
+        ));
+        assert!(
+            engine.position() < Duration::from_millis(5),
+            "an older seek position survived the newer load: {:?}",
+            engine.position()
+        );
+        control.drain_frames(512);
+        assert!(engine.position() < Duration::from_millis(5));
         engine.shutdown();
     }
 

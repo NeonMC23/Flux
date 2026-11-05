@@ -1913,6 +1913,7 @@ struct FluxReady {
     show_setup: bool,
     queue_visible: bool,
     window_width: f32,
+    closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2231,6 +2232,7 @@ impl FluxReady {
             show_setup,
             queue_visible: true,
             window_width: 1_180.0,
+            closed: false,
         }
     }
 
@@ -3351,6 +3353,9 @@ impl FluxReady {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.closed {
+            return Task::none();
+        }
         match message {
             Message::LibInputChanged(value) => self.lib_input = value,
             Message::EditTrack(id) => self.start_track_editor(id),
@@ -5566,7 +5571,9 @@ impl FluxReady {
                 self.window_width = width;
             }
             Message::WindowCloseRequested(id) => {
+                self.closed = true;
                 let _ = self.controller.save_index();
+                self.controller.shutdown_in_place();
                 return window::close(id);
             }
         }
@@ -13177,6 +13184,7 @@ mod tests {
             show_setup: false,
             queue_visible: true,
             window_width: 1_180.0,
+            closed: false,
         }
     }
 
@@ -13191,6 +13199,26 @@ mod tests {
 
     fn send(gui: &mut FluxReady, message: Message) {
         let _task = gui.update(message);
+    }
+
+    #[test]
+    fn window_close_shuts_down_and_ignores_later_messages() {
+        let dir = TempDir::new("gui-close-shutdown");
+        let mut gui = gui(&dir);
+        let state = gui.controller.player_state();
+        let queue_len = gui.controller.queue_len();
+        let current = gui.controller.current_queue_entry_id();
+        let _ = gui.update(Message::WindowCloseRequested(iced::window::Id::unique()));
+        assert!(gui.closed);
+        assert!(gui.controller.is_shutdown());
+
+        send(&mut gui, Message::TogglePlayPause);
+        send(&mut gui, Message::Stop);
+        send(&mut gui, Message::Next);
+        assert_eq!(gui.controller.player_state(), state);
+        assert_eq!(gui.controller.queue_len(), queue_len);
+        assert_eq!(gui.controller.current_queue_entry_id(), current);
+        assert!(gui.controller.poll().is_empty());
     }
 
     #[test]
