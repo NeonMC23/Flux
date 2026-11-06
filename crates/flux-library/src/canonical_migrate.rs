@@ -417,18 +417,17 @@ pub fn plan_portable_v3(
                 }
             }
         };
-        let album_title = effective
+        let album_id = effective
             .album
             .as_deref()
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or("Unknown Album")
-            .to_owned();
-        let album_id = *albums
-            .entry((owner, album_title.clone()))
-            .or_insert_with(|| {
-                let id = AlbumId::new(next_album);
-                next_album += 1;
-                id
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(|title| {
+                *albums.entry((owner, title.to_owned())).or_insert_with(|| {
+                    let id = AlbumId::new(next_album);
+                    next_album += 1;
+                    id
+                })
             });
         let rel = stored.path();
         let Some(os_rel) = rel.to_os_path() else {
@@ -487,13 +486,15 @@ pub fn plan_portable_v3(
                 continue;
             }
         }
-        let album_order = album_orders.entry(album_id).or_default();
-        album_order.push((
-            effective.disc_number,
-            effective.track_number,
-            stored.id().get(),
-            stored.id(),
-        ));
+        if let Some(album_id) = album_id {
+            let album_order = album_orders.entry(album_id).or_default();
+            album_order.push((
+                effective.disc_number,
+                effective.track_number,
+                stored.id().get(),
+                stored.id(),
+            ));
+        }
         seed.tracks.push(CanonicalSeedTrack {
             track: CanonicalTrack {
                 id: stored.id(),
@@ -672,24 +673,27 @@ pub fn plan_legacy_index(
             });
             id
         });
-        let album_title = record
+        let album_id = record
             .album
             .as_deref()
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or("Unknown Album")
-            .to_owned();
-        let album_id = *albums.entry((owner, album_title)).or_insert_with(|| {
-            let id = AlbumId::new(next_album);
-            next_album += 1;
-            id
-        });
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(|title| {
+                *albums.entry((owner, title.to_owned())).or_insert_with(|| {
+                    let id = AlbumId::new(next_album);
+                    next_album += 1;
+                    id
+                })
+            });
         let track_id = TrackId::new(record.id);
-        album_orders.entry(album_id).or_default().push((
-            record.disc_number,
-            record.track_number,
-            record.id,
-            track_id,
-        ));
+        if let Some(album_id) = album_id {
+            album_orders.entry(album_id).or_default().push((
+                record.disc_number,
+                record.track_number,
+                record.id,
+                track_id,
+            ));
+        }
         seed.tracks.push(CanonicalSeedTrack {
             track: CanonicalTrack {
                 id: track_id,
@@ -911,11 +915,13 @@ mod tests {
         let track = library.track(TrackId::new(1)).expect("track ID preserved");
         assert_eq!(track.title, "User Title");
         assert_eq!(track.owner_artist_id, ArtistId::new(1));
-        assert_eq!(track.album_id, crate::canonical::AlbumId::new(1));
+        assert_eq!(track.album_id, Some(crate::canonical::AlbumId::new(1)));
         assert_eq!(track.track_number, Some(3));
         assert_eq!(track.disc_number, Some(1));
         assert_eq!(track.duration_ms, Some(201_000));
-        let album = library.album(track.album_id).expect("album");
+        let album = library
+            .album(track.album_id.expect("album"))
+            .expect("album");
         assert_eq!(album.title, "Stored Album");
         assert_eq!(album.release_type, ReleaseType::Album);
         assert_eq!(album.track_order, vec![TrackId::new(1)]);
@@ -1080,7 +1086,9 @@ mod legacy_tests {
             Some("Legacy Artist")
         );
         assert_eq!(
-            library.album(track.album_id).map(|a| a.title.as_str()),
+            library
+                .album(track.album_id.expect("album"))
+                .map(|a| a.title.as_str()),
             Some("Legacy Album")
         );
         assert_eq!(fs::read(&index).expect("index after"), index_before);

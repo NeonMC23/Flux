@@ -22,9 +22,13 @@ and the real-time oscilloscope continue to use the same engine. Managed album
 and artist artwork plus optional per-Track artwork overrides are decoded and
 displayed throughout the library. Artists and Albums are first-class editable
 entities with detail pages, relationships and navigation to their Tracks.
-Dedicated canonical playlist management and an integrated
-lyrics library/editor/karaoke system are implemented; rating UI remains
-incomplete and is called out below rather than presented as finished.
+Album membership is optional: standalone Tracks, singles and incomplete imports
+remain fully functional without a placeholder Album. Import review supports
+multi-candidate selection, shared Artist/Album assignment and shared Album
+artwork while preserving per-Track overrides. Dedicated canonical playlist
+management and an integrated lyrics library/editor/karaoke system are
+implemented; rating UI remains incomplete and is called out below rather than
+presented as finished.
 
 ## Canonical storage
 
@@ -34,8 +38,10 @@ A library owns its managed audio, stable artist/album/track IDs, per-entity
 `.flux` records, managed lyrics/cover primitives, playlists, ratings and
 transaction journals. Every persisted managed path is relative to the library
 root. `catalog.flux` is authoritative for identity/ownership/paths and is
-published last; per-entity files are validated against it. Audio tags are not a
-metadata source and are never rewritten.
+published last; per-entity files are validated against it. A Track's Album
+reference is optional: Album members live under the Album directory, while
+standalone Tracks use an owner Artist `standalone/tracks/` container. Audio tags
+are not a metadata source and are never rewritten.
 
 Older formats remain reachable only through the explicit migration planner:
 the legacy `library-index.json` and portable schema-v3 `.flux` catalogue are
@@ -125,9 +131,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   credited Albums plus related Tracks, and navigates directly to those entities.
   Album detail edits title/release metadata and cover artwork, shows owner and
   ordered membership, and supports reorder, fixed-target import, transfer and
-  safe empty deletion. Track editing can move a Track to another Album owned by
-  the same Artist, correct ordered credits/owner and assign or remove a managed
-  Track artwork override; removing the override restores Album artwork. The
+  safe empty deletion. The Albums view includes a **Standalone tracks** group for
+  Tracks with no Album. Track editing can add a standalone Track to an Album,
+  move a member between Albums owned by the same Artist, convert a member to
+  standalone while retaining the Track and its empty source Album, correct
+  ordered credits/owner and assign or remove a managed Track artwork override;
+  removing the override restores Album artwork or the standalone fallback. The
   queue panel supports stable
   per-entry duplicate disambiguation, drag/keyboard reordering, removal and
   direct entry playback; the seek bar moves the decoder. Playback modes cycle
@@ -210,10 +219,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   inaccessible paths are labelled separately; the TUI never rewrites them or
   treats an inaccessible path as missing.
   Track moves, managed-audio repair/replacement, artwork repair and
-  single-track deletion require the GUI review workflow. `D` shows the selected
-  track's album ownership; `E` lists every catalogue album, including empty
-  albums, with owner, track count and cover availability. `T` refuses ownership
-  transfer and destructive artist deletion, directing the user to the GUI.
+  single-track deletion require the GUI review workflow. Rows mark standalone
+  Tracks. `D` shows the selected Track's Album ownership or standalone state;
+  `E` lists every catalogue album, including empty albums, plus the standalone
+  Track group, with owner, order, cover and artwork/lyrics markers. `T` refuses
+  ownership transfer and destructive artist deletion, directing the user to the
+  GUI.
   `U` preserving a protected index and `A` acknowledging portable recovery both
   require an explicit `y` confirmation. The terminal is always restored on exit.
 
@@ -227,14 +238,21 @@ player remains visible:
 - drop audio files or folders (Iced/winit X11/Windows/macOS; Wayland file-drop
   is not supported by the toolkit);
 - infer provisional artist, album, title, track number and disc number only
-  from filenames and directory names — no embedded tag is read;
+  from filenames and directory names — no embedded tag is read; a missing Album
+  remains a standalone Track and never creates an “Unknown Album” placeholder;
 - edit ordered credits, add existing or named artists, remove/reorder credits,
   and choose the physical owner from the credits; the first credit is the
   default owner;
 - select an existing stable Artist and an existing Album owned by that Artist,
-  or create a new Album by title; ambiguous/fuzzy names are never merged;
+  create a new Album by title, or leave Album empty for a standalone Track;
+  ambiguous/fuzzy names are never merged;
+- check multiple candidates and apply one existing Artist or shared new Artist
+  name, one Album title (or standalone state), and one Album artwork asset to the
+  checked set; per-candidate Artist/Album edits override the bulk value
+  afterward;
 - attach a validated managed Album cover, a Track-specific artwork override, and
-  an LRC/TXT lyrics file to individual candidates before commit;
+  an LRC/TXT lyrics file to individual candidates before commit; Album artwork
+  never overwrites individual Track artwork overrides;
 - review and edit every candidate, with incomplete metadata visibly marked and
   inherited Album artwork distinguished from Track overrides;
 - validate each candidate by opening its decoder before review and again while
@@ -259,9 +277,9 @@ one Album rejects the batch with complete-old state; no artist, Album, Track or
 managed asset is left partially published. Managed covers are decoded
 asynchronously for display; no tag artwork extraction occurs. The TUI uses the
 same filename inference and copy-only application path via its quick-import
-keys; rich review with artwork/lyrics attachment is GUI-only. Per-candidate
-attachment is implemented; a one-action “apply this cover/lyrics to all selected
-candidates” batch helper is not.
+keys; rich review with artwork/lyrics attachment is GUI-only. Bulk Artist,
+Album/standalone assignment and shared Album artwork are explicit actions on
+checked candidates; lyrics and Track artwork remain per-candidate overrides.
 
 Migration is explicit: *Library setup* accepts a legacy index file or portable
 schema-v3 folder, presents a read-only inventory and disk estimate, builds and
@@ -427,15 +445,16 @@ accounts, installers and updaters remain future work. External reference
 imports are intentionally rejected in canonical mode. Rating storage APIs exist
 but are not yet exposed as a screen.
 
-M2 entity limitations are deliberate: every Track must belong to an Album, so
-the GUI supports moving a Track to another Album but not detaching it into a
-no-Album state. Album owner transfer is the authoritative way to change the
-Album's Artist association; cross-owner Track moves use the existing reviewed
-ownership-transfer workflow. The import manager attaches artwork/lyrics per
-candidate rather than applying one asset to a multi-selection. The TUI exposes
+Optional Album membership is canonical, but Album owner transfer and Track
+ownership transfer still require an Album destination; standalone ownership
+changes therefore need an Album first. Cross-owner Track moves use the reviewed
+ownership-transfer workflow. The import manager applies shared Artist/Album and
+Album artwork to checked candidates, while Track artwork and lyrics remain
+per-candidate; release-type selection, a featuring boolean and one-action
+metadata templates beyond that scope remain future work. The TUI exposes
 inspection and safe rename/create operations, not Album/Track artwork pickers,
-rich import review or ownership transfer. Lyrics must be valid UTF-8 LRC/TXT;
-embedded audio tags are neither read nor written.
+rich import review, membership changes or ownership transfer. Lyrics must be
+valid UTF-8 LRC/TXT; embedded audio tags are neither read nor written.
 Native dialogs and file-drop are implemented; cross-platform runtime
 verification remains limited to Linux/X11. Native picker parsing preserves
 leading/trailing spaces, Unicode, and non-UTF-8 Unix names; Windows PowerShell

@@ -1014,7 +1014,7 @@ fn display_artist(track: &Track) -> String {
 }
 
 fn display_album(track: &Track) -> String {
-    nonempty(track.album()).unwrap_or_else(|| "Unknown album".to_owned())
+    nonempty(track.album()).unwrap_or_else(|| "Standalone tracks".to_owned())
 }
 
 type HistoryEntityTotals = (Vec<(String, u64)>, Vec<(String, u64)>);
@@ -1939,6 +1939,11 @@ struct ImportManager {
     edit_artwork: String,
     edit_album_artwork: String,
     edit_lyrics_path: String,
+    checked: HashSet<usize>,
+    bulk_artist: Option<ArtistChoice>,
+    bulk_new_artist_name: String,
+    bulk_album_title: String,
+    bulk_album_artwork_path: String,
     asset_error: Option<String>,
     number_error: Option<String>,
 }
@@ -1973,6 +1978,11 @@ impl ImportManager {
             edit_artwork: String::new(),
             edit_album_artwork: String::new(),
             edit_lyrics_path: String::new(),
+            checked: HashSet::new(),
+            bulk_artist: None,
+            bulk_new_artist_name: String::new(),
+            bulk_album_title: String::new(),
+            bulk_album_artwork_path: String::new(),
             asset_error: None,
             number_error: None,
         }
@@ -2004,8 +2014,27 @@ impl ImportManager {
         self.progress = Arc::new(Mutex::new(ImportProgress::default()));
         self.progress_view = ImportProgress::default();
         self.cancel = Arc::new(AtomicBool::new(false));
+        self.checked.clear();
+        self.bulk_artist = None;
+        self.bulk_new_artist_name.clear();
+        self.bulk_album_title.clear();
+        self.bulk_album_artwork_path.clear();
         self.asset_error = None;
         self.number_error = None;
+    }
+
+    fn checked_indices(&self) -> Vec<usize> {
+        let Some(plan) = self.plan.as_ref() else {
+            return Vec::new();
+        };
+        let mut indices = self
+            .checked
+            .iter()
+            .copied()
+            .filter(|index| *index < plan.candidates.len())
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices
     }
 
     fn select_candidate(&mut self, index: usize) {
@@ -2155,6 +2184,7 @@ enum Message {
     EditorMoveDestination(Option<AlbumChoice>),
     EditorMovePositionChanged(String),
     EditorPlanMove,
+    EditorPlanDetach,
     EditorConfirmMove,
     ArtistSelected(Option<ArtistChoice>),
     ArtistNameChanged(String),
@@ -2233,6 +2263,21 @@ enum Message {
     ImportPlanReady(u64, Box<ImportPlan>),
     ImportPrepared(u64, Box<PreparedImport>),
     ImportSelect(usize),
+    ImportToggleChecked(usize),
+    ImportCheckAll,
+    ImportClearChecked,
+    ImportBulkArtistPicked(Option<ArtistChoice>),
+    ImportBulkApplyArtist,
+    ImportBulkNewArtistChanged(String),
+    ImportBulkApplyNewArtist,
+    ImportBulkAlbumChanged(String),
+    ImportBulkApplyAlbum,
+    ImportBulkMakeStandalone,
+    ImportBulkAlbumArtworkChanged(String),
+    ImportBulkAlbumArtworkPicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    ImportBulkAlbumArtworkChoose,
+    ImportBulkApplyAlbumArtwork,
+    ImportBulkClearAlbumArtwork,
     ImportDecisionChanged(usize, ImportDecision),
     ImportBulkSkip,
     ImportBulkImport,
@@ -2407,6 +2452,7 @@ impl Message {
             | Self::TrackArtworkPicked(session, _)
             | Self::ImportArtworkPicked(session, _)
             | Self::ImportAlbumArtworkPicked(session, _)
+            | Self::ImportBulkAlbumArtworkPicked(session, _)
             | Self::ArtworkLoaded(session, _, _)
             | Self::ImportNativeFilesPicked(session, _)
             | Self::ImportNativeFolderPicked(session, _)
@@ -2426,6 +2472,7 @@ impl Message {
             | Self::TrackArtworkPicked(current, _)
             | Self::ImportArtworkPicked(current, _)
             | Self::ImportAlbumArtworkPicked(current, _)
+            | Self::ImportBulkAlbumArtworkPicked(current, _)
             | Self::ArtworkLoaded(current, _, _)
             | Self::ImportNativeFilesPicked(current, _)
             | Self::ImportNativeFolderPicked(current, _)
@@ -3152,8 +3199,12 @@ impl FluxReady {
                 self.invalidate_search_cache();
                 self.lifecycle_msg = Some(if report.cleanup_errors.is_empty() {
                     format!(
-                        "Deleted track {} from the library; album and artist retained.",
-                        report.track_id
+                        "Deleted track {} from the library; {} and artist retained.",
+                        report.track_id,
+                        report.album_id.map_or_else(
+                            || "standalone state".to_owned(),
+                            |album| format!("album {album}")
+                        )
                     )
                 } else {
                     format!(
@@ -3193,9 +3244,34 @@ impl FluxReady {
                 return;
             }
         };
-        match self.controller.plan_track_move(id, destination, index) {
+        match self
+            .controller
+            .plan_track_move(id, Some(destination), index)
+        {
             Ok(plan) => {
                 if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_plan = Some(plan);
+                    editor.error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_plan = None;
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn plan_editor_detach(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let id = editor.id;
+        match self.controller.plan_track_move(id, None, 0) {
+            Ok(plan) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.move_destination = None;
                     editor.move_plan = Some(plan);
                     editor.error = None;
                 }
@@ -3220,10 +3296,14 @@ impl FluxReady {
             Ok(report) => {
                 self.track_editor = None;
                 self.lifecycle_msg = Some(format!(
-                    "Moved track {} from album {} to album {} at position {}.",
+                    "Moved track {} from {} to {} at position {}.",
                     report.track_id,
-                    report.from_album_id,
-                    report.to_album_id,
+                    report
+                        .from_album_id
+                        .map_or_else(|| "Standalone".to_owned(), |album| format!("album {album}")),
+                    report
+                        .to_album_id
+                        .map_or_else(|| "Standalone".to_owned(), |album| format!("album {album}")),
                     report.insertion_index + 1
                 ));
             }
@@ -3973,6 +4053,7 @@ impl FluxReady {
                 }
             }
             Message::EditorPlanMove => self.plan_editor_move(),
+            Message::EditorPlanDetach => self.plan_editor_detach(),
             Message::EditorConfirmMove => self.confirm_editor_move(),
             Message::ArtistSelected(choice) => {
                 self.artist_selected = choice.as_ref().and_then(|choice| choice.id);
@@ -4884,6 +4965,251 @@ impl FluxReady {
                     manager.select_candidate(index);
                 }
             }
+            Message::ImportToggleChecked(index) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager
+                        .plan
+                        .as_ref()
+                        .is_some_and(|plan| index < plan.candidates.len())
+                    && !manager.checked.remove(&index)
+                {
+                    manager.checked.insert(index);
+                }
+            }
+            Message::ImportCheckAll => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(plan) = manager.plan.as_ref()
+                {
+                    manager.checked = (0..plan.candidates.len()).collect();
+                }
+            }
+            Message::ImportClearChecked => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.checked.clear();
+                }
+            }
+            Message::ImportBulkArtistPicked(choice) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.bulk_artist = choice;
+                }
+            }
+            Message::ImportBulkApplyArtist => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let Some(choice) = manager.bulk_artist.clone() else {
+                    manager.asset_error = Some("Select an existing Artist to apply.".to_owned());
+                    return Task::none();
+                };
+                let Some(artist_id) = choice.id else {
+                    manager.asset_error = Some(
+                        "Bulk Artist assignment requires a stable existing Artist.".to_owned(),
+                    );
+                    return Task::none();
+                };
+                let name = self
+                    .controller
+                    .artist(artist_id)
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or(choice.label);
+                let indices = manager.checked_indices();
+                if indices.is_empty() {
+                    manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                if manager.plan.as_ref().is_some_and(|plan| {
+                    indices.iter().any(|index| {
+                        plan.candidates.get(*index).is_some_and(|candidate| {
+                            candidate.decision() == ImportDecision::UpdateExisting
+                        })
+                    })
+                }) {
+                    manager.asset_error = Some(
+                        "Bulk Artist assignment cannot change an existing Track's physical owner; update that candidate individually or skip it."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut() {
+                    plan.apply_artist_to(&indices, artist_id, &name);
+                }
+                manager.asset_error = None;
+                if let Some(selected) = manager.selected {
+                    manager.select_candidate(selected);
+                }
+            }
+            Message::ImportBulkNewArtistChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.bulk_new_artist_name = value;
+                }
+            }
+            Message::ImportBulkApplyNewArtist => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let name = manager.bulk_new_artist_name.trim().to_owned();
+                if name.is_empty() {
+                    manager.asset_error = Some("Enter an Artist name to apply.".to_owned());
+                    return Task::none();
+                }
+                let indices = manager.checked_indices();
+                if indices.is_empty() {
+                    manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                if manager.plan.as_ref().is_some_and(|plan| {
+                    indices.iter().any(|index| {
+                        plan.candidates.get(*index).is_some_and(|candidate| {
+                            candidate.decision() == ImportDecision::UpdateExisting
+                        })
+                    })
+                }) {
+                    manager.asset_error = Some(
+                        "Bulk Artist assignment cannot change an existing Track's physical owner; update that candidate individually or skip it."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut() {
+                    plan.apply_artist_name_to(&indices, &name);
+                }
+                manager.asset_error = None;
+                if let Some(selected) = manager.selected {
+                    manager.select_candidate(selected);
+                }
+            }
+            Message::ImportBulkAlbumChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.bulk_album_title = value;
+                }
+            }
+            Message::ImportBulkApplyAlbum => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let indices = manager.checked_indices();
+                if indices.is_empty() {
+                    manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                let title = manager.bulk_album_title.trim().to_owned();
+                if let Some(plan) = manager.plan.as_mut() {
+                    plan.apply_album_to(&indices, (!title.is_empty()).then_some(title.as_str()));
+                }
+                manager.asset_error = None;
+                if let Some(selected) = manager.selected {
+                    manager.select_candidate(selected);
+                }
+            }
+            Message::ImportBulkMakeStandalone => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let indices = manager.checked_indices();
+                if indices.is_empty() {
+                    manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                if manager.plan.as_ref().is_some_and(|plan| {
+                    indices.iter().any(|index| {
+                        plan.candidates.get(*index).is_some_and(|candidate| {
+                            candidate.decision() == ImportDecision::UpdateExisting
+                        })
+                    })
+                }) {
+                    manager.asset_error = Some(
+                        "Bulk Album membership does not rewrite existing Tracks. Use the Track editor move workflow for those candidates."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                manager.bulk_album_title.clear();
+                if let Some(plan) = manager.plan.as_mut() {
+                    plan.apply_album_to(&indices, None);
+                }
+                manager.asset_error = None;
+                if let Some(selected) = manager.selected {
+                    manager.select_candidate(selected);
+                }
+            }
+            Message::ImportBulkAlbumArtworkChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.bulk_album_artwork_path = value;
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportBulkAlbumArtworkChoose => {
+                let start = self.controller.canonical_root().map(Path::to_path_buf);
+                let session = self.controller.library_session();
+                return Task::perform(
+                    async move { flux_platform::pick_image_files_in(start.as_deref()) },
+                    move |result| Message::ImportBulkAlbumArtworkPicked(session, result),
+                );
+            }
+            Message::ImportBulkAlbumArtworkPicked(_, result) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    match result {
+                        Ok(Some(paths)) => {
+                            if let Some(path) = paths.first() {
+                                manager.bulk_album_artwork_path = path.display().to_string();
+                                manager.asset_error = None;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkApplyAlbumArtwork => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let indices = manager.checked_indices();
+                if indices.is_empty() {
+                    manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                let path = PathBuf::from(manager.bulk_album_artwork_path.trim());
+                if path.as_os_str().is_empty() {
+                    manager.asset_error = Some("Choose an Album artwork file.".to_owned());
+                    return Task::none();
+                }
+                if let Err(error) = decode_artwork(&artwork_key(
+                    ArtworkOwner::Album(AlbumId::new(0)),
+                    path.clone(),
+                )) {
+                    manager.asset_error = Some(format!("Album artwork rejected: {error}"));
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut() {
+                    match plan.apply_album_artwork_from_path(&indices, &path) {
+                        Ok(()) => {
+                            manager.asset_error = None;
+                            if let Some(selected) = manager.selected {
+                                manager.select_candidate(selected);
+                            }
+                        }
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkClearAlbumArtwork => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    let indices = manager.checked_indices();
+                    if indices.is_empty() {
+                        manager.asset_error =
+                            Some("Select one or more candidates first.".to_owned());
+                    } else {
+                        if let Some(plan) = manager.plan.as_mut() {
+                            plan.clear_album_artwork_for(&indices);
+                        }
+                        manager.asset_error = None;
+                        if let Some(selected) = manager.selected {
+                            manager.select_candidate(selected);
+                        }
+                    }
+                }
+            }
             Message::ImportDecisionChanged(index, decision) => {
                 if let Some(manager) = self.import_manager.as_mut()
                     && manager.stage == ImportUiStage::Review
@@ -4954,6 +5280,10 @@ impl FluxReady {
                         && let Some(candidate) = plan.candidates.get_mut(index)
                     {
                         candidate.set_album(nonempty_string(&manager.edit_album));
+                        if candidate.album().is_none() {
+                            candidate.clear_album_artwork();
+                            manager.edit_album_artwork.clear();
+                        }
                     }
                 }
             }
@@ -5218,6 +5548,18 @@ impl FluxReady {
                 let path = PathBuf::from(manager.edit_album_artwork.trim());
                 if path.as_os_str().is_empty() {
                     manager.asset_error = Some("Choose an Album artwork file.".to_owned());
+                    return Task::none();
+                }
+                if manager
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.candidates.get(index))
+                    .is_some_and(|candidate| candidate.album().is_none())
+                {
+                    manager.asset_error = Some(
+                        "Attach the candidate to an Album before applying Album artwork."
+                            .to_owned(),
+                    );
                     return Task::none();
                 }
                 let album = manager.plan.as_ref().map_or(AlbumId::new(0), |plan| {
@@ -7981,6 +8323,30 @@ impl FluxReady {
         );
         body = body.push(
             row![
+                text(format!(
+                    "{} candidate(s) checked for bulk actions",
+                    manager.checked.len()
+                ))
+                .size(9)
+                .color(if manager.checked.is_empty() {
+                    MUTED
+                } else {
+                    ACCENT
+                }),
+                button(text("Check all").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::ImportCheckAll),
+                button(text("Clear checks").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::ImportClearChecked),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+        body = body.push(
+            row![
                 text("COPY-ONLY · managed canonical library")
                     .size(9)
                     .color(ACCENT),
@@ -8127,12 +8493,27 @@ impl FluxReady {
         if !flux_app::is_track_playable(candidate.source_track()) {
             title = title.push(text("indexed, not playable").size(8).color(MUTED));
         }
-        button(title)
-            .width(Length::Fill)
-            .padding([7, 8])
-            .style(track_row_style(selected))
-            .on_press(Message::ImportSelect(index))
-            .into()
+        row![
+            button(
+                text(if manager.checked.contains(&index) {
+                    "☑"
+                } else {
+                    "☐"
+                })
+                .size(13)
+            )
+            .style(ghost_style)
+            .padding([5, 6])
+            .on_press(Message::ImportToggleChecked(index)),
+            button(title)
+                .width(Length::Fill)
+                .padding([7, 8])
+                .style(track_row_style(selected))
+                .on_press(Message::ImportSelect(index)),
+        ]
+        .spacing(3)
+        .align_y(Alignment::Center)
+        .into()
     }
 
     fn import_candidate_details<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
@@ -8378,6 +8759,85 @@ impl FluxReady {
         }
 
         let editable = manager.stage == ImportUiStage::Review;
+        let bulk_artists = self.artist_choices();
+        let mut bulk = column![
+            text(format!(
+                "BULK APPLY · {} checked",
+                manager.checked.len()
+            ))
+            .size(9)
+            .color(ACCENT),
+            text("Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; Track artwork overrides and lyrics remain individual.")
+                .size(8)
+                .color(MUTED),
+            row![
+                pick_list(bulk_artists, manager.bulk_artist.clone(), |choice| {
+                    Message::ImportBulkArtistPicked(Some(choice))
+                })
+                .placeholder("Existing Artist for checked candidates…")
+                .text_size(10)
+                .padding([5, 7])
+                .width(Length::Fill),
+                button(text("Apply Artist").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkApplyArtist),
+            ]
+            .spacing(6),
+            row![
+                text_input("Or new Artist name for checked candidates…", &manager.bulk_new_artist_name)
+                    .on_input(Message::ImportBulkNewArtistChanged)
+                    .on_submit(Message::ImportBulkApplyNewArtist)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Apply new name").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkApplyNewArtist),
+            ]
+            .spacing(6),
+            row![
+                text_input("Album title for checked candidates…", &manager.bulk_album_title)
+                    .on_input(Message::ImportBulkAlbumChanged)
+                    .on_submit(Message::ImportBulkApplyAlbum)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Apply Album").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkApplyAlbum),
+                button(text("Make standalone").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkMakeStandalone),
+            ]
+            .spacing(6),
+            row![
+                text_input("Album artwork path…", &manager.bulk_album_artwork_path)
+                    .on_input(Message::ImportBulkAlbumArtworkChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Choose…").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkAlbumArtworkChoose),
+                button(text("Apply artwork").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkApplyAlbumArtwork),
+                button(text("Clear artwork").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkClearAlbumArtwork),
+            ]
+            .spacing(6),
+        ]
+        .spacing(5)
+        .padding(8);
+        if let Some(error) = &manager.asset_error {
+            bulk = bulk.push(text(error).size(9).color(DANGER));
+        }
+        body = body.push(container(bulk).style(card_style));
         body = body.push(text("TITLE").size(8).color(MUTED));
         body = body.push(
             text_input("Title", &manager.edit_title)
@@ -8517,12 +8977,22 @@ impl FluxReady {
                 .color(MUTED),
             );
         } else {
-            body = body.push(text("ALBUM").size(8).color(MUTED));
+            body = body.push(text("ALBUM (OPTIONAL)").size(8).color(MUTED));
             body = body.push(
-                text_input("Album", &manager.edit_album)
+                row![
+                    text_input(
+                        "Album title, or leave empty for standalone…",
+                        &manager.edit_album
+                    )
                     .on_input(Message::ImportAlbumChanged)
                     .style(input_style)
                     .width(Length::Fill),
+                    button(text("Make standalone").size(9))
+                        .style(ghost_style)
+                        .padding([5, 7])
+                        .on_press(Message::ImportAlbumChanged(String::new())),
+                ]
+                .spacing(6),
             );
             let album_choices = self.import_album_choices(candidate);
             if candidate.artist_id().is_some() {
@@ -8548,6 +9018,35 @@ impl FluxReady {
                     text("Assign a stable Artist above before selecting an existing Album. Typing a title creates a new Album only when no exact match exists for that owner.")
                         .size(8)
                         .color(MUTED),
+                );
+            }
+            if let (Some(owner), Some(title)) = (candidate.artist_id(), candidate.album()) {
+                if let Some(existing) = self
+                    .controller
+                    .albums()
+                    .into_iter()
+                    .find(|album| album.owner_artist_id == owner && album.title == title)
+                {
+                    body = body.push(
+                        text(format!(
+                            "Reuses existing AlbumId {} · owner {}",
+                            existing.id, existing.title
+                        ))
+                        .size(8)
+                        .color(SUCCESS),
+                    );
+                } else {
+                    body = body.push(
+                        text("Creates a new Album inside the import transaction.")
+                            .size(8)
+                            .color(ACCENT),
+                    );
+                }
+            } else if candidate.album().is_none() {
+                body = body.push(
+                    text("Standalone Track · no Album will be created or referenced.")
+                        .size(8)
+                        .color(ACCENT),
                 );
             }
             if candidate.decision() == ImportDecision::UpdateExisting {
@@ -9880,12 +10379,20 @@ impl FluxReady {
                 .style(input_style)
                 .width(Length::Fill),
         );
-        body = body.push(
-            text_input("Album…", &editor.album)
-                .on_input(Message::EditorAlbumChanged)
-                .style(input_style)
-                .width(Length::Fill),
-        );
+        if self.controller.track_album_id(editor.id).is_some() {
+            body = body.push(
+                text_input("Album…", &editor.album)
+                    .on_input(Message::EditorAlbumChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+            );
+        } else {
+            body = body.push(
+                text("Standalone Track · no Album membership. Use Album membership below to add it to an Album.")
+                    .size(9)
+                    .color(ACCENT),
+            );
+        }
         body = body.push(
             row![
                 text_input("Track number", &editor.track_number)
@@ -10108,9 +10615,12 @@ impl FluxReady {
         if let Some(plan) = &editor.deletion_plan {
             body = body.push(
                 text(format!(
-                    "REVIEWED DELETE: {} · album {} retained · {} · {}{}",
+                    "REVIEWED DELETE: {} · {} retained · {} · {}{}",
                     plan.title(),
-                    plan.album_id(),
+                    plan.album_id().map_or_else(
+                        || "standalone state".to_owned(),
+                        |album| format!("album {album}")
+                    ),
                     if plan.audio_present() {
                         "managed audio will be deleted after the catalogue commit"
                     } else {
@@ -10151,15 +10661,23 @@ impl FluxReady {
                     .on_press(Message::EditorPlanDeletion),
             );
         }
-        body = body.push(text("MOVE TO ANOTHER ALBUM").size(9).color(ACCENT));
+        body = body.push(text("ALBUM MEMBERSHIP").size(9).color(ACCENT));
         body = body.push(
-            text("Save metadata changes before confirming a move. The source album remains even if it becomes empty.")
+            text("Save metadata changes before changing membership. The source album remains even if it becomes empty. Track artwork and lyrics follow the TrackId.")
                 .size(9)
                 .color(MUTED),
         );
+        if self.controller.track_album_id(editor.id).is_some() {
+            body = body.push(
+                button(text("Review conversion to standalone Track…").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::EditorPlanDetach),
+            );
+        }
         if move_choices.is_empty() {
             body = body.push(
-                text("No other album is owned by this track's physical owner. Ownership-transfer is a separate operation.")
+                text("No Album owned by this Track's physical owner can be selected. Ownership transfer is a separate operation.")
                     .size(9)
                     .color(MUTED),
             );
@@ -10197,15 +10715,20 @@ impl FluxReady {
             if let Some(plan) = &editor.move_plan {
                 body = body.push(
                     text(format!(
-                        "REVIEWED: {} → {} at position {} · final order {} · source album remains even if empty",
-                        plan.from_album_title,
-                        plan.to_album_title,
+                        "REVIEWED: {} → {} at position {} · final order {} · {}",
+                        plan.from_album_title.as_deref().unwrap_or("Standalone"),
+                        plan.to_album_title.as_deref().unwrap_or("Standalone"),
                         plan.insertion_index + 1,
                         plan.destination_order
                             .iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join(", "),
+                        if plan.to_album_id.is_some() {
+                            "source album remains even if empty"
+                        } else {
+                            "source album becomes empty and is retained; Album artwork inheritance stops"
+                        }
                     ))
                     .size(9)
                     .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
@@ -10307,7 +10830,7 @@ impl FluxReady {
 
     fn groups_for(&self, view: LibraryView) -> Vec<(String, usize)> {
         if view == LibraryView::Albums {
-            return self
+            let mut groups = self
                 .controller
                 .albums()
                 .into_iter()
@@ -10317,7 +10840,20 @@ impl FluxReady {
                         album.track_order.len(),
                     )
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let standalone = self
+                .controller
+                .tracks()
+                .iter()
+                .filter(|(id, _)| self.controller.track_album_id(*id).is_none())
+                .count();
+            if standalone > 0 {
+                groups.push((
+                    format!("Standalone tracks{ALBUM_KEY_SEPARATOR}none"),
+                    standalone,
+                ));
+            }
+            return groups;
         }
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
         for (id, track) in self.controller.tracks() {
@@ -10359,7 +10895,7 @@ impl FluxReady {
             } else if self.view == LibraryView::Albums {
                 let (_, album_id) = album_key_parts(key);
                 if album_id == "none" {
-                    format!("{count} track(s) · no stable album")
+                    format!("{count} standalone track(s) · no Album membership")
                 } else {
                     format!("{count} track(s) · album {album_id}")
                 }
@@ -13115,7 +13651,7 @@ impl FluxReady {
                     .track_album_id(track_id)
                     .and_then(|album| self.controller.album(album))
                     .map(|album| album.title.clone())
-                    .unwrap_or_else(|| "Unknown album".to_owned());
+                    .unwrap_or_else(|| "Standalone".to_owned());
                 body = body.push(
                     row![
                         self.track_artwork(
@@ -15344,6 +15880,21 @@ mod tests {
                 .edit_album_artwork,
             "keep-album-art"
         );
+        gui.import_manager
+            .as_mut()
+            .expect("manager")
+            .bulk_album_artwork_path = "keep-bulk-album-art".to_owned();
+        let _ = gui.update(Message::ImportBulkAlbumArtworkPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-bulk-album-art.png")])),
+        ));
+        assert_eq!(
+            gui.import_manager
+                .as_ref()
+                .expect("manager")
+                .bulk_album_artwork_path,
+            "keep-bulk-album-art"
+        );
 
         send(&mut gui, Message::EditTrack(id));
         let editor_before = gui
@@ -15928,6 +16479,176 @@ mod tests {
         assert_eq!(gui.controller.queue_len(), 1);
         assert_eq!(std::fs::read(&source).expect("source"), source_bytes);
         assert_ne!(track.source().path(), source);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn import_review_clears_album_and_publishes_a_standalone_track() {
+        let dir = TempDir::new("gui-import-standalone");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create");
+        let source = dir.path().join("Incoming/Standalone.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("source dir");
+        std::fs::write(&source, minimal_wav()).expect("audio");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let request = ImportRequest {
+            sources: vec![source],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: root,
+            existing_tracks: Vec::new(),
+            existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
+            target_album: None,
+            generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
+        };
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(&mut gui, Message::ImportAlbumChanged(String::new()));
+        let plan = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.clone())
+            .expect("plan");
+        assert_eq!(plan.candidates[0].album(), None);
+        assert!(plan.can_import(), "{:?}", plan.blocking_reason());
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        let id = gui.controller.tracks()[0].0;
+        assert_eq!(gui.controller.track_album_id(id), None);
+        assert_eq!(gui.controller.albums().len(), 0);
+        assert!(
+            gui.controller
+                .track(id)
+                .is_some_and(|track| track.source().path().is_file())
+        );
+        gui.view = LibraryView::Albums;
+        gui.selected_group = None;
+        assert!(
+            gui.groups_for(LibraryView::Albums)
+                .iter()
+                .any(|(key, count)| key.contains("Standalone tracks") && *count == 1),
+            "standalone Tracks have a visible Albums-view group"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn import_review_bulk_applies_artist_album_and_artwork_to_checked_candidates() {
+        let dir = TempDir::new("gui-import-bulk");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create");
+        let source_dir = dir.path().join("Incoming");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let one = source_dir.join("one.wav");
+        let mut two_bytes = minimal_wav();
+        two_bytes.push(1);
+        let two = source_dir.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        std::fs::write(&two, two_bytes).expect("two");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let artist = gui
+            .controller
+            .create_artist("Bulk GUI Artist")
+            .expect("artist");
+        let request = ImportRequest {
+            sources: vec![one, two],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: root.clone(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
+            target_album: None,
+            generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
+        };
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(&mut gui, Message::ImportToggleChecked(0));
+        send(&mut gui, Message::ImportToggleChecked(1));
+        send(
+            &mut gui,
+            Message::ImportBulkArtistPicked(Some(ArtistChoice {
+                id: Some(artist),
+                label: "Bulk GUI Artist".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::ImportBulkApplyArtist);
+        send(
+            &mut gui,
+            Message::ImportBulkAlbumChanged("Bulk GUI Album".to_owned()),
+        );
+        send(&mut gui, Message::ImportBulkApplyAlbum);
+        let album_art = dir.path().join("bulk-gui.png");
+        write_test_png(&album_art, 64, 64);
+        send(
+            &mut gui,
+            Message::ImportBulkAlbumArtworkPicked(0, Ok(Some(vec![album_art]))),
+        );
+        send(&mut gui, Message::ImportBulkApplyAlbumArtwork);
+        let plan = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.clone())
+            .expect("plan");
+        assert_eq!(
+            gui.import_manager
+                .as_ref()
+                .map(|manager| manager.checked.len()),
+            Some(2)
+        );
+        assert_eq!(plan.candidates[0].artist_id(), Some(artist));
+        assert_eq!(plan.candidates[1].artist_id(), Some(artist));
+        assert_eq!(plan.candidates[0].album(), Some("Bulk GUI Album"));
+        assert_eq!(plan.candidates[1].album(), Some("Bulk GUI Album"));
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| candidate.album_artwork_path().is_some())
+        );
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        let albums = gui.controller.albums();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(gui.controller.album_tracks(albums[0].id).len(), 2);
+        assert!(
+            gui.controller
+                .tracks()
+                .iter()
+                .all(|(id, _)| { gui.controller.track_artist_id(*id) == Some(artist) })
+        );
         gui.controller.shutdown();
     }
 
@@ -16861,6 +17582,37 @@ mod tests {
             gui.controller.album_cover_path(album).is_none(),
             "Track override removal does not fabricate Album artwork"
         );
+
+        send(&mut gui, Message::EditTrack(id));
+        send(&mut gui, Message::EditorPlanDetach);
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .and_then(|editor| editor.move_plan.as_ref())
+                .is_some_and(|plan| plan.to_album_id.is_none())
+        );
+        send(&mut gui, Message::EditorConfirmMove);
+        assert_eq!(gui.controller.track_album_id(id), None);
+        assert!(
+            gui.controller
+                .album(album)
+                .is_some_and(|album| album.track_order.is_empty()),
+            "empty Album remains a first-class entity"
+        );
+
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorMoveDestination(Some(AlbumChoice {
+                id: album,
+                label: "Entity Album".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::EditorMovePositionChanged("1".to_owned()));
+        send(&mut gui, Message::EditorPlanMove);
+        send(&mut gui, Message::EditorConfirmMove);
+        assert_eq!(gui.controller.track_album_id(id), Some(album));
+        assert_eq!(gui.controller.album_tracks(album), vec![id]);
         gui.controller.shutdown();
     }
 

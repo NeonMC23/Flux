@@ -806,8 +806,16 @@ impl Tui {
             }
             KeyCode::Char('E') => {
                 let albums = self.controller.albums();
-                if albums.is_empty() {
-                    self.lifecycle_msg = Some("No canonical albums.".to_owned());
+                let standalone = self
+                    .controller
+                    .tracks()
+                    .iter()
+                    .filter(|(id, _)| self.controller.track_album_id(*id).is_none())
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                if albums.is_empty() && standalone.is_empty() {
+                    self.lifecycle_msg =
+                        Some("No canonical albums or standalone tracks.".to_owned());
                 } else {
                     let mut lines = vec![
                         "Album membership and order are canonical; Track.album_id and \
@@ -855,6 +863,35 @@ impl Tui {
                         }
                         lines.push(String::new());
                     }
+                    if !standalone.is_empty() {
+                        lines.push(format!(
+                            "Standalone Tracks · no Album membership · {} track(s)",
+                            standalone.len()
+                        ));
+                        for track_id in standalone {
+                            let title = self
+                                .controller
+                                .track(track_id)
+                                .map(display_title)
+                                .unwrap_or_else(|| format!("missing TrackId {track_id}"));
+                            lines.push(format!(
+                                "  · {} · TrackId {}{}{}",
+                                title,
+                                track_id,
+                                if self.controller.track_artwork_path(track_id).is_some() {
+                                    " · Track artwork"
+                                } else {
+                                    ""
+                                },
+                                if self.controller.track_lyrics_path(track_id).is_some() {
+                                    " · lyrics"
+                                } else {
+                                    ""
+                                },
+                            ));
+                        }
+                        lines.push(String::new());
+                    }
                     lines.push(
                         "Empty albums are retained deliberately. TUI can inspect membership; \
                          rename, artwork, reorder, add/move/remove Tracks and ownership transfer \
@@ -865,67 +902,100 @@ impl Tui {
                 }
             }
             KeyCode::Char('D') => {
-                if let Some(id) = self.rows().get(self.cursor).copied()
-                    && let Some(album_id) = self.controller.track_album_id(id)
-                    && let Some(album) = self.controller.album(album_id)
-                {
-                    let owner = self
+                if let Some(id) = self.rows().get(self.cursor).copied() {
+                    if let Some(album) = self
                         .controller
-                        .artist(album.owner_artist_id)
-                        .map(|artist| artist.name().to_owned())
-                        .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
-                    let credited = self.controller.albums_credited_for(album.owner_artist_id);
-                    let mut lines = vec![
-                        format!("AlbumId {} · “{}”", album.id, album.title),
-                        format!(
-                            "{} · owner {} (ArtistId {}) · artwork {}",
-                            album.release_type.as_str(),
-                            owner,
-                            album.owner_artist_id,
-                            if album.cover.is_some() { "yes" } else { "no" },
-                        ),
-                        format!(
-                            "{} ordered track(s) · credited-only albums for owner: {}",
-                            album.track_order.len(),
-                            credited.len()
-                        ),
-                        String::new(),
-                    ];
-                    for (position, track_id) in album.track_order.iter().enumerate() {
-                        let title = self
+                        .track_album_id(id)
+                        .and_then(|album_id| self.controller.album(album_id))
+                    {
+                        let owner = self
                             .controller
-                            .track(*track_id)
-                            .map(display_title)
-                            .unwrap_or_else(|| format!("missing TrackId {track_id}"));
-                        lines.push(format!(
-                            "  {}. {} · TrackId {} · artwork {} · lyrics {}",
-                            position + 1,
-                            title,
-                            track_id,
-                            if self.controller.track_artwork_path(*track_id).is_some() {
-                                "Track override"
-                            } else if album.cover.is_some() {
-                                "inherited Album"
-                            } else {
-                                "none"
-                            },
-                            if self.controller.track_lyrics_path(*track_id).is_some() {
-                                "yes"
-                            } else {
-                                "no"
-                            },
-                        ));
-                    }
-                    lines.push(String::new());
-                    lines.push(
-                        "TUI is inspection-only here. Album metadata/artwork, order, \
+                            .artist(album.owner_artist_id)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+                        let credited = self.controller.albums_credited_for(album.owner_artist_id);
+                        let mut lines = vec![
+                            format!("AlbumId {} · “{}”", album.id, album.title),
+                            format!(
+                                "{} · owner {} (ArtistId {}) · artwork {}",
+                                album.release_type.as_str(),
+                                owner,
+                                album.owner_artist_id,
+                                if album.cover.is_some() { "yes" } else { "no" },
+                            ),
+                            format!(
+                                "{} ordered track(s) · credited-only albums for owner: {}",
+                                album.track_order.len(),
+                                credited.len()
+                            ),
+                            String::new(),
+                        ];
+                        for (position, track_id) in album.track_order.iter().enumerate() {
+                            let title = self
+                                .controller
+                                .track(*track_id)
+                                .map(display_title)
+                                .unwrap_or_else(|| format!("missing TrackId {track_id}"));
+                            lines.push(format!(
+                                "  {}. {} · TrackId {} · artwork {} · lyrics {}",
+                                position + 1,
+                                title,
+                                track_id,
+                                if self.controller.track_artwork_path(*track_id).is_some() {
+                                    "Track override"
+                                } else if album.cover.is_some() {
+                                    "inherited Album"
+                                } else {
+                                    "none"
+                                },
+                                if self.controller.track_lyrics_path(*track_id).is_some() {
+                                    "yes"
+                                } else {
+                                    "no"
+                                },
+                            ));
+                        }
+                        lines.push(String::new());
+                        lines.push(
+                            "TUI is inspection-only here. Album metadata/artwork, order, \
                          membership and Track movement use the GUI transactional workflows."
-                            .to_owned(),
-                    );
-                    self.open_info("Selected album", lines);
+                                .to_owned(),
+                        );
+                        self.open_info("Selected album", lines);
+                    } else if let Some(track) = self.controller.track(id) {
+                        let mut lines = vec![
+                            format!("Standalone Track · TrackId {id}"),
+                            format!(
+                                "Title: {} · artist: {} · artwork: {} · lyrics: {}",
+                                display_title(track),
+                                credit_display(&self.controller, id),
+                                if self.controller.track_artwork_path(id).is_some() {
+                                    "Track override"
+                                } else {
+                                    "generated fallback (no Album inheritance)"
+                                },
+                                if self.controller.track_lyrics_path(id).is_some() {
+                                    "yes"
+                                } else {
+                                    "no"
+                                },
+                            ),
+                            String::new(),
+                            "This Track has no Album membership. Album artwork cannot be inherited; \
+                             playback, queue, history, ratings and playlists remain available."
+                                .to_owned(),
+                            "TUI is inspection-only here. Adding it to an Album or moving it use \
+                             the GUI transactional membership workflow."
+                                .to_owned(),
+                        ];
+                        lines.push(String::new());
+                        self.open_info("Selected standalone Track", lines);
+                    } else {
+                        self.lifecycle_msg =
+                            Some("The selected track is no longer present.".to_owned());
+                    }
                 } else {
-                    self.lifecycle_msg =
-                        Some("Select a track with a canonical album first.".to_owned());
+                    self.lifecycle_msg = Some("Select a track first.".to_owned());
                 }
             }
             KeyCode::Char('T') => {
@@ -1709,6 +1779,9 @@ impl Tui {
                     text.push_str("  ");
                     text.push_str(label);
                 }
+                if self.controller.track_album_id(*id).is_none() {
+                    text.push_str("  [standalone]");
+                }
                 if self.controller.track_artwork_path(*id).is_some() {
                     text.push_str("  [art]");
                 }
@@ -2149,7 +2222,8 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "CATALOGUE".to_owned(),
         "o scan folder · i/I copy-import files · r refresh".to_owned(),
         "e edit selected metadata · y read managed lyrics".to_owned(),
-        "H local history · D selected album detail · E album relationships".to_owned(),
+        "H local history · D selected Track membership · E Album/standalone relationships"
+            .to_owned(),
         "V artist/album relationships · P create artist · Y rename artist".to_owned(),
         "X refresh/reconcile · L relink a unique reported move candidate".to_owned(),
         String::new(),
@@ -3079,6 +3153,57 @@ mod tests {
         );
         tui.search.clear();
         assert!(tui.empty_rows_message().contains("No favorite tracks"));
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_marks_and_inspects_standalone_tracks_without_album_membership() {
+        let dir = TempDir::new("tui-standalone");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        let source = dir.path().join("source/standalone.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("source");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        let artist = tui.controller.create_artist("Solo Artist").expect("artist");
+        let id = tui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source,
+                title: "Standalone Song".to_owned(),
+                artist_id: Some(artist),
+                artist_name: "Solo Artist".to_owned(),
+                credited_artist_ids: vec![artist],
+                album_title: None,
+                release_type: flux_app::ReleaseType::Single,
+                track_number: None,
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("standalone import");
+        assert_eq!(tui.controller.track_album_id(id), None);
+
+        let mut rendered = Vec::new();
+        tui.draw(&mut rendered).expect("draw");
+        let rendered = String::from_utf8_lossy(&rendered);
+        assert!(rendered.contains("[standalone]"), "{rendered}");
+
+        key(&mut tui, KeyCode::Char('E'));
+        assert_eq!(tui.mode, Mode::InfoView);
+        let albums = tui.info_lines.join("\n");
+        assert!(albums.contains("Standalone Tracks"), "{albums}");
+        assert!(albums.contains("Standalone Song"), "{albums}");
+        key(&mut tui, KeyCode::Esc);
+        key(&mut tui, KeyCode::Char('D'));
+        assert_eq!(tui.mode, Mode::InfoView);
+        assert_eq!(tui.info_title, "Selected standalone Track");
+        assert!(
+            tui.info_lines
+                .iter()
+                .any(|line| line.contains("no Album membership"))
+        );
         tui.controller.shutdown();
     }
 

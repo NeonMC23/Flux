@@ -88,6 +88,11 @@ root may leave its documented temporary leftovers there after the switch.
   the audio, Album/Artist creation and metadata updates. Selected existing
   Artists/Albums use stable IDs or exact owner/title resolution; no fuzzy entity
   merge exists.
+- M3 makes Album membership optional in both catalogue and entity records.
+  Standalone Tracks use owner-scoped paths, preserve TrackId/resources across
+  attach/detach/move, and are surfaced as a dedicated GUI group and TUI state.
+  Import review supports checked-candidate bulk Artist, Album/standalone and
+  Album-artwork assignment while retaining per-candidate overrides.
 - The GUI Import Manager is review-first and copy-only; the TUI exposes the
   same canonical validation through a synchronous quick copy-import path with a
   scrollable per-path result panel. Reference imports are rejected in canonical
@@ -184,14 +189,15 @@ state and announce the newly active library.
 
 The TUI `V` view lists ArtistId, description/image presence, owned/credited
 Album relationships and Track counts; `E` lists canonical Albums with owner,
-cover state and ordered Track membership, marking Track-specific artwork and
-lyrics. `D` opens the selected Track's Album with inherited/override artwork
-labels. `Y`/`P` support safe rename/create operations.
+cover state and ordered Track membership, plus standalone Tracks, marking
+Track-specific artwork and lyrics. `D` opens the selected Track's Album with
+inherited/override artwork labels, or its standalone state with no Album
+inheritance. `Y`/`P` support safe rename/create operations.
 
 Track deletion, audio/artwork/lyrics repair, Album metadata/cover/order or
-membership changes, ownership/artist/album transfer, rich import review with
-artwork/lyrics attachment, playlists, batch actions and global filters remain
-GUI-only. The TUI never bypasses H2 deletion/repair safety, never deletes
+membership changes (including converting to standalone), ownership/artist/album
+transfer, rich import review with bulk selection/artwork/lyrics attachment,
+playlists, batch actions and global filters remain GUI-only. The TUI never bypasses H2 deletion/repair safety, never deletes
 external audio, and does not treat an inaccessible path as missing. These are
 documented capability differences, not hidden shortcuts.
 
@@ -249,6 +255,10 @@ FluxLibrary/
       tracks/track_000001.flac
       tracks/track_000001.flux
       tracks/track_000001.lrc   optional
+    standalone/tracks/
+      track_000002.flac         optional standalone Track
+      track_000002.flux
+      track_000002.lrc          optional
   track-artwork/track_000001.png optional Track override
   playlists/playlist_000001.flux
   ratings.flux
@@ -281,19 +291,23 @@ counters and are never reused.
   validated against the catalogue; the catalogue wins for relationships and
   paths. A mismatch is rejected rather than silently repaired.
 - Album track order lives in `album.flux`; every referenced track must exist and
-  belong to that album. Track owner must equal album owner and must be one of the
-  ordered credited artists. The first credit is the default owner at import time;
-  an explicit review decision may select a later credit as physical owner.
-  Featuring/collaboration is represented by additional ordered credits, never by
-  duplicate audio.
+  have that AlbumId. `Track.album_id` is optional. When present, the Track must
+  be listed exactly once in that Album's order and its owner must equal the Album
+  owner. When absent, the Track is standalone and must not appear in any Album
+  order. Track owner must always be one of the ordered credited artists. The
+  first credit is the default owner at import time; an explicit review decision
+  may select a later credit as physical owner. Featuring/collaboration is
+  represented by additional ordered credits, never by duplicate audio.
 - Audio tags are never read or written. Stored duration comes from Flux
   metadata (or is absent); content fingerprints are streamed bytes.
 - Album cover, Artist image, Track artwork and lyrics are optional managed
   files with relative, validated names. Artist `description`/`image`, Track
   `artwork` and the managed asset fields are optional serde-defaulted additions
-  to canonical schema version 1. Libraries written before M2 remain readable;
-  no version bump or migration is required. Missing artwork never invalidates
-  the owning entity.
+  to canonical schema version 1. `TrackEntityDto.album_id` and the catalogue
+  Track `album_id` are optional; a missing field deserializes as standalone,
+  while every pre-M3 library has a numeric value and remains an Album member.
+  Libraries written before M2/M3 remain readable; no version bump or migration
+  is required. Missing artwork never invalidates the owning entity.
 - Artist name/description/image are Artist-owned. Album title/release/cover and
   order are Album-owned. Track title/track-disc numbers/credits/lyrics and its
   optional artwork override are Track-owned. Displaying an owner or Album name
@@ -324,6 +338,46 @@ intact.
 The TUI `V` view lists ArtistId, optional description/image state, owned and
 credited Album relationships and related Track counts. `Y` renames an existing
 Artist and `P` creates one; description/image editing is GUI-only.
+
+## Standalone Tracks and optional Album membership
+
+A Track may have no Album. Standalone Tracks remain first-class catalogue
+entities with a stable TrackId, physical owner Artist, ordered credits, metadata,
+managed audio, lyrics, ratings/favorites, history, queue and playlist references.
+They use `<artist>/standalone/tracks/track_<id>.*` paths so no placeholder Album
+is created.
+
+Membership operations preserve TrackId and resources:
+
+- adding a standalone Track to an Album moves its managed audio, record and
+  lyrics into the destination Album directory;
+- moving between Albums updates both album orders and the Track reference in one
+  transaction;
+- converting an Album member to standalone removes it from the source order,
+  moves resources to the owner's standalone container and retains the source
+  Album as a valid empty entity.
+
+Album order and Track membership are always validated together at open. A
+standalone Track appearing in an Album order, or a member missing from its
+Album order/dangling to a missing Album, rejects the catalogue rather than being
+silently repaired. Deleting a Track removes its Album order entry when present
+and never deletes the Album or Artist.
+
+Legacy/portable migrations map a missing source album to standalone membership
+rather than creating an “Unknown Album” placeholder; an actual source album
+title still becomes a canonical Album. The GUI Albums view contains a
+**Standalone tracks** group. Track editing offers
+reviewed **convert to standalone** and Album destination choices. The TUI marks
+standalone rows and shows Album or standalone detail with artwork inheritance
+state; membership mutations remain GUI-only. Track ownership transfer still
+requires an Album destination, so a standalone Track must first be attached to
+an Album before a cross-owner transfer.
+
+Album artwork inheritance is strictly membership-derived. A Track override
+survives attach/detach/move unchanged; without an override, an Album member
+inherits its Album cover, while a standalone Track uses its own override or the
+generated fallback. Detaching never converts inherited Album artwork into a
+permanent Track override.
 
 ## Credits and physical ownership
 
@@ -401,15 +455,17 @@ release type, track count, ordered track list, cover status and actions for
 metadata, artwork, transfer, reorder and empty-album deletion. Empty albums show
 a deliberate empty state rather than disappearing. The TUI `E` command opens a
 scrollable Album relationship/order view with owner, cover, Track artwork/lyrics
-markers and membership; `D` opens the selected Track's Album detail. Both are
-inspection views and explicitly direct mutations to the GUI.
+markers and membership; `D` opens the selected Track's Album or standalone
+detail. Both are inspection views and explicitly direct membership mutations to
+the GUI.
 
-The model requires every Track to have an Album. Therefore “remove from Album”
-is implemented as a reviewed move to another Album owned by the same Artist, not
-as a no-Album state. A cross-owner destination requires the existing reviewed
-ownership-transfer workflow. Removing a Track by deletion also removes it from
-the canonical Album order but retains the Album and Artist entities. Empty
-entities are never auto-deleted.
+A Track may be standalone, so “remove from Album” is a reviewed membership change
+that retains the Track and the now-empty Album. Adding a standalone Track to an
+Album and moving it between Albums use the same reviewed plan/transaction. A
+cross-owner destination requires the existing reviewed ownership-transfer
+workflow. Removing a Track by deletion also removes it from the canonical Album
+order when present but retains the Album and Artist entities. Empty entities are
+never auto-deleted.
 
 ### Catalogue search, filtering and batch selection
 
@@ -760,6 +816,7 @@ from what remains structurally or physically unverified.
 | Meaningful-listening accounting, seek/pause/recovery/transition attribution, history persistence and dashboard aggregates | Confirmed by deterministic Controller/GUI tests with injected positions and transitions; no acoustic measurement or physical-device timing validation |
 | Import discovery, decode validation, partial preparation, cancellation and folder traversal | Confirmed by deterministic filesystem/import tests; real native dialogs and cross-platform traversal remain unverified |
 | M2 Artist/Album/Track entities, synchronization, artwork inheritance, enriched atomic import and GUI/TUI navigation | Confirmed by deterministic canonical/Controller/GUI/TUI state, transaction-failure, artwork round-trip/move/delete and import conflict tests; no real mouse/window-manager or terminal-emulator interaction audit |
+| M3 optional Album membership, standalone artwork/lyrics/member transitions and bulk import enrichment | Confirmed by deterministic canonical/Controller/GUI/TUI tests for standalone import, attach/detach/move, resource preservation, empty-Album retention, shared Artist/Album/artwork plus individual overrides, and invalid Album-artwork rejection; no real multi-candidate GUI mouse interaction audit |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
@@ -1346,10 +1403,13 @@ Track never deletes Album or Artist artwork. Changing Album artwork never edits
 Track records.
 
 Display inheritance is derived, not copied: a Track with an override renders it
-first; otherwise the GUI uses its Album cover; otherwise it shows the generated
-glyph. Removing the override therefore restores Album fallback immediately.
-Album cover replacement invalidates the Album cache, while Track overrides keep
-their own cache entries until replaced/removed.
+first; otherwise an Album member uses its Album cover; a standalone Track has no
+Album fallback and uses the generated glyph. Removing an override therefore
+restores the current membership-derived fallback immediately. Attaching to an
+Album starts using that destination cover when no override exists; detaching
+stops Album inheritance without inventing an override. Album cover replacement
+invalidates the Album cache, while Track overrides keep their own cache entries
+until replaced/removed.
 
 The GUI decodes managed PNG, JPEG and WebP artwork off the UI thread for display.
 Decoding rejects files over 32 MiB, dimensions over 4096 px on either side or
@@ -1458,11 +1518,34 @@ unique existing names can resolve to an existing ID; ambiguous names require an
 explicit artist selection in review. The review also offers an existing Album
 picker filtered to the selected owner Artist; selecting one sets the exact owner
 title reference rather than fuzzy-matching. Typing a title creates a new Album
-only when no exact owner/title match exists. Proposed artists with the same exact
-name are allocated one new ID within the batch. The physical owner remains one
-of the ordered credits, and an existing destination album must have the same
-owner. Per-candidate artwork/lyrics are supported; a bulk “apply to all selected
-candidates” helper is not implemented.
+only when no exact owner/title match exists; an empty Album field creates a
+standalone Track. Proposed artists with the same exact name are allocated one new
+ID within the batch. The physical owner remains one of the ordered credits, and
+an existing destination album must have the same owner.
+
+The GUI review supports checking multiple candidates and applying:
+
+- one existing stable Artist as physical owner, or one shared new Artist name
+  (exact unique existing names resolve before creating an identity), retaining
+  other collaboration credits;
+- one Album title (exact existing owner/title reuse or one new Album per owner)
+  or converting the checked candidates to standalone;
+- one validated Album artwork asset to all checked Album-member candidates.
+
+Bulk changes are explicit actions. The effective precedence is:
+
+1. individual Track artwork/lyrics overrides (always separate fields);
+2. per-candidate edits made after a bulk action (last explicit edit wins);
+3. bulk-applied Artist/Album values;
+4. explicitly selected existing Artist/Album metadata and stable identities;
+5. filename/folder inference fallback captured at discovery.
+
+Album artwork and Track artwork are separate fields, so a shared cover cannot
+overwrite an individual Track override. If any checked candidate is an
+existing-Track metadata update, bulk Artist/Album membership is refused and the
+user is directed to the Track editor, because metadata import preserves existing
+ownership/membership. The reviewed plan is inspected as a normal ImportPlan and
+commits atomically.
 
 The album detail view exposes **Add tracks…**, opening the existing Import
 Manager in fixed-target mode. The target carries AlbumId, owner, title, release
@@ -1955,8 +2038,10 @@ cleanup.
    switches for migration compatibility and existing tests. No GUI/TUI normal
    workflow uses them, but the API-level retirement is incomplete.
 2. Import review supports ordered credits, owner selection, add/remove/reorder,
-   and existing-artist selection. A separate featuring boolean and release-type
-   picker are not exposed; the canonical model stores order only.
+   existing-artist selection, optional Album/standalone choice and bulk Artist/
+   Album/Album-artwork actions. A separate featuring boolean and release-type
+   picker are not exposed; the canonical model stores order only. Track artwork
+   and lyrics remain individual rather than bulk-copy actions.
 3. Import copy/publication runs synchronously at the canonical commit boundary;
    cancellation is safe before commit. Import preflight opens the decoder and
    validates the container/header plus the source fingerprint, but it does not

@@ -285,7 +285,8 @@ pub struct TrackMetadataEdit {
     pub artist_id: Option<ArtistId>,
     /// Ordered canonical credits, or `None` to preserve the existing credits.
     pub credited_artist_ids: Option<Vec<ArtistId>>,
-    /// Album title override.
+    /// Album title override for an Album member. Ignored for standalone Tracks;
+    /// membership changes use the reviewed move workflow.
     pub album: Option<String>,
     /// Track number override.
     pub track_number: Option<u32>,
@@ -438,9 +439,9 @@ impl TrackDeletionPlan {
         &self.inner.title
     }
 
-    /// Album retained by deletion.
+    /// Album retained by deletion, when the Track belonged to one.
     #[must_use]
-    pub fn album_id(&self) -> AlbumId {
+    pub fn album_id(&self) -> Option<AlbumId> {
         self.inner.album_id
     }
 
@@ -1915,7 +1916,7 @@ impl Controller {
         self.canonical_store
             .as_ref()
             .and_then(|store| store.track(id))
-            .map(|track| track.album_id)
+            .and_then(|track| track.album_id)
     }
 
     /// Track IDs in canonical album order.
@@ -4584,13 +4585,15 @@ impl Controller {
                 .filter(|title| !title.is_empty())
                 .unwrap_or(&plan.expected_title)
                 .to_owned();
-            let album_title = edit
-                .album
-                .as_deref()
-                .map(str::trim)
-                .filter(|album| !album.is_empty())
-                .unwrap_or(&plan.expected_album_title)
-                .to_owned();
+            let album_title = plan.album_id.map(|_| {
+                edit.album
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|album| !album.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| plan.expected_album_title.clone())
+                    .unwrap_or_default()
+            });
             let credits = edit
                 .credited_artist_ids
                 .clone()
@@ -4708,13 +4711,15 @@ impl Controller {
             .filter(|title| !title.is_empty())
             .unwrap_or(&plan.expected_title)
             .to_owned();
-        let album_title = edit
-            .album
-            .as_deref()
-            .map(str::trim)
-            .filter(|album| !album.is_empty())
-            .unwrap_or(&plan.expected_album_title)
-            .to_owned();
+        let album_title = plan.album_id.map(|_| {
+            edit.album
+                .as_deref()
+                .map(str::trim)
+                .filter(|album| !album.is_empty())
+                .map(str::to_owned)
+                .or_else(|| plan.expected_album_title.clone())
+                .unwrap_or_default()
+        });
         let credits = edit
             .credited_artist_ids
             .clone()
@@ -4740,7 +4745,7 @@ impl Controller {
     pub fn plan_track_move(
         &self,
         id: TrackId,
-        to_album_id: AlbumId,
+        to_album_id: Option<AlbumId>,
         insertion_index: usize,
     ) -> Result<TrackMovePlan, String> {
         let Some(store) = self.canonical_store.as_ref() else {
@@ -4767,10 +4772,14 @@ impl Controller {
         self.sync_default_queue();
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(format!(
-            "Moved track {} from album {} to album {} at position {}.",
+            "Moved track {} from {} to {} at position {}.",
             report.track_id,
-            report.from_album_id,
-            report.to_album_id,
+            report
+                .from_album_id
+                .map_or_else(|| "Standalone".to_owned(), |album| format!("album {album}")),
+            report
+                .to_album_id
+                .map_or_else(|| "Standalone".to_owned(), |album| format!("album {album}")),
             report.insertion_index + 1
         ));
         Ok(report)
@@ -5232,19 +5241,22 @@ impl Controller {
                     }
                 }
             };
-            let album_title = inferred
-                .album_title
-                .clone()
-                .unwrap_or_else(|| "Unknown Album".to_owned());
+            let album =
+                inferred
+                    .album_title
+                    .clone()
+                    .map_or(CanonicalImportAlbumRef::Standalone, |title| {
+                        CanonicalImportAlbumRef::ByName {
+                            title,
+                            release_type: inferred.release_type,
+                        }
+                    });
             requests.push(CanonicalImportTrackRequest {
                 source: source.clone(),
                 title: inferred.title,
                 credited_artists: vec![artist_ref],
                 owner_index: 0,
-                album: CanonicalImportAlbumRef::ByName {
-                    title: album_title,
-                    release_type: inferred.release_type,
-                },
+                album,
                 track_number: inferred.track_number,
                 disc_number: inferred.disc_number,
                 duration_ms: inferred.duration_ms,
@@ -7381,14 +7393,13 @@ fn infer_canonical_import(path: &Path) -> Option<CanonicalImportedTrack> {
             .map(ToOwned::to_owned);
     }
     let artist_name = artist_name.unwrap_or_else(|| "Unknown Artist".to_owned());
-    let album_title = album.unwrap_or_else(|| "Unknown Album".to_owned());
     Some(CanonicalImportedTrack {
         source: path.to_path_buf(),
         title,
         artist_id: None,
         artist_name,
         credited_artist_ids: Vec::new(),
-        album_title: Some(album_title),
+        album_title: album,
         release_type: ReleaseType::Album,
         track_number,
         disc_number: None,
@@ -13368,7 +13379,7 @@ mod tests {
         let queue_entry = controller.current_queue_entry_id();
         let playback_state = controller.player_state();
         let plan = controller
-            .plan_track_move(id, destination, 0)
+            .plan_track_move(id, Some(destination), 0)
             .expect("move plan");
         let report = controller.execute_track_move(&plan).expect("move");
         assert_eq!(report.track_id, id);
@@ -14346,7 +14357,7 @@ mod tests {
         controller.enqueue_track(first).expect("duplicate first");
         let plan = controller.plan_track_deletion(first).expect("delete plan");
         assert!(plan.audio_present());
-        assert_eq!(plan.album_id(), album);
+        assert_eq!(plan.album_id(), Some(album));
         assert_eq!(plan.playlists(), &["Keep".to_owned()]);
         let report = controller.delete_track(&plan).expect("delete first");
 
@@ -16151,7 +16162,7 @@ mod tests {
             .create_album(owner, "Timestamp destination", crate::ReleaseType::Album)
             .expect("album");
         let plan = controller
-            .plan_track_move(id, destination, 0)
+            .plan_track_move(id, Some(destination), 0)
             .expect("move plan");
         controller.execute_track_move(&plan).expect("move");
         assert_eq!(controller.track_created_unix_ms(id), created);

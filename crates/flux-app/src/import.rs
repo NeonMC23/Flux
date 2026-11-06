@@ -502,6 +502,9 @@ impl ImportCandidate {
         if self.owner_index >= self.credits.len() {
             return Some("Select a physical owner from the credited artists.".to_owned());
         }
+        if self.album.is_none() && self.album_artwork.is_some() {
+            return Some("Album artwork requires an Album title or existing Album.".to_owned());
+        }
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
         for credit in &self.credits {
@@ -762,6 +765,144 @@ impl ImportPlan {
                 }
             } else {
                 candidate.decision = ImportDecision::ImportNew;
+            }
+        }
+    }
+
+    /// Applies one existing stable Artist as the physical owner to selected
+    /// candidates while retaining their other ordered collaboration credits.
+    pub fn apply_artist_to(&mut self, indices: &[usize], artist_id: ArtistId, name: &str) {
+        for index in indices {
+            let Some(candidate) = self.candidates.get_mut(*index) else {
+                continue;
+            };
+            let owner_index = candidate
+                .owner_index
+                .min(candidate.credits.len().saturating_sub(1));
+            if candidate.credits.is_empty() {
+                candidate
+                    .credits
+                    .push(ImportCredit::new(Some(artist_id), name.to_owned(), false));
+                candidate.owner_index = 0;
+            } else {
+                candidate.set_credit_artist(owner_index, artist_id, name.to_owned());
+                candidate.set_owner_index(owner_index);
+            }
+            let mut seen = candidate
+                .credits
+                .get(candidate.owner_index)
+                .and_then(|credit| credit.artist_id)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let mut duplicate = Vec::new();
+            for (credit_index, credit) in candidate.credits.iter().enumerate() {
+                if credit_index == candidate.owner_index {
+                    continue;
+                }
+                if let Some(id) = credit.artist_id
+                    && !seen.insert(id)
+                {
+                    duplicate.push(credit_index);
+                }
+            }
+            for duplicate_index in duplicate.into_iter().rev() {
+                candidate.remove_credit(duplicate_index);
+            }
+        }
+    }
+
+    /// Applies one new Artist name association to selected candidates. The
+    /// canonical resolver reuses an exact unique existing name or creates a new
+    /// identity only when no exact identity exists.
+    pub fn apply_artist_name_to(&mut self, indices: &[usize], name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        for index in indices {
+            let Some(candidate) = self.candidates.get_mut(*index) else {
+                continue;
+            };
+            let owner_index = candidate
+                .owner_index
+                .min(candidate.credits.len().saturating_sub(1));
+            if candidate.credits.is_empty() {
+                candidate
+                    .credits
+                    .push(ImportCredit::new(None, name.to_owned(), false));
+                candidate.owner_index = 0;
+            } else {
+                let credit = &mut candidate.credits[owner_index];
+                credit.artist_id = None;
+                credit.name = name.to_owned();
+                candidate.owner_index = owner_index;
+            }
+            candidate.artist_id = None;
+            candidate.artist_name = Some(name.to_owned());
+        }
+    }
+
+    /// Applies an Album title to selected candidates. An empty title makes
+    /// them standalone and clears Album artwork that would no longer apply.
+    pub fn apply_album_to(&mut self, indices: &[usize], title: Option<&str>) {
+        for index in indices {
+            let Some(candidate) = self.candidates.get_mut(*index) else {
+                continue;
+            };
+            candidate.set_album(title.map(str::to_owned));
+            if candidate.album.is_none() {
+                candidate.clear_album_artwork();
+            }
+        }
+    }
+
+    /// Applies one reviewed Album artwork asset to selected candidates that
+    /// already have Album membership.
+    pub fn apply_album_artwork_to(
+        &mut self,
+        indices: &[usize],
+        asset: flux_library::canonical::CanonicalImportAsset,
+    ) -> Result<(), String> {
+        if indices.iter().any(|index| {
+            self.candidates
+                .get(*index)
+                .is_some_and(|candidate| candidate.album.is_none())
+        }) {
+            return Err(
+                "Album artwork can only be applied to candidates with an Album title.".to_owned(),
+            );
+        }
+        for index in indices {
+            if let Some(candidate) = self.candidates.get_mut(*index) {
+                candidate.album_artwork = Some(asset.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Fingerprints and applies one Album artwork source to selected candidates.
+    pub fn apply_album_artwork_from_path(
+        &mut self,
+        indices: &[usize],
+        source: &Path,
+    ) -> Result<(), String> {
+        let fingerprint = flux_library::canonical::ContentFingerprint::of_file(source)
+            .map_err(|error| format!("Could not fingerprint Album artwork: {error}"))?;
+        self.apply_album_artwork_to(
+            indices,
+            flux_library::canonical::CanonicalImportAsset {
+                source: source.to_path_buf(),
+                fingerprint,
+            },
+        )
+    }
+
+    /// Clears Album artwork from selected candidates without touching their
+    /// individual Track artwork overrides.
+    pub fn clear_album_artwork_for(&mut self, indices: &[usize]) {
+        for index in indices {
+            if let Some(candidate) = self.candidates.get_mut(*index) {
+                candidate.clear_album_artwork();
             }
         }
     }
@@ -2129,20 +2270,10 @@ fn apply_import_plan_canonical(
                     });
                     continue;
                 };
-                let Some(expected_album_id) = existing.album_id else {
-                    report.items.push(AppliedImportItem {
-                        index,
-                        track_id: Some(existing.track_id),
-                        state: ImportItemState::Failed,
-                        message: "The existing album membership is unavailable; review again."
-                            .to_owned(),
-                    });
-                    continue;
-                };
                 updates.push(flux_library::canonical::CanonicalTrackMetadataUpdate {
                     track_id: existing.track_id,
                     expected_fingerprint: Some(expected_fingerprint),
-                    expected_album_id,
+                    expected_album_id: existing.album_id,
                     expected_title: existing.title.clone(),
                     expected_credited_artist_ids: existing.credited_artist_ids.clone(),
                     expected_track_number: existing.track_number,
@@ -2240,23 +2371,16 @@ fn apply_import_plan_canonical(
                 let album = if let Some(target) = &plan.target_album {
                     CanonicalImportAlbumRef::Existing(target.album_id)
                 } else {
-                    let Some(title) = candidate
+                    candidate
                         .album()
                         .map(str::trim)
                         .filter(|title| !title.is_empty())
-                    else {
-                        report.items.push(AppliedImportItem {
-                            index,
-                            track_id: None,
-                            state: ImportItemState::Failed,
-                            message: "Album title is required.".to_owned(),
-                        });
-                        continue;
-                    };
-                    CanonicalImportAlbumRef::ByName {
-                        title: title.to_owned(),
-                        release_type: ReleaseType::Album,
-                    }
+                        .map_or(CanonicalImportAlbumRef::Standalone, |title| {
+                            CanonicalImportAlbumRef::ByName {
+                                title: title.to_owned(),
+                                release_type: ReleaseType::Album,
+                            }
+                        })
                 };
                 requests.push(CanonicalImportTrackRequest {
                     source: candidate.source_path().to_path_buf(),
@@ -3939,6 +4063,106 @@ mod tests {
             Some("Target update")
         );
         assert_eq!(controller.album_tracks(other_album), Vec::<TrackId>::new());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_bulk_import_applies_shared_and_individual_metadata_atomically() {
+        let dir = TempDir::new("canonical-bulk-import");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let artist = controller.create_artist("Bulk Artist").expect("artist");
+        let existing_album = controller
+            .create_album(artist, "Bulk Album", crate::ReleaseType::Album)
+            .expect("existing album");
+        let source_dir = dir.path().join("Incoming");
+        let one = wav(&source_dir, "one.wav", 4_410, 0.1);
+        let two = wav(&source_dir, "two.wav", 4_410, 0.2);
+        let three = wav(&source_dir, "three.wav", 4_410, 0.3);
+        let mut plan = prepare_import_plan(
+            canonical_request(&controller, &root, vec![one, two, three], None),
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(plan.candidates.len(), 3);
+        for candidate in &mut plan.candidates {
+            candidate.set_decision(ImportDecision::ImportNew);
+        }
+        let indices = [0, 1, 2];
+        plan.apply_artist_to(&indices, artist, "Bulk Artist");
+        plan.apply_artist_name_to(&[2], "Bulk Artist");
+        plan.apply_album_to(&[0, 1], Some("Bulk Album"));
+        plan.apply_album_to(&[2], None);
+        plan.candidates[0].set_title("Individual Title");
+        let album_art = dir.path().join("bulk-album.png");
+        fs::write(&album_art, b"\x89PNG\r\n\x1a\nbulk album").expect("album art");
+        assert!(
+            plan.apply_album_artwork_from_path(&[0, 2], &album_art)
+                .is_err(),
+            "standalone candidates cannot receive Album artwork"
+        );
+        plan.apply_album_artwork_from_path(&[0, 1], &album_art)
+            .expect("shared Album artwork");
+        let track_art = dir.path().join("individual.webp");
+        fs::write(&track_art, b"RIFF....WEBPindividual").expect("track art");
+        plan.candidates[1]
+            .set_artwork(&track_art)
+            .expect("track artwork");
+        plan.candidates[2].set_lyrics_text(Some("[00:04.00]individual lyrics".to_owned()));
+
+        assert_eq!(plan.candidates[0].artist_id(), Some(artist));
+        assert_eq!(plan.candidates[0].album(), Some("Bulk Album"));
+        assert_eq!(plan.candidates[0].title(), "Individual Title");
+        assert_eq!(plan.candidates[1].album(), Some("Bulk Album"));
+        assert_eq!(plan.candidates[2].album(), None);
+        assert!(plan.can_import(), "{:?}", plan.blocking_reason());
+
+        let report = controller
+            .apply_import_plan(&plan, &prepared_for(&plan))
+            .expect("bulk import");
+        assert_eq!(report.imported, 3);
+        assert_eq!(controller.artists().len(), 1);
+        assert_eq!(controller.albums().len(), 1, "existing Album was reused");
+        let album = existing_album;
+        assert_eq!(controller.album_tracks(album).len(), 2);
+        assert!(
+            controller
+                .album_cover_path(album)
+                .is_some_and(|path| path.is_file())
+        );
+        let mut standalone = 0;
+        let mut individual_art = 0;
+        let mut individual_lyrics = 0;
+        for (id, track) in controller.tracks() {
+            assert_eq!(controller.track_artist_id(*id), Some(artist));
+            assert_eq!(
+                controller.track_credits(*id),
+                vec![artist],
+                "bulk Artist preserves one owner credit"
+            );
+            match controller.track_album_id(*id) {
+                Some(membership) => assert_eq!(membership, album),
+                None => standalone += 1,
+            }
+            if controller.track_artwork_path(*id).is_some() {
+                individual_art += 1;
+            }
+            if controller.track_lyrics(*id).as_deref() == Some("[00:04.00]individual lyrics") {
+                individual_lyrics += 1;
+            }
+            if track.title() == "Individual Title" {
+                assert_eq!(controller.track_album_id(*id), Some(album));
+            }
+        }
+        assert_eq!(standalone, 1);
+        assert_eq!(individual_art, 1);
+        assert_eq!(individual_lyrics, 1);
+        let all_titles = controller
+            .tracks()
+            .iter()
+            .map(|(_, track)| track.title().to_owned())
+            .collect::<Vec<_>>();
+        assert!(all_titles.contains(&"Individual Title".to_owned()));
         controller.shutdown();
     }
 
