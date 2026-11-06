@@ -743,6 +743,10 @@ impl Tui {
                     self.open_info("Artists", lines);
                 }
             }
+            KeyCode::Char('c') => {
+                self.controller.dismiss_notice();
+                self.lifecycle_msg = None;
+            }
             KeyCode::Char('F') => {
                 self.favorites_only = !self.favorites_only;
                 self.cursor = 0;
@@ -2206,12 +2210,14 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         String::new(),
         "NAVIGATION".to_owned(),
         "↑/↓ or k/j move · PgUp/PgDn · g/G first/last".to_owned(),
-        "/ search · Esc clears the active search · F favorites".to_owned(),
+        "/ search · Esc clears the active search · F favorites · c clears notice".to_owned(),
         "Q queue view · ? help · q or Ctrl-C quits".to_owned(),
         String::new(),
         "PLAYBACK".to_owned(),
         "Enter play · Space play/pause · s stop · n/p skip".to_owned(),
         "+/- volume · R playback mode · K crossfade · [ ] crossfade duration".to_owned(),
+        "Output loss triggers bounded automatic recovery; after exhaustion, Play starts a fresh retry."
+            .to_owned(),
         String::new(),
         "QUEUE".to_owned(),
         "a add selected · x play selected next".to_owned(),
@@ -2955,12 +2961,16 @@ mod tests {
         assert!(help.contains("Q queue view"), "{help}");
         assert!(help.contains("Active library:"), "{help}");
         assert!(help.contains("SAFETY AND LIMITS"), "{help}");
+        assert!(help.contains("bounded automatic recovery"), "{help}");
         assert!(help.contains("GUI review workflows"), "{help}");
         assert!(help.contains("synchronous quick copy"), "{help}");
         key(&mut tui, KeyCode::Down);
         assert_eq!(tui.info_scroll, 1);
         key(&mut tui, KeyCode::Esc);
         assert_eq!(tui.mode, Mode::Normal);
+        tui.lifecycle_msg = Some("transient notice".to_owned());
+        key(&mut tui, KeyCode::Char('c'));
+        assert!(tui.lifecycle_msg.is_none());
 
         assert_eq!(clamp_terminal_size(0, 0), (20, 6));
         assert_eq!(clamp_terminal_size(120, 40), (120, 40));

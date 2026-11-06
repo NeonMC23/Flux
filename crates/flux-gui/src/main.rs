@@ -2425,6 +2425,8 @@ enum Message {
     QueueDragRelease,
     TogglePlayPause,
     Stop,
+    RetryAudioOutput,
+    DismissNotice,
     Next,
     Previous,
     CycleRepeat,
@@ -6733,6 +6735,20 @@ impl FluxReady {
                 self.seek_preview = None;
                 self.controller.stop();
             }
+            Message::RetryAudioOutput => {
+                if self.controller.retry_audio_output() {
+                    self.lifecycle_msg = Some(
+                        "Retrying audio output; playback follows the current state.".to_owned(),
+                    );
+                } else {
+                    self.lifecycle_msg =
+                        Some("Audio output is not in a retryable failed state.".to_owned());
+                }
+            }
+            Message::DismissNotice => {
+                self.controller.dismiss_notice();
+                self.lifecycle_msg = None;
+            }
             Message::Next => {
                 self.seek_preview = None;
                 self.controller.next();
@@ -9876,6 +9892,16 @@ impl FluxReady {
                     .style(danger_button_style)
                     .padding([4, 8])
                     .on_press(Message::AcknowledgeRecoveryPressed),
+            );
+        }
+        if !self.controller.legacy_index_write_protected()
+            && self.controller.portable_recovery().is_none()
+        {
+            line = line.push(
+                button(text("Dismiss").size(10))
+                    .style(ghost_style)
+                    .padding([4, 8])
+                    .on_press(Message::DismissNotice),
             );
         }
 
@@ -14097,15 +14123,34 @@ impl FluxReady {
 
         let (audio_title, audio_detail, audio_color) =
             audio_summary(self.controller.audio_status());
+        let mut audio_status = column![
+            text(audio_title).size(12).color(audio_color),
+            text(audio_detail).size(10).color(MUTED),
+        ]
+        .spacing(4);
+        if self.controller.can_retry_audio_output() {
+            audio_status = audio_status.push(
+                row![
+                    button(text("Retry audio output").size(11))
+                        .style(accent_button_style)
+                        .padding([7, 12])
+                        .on_press(Message::RetryAudioOutput),
+                    text(
+                        "Automatic recovery attempts were exhausted. Retry reopens the \
+                         current default device; Play is not required.",
+                    )
+                    .size(9)
+                    .color(MUTED),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
         setup = setup.push(setup_card(
             "AUDIO OUTPUT",
             "The actual result of initializing this session's output backend. This is \
              information about the build or device, not a library error.",
-            column![
-                text(audio_title).size(12).color(audio_color),
-                text(audio_detail).size(10).color(MUTED),
-            ]
-            .spacing(4),
+            audio_status,
         ));
 
         setup = setup.push(setup_card(
@@ -14711,12 +14756,27 @@ impl FluxReady {
         .spacing(2)
         .width(Length::Fill);
         if !audio_ready {
-            let (_, _, color) = audio_summary(self.controller.audio_status());
-            info = info.push(
-                text("Audio unavailable · see Library setup")
-                    .size(9)
-                    .color(color),
-            );
+            let (message, color) = match self.controller.audio_status() {
+                AudioStatus::Recovering(_) => (
+                    "Audio recovering · playback follows the current state when the device returns"
+                        .to_owned(),
+                    ACCENT,
+                ),
+                AudioStatus::DeviceUnavailable(_) if self.controller.can_retry_audio_output() => (
+                    "Audio unavailable · retry in Library setup, or press Play to retry".to_owned(),
+                    DANGER,
+                ),
+                AudioStatus::DeviceUnavailable(_) => (
+                    "Audio unavailable · check the output device in Library setup".to_owned(),
+                    DANGER,
+                ),
+                AudioStatus::BuildWithoutBackend => (
+                    "Audio unavailable · this build has no output backend".to_owned(),
+                    MUTED,
+                ),
+                AudioStatus::Ready => (String::new(), MUTED),
+            };
+            info = info.push(text(message).size(9).color(color));
         }
         let compact = self.window_width < 1_080.0;
         let current_album =
@@ -15722,6 +15782,26 @@ mod tests {
     }
 
     #[test]
+    fn retry_audio_message_never_claims_recovery_when_none_is_available() {
+        let dir = TempDir::new("gui-audio-retry");
+        let mut gui = gui(&dir);
+        assert!(!gui.controller.can_retry_audio_output());
+        send(&mut gui, Message::RetryAudioOutput);
+        assert!(
+            gui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("not in a retryable failed state")),
+            "{:?}",
+            gui.lifecycle_msg
+        );
+        assert!(!matches!(
+            gui.controller.audio_status(),
+            AudioStatus::Recovering(_)
+        ));
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn create_library_message_creates_and_switches() {
         let dir = TempDir::new("create-switch");
         let root = dir.path().join("library");
@@ -15770,6 +15850,10 @@ mod tests {
         assert_eq!(gui.controller.storage_mode(), StorageMode::Legacy);
         assert!(gui.controller.last_error().is_some(), "failure is visible");
         assert!(!empty.join(".flux").exists(), "opening created nothing");
+        send(&mut gui, Message::DismissNotice);
+        assert!(gui.controller.last_error().is_none());
+        assert!(gui.lifecycle_msg.is_none());
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Legacy);
         gui.controller.shutdown();
     }
 

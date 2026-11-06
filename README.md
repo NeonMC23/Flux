@@ -190,7 +190,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   instead of relying on a clipped one-line help bar. The header identifies the
   active library, view, queue length, playback mode and active search/favorite
   filter; long paths/inputs are bounded and input lines keep their trailing
-  path visible.
+  path visible. `c` clears a transient status/error notice without changing
+  playback or library state.
   `o` recursively copy-imports a folder, and `i` copy-imports
   paths separated by `;` into the canonical library. Import summaries include
   added, updated, already-indexed, copied and issue counts; any per-path errors
@@ -392,12 +393,17 @@ identity and play/pause intent, releases the failed stream, and
 attempts up to four fresh opens of the current default device in the
 background with bounded backoff. A successful replacement gets a new
 ring, generation, device callback and prebuffer; it reloads the same
-queue entry and restores the last delivered position. Pause or stop
-during recovery prevents unexpected autoplay. If every attempt fails,
-the UI reports the output as unavailable and a later Play starts a
-new bounded attempt. Flux does not persist an explicit device choice,
-does not switch to a user-selected device, and does not claim gapless
-continuity across a device loss.
+queue entry and restores the last delivered position. Pause during
+recovery preserves the paused position; Stop clears the recovery
+restore point, so a later Play restarts from the beginning. If every
+attempt fails, the UI reports the output as unavailable and exposes
+an explicit **Retry audio output** action in Library setup; Play also
+starts a fresh bounded retry. The GUI player bar distinguishes
+recovering, retryable failure and build-without-backend states, and
+transient error banners can be dismissed after reading them. Flux
+does not persist an explicit device choice, does not switch to a
+user-selected device, and does not claim gapless continuity across a
+device loss.
 
 One build prerequisite joined with MP3 support: the minimp3 decoder
 is C (bundled by the `rmp3` crate) and is compiled at build time, so

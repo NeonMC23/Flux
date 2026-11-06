@@ -2898,6 +2898,22 @@ impl Controller {
         self.audio.is_ready() || self.audio_recovery.is_some()
     }
 
+    /// Whether a previously exhausted automatic recovery can be retried
+    /// explicitly. This is separate from ordinary playback because a retry
+    /// must reopen the output backend before audio can resume.
+    #[must_use]
+    pub fn can_retry_audio_output(&self) -> bool {
+        self.audio_recovery_failed()
+    }
+
+    /// Starts a fresh bounded recovery cycle after automatic attempts were
+    /// exhausted. Returns `false` when no retryable recovery is available.
+    /// Playback intent is preserved: paused/stopped states are not changed and
+    /// an actively playing track resumes only after the device opens.
+    pub fn retry_audio_output(&mut self) -> bool {
+        self.retry_audio_recovery_if_failed()
+    }
+
     /// Enables bounded recovery on the current default output device.
     /// Caller-supplied engines deliberately keep their existing fatal
     /// behavior; only Flux's normal default-device setup opts in.
@@ -3124,6 +3140,13 @@ impl Controller {
         }
         let placeholder = std::mem::replace(&mut self.engine, engine);
         drop(placeholder);
+        if self
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("audio output unavailable after"))
+        {
+            self.last_error = None;
+        }
         self.engine.set_volume(self.volume);
         self.engine.set_crossfade_ms(if self.crossfade_enabled {
             self.crossfade_duration_ms
@@ -5345,6 +5368,14 @@ impl Controller {
         self.last_status.as_deref()
     }
 
+    /// Clears the current error/status banner without changing playback,
+    /// device state, the library or any persisted state. This is a presentation
+    /// acknowledgement for transient errors after the user has read them.
+    pub fn dismiss_notice(&mut self) {
+        self.last_error = None;
+        self.last_status = None;
+    }
+
     // ------------------------------------------------------- commands ---
 
     /// Plays a library track immediately.
@@ -5541,8 +5572,15 @@ impl Controller {
             return;
         }
         self.update_playback_history();
+        let was_stopped = self.player.state() == PlaybackState::Stopped;
         match self.player.play() {
             Ok(()) => {
+                if was_stopped {
+                    // Stop/Play is an explicit restart. This also prevents a
+                    // stale recovery position from resuming after the output
+                    // device returns.
+                    self.restart_recovery_position();
+                }
                 let retried = self.retry_audio_recovery_if_failed();
                 if self.audio_recovery_active() {
                     if !retried {
@@ -5607,6 +5645,7 @@ impl Controller {
         }
         self.update_playback_history();
         self.player.stop();
+        self.restart_recovery_position();
         self.persist_queue();
         self.sync_engine(false);
     }
@@ -6596,6 +6635,9 @@ impl Controller {
         }
         if self.audio_recovery_active() {
             self.preloaded_entry = None;
+            if self.player.state() == PlaybackState::Stopped {
+                self.restart_recovery_position();
+            }
             return;
         }
         match self.player.state() {
@@ -8963,6 +9005,47 @@ mod tests {
     }
 
     #[test]
+    fn stop_then_play_during_recovery_restarts_from_zero_not_the_stale_position() {
+        let dir = TempDir::new("audio-recovery-stop-play");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().played_frames > 6_000
+        });
+        let stale_position = controller.position();
+        assert!(
+            stale_position >= Duration::from_millis(100),
+            "test requires a materially non-zero pre-stop position: {stale_position:?}"
+        );
+
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated loss before stop/play");
+        controller.stop();
+        controller.play();
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert!(controller.audio_recovery_active());
+
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+        let recovered = last_recovery_control(&controls);
+        for _ in 0..4 {
+            recovered.drain_frames(128);
+            let _ = controller.poll();
+        }
+        assert!(
+            controller.position() < Duration::from_millis(80),
+            "Stop then Play must restart from the beginning, got {:?} (stale {:?})",
+            controller.position(),
+            stale_position
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn queue_replacement_during_recovery_restores_the_new_current_entry() {
         let dir = TempDir::new("audio-recovery-queue-replacement");
         let fx = fixtures(&dir);
@@ -9124,6 +9207,7 @@ mod tests {
                 if reason.contains("after 4 recovery attempts")
         ));
         assert!(controller.can_attempt_playback());
+        assert!(controller.can_retry_audio_output());
         assert_eq!(controller.player_state(), PlaybackState::Stopped);
         assert_eq!(controller.current_queue_entry_id(), entry);
         assert!(
@@ -9132,15 +9216,22 @@ mod tests {
                 .is_some_and(|error| error.contains("after 4 recovery attempts"))
         );
 
-        // A user Play after final failure starts a fresh bounded cycle. The
-        // simulated device becomes available on that cycle.
-        controller.play();
+        // An explicit retry after final failure starts a fresh bounded cycle.
+        // The simulated device becomes available on that cycle.
+        assert!(controller.retry_audio_output());
         assert!(matches!(
             controller.audio_status(),
             AudioStatus::Recovering(_)
         ));
         wait_for_audio_ready(&mut controller);
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert!(!controller.can_retry_audio_output());
+        assert!(
+            controller.last_error().is_none(),
+            "successful recovery must clear the stale final audio error"
+        );
+        controller.play();
         assert_eq!(controller.player_state(), PlaybackState::Playing);
         assert_eq!(controller.current_queue_entry_id(), entry);
         let recovered = last_recovery_control(&controls);
@@ -9359,6 +9450,29 @@ mod tests {
                 .any(|event| matches!(event, ControllerEvent::Error(_))),
             "stale/duplicate errors reached the UI: {events:?}"
         );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn transient_notice_can_be_dismissed_without_changing_playback_or_library() {
+        let dir = TempDir::new("dismiss-notice");
+        let (mut controller, control) = boot(&dir);
+        let fx = fixtures(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let id = id_of(&controller, &fx.a);
+        controller.play_track(id);
+        let state = controller.player_state();
+        let entry = controller.current_queue_entry_id();
+        let track_count = controller.tracks().len();
+        controller.report_error("simulated playback error".to_owned());
+        controller.report_status("simulated status".to_owned());
+        assert!(controller.last_error().is_some());
+        controller.dismiss_notice();
+        assert!(controller.last_error().is_none());
+        assert!(controller.last_status().is_none());
+        assert_eq!(controller.player_state(), state);
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        assert_eq!(controller.tracks().len(), track_count);
         controller.shutdown();
     }
 

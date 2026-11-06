@@ -192,7 +192,8 @@ Album relationships and Track counts; `E` lists canonical Albums with owner,
 cover state and ordered Track membership, plus standalone Tracks, marking
 Track-specific artwork and lyrics. `D` opens the selected Track's Album with
 inherited/override artwork labels, or its standalone state with no Album
-inheritance. `Y`/`P` support safe rename/create operations.
+inheritance. `Y`/`P` support safe rename/create operations. `c` clears a
+transient status/error notice without changing playback or library state.
 
 Track deletion, audio/artwork/lyrics repair, Album metadata/cover/order or
 membership changes (including converting to standalone), ownership/artist/album
@@ -817,6 +818,7 @@ from what remains structurally or physically unverified.
 | Import discovery, decode validation, partial preparation, cancellation and folder traversal | Confirmed by deterministic filesystem/import tests; real native dialogs and cross-platform traversal remain unverified |
 | M2 Artist/Album/Track entities, synchronization, artwork inheritance, enriched atomic import and GUI/TUI navigation | Confirmed by deterministic canonical/Controller/GUI/TUI state, transaction-failure, artwork round-trip/move/delete and import conflict tests; no real mouse/window-manager or terminal-emulator interaction audit |
 | M3 optional Album membership, standalone artwork/lyrics/member transitions and bulk import enrichment | Confirmed by deterministic canonical/Controller/GUI/TUI tests for standalone import, attach/detach/move, resource preservation, empty-Album retention, shared Artist/Album/artwork plus individual overrides, and invalid Album-artwork rejection; no real multi-candidate GUI mouse interaction audit |
+| M4 playback/device UX hardening: explicit recovery retry and Stop/Play recovery position reset | Confirmed by deterministic Controller recovery tests and GUI/TUI message/help tests; actual CPAL device-open and short real-output smoke checks were run, but no listening/acoustic or physical hotplug validation |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
@@ -1189,14 +1191,20 @@ Implemented semantics:
   `Playing`. Paused intent loads the track paused at the captured position;
   Stopped intent loads nothing. The recovery gap is not bridged: playback does
   not claim gapless continuity across a device loss.
-- A pause or stop issued during recovery changes the preserved intent, so a
-  later successful recovery does not start unexpected audio. Track selection
-  during recovery resets the restore point to zero; queue edits preserve the
-  selected stable entry; seeking during recovery updates the restore point.
+- A pause issued during recovery preserves the selected track and position
+  without autoplay. Stop clears the recovery restore point; Stop followed by
+  Play while recovery is still pending starts from zero rather than resuming a
+  stale pre-stop position. Track selection during recovery resets the restore
+  point to zero; queue edits preserve the selected stable entry; seeking during
+  recovery updates the restore point.
 - If all attempts fail, the Controller reports `AudioStatus::DeviceUnavailable`,
   stops the model, preserves the queue/current selection, and emits one final
-  error. A later user Play starts a fresh bounded cycle, allowing a returning
-  device to be reconsidered without an unbounded background retry loop.
+  error. `can_retry_audio_output`/`retry_audio_output` expose an explicit fresh
+  bounded cycle; the GUI Library setup shows **Retry audio output**, and a later
+  Play also starts a retry, allowing a returning device to be reconsidered
+  without an unbounded background retry loop. Successful recovery clears the
+  stale final audio-unavailable error; other transient error/status notices can
+  be dismissed from the GUI or with TUI `c` without changing playback state.
 - Shutdown joins any pending recovery thread. A recovered engine that arrives
   after the Controller is gone is dropped and cleanly shut down by the channel
   owner. The real-time fill callback still performs only ring/atomic work; all
