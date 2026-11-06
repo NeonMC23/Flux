@@ -3929,6 +3929,143 @@ impl Controller {
         Ok(())
     }
 
+    /// Updates an Artist display name and optional description. Canonical
+    /// relationships, aliases and image are preserved.
+    pub fn update_artist_metadata(
+        &mut self,
+        id: ArtistId,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            let message = "Artist editing requires a canonical library.".to_owned();
+            self.report_error(message.clone());
+            return Err(message);
+        };
+        if let Err(err) = store.update_artist_metadata(id, name, description.map(ToOwned::to_owned))
+        {
+            let message = format!("Could not update artist: {err}");
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Updated artist {}.", name.trim()));
+        Ok(())
+    }
+
+    /// Optional canonical Artist description.
+    #[must_use]
+    pub fn artist_description(&self, id: ArtistId) -> Option<&str> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.artist(id))
+            .and_then(|artist| artist.description.as_deref())
+    }
+
+    /// Absolute managed Artist image path, when assigned.
+    #[must_use]
+    pub fn artist_image_path(&self, id: ArtistId) -> Option<PathBuf> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.artist_image_path(id))
+    }
+
+    /// Assigns or replaces a managed Artist image.
+    pub fn set_artist_image(&mut self, id: ArtistId, source: &Path) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .ok_or_else(|| "artist image has no extension".to_owned())?;
+        validate_cover_signature(source, extension)?;
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Artist images require a canonical library.".to_owned());
+        };
+        store
+            .set_artist_image(id, source, extension)
+            .map_err(|err| format!("Could not set artist image: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Updated image for artist {id}."));
+        Ok(())
+    }
+
+    /// Removes an Artist image reference and its managed file after commit.
+    pub fn remove_artist_image(&mut self, id: ArtistId) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Artist images require a canonical library.".to_owned());
+        };
+        store
+            .remove_artist_image(id)
+            .map_err(|err| format!("Could not remove artist image: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Removed image for artist {id}."));
+        Ok(())
+    }
+
+    /// Absolute managed Track-specific artwork path, when assigned.
+    #[must_use]
+    pub fn track_artwork_path(&self, id: TrackId) -> Option<PathBuf> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.track_artwork_path(id))
+    }
+
+    /// Assigns or replaces a Track-specific artwork override. Album artwork is
+    /// untouched and remains the fallback after removal.
+    pub fn set_track_artwork(&mut self, id: TrackId, source: &Path) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .ok_or_else(|| "track artwork has no extension".to_owned())?;
+        validate_cover_signature(source, extension)?;
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Track artwork requires a canonical library.".to_owned());
+        };
+        store
+            .set_track_artwork(id, source, extension)
+            .map_err(|err| format!("Could not set track artwork: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Updated artwork for track {id}."));
+        Ok(())
+    }
+
+    /// Removes a Track artwork override, restoring Album artwork fallback.
+    pub fn remove_track_artwork(&mut self, id: TrackId) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Track artwork requires a canonical library.".to_owned());
+        };
+        store
+            .remove_track_artwork(id)
+            .map_err(|err| format!("Could not remove track artwork: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        self.report_status(format!("Removed artwork override for track {id}."));
+        Ok(())
+    }
+
     /// Creates an empty canonical album under an existing artist.
     pub fn create_album(
         &mut self,
@@ -5111,6 +5248,9 @@ impl Controller {
                 track_number: inferred.track_number,
                 disc_number: inferred.disc_number,
                 duration_ms: inferred.duration_ms,
+                artwork: None,
+                album_artwork: None,
+                lyrics: None,
                 allow_duplicate_content: false,
                 expected_source_fingerprint: None,
             });

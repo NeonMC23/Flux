@@ -73,6 +73,8 @@ pub const BACKUPS_DIR_NAME: &str = "backups";
 pub const ARTISTS_DIR_NAME: &str = "artists";
 /// Playlists directory.
 pub const PLAYLISTS_DIR_NAME: &str = "playlists";
+/// Track-specific artwork overrides, keyed by managed file names.
+pub const TRACK_ARTWORK_DIR_NAME: &str = "track-artwork";
 
 const MANIFEST_KIND: &str = "flux-library";
 const CATALOG_KIND: &str = "flux-catalog";
@@ -307,6 +309,10 @@ pub struct CanonicalArtist {
     pub name: String,
     /// Optional alternate names.
     pub aliases: Vec<String>,
+    /// Optional user-authored description.
+    pub description: Option<String>,
+    /// Optional managed artist image file name inside the artist directory.
+    pub image: Option<String>,
 }
 
 /// One canonical album/release.
@@ -350,6 +356,9 @@ pub struct CanonicalTrack {
     pub duration_ms: Option<u64>,
     /// Optional lyrics file name inside the track directory.
     pub lyrics: Option<String>,
+    /// Optional Track-specific artwork file name under `track-artwork/`.
+    /// Album artwork is the fallback when absent.
+    pub artwork: Option<String>,
     /// Optional content fingerprint.
     pub fingerprint: Option<ContentFingerprint>,
     /// Canonical creation/import time; zero means unknown/legacy.
@@ -619,6 +628,10 @@ struct ArtistEntityDto {
     name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AlbumEntityDto {
@@ -649,6 +662,8 @@ struct TrackEntityDto {
     duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lyrics: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artwork: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fingerprint: Option<ContentFingerprint>,
     /// Canonical creation/import time; zero means this predates the field.
@@ -821,6 +836,58 @@ fn safe_join(root: &Path, rel: &RelPath) -> Result<PathBuf, CanonicalError> {
         PathValidationError::NonUtf8Component,
     ))?;
     Ok(root.join(os))
+}
+
+fn validate_image_extension_size(
+    source: &Path,
+    extension: &str,
+    label: &str,
+) -> Result<String, CanonicalError> {
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+        return Err(CanonicalError::Invalid(format!(
+            "{label} must be png, jpg, jpeg, or webp"
+        )));
+    }
+    let size = fs::metadata(source)?.len();
+    if size == 0 || size > 16 * 1024 * 1024 {
+        return Err(CanonicalError::Invalid(format!(
+            "{label} must be between 1 byte and 16 MiB"
+        )));
+    }
+    Ok(extension)
+}
+
+fn validate_import_asset(
+    asset: &CanonicalImportAsset,
+    label: &str,
+) -> Result<String, CanonicalError> {
+    if !asset.source.is_file() {
+        return Err(CanonicalError::Invalid(format!(
+            "{label} source is not a readable file"
+        )));
+    }
+    let extension = asset
+        .source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or_else(|| CanonicalError::Invalid(format!("{label} has no extension")))?;
+    let extension = validate_image_extension_size(&asset.source, extension, label)?;
+    if ContentFingerprint::of_file(&asset.source)? != asset.fingerprint {
+        return Err(CanonicalError::Invalid(format!(
+            "{label} source changed after review"
+        )));
+    }
+    Ok(extension)
+}
+
+fn validate_asset_name(name: &str, file: &str, label: &str) -> Result<(), CanonicalError> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return Err(CanonicalError::Invalid(format!(
+            "{file} has an invalid {label} file name"
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects symlink components in an existing canonical resource path. The
@@ -1266,12 +1333,21 @@ impl CanonicalLibrary {
             if dto.name.trim().is_empty() {
                 return Err(CanonicalError::Invalid(format!("{file} has an empty name")));
             }
+            if let Some(image) = &dto.image {
+                validate_asset_name(image, &file, "artist image")?;
+                reject_symlink_escape(
+                    &root,
+                    &RelPath::from_utf8(&format!("{}/{}", rel.display_lossy(), image))?,
+                )?;
+            }
             artists.insert(
                 *id,
                 CanonicalArtist {
                     id: *id,
                     name: dto.name,
                     aliases: dto.aliases,
+                    description: dto.description,
+                    image: dto.image,
                 },
             );
         }
@@ -1442,6 +1518,13 @@ impl CanonicalLibrary {
                     ))?,
                 )?;
             }
+            if let Some(artwork) = &dto.artwork {
+                validate_asset_name(artwork, &file, "track artwork")?;
+                reject_symlink_escape(
+                    &root,
+                    &RelPath::from_utf8(&format!("{TRACK_ARTWORK_DIR_NAME}/{artwork}"))?,
+                )?;
+            }
             tracks.insert(
                 id,
                 CanonicalTrack {
@@ -1454,6 +1537,7 @@ impl CanonicalLibrary {
                     disc_number: dto.disc_number,
                     duration_ms: dto.duration_ms,
                     lyrics: dto.lyrics,
+                    artwork: dto.artwork,
                     fingerprint: dto.fingerprint,
                     created_unix_ms: dto.created_unix_ms,
                 },
@@ -1905,6 +1989,15 @@ pub enum CanonicalImportAlbumRef {
     },
 }
 
+/// Reviewed managed artwork attached during import.
+#[derive(Debug, Clone)]
+pub struct CanonicalImportAsset {
+    /// Source image file.
+    pub source: PathBuf,
+    /// Fingerprint captured at review time.
+    pub fingerprint: ContentFingerprint,
+}
+
 /// One reviewed track in an atomic import batch.
 #[derive(Debug, Clone)]
 pub struct CanonicalImportTrackRequest {
@@ -1924,6 +2017,12 @@ pub struct CanonicalImportTrackRequest {
     pub disc_number: Option<u32>,
     /// Optional technical duration.
     pub duration_ms: Option<u64>,
+    /// Optional Track-specific artwork override.
+    pub artwork: Option<CanonicalImportAsset>,
+    /// Optional album artwork applied to the destination album.
+    pub album_artwork: Option<CanonicalImportAsset>,
+    /// Optional managed lyrics text (LRC or plain text).
+    pub lyrics: Option<String>,
     /// Explicit duplicate review decision permits identical content in this batch.
     pub allow_duplicate_content: bool,
     /// Source fingerprint captured at review time; changed sources are stale.
@@ -1960,6 +2059,12 @@ pub struct CanonicalTrackMetadataUpdate {
     pub disc_number: Option<u32>,
     /// Proposed duration.
     pub duration_ms: Option<u64>,
+    /// Optional Track artwork override to attach or replace.
+    pub artwork: Option<CanonicalImportAsset>,
+    /// Optional Album artwork to attach or replace.
+    pub album_artwork: Option<CanonicalImportAsset>,
+    /// Optional lyrics text to attach or replace.
+    pub lyrics: Option<String>,
 }
 
 fn resolve_import_artists(
@@ -2003,6 +2108,8 @@ fn resolve_import_artists(
                         id: id.get(),
                         name: name.clone(),
                         aliases: Vec::new(),
+                        description: None,
+                        image: None,
                     };
                     push_entity_write(writes, &rel, "artist.flux", &dto)?;
                     artists.insert(
@@ -2011,6 +2118,8 @@ fn resolve_import_artists(
                             id,
                             name: name.clone(),
                             aliases: Vec::new(),
+                            description: None,
+                            image: None,
                         },
                     );
                     new_artist_ids.insert(name, id);
@@ -2574,6 +2683,8 @@ pub struct TrackDeletionPlan {
     pub record_path: RelPath,
     /// Managed lyrics path, when recorded.
     pub lyrics_path: Option<RelPath>,
+    /// Managed Track artwork override path, when recorded.
+    pub artwork_path: Option<RelPath>,
     /// Playlist names referencing this track at review.
     pub playlists: Vec<String>,
     /// Catalogue generation at review.
@@ -2969,6 +3080,8 @@ impl CanonicalLibrary {
                 .map(|alias| alias.trim().to_owned())
                 .filter(|alias| !alias.is_empty())
                 .collect(),
+            description: None,
+            image: None,
         };
         let mut catalog = self.catalog.clone();
         catalog.next_artist_id = advance_counter(catalog.next_artist_id, "artist")?;
@@ -3003,6 +3116,8 @@ impl CanonicalLibrary {
             id: id.get(),
             name,
             aliases: artist.aliases,
+            description: artist.description,
+            image: artist.image,
         };
         let rel = self
             .artist_paths
@@ -3012,6 +3127,158 @@ impl CanonicalLibrary {
         let mut writes = Vec::new();
         push_entity_write(&mut writes, &rel, "artist.flux", &dto)?;
         self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Updates an artist's display name and optional description while
+    /// preserving aliases, image and every relationship.
+    pub fn update_artist_metadata(
+        &mut self,
+        id: ArtistId,
+        name: impl Into<String>,
+        description: Option<String>,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let artist =
+            self.artists.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("artist {id} is not in the library"))
+            })?;
+        let name = name.into().trim().to_owned();
+        if name.is_empty() {
+            return Err(CanonicalError::Invalid(
+                "artist name must not be empty".to_owned(),
+            ));
+        }
+        if self
+            .artists
+            .values()
+            .any(|other| other.id != id && other.name == name)
+        {
+            return Err(CanonicalError::Invalid(format!(
+                "artist name {name:?} is already in use"
+            )));
+        }
+        let description = description
+            .map(|description| description.trim().to_owned())
+            .filter(|description| !description.is_empty());
+        let dto = ArtistEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ARTIST_KIND.to_owned(),
+            id: id.get(),
+            name,
+            aliases: artist.aliases,
+            description,
+            image: artist.image,
+        };
+        let rel = self
+            .artist_paths
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing artist path".to_owned()))?;
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &rel, "artist.flux", &dto)?;
+        self.commit_writes(None, writes)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Absolute path for an artist's managed image.
+    #[must_use]
+    pub fn artist_image_path(&self, id: ArtistId) -> Option<PathBuf> {
+        let rel = self.artist_paths.get(&id)?;
+        let image = self.artists.get(&id)?.image.as_ref()?;
+        let os = rel.to_os_path()?;
+        Some(self.root.join(os).join(image))
+    }
+
+    /// Writes or replaces an artist image. The caller has already validated
+    /// decodability; this validates the managed extension/size and commits the
+    /// file and entity update atomically.
+    pub fn set_artist_image(
+        &mut self,
+        id: ArtistId,
+        source: &Path,
+        extension: &str,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let extension = validate_image_extension_size(source, extension, "artist image")?;
+        let artist =
+            self.artists.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("artist {id} is not in the library"))
+            })?;
+        let artist_rel = self
+            .artist_paths
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing artist path".to_owned()))?;
+        let image_name = format!("image.{extension}");
+        let dto = ArtistEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ARTIST_KIND.to_owned(),
+            id: id.get(),
+            name: artist.name,
+            aliases: artist.aliases,
+            description: artist.description,
+            image: Some(image_name.clone()),
+        };
+        let image_rel =
+            RelPath::from_utf8(&format!("{}/{}", artist_rel.display_lossy(), image_name))?;
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &artist_rel, "artist.flux", &dto)?;
+        writes.push(PendingWrite {
+            target: image_rel,
+            bytes: None,
+            copy_from: Some(source.to_path_buf()),
+            expected: Some(ContentFingerprint::of_file(source)?),
+        });
+        let mut cleanup = Vec::new();
+        if let Some(old) = artist.image
+            && old != image_name
+        {
+            cleanup.push(RelPath::from_utf8(&format!(
+                "{}/{}",
+                artist_rel.display_lossy(),
+                old
+            ))?);
+        }
+        self.commit_writes_with_cleanup(None, writes, cleanup)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Removes an artist image reference and its managed file after commit.
+    pub fn remove_artist_image(&mut self, id: ArtistId) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let artist =
+            self.artists.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("artist {id} is not in the library"))
+            })?;
+        let Some(old) = artist.image.clone() else {
+            return Ok(());
+        };
+        let artist_rel = self
+            .artist_paths
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CanonicalError::Invalid("missing artist path".to_owned()))?;
+        let dto = ArtistEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: ARTIST_KIND.to_owned(),
+            id: id.get(),
+            name: artist.name,
+            aliases: artist.aliases,
+            description: artist.description,
+            image: None,
+        };
+        let mut writes = Vec::new();
+        push_entity_write(&mut writes, &artist_rel, "artist.flux", &dto)?;
+        let cleanup = vec![RelPath::from_utf8(&format!(
+            "{}/{}",
+            artist_rel.display_lossy(),
+            old
+        ))?];
+        self.commit_writes_with_cleanup(None, writes, cleanup)?;
         self.reopen_after()?;
         Ok(())
     }
@@ -3100,6 +3367,9 @@ impl CanonicalLibrary {
         let mut new_album_ids: BTreeMap<(ArtistId, String), AlbumId> = BTreeMap::new();
         let mut album_orders: BTreeMap<AlbumId, Vec<TrackId>> = BTreeMap::new();
         let mut touched_albums: BTreeSet<AlbumId> = BTreeSet::new();
+        let mut album_artwork_updates: BTreeMap<AlbumId, (String, CanonicalImportAsset)> =
+            BTreeMap::new();
+        let mut cleanup = Vec::new();
         let mut ids = Vec::with_capacity(requests.len());
         let mut fingerprints = self
             .tracks
@@ -3213,6 +3483,23 @@ impl CanonicalLibrary {
                     }
                 }
             };
+            if let Some(asset) = request.album_artwork.as_ref() {
+                let extension = validate_import_asset(asset, "album artwork")?;
+                let cover_name = format!("cover.{extension}");
+                if let Some((existing_name, existing_asset)) = album_artwork_updates.get(&album_id)
+                {
+                    if existing_name != &cover_name
+                        || existing_asset.fingerprint != asset.fingerprint
+                    {
+                        return Err(CanonicalError::Invalid(
+                            "one import batch requested conflicting artwork for the same album"
+                                .to_owned(),
+                        ));
+                    }
+                } else {
+                    album_artwork_updates.insert(album_id, (cover_name, asset.clone()));
+                }
+            }
             let album = albums.get_mut(&album_id).ok_or_else(|| {
                 CanonicalError::Invalid("import destination album disappeared".to_owned())
             })?;
@@ -3224,6 +3511,39 @@ impl CanonicalLibrary {
                 return Err(CanonicalError::Invalid(format!(
                     "destination collision for track {track_id}"
                 )));
+            }
+            let artwork_name = if let Some(asset) = request.artwork.as_ref() {
+                let extension = validate_import_asset(asset, "track artwork")?;
+                let name = format!("track_{}.{}", track_id.get(), extension);
+                writes.push(PendingWrite {
+                    target: RelPath::from_utf8(&format!("{TRACK_ARTWORK_DIR_NAME}/{name}"))?,
+                    bytes: None,
+                    copy_from: Some(asset.source.clone()),
+                    expected: Some(asset.fingerprint),
+                });
+                Some(name)
+            } else {
+                None
+            };
+            let lyrics_name = request
+                .lyrics
+                .as_ref()
+                .map(|_| format!("track_{:06}.lrc", track_id.get()));
+            if let Some(text) = request.lyrics.as_ref() {
+                let target = RelPath::from_utf8(&format!(
+                    "{}/{}",
+                    record
+                        .display_lossy()
+                        .rsplit_once('/')
+                        .map_or("", |(dir, _)| dir),
+                    lyrics_name.as_deref().expect("lyrics name")
+                ))?;
+                writes.push(PendingWrite {
+                    target,
+                    bytes: Some(text.as_bytes().to_vec()),
+                    copy_from: None,
+                    expected: None,
+                });
             }
             catalog.tracks.push(CatalogTrackDto {
                 id: track_id.get(),
@@ -3246,7 +3566,8 @@ impl CanonicalLibrary {
                 track_number: request.track_number,
                 disc_number: request.disc_number,
                 duration_ms: request.duration_ms,
-                lyrics: None,
+                lyrics: lyrics_name,
+                artwork: artwork_name,
                 fingerprint: Some(fingerprint),
                 created_unix_ms: crate::portable::now_unix_ms(),
             };
@@ -3303,6 +3624,66 @@ impl CanonicalLibrary {
                 .get(&update.track_id)
                 .cloned()
                 .ok_or_else(|| CanonicalError::Invalid("missing track record path".to_owned()))?;
+            if let Some(asset) = update.album_artwork.as_ref() {
+                let extension = validate_import_asset(asset, "album artwork")?;
+                let cover_name = format!("cover.{extension}");
+                if let Some((existing_name, existing_asset)) =
+                    album_artwork_updates.get(&track.album_id)
+                {
+                    if existing_name != &cover_name
+                        || existing_asset.fingerprint != asset.fingerprint
+                    {
+                        return Err(CanonicalError::Invalid(
+                            "one import batch requested conflicting artwork for the same album"
+                                .to_owned(),
+                        ));
+                    }
+                } else {
+                    album_artwork_updates.insert(track.album_id, (cover_name, asset.clone()));
+                }
+                touched_albums.insert(track.album_id);
+            }
+            let artwork_name = if let Some(asset) = update.artwork.as_ref() {
+                let extension = validate_import_asset(asset, "track artwork")?;
+                let name = format!("track_{}.{}", track.id.get(), extension);
+                writes.push(PendingWrite {
+                    target: RelPath::from_utf8(&format!("{TRACK_ARTWORK_DIR_NAME}/{name}"))?,
+                    bytes: None,
+                    copy_from: Some(asset.source.clone()),
+                    expected: Some(asset.fingerprint),
+                });
+                if let Some(old) = &track.artwork
+                    && old != &name
+                {
+                    cleanup.push(RelPath::from_utf8(&format!(
+                        "{TRACK_ARTWORK_DIR_NAME}/{old}"
+                    ))?);
+                }
+                Some(name)
+            } else {
+                track.artwork.clone()
+            };
+            let lyrics_name = update
+                .lyrics
+                .as_ref()
+                .map(|_| format!("track_{:06}.lrc", track.id.get()))
+                .or_else(|| track.lyrics.clone());
+            if let Some(text) = update.lyrics.as_ref() {
+                let target = RelPath::from_utf8(&format!(
+                    "{}/{}",
+                    record
+                        .display_lossy()
+                        .rsplit_once('/')
+                        .map_or("", |(dir, _)| dir),
+                    lyrics_name.as_deref().expect("lyrics name")
+                ))?;
+                writes.push(PendingWrite {
+                    target,
+                    bytes: Some(text.as_bytes().to_vec()),
+                    copy_from: None,
+                    expected: None,
+                });
+            }
             let dto = TrackEntityDto {
                 schema_version: CANONICAL_SCHEMA_VERSION,
                 kind: TRACK_KIND.to_owned(),
@@ -3314,7 +3695,8 @@ impl CanonicalLibrary {
                 track_number: update.track_number,
                 disc_number: update.disc_number,
                 duration_ms: update.duration_ms,
-                lyrics: track.lyrics,
+                lyrics: lyrics_name,
+                artwork: artwork_name,
                 fingerprint: track.fingerprint,
                 created_unix_ms: track.created_unix_ms,
             };
@@ -3337,6 +3719,29 @@ impl CanonicalLibrary {
             if let Some(order) = album_orders.get(&album_id) {
                 dto.track_order = order.iter().map(|track| track.get()).collect();
             }
+            if let Some((cover_name, asset)) = album_artwork_updates.get(&album_id) {
+                dto.cover = Some(cover_name.clone());
+                let album_path = album_rel(album.owner_artist_id, album.id);
+                writes.push(PendingWrite {
+                    target: RelPath::from_utf8(&format!(
+                        "{}/{}",
+                        album_path.display_lossy(),
+                        cover_name
+                    ))?,
+                    bytes: None,
+                    copy_from: Some(asset.source.clone()),
+                    expected: Some(asset.fingerprint),
+                });
+                if let Some(old) = &album.cover
+                    && old != cover_name
+                {
+                    cleanup.push(RelPath::from_utf8(&format!(
+                        "{}/{}",
+                        album_path.display_lossy(),
+                        old
+                    ))?);
+                }
+            }
             push_entity_write(
                 &mut writes,
                 &album_rel(album.owner_artist_id, album.id),
@@ -3347,7 +3752,7 @@ impl CanonicalLibrary {
         catalog.artists.sort_by_key(|entry| entry.id);
         catalog.albums.sort_by_key(|entry| entry.id);
         catalog.tracks.sort_by_key(|entry| entry.id);
-        self.commit_writes(Some(catalog), writes)?;
+        self.commit_writes_with_cleanup(Some(catalog), writes, cleanup)?;
         self.reopen_after()?;
         Ok(ids)
     }
@@ -3459,6 +3864,7 @@ impl CanonicalLibrary {
                 disc_number: imported.disc_number,
                 duration_ms: imported.duration_ms,
                 lyrics: None,
+                artwork: None,
                 fingerprint: Some(fingerprint),
                 created_unix_ms: crate::portable::now_unix_ms(),
             };
@@ -3555,6 +3961,8 @@ impl CanonicalLibrary {
                     id: id.get(),
                     name: artist_name,
                     aliases: Vec::new(),
+                    description: None,
+                    image: None,
                 };
                 push_entity_write(&mut writes, &rel, "artist.flux", &artist)?;
                 id
@@ -3659,6 +4067,7 @@ impl CanonicalLibrary {
             disc_number: imported.disc_number,
             duration_ms: imported.duration_ms,
             lyrics: None,
+            artwork: None,
             fingerprint: Some(fingerprint),
             created_unix_ms: crate::portable::now_unix_ms(),
         };
@@ -3797,6 +4206,7 @@ impl CanonicalLibrary {
             disc_number,
             duration_ms: track.duration_ms,
             lyrics: track.lyrics,
+            artwork: track.artwork.clone(),
             fingerprint: track.fingerprint,
             created_unix_ms: track.created_unix_ms,
         };
@@ -4036,6 +4446,7 @@ impl CanonicalLibrary {
             disc_number: track.disc_number,
             duration_ms: track.duration_ms,
             lyrics: track.lyrics.clone(),
+            artwork: track.artwork.clone(),
             fingerprint: Some(plan.fingerprint),
             created_unix_ms: track.created_unix_ms,
         };
@@ -4283,6 +4694,7 @@ impl CanonicalLibrary {
             disc_number: track.disc_number,
             duration_ms: track.duration_ms,
             lyrics: track.lyrics.clone(),
+            artwork: track.artwork.clone(),
             fingerprint: Some(plan.source_fingerprint),
             created_unix_ms: track.created_unix_ms,
         };
@@ -4341,6 +4753,11 @@ impl CanonicalLibrary {
             None
         };
         let lyrics_path = plan_track_lyrics_rel(&record_path, track.lyrics.as_deref());
+        let artwork_path = track
+            .artwork
+            .as_ref()
+            .map(|artwork| RelPath::from_utf8(&format!("{TRACK_ARTWORK_DIR_NAME}/{artwork}")))
+            .transpose()?;
         let mut playlists = self
             .playlists
             .values()
@@ -4358,6 +4775,7 @@ impl CanonicalLibrary {
             audio_fingerprint,
             record_path,
             lyrics_path,
+            artwork_path,
             playlists,
             generation: self.catalog.generation,
         })
@@ -4495,6 +4913,7 @@ impl CanonicalLibrary {
             Some(plan.audio_path.clone()),
             Some(plan.record_path.clone()),
             plan.lyrics_path.clone(),
+            plan.artwork_path.clone(),
         ]
         .into_iter()
         .flatten()
@@ -4599,6 +5018,7 @@ impl CanonicalLibrary {
             disc_number,
             duration_ms,
             lyrics: track.lyrics,
+            artwork: track.artwork.clone(),
             fingerprint: track.fingerprint,
             created_unix_ms: track.created_unix_ms,
         };
@@ -4681,6 +5101,119 @@ impl CanonicalLibrary {
         Ok(())
     }
 
+    /// Absolute path for a Track-specific artwork override, when present.
+    #[must_use]
+    pub fn track_artwork_path(&self, id: TrackId) -> Option<PathBuf> {
+        let artwork = self.tracks.get(&id)?.artwork.as_ref()?;
+        Some(self.root.join(TRACK_ARTWORK_DIR_NAME).join(artwork))
+    }
+
+    /// Writes or replaces a Track-specific artwork override. Album artwork
+    /// remains untouched and is the fallback when this is absent.
+    pub fn set_track_artwork(
+        &mut self,
+        id: TrackId,
+        source: &Path,
+        extension: &str,
+    ) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let extension = validate_image_extension_size(source, extension, "track artwork")?;
+        let track =
+            self.tracks.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("track {id} is not in the library"))
+            })?;
+        let record_rel =
+            self.track_records.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid("track record path is missing".to_owned())
+            })?;
+        let artwork_name = format!("track_{}.{}", id.get(), extension);
+        let dto = TrackEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: TRACK_KIND.to_owned(),
+            id: id.get(),
+            title: track.title,
+            credited_artist_ids: track
+                .credited_artist_ids
+                .iter()
+                .map(|artist| artist.get())
+                .collect(),
+            owner_artist_id: track.owner_artist_id.get(),
+            album_id: track.album_id.get(),
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            duration_ms: track.duration_ms,
+            lyrics: track.lyrics,
+            artwork: Some(artwork_name.clone()),
+            fingerprint: track.fingerprint,
+            created_unix_ms: track.created_unix_ms,
+        };
+        let artwork_rel = RelPath::from_utf8(&format!("{TRACK_ARTWORK_DIR_NAME}/{artwork_name}"))?;
+        let mut writes = Vec::new();
+        push_file_write(&mut writes, &record_rel, &dto)?;
+        writes.push(PendingWrite {
+            target: artwork_rel,
+            bytes: None,
+            copy_from: Some(source.to_path_buf()),
+            expected: Some(ContentFingerprint::of_file(source)?),
+        });
+        let mut cleanup = Vec::new();
+        if let Some(old) = track.artwork
+            && old != artwork_name
+        {
+            cleanup.push(RelPath::from_utf8(&format!(
+                "{TRACK_ARTWORK_DIR_NAME}/{old}"
+            ))?);
+        }
+        self.commit_writes_with_cleanup(None, writes, cleanup)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
+    /// Removes a Track-specific artwork override; Album artwork fallback is
+    /// unaffected.
+    pub fn remove_track_artwork(&mut self, id: TrackId) -> Result<(), CanonicalError> {
+        self.ensure_writable()?;
+        let track =
+            self.tracks.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid(format!("track {id} is not in the library"))
+            })?;
+        let Some(old) = track.artwork.clone() else {
+            return Ok(());
+        };
+        let record_rel =
+            self.track_records.get(&id).cloned().ok_or_else(|| {
+                CanonicalError::Invalid("track record path is missing".to_owned())
+            })?;
+        let dto = TrackEntityDto {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            kind: TRACK_KIND.to_owned(),
+            id: id.get(),
+            title: track.title,
+            credited_artist_ids: track
+                .credited_artist_ids
+                .iter()
+                .map(|artist| artist.get())
+                .collect(),
+            owner_artist_id: track.owner_artist_id.get(),
+            album_id: track.album_id.get(),
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            duration_ms: track.duration_ms,
+            lyrics: track.lyrics,
+            artwork: None,
+            fingerprint: track.fingerprint,
+            created_unix_ms: track.created_unix_ms,
+        };
+        let mut writes = Vec::new();
+        push_file_write(&mut writes, &record_rel, &dto)?;
+        let cleanup = vec![RelPath::from_utf8(&format!(
+            "{TRACK_ARTWORK_DIR_NAME}/{old}"
+        ))?];
+        self.commit_writes_with_cleanup(None, writes, cleanup)?;
+        self.reopen_after()?;
+        Ok(())
+    }
+
     /// Writes or removes a managed lyrics file. The caller supplies text; no
     /// tag metadata is consulted.
     pub fn set_lyrics(&mut self, id: TrackId, lyrics: Option<&str>) -> Result<(), CanonicalError> {
@@ -4712,6 +5245,7 @@ impl CanonicalLibrary {
             disc_number: track.disc_number,
             duration_ms: track.duration_ms,
             lyrics: lyrics_name.clone(),
+            artwork: track.artwork.clone(),
             fingerprint: track.fingerprint,
             created_unix_ms: track.created_unix_ms,
         };
@@ -5690,6 +6224,9 @@ mod tests {
             track_number: None,
             disc_number: None,
             duration_ms: None,
+            artwork: None,
+            album_artwork: None,
+            lyrics: None,
             allow_duplicate_content: false,
             expected_source_fingerprint: Some(
                 ContentFingerprint::of_file(&source).expect("fingerprint"),
@@ -6091,6 +6628,8 @@ impl CanonicalLibrary {
                 id: artist.id.get(),
                 name: artist.name.clone(),
                 aliases: artist.aliases.clone(),
+                description: artist.description.clone(),
+                image: artist.image.clone(),
             };
             push_entity_write(&mut writes, &rel, "artist.flux", &dto)?;
         }
@@ -6215,6 +6754,7 @@ impl CanonicalLibrary {
                 disc_number: track.disc_number,
                 duration_ms: track.duration_ms,
                 lyrics,
+                artwork: track.artwork.clone(),
                 fingerprint: track.fingerprint.or(Some(fingerprint)),
                 created_unix_ms: track.created_unix_ms,
             };
@@ -6796,6 +7336,7 @@ impl CanonicalLibrary {
             disc_number: track.disc_number,
             duration_ms: track.duration_ms,
             lyrics: track.lyrics,
+            artwork: track.artwork.clone(),
             fingerprint: plan.expected_fingerprint,
             created_unix_ms: track.created_unix_ms,
         };
@@ -7891,6 +8432,7 @@ impl CanonicalLibrary {
                         disc_number: current.disc_number,
                         duration_ms: current.duration_ms,
                         lyrics,
+                        artwork: current.artwork.clone(),
                         fingerprint: current.fingerprint,
                         created_unix_ms: current.created_unix_ms,
                     };
@@ -8007,6 +8549,7 @@ impl CanonicalLibrary {
                 disc_number: updated.disc_number,
                 duration_ms: updated.duration_ms,
                 lyrics: updated.lyrics,
+                artwork: updated.artwork,
                 fingerprint: updated.fingerprint,
                 created_unix_ms: updated.created_unix_ms,
             };
@@ -9411,6 +9954,404 @@ mod track_deletion_tests {
             fs::read_to_string(fx.library.track_lyrics_path(second).expect("second lyrics"))
                 .expect("second lyrics text"),
             "[00:01.00]second lyrics"
+        );
+    }
+
+    #[test]
+    fn artist_metadata_image_and_track_artwork_round_trip_and_delete_cleanup() {
+        let mut fx = fixture("artist-track-artwork");
+        let artist_image = fx._dir.write("artist.png", b"\x89PNG\r\n\x1a\nartist");
+        fx.library
+            .update_artist_metadata(
+                fx.a,
+                "Renamed A",
+                Some("Warm synthesizer artist".to_owned()),
+            )
+            .expect("artist metadata");
+        fx.library
+            .set_artist_image(fx.a, &artist_image, "png")
+            .expect("artist image");
+        let managed_artist_image = fx
+            .library
+            .artist_image_path(fx.a)
+            .expect("artist image path");
+        assert!(managed_artist_image.is_file());
+
+        let album_id = fx.library.track(fx.track).expect("track").album_id;
+        let album_cover = fx._dir.write("album.png", b"\x89PNG\r\n\x1a\nalbum");
+        fx.library
+            .set_cover(album_id, &album_cover, "png")
+            .expect("album cover");
+        let managed_album_cover = fx
+            .library
+            .album_cover_path(album_id)
+            .expect("album cover path");
+        assert!(managed_album_cover.is_file());
+
+        let track_art = fx._dir.write("track.webp", b"RIFF....WEBPtrack");
+        fx.library
+            .set_track_artwork(fx.track, &track_art, "webp")
+            .expect("track artwork");
+        let managed_track_art = fx
+            .library
+            .track_artwork_path(fx.track)
+            .expect("track artwork path");
+        assert!(managed_track_art.is_file());
+        assert_eq!(
+            fx.library
+                .track(fx.track)
+                .and_then(|track| track.artwork.as_deref()),
+            Some("track_1.webp")
+        );
+        fx.library
+            .remove_track_artwork(fx.track)
+            .expect("remove track artwork");
+        assert!(!managed_track_art.exists());
+        assert!(fx.library.track_artwork_path(fx.track).is_none());
+        assert!(
+            fx.library
+                .album_cover_path(album_id)
+                .is_some_and(|path| path.is_file()),
+            "removing a Track override restores Album fallback"
+        );
+        let replacement_art = fx._dir.write("track2.png", b"\x89PNG\r\n\x1a\ntrack2");
+        fx.library
+            .set_track_artwork(fx.track, &replacement_art, "png")
+            .expect("re-add track artwork");
+        let managed_track_art = fx
+            .library
+            .track_artwork_path(fx.track)
+            .expect("track artwork path");
+        assert!(managed_track_art.is_file());
+        let replacement_cover = fx
+            ._dir
+            .write("album-replacement.jpg", b"\xff\xd8\xffreplacement");
+        fx.library
+            .set_cover(album_id, &replacement_cover, "jpg")
+            .expect("replace album cover");
+        assert!(!managed_album_cover.exists());
+        assert!(
+            managed_track_art.is_file(),
+            "Album cover replacement does not touch Track overrides"
+        );
+        assert_eq!(
+            fx.library
+                .track(fx.track)
+                .and_then(|track| track.artwork.as_deref()),
+            Some("track_1.png")
+        );
+        let managed_album_cover = fx
+            .library
+            .album_cover_path(album_id)
+            .expect("replacement album cover path");
+        assert!(managed_album_cover.is_file());
+
+        let destination = fx
+            .library
+            .create_album(fx.a, "Artwork destination", ReleaseType::Album)
+            .expect("destination album");
+        let move_plan = fx
+            .library
+            .plan_track_move(fx.track, destination, 0)
+            .expect("move plan");
+        fx.library.execute_track_move(&move_plan).expect("move");
+        assert_eq!(
+            fx.library.track(fx.track).map(|track| track.album_id),
+            Some(destination)
+        );
+        assert!(
+            managed_track_art.is_file(),
+            "track artwork survives album move"
+        );
+        assert_eq!(
+            fx.library
+                .artist(fx.a)
+                .and_then(|artist| artist.image.as_deref()),
+            Some("image.png")
+        );
+        assert_eq!(
+            fx.library
+                .artist(fx.a)
+                .and_then(|artist| artist.description.as_deref()),
+            Some("Warm synthesizer artist")
+        );
+
+        let root = fx.library.root.clone();
+        drop(fx.library);
+        let reopened = CanonicalLibrary::open(&root).expect("reopen");
+        assert_eq!(
+            reopened
+                .artist(fx.a)
+                .and_then(|artist| artist.description.as_deref()),
+            Some("Warm synthesizer artist")
+        );
+        assert!(
+            reopened
+                .artist_image_path(fx.a)
+                .is_some_and(|path| path.is_file())
+        );
+        assert_eq!(
+            reopened.track(fx.track).map(|track| track.album_id),
+            Some(destination)
+        );
+        assert!(
+            reopened
+                .track_artwork_path(fx.track)
+                .is_some_and(|path| path.is_file())
+        );
+        assert_eq!(
+            reopened.album(album_id).expect("source album").track_order,
+            Vec::<TrackId>::new(),
+            "source album remains empty"
+        );
+        drop(reopened);
+
+        let mut reopened = CanonicalLibrary::open(&root).expect("reopen for delete");
+        let deletion = reopened
+            .plan_track_deletion(fx.track)
+            .expect("deletion plan");
+        let report = reopened.delete_track(&deletion).expect("delete");
+        assert!(report.cleanup_errors.is_empty(), "{report:?}");
+        assert!(reopened.artist(fx.a).is_some(), "artist retained");
+        assert!(
+            reopened
+                .artist_image_path(fx.a)
+                .is_some_and(|path| path.is_file()),
+            "artist image is not owned by the deleted track"
+        );
+        assert!(
+            !managed_track_art.exists(),
+            "track artwork cleaned after deletion"
+        );
+        assert!(
+            reopened
+                .album_cover_path(album_id)
+                .is_some_and(|path| path.is_file()),
+            "Track deletion never deletes unrelated Album artwork"
+        );
+    }
+
+    #[test]
+    fn import_batch_enriches_track_album_artwork_and_lyrics_atomically() {
+        use super::{
+            CanonicalImportAlbumRef, CanonicalImportArtistRef, CanonicalImportAsset,
+            CanonicalImportTrackRequest,
+        };
+
+        let mut fx = fixture("import-enrichment");
+        let source = fx._dir.write("incoming/enriched.wav", b"enriched audio");
+        let track_art = fx
+            ._dir
+            .write("incoming/track.png", b"\x89PNG\r\n\x1a\ntrack");
+        let album_art = fx
+            ._dir
+            .write("incoming/album.png", b"\x89PNG\r\n\x1a\nalbum");
+        let request = CanonicalImportTrackRequest {
+            source: source.clone(),
+            title: "Enriched".to_owned(),
+            credited_artists: vec![CanonicalImportArtistRef::Existing(fx.a)],
+            owner_index: 0,
+            album: CanonicalImportAlbumRef::ByName {
+                title: "Enriched Album".to_owned(),
+                release_type: ReleaseType::Album,
+            },
+            track_number: Some(1),
+            disc_number: None,
+            duration_ms: None,
+            artwork: Some(CanonicalImportAsset {
+                source: track_art.clone(),
+                fingerprint: ContentFingerprint::of_file(&track_art)
+                    .expect("track art fingerprint"),
+            }),
+            album_artwork: Some(CanonicalImportAsset {
+                source: album_art.clone(),
+                fingerprint: ContentFingerprint::of_file(&album_art)
+                    .expect("album art fingerprint"),
+            }),
+            lyrics: Some("[00:01.00]enriched lyrics".to_owned()),
+            allow_duplicate_content: false,
+            expected_source_fingerprint: Some(
+                ContentFingerprint::of_file(&source).expect("audio fingerprint"),
+            ),
+        };
+        let old_album = fx.library.track(fx.track).expect("old track").album_id;
+        let generation = fx.library.catalog.generation;
+        let ids = fx
+            .library
+            .import_review_batch(generation, vec![request], Vec::new())
+            .expect("atomic enriched import");
+        assert_eq!(ids.len(), 1);
+        let id = ids[0];
+        let track = fx.library.track(id).expect("imported track");
+        let album = fx.library.album(track.album_id).expect("album");
+        let imported_album_id = album.id;
+        assert_eq!(album.title, "Enriched Album");
+        let cover = fx.library.album_cover_path(album.id).expect("album cover");
+        assert_eq!(
+            fs::read(&cover).expect("cover bytes"),
+            b"\x89PNG\r\n\x1a\nalbum"
+        );
+        let artwork = fx.library.track_artwork_path(id).expect("track artwork");
+        assert_eq!(
+            fs::read(&artwork).expect("art bytes"),
+            b"\x89PNG\r\n\x1a\ntrack"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.library.track_lyrics_path(id).expect("lyrics path"))
+                .expect("lyrics"),
+            "[00:01.00]enriched lyrics"
+        );
+        assert_eq!(album.track_order, vec![id]);
+        assert_eq!(
+            fx.library.track(fx.track).expect("old track").album_id,
+            old_album
+        );
+
+        let updated_art = fx
+            ._dir
+            .write("incoming/track-updated.png", b"\x89PNG\r\n\x1a\nupdated");
+        let updated_album_art = fx
+            ._dir
+            .write("incoming/album-updated.jpg", b"\xff\xd8\xffupdated");
+        let track = fx.library.track(id).expect("track for update");
+        let update = super::CanonicalTrackMetadataUpdate {
+            track_id: id,
+            expected_fingerprint: track.fingerprint,
+            expected_album_id: track.album_id,
+            expected_title: track.title.clone(),
+            expected_credited_artist_ids: track.credited_artist_ids.clone(),
+            expected_track_number: track.track_number,
+            expected_disc_number: track.disc_number,
+            expected_duration_ms: track.duration_ms,
+            title: track.title.clone(),
+            credited_artists: track
+                .credited_artist_ids
+                .iter()
+                .map(|artist| CanonicalImportArtistRef::Existing(*artist))
+                .collect(),
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            duration_ms: track.duration_ms,
+            artwork: Some(CanonicalImportAsset {
+                source: updated_art.clone(),
+                fingerprint: ContentFingerprint::of_file(&updated_art).expect("updated art"),
+            }),
+            album_artwork: Some(CanonicalImportAsset {
+                source: updated_album_art.clone(),
+                fingerprint: ContentFingerprint::of_file(&updated_album_art)
+                    .expect("updated album art"),
+            }),
+            lyrics: Some("[00:02.00]updated lyrics".to_owned()),
+        };
+        fx.library
+            .import_review_batch(fx.library.catalog.generation, Vec::new(), vec![update])
+            .expect("enrich existing track atomically");
+        assert_eq!(
+            fs::read(fx.library.track_artwork_path(id).expect("updated artwork"))
+                .expect("updated artwork bytes"),
+            b"\x89PNG\r\n\x1a\nupdated"
+        );
+        assert_eq!(
+            fs::read(
+                fx.library
+                    .album_cover_path(imported_album_id)
+                    .expect("updated album cover")
+            )
+            .expect("updated cover bytes"),
+            b"\xff\xd8\xffupdated"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.library.track_lyrics_path(id).expect("updated lyrics"))
+                .expect("updated lyrics text"),
+            "[00:02.00]updated lyrics"
+        );
+        assert_eq!(
+            fx.library.track(id).expect("track").album_id,
+            imported_album_id
+        );
+    }
+
+    #[test]
+    fn import_conflicting_album_artwork_or_changed_asset_leaves_no_partial_state() {
+        use super::{
+            CanonicalImportAlbumRef, CanonicalImportArtistRef, CanonicalImportAsset,
+            CanonicalImportTrackRequest,
+        };
+
+        let mut fx = fixture("import-artwork-failure");
+        let source_one = fx._dir.write("incoming/one.wav", b"one audio");
+        let source_two = fx._dir.write("incoming/two.wav", b"two audio");
+        let art_one = fx._dir.write("incoming/one.png", b"\x89PNG\r\n\x1a\none");
+        let art_two = fx._dir.write("incoming/two.png", b"\x89PNG\r\n\x1a\ntwo");
+        let request = |source: &Path, art: &Path| CanonicalImportTrackRequest {
+            source: source.to_path_buf(),
+            title: source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("track")
+                .to_owned(),
+            credited_artists: vec![CanonicalImportArtistRef::Existing(fx.a)],
+            owner_index: 0,
+            album: CanonicalImportAlbumRef::ByName {
+                title: "Conflict Album".to_owned(),
+                release_type: ReleaseType::Album,
+            },
+            track_number: None,
+            disc_number: None,
+            duration_ms: None,
+            artwork: Some(CanonicalImportAsset {
+                source: art.to_path_buf(),
+                fingerprint: ContentFingerprint::of_file(art).expect("art fingerprint"),
+            }),
+            album_artwork: Some(CanonicalImportAsset {
+                source: art.to_path_buf(),
+                fingerprint: ContentFingerprint::of_file(art).expect("album art fingerprint"),
+            }),
+            lyrics: Some("[00:01.00]failure test".to_owned()),
+            allow_duplicate_content: false,
+            expected_source_fingerprint: Some(
+                ContentFingerprint::of_file(source).expect("source fingerprint"),
+            ),
+        };
+        let tracks_before = fx.library.tracks().count();
+        let albums_before = fx.library.albums().count();
+        let generation = fx.library.catalog.generation;
+        let error = fx
+            .library
+            .import_review_batch(
+                generation,
+                vec![
+                    request(&source_one, &art_one),
+                    request(&source_two, &art_two),
+                ],
+                Vec::new(),
+            )
+            .expect_err("conflicting album artwork must fail the batch");
+        assert!(error.to_string().contains("conflicting artwork"), "{error}");
+        assert_eq!(fx.library.tracks().count(), tracks_before);
+        assert_eq!(fx.library.albums().count(), albums_before);
+        assert!(!fx.library.root.join(TRACK_ARTWORK_DIR_NAME).exists());
+
+        let mut stale = request(&source_one, &art_one);
+        stale.album = CanonicalImportAlbumRef::ByName {
+            title: "Stale Album".to_owned(),
+            release_type: ReleaseType::Album,
+        };
+        fs::write(&art_one, b"\x89PNG\r\n\x1a\nchanged").expect("change reviewed artwork");
+        let error = fx
+            .library
+            .import_review_batch(fx.library.catalog.generation, vec![stale], Vec::new())
+            .expect_err("changed reviewed artwork must fail");
+        assert!(
+            error.to_string().contains("changed after review"),
+            "{error}"
+        );
+        assert_eq!(fx.library.tracks().count(), tracks_before);
+        assert_eq!(fx.library.albums().count(), albums_before);
+        assert!(
+            fx.library
+                .albums()
+                .all(|album| album.title != "Stale Album")
         );
     }
 
@@ -10878,6 +11819,7 @@ impl CanonicalLibrary {
                 disc_number: track.disc_number,
                 duration_ms: track.duration_ms,
                 lyrics,
+                artwork: track.artwork.clone(),
                 fingerprint: track.fingerprint,
                 created_unix_ms: track.created_unix_ms,
             };
@@ -11853,6 +12795,9 @@ mod atomic_import_tests {
             track_number: None,
             disc_number: None,
             duration_ms: None,
+            artwork: None,
+            album_artwork: None,
+            lyrics: None,
             allow_duplicate_content: false,
             expected_source_fingerprint: None,
         }
@@ -12000,6 +12945,9 @@ mod atomic_import_tests {
             track_number: Some(1),
             disc_number: None,
             duration_ms: None,
+            artwork: None,
+            album_artwork: None,
+            lyrics: None,
             allow_duplicate_content: false,
             expected_source_fingerprint: None,
         };
@@ -12037,6 +12985,9 @@ mod atomic_import_tests {
                     track_number: Some(1),
                     disc_number: None,
                     duration_ms: Some(1_000),
+                    artwork: None,
+                    album_artwork: None,
+                    lyrics: None,
                     allow_duplicate_content: false,
                     expected_source_fingerprint: None,
                 }],
@@ -12066,6 +13017,9 @@ mod atomic_import_tests {
             track_number: track.track_number,
             disc_number: track.disc_number,
             duration_ms: track.duration_ms,
+            artwork: None,
+            album_artwork: None,
+            lyrics: None,
         }
     }
 
@@ -12236,6 +13190,9 @@ mod atomic_import_tests {
                             track_number: Some(index as u32 + 1),
                             disc_number: None,
                             duration_ms: Some(1_000),
+                            artwork: None,
+                            album_artwork: None,
+                            lyrics: None,
                             allow_duplicate_content: false,
                             expected_source_fingerprint: None,
                         })

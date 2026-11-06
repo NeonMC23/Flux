@@ -74,9 +74,20 @@ root may leave its documented temporary leftovers there after the switch.
   queue data. Portable records are relative, but the legacy index and runtime
   queue are not guaranteed to be library-owned.
 - AlbumId, playlist, rating/favorite and managed-lyrics runtime types now exist
-  in the canonical engine. The GUI implements playlist management and a full
+  in the canonical engine. Artists and Albums are independently editable
+  entities with stable identity, optional artwork and relationship views. The
+  GUI implements Artist/Album detail pages, playlist management and a full
   lyrics library/editor/karaoke workflow; a dedicated rating screen is not
   implemented.
+- Track artwork is an optional managed override keyed by stable TrackId, stored
+  outside the Album directory so Album moves do not move it. The GUI displays it
+  before Album artwork and restores the inherited Album image when the override
+  is removed.
+- Import review can attach validated Album artwork, Track artwork and lyrics to
+  each candidate. These assets are staged in the same canonical transaction as
+  the audio, Album/Artist creation and metadata updates. Selected existing
+  Artists/Albums use stable IDs or exact owner/title resolution; no fuzzy entity
+  merge exists.
 - The GUI Import Manager is review-first and copy-only; the TUI exposes the
   same canonical validation through a synchronous quick copy-import path with a
   scrollable per-path result panel. Reference imports are rejected in canonical
@@ -171,10 +182,18 @@ or cancelled library switches leave the active library untouched and report the
 cancellation/failure. Successful switches reset cursor/search/queue-view/help
 state and announce the newly active library.
 
-Track deletion, audio/artwork/lyrics repair, ownership/album/artist transfer,
-playlists, batch actions and global filters remain GUI-only. The TUI never
-bypasses H2 deletion/repair safety, never deletes external audio, and does not
-treat an inaccessible path as missing.
+The TUI `V` view lists ArtistId, description/image presence, owned/credited
+Album relationships and Track counts; `E` lists canonical Albums with owner,
+cover state and ordered Track membership, marking Track-specific artwork and
+lyrics. `D` opens the selected Track's Album with inherited/override artwork
+labels. `Y`/`P` support safe rename/create operations.
+
+Track deletion, audio/artwork/lyrics repair, Album metadata/cover/order or
+membership changes, ownership/artist/album transfer, rich import review with
+artwork/lyrics attachment, playlists, batch actions and global filters remain
+GUI-only. The TUI never bypasses H2 deletion/repair safety, never deletes
+external audio, and does not treat an inaccessible path as missing. These are
+documented capability differences, not hidden shortcuts.
 
 ### Cross-platform storage and platform notes
 
@@ -223,12 +242,14 @@ FluxLibrary/
   catalog.flux.bak
   artists/artist_000001/
     artist.flux
+    image.png                   optional
     albums/album_000001/
       album.flux
       cover.png                 optional
       tracks/track_000001.flac
       tracks/track_000001.flux
       tracks/track_000001.lrc   optional
+  track-artwork/track_000001.png optional Track override
   playlists/playlist_000001.flux
   ratings.flux
   transactions/<txn>/journal.flux
@@ -267,8 +288,42 @@ counters and are never reused.
   duplicate audio.
 - Audio tags are never read or written. Stored duration comes from Flux
   metadata (or is absent); content fingerprints are streamed bytes.
-- Cover and lyrics are optional managed files with relative, validated names.
-  A missing cover does not invalidate an album.
+- Album cover, Artist image, Track artwork and lyrics are optional managed
+  files with relative, validated names. Artist `description`/`image`, Track
+  `artwork` and the managed asset fields are optional serde-defaulted additions
+  to canonical schema version 1. Libraries written before M2 remain readable;
+  no version bump or migration is required. Missing artwork never invalidates
+  the owning entity.
+- Artist name/description/image are Artist-owned. Album title/release/cover and
+  order are Album-owned. Track title/track-disc numbers/credits/lyrics and its
+  optional artwork override are Track-owned. Displaying an owner or Album name
+  on a Track derives it from stable references; unrelated Track edits never copy
+  or overwrite Artist/Album metadata.
+- All multi-entity changes use the canonical journal and generation rules.
+  Imported audio, artwork, lyrics, new entities and relationship updates share
+  one commit; archive changed/corrupt state yields complete-old or
+  complete-new state through normal C1 recovery.
+
+## Artist entities and metadata
+
+Artists are first-class catalogue entities with a stable ArtistId, display name,
+optional aliases, optional description and optional managed `image.<ext>` in the
+Artist directory. Existing duplicate names remain distinct identities; creation,
+rename and image assignment never perform fuzzy merging. An Artist is retained
+when its last Track is removed or moved, so an empty Artist remains deliberate
+and visible.
+
+The GUI Artist list opens a detail page that edits name/description, assigns or
+removes a managed image, shows owned and credited-only Albums, lists all related
+Tracks by stable TrackId, and navigates to Album/Track views. Renames are
+metadata-only, so paths and every queue/playlist/history/rating reference stay
+valid. Images use the same extension/size validation as Album covers plus the
+bounded GUI decoder; a failed replacement leaves the previous managed image
+intact.
+
+The TUI `V` view lists ArtistId, optional description/image state, owned and
+credited Album relationships and related Track counts. `Y` renames an existing
+Artist and `P` creates one; description/image editing is GUI-only.
 
 ## Credits and physical ownership
 
@@ -344,9 +399,17 @@ The GUI album list is catalogue-derived, not track-derived, so empty albums are
 visible. Selecting one opens a dedicated album detail view with AlbumId, owner,
 release type, track count, ordered track list, cover status and actions for
 metadata, artwork, transfer, reorder and empty-album deletion. Empty albums show
-a deliberate empty state rather than disappearing. The TUI `E` command lists all
-catalogue albums with owner, track count and cover availability; `D` shows the
-selected track's album.
+a deliberate empty state rather than disappearing. The TUI `E` command opens a
+scrollable Album relationship/order view with owner, cover, Track artwork/lyrics
+markers and membership; `D` opens the selected Track's Album detail. Both are
+inspection views and explicitly direct mutations to the GUI.
+
+The model requires every Track to have an Album. Therefore “remove from Album”
+is implemented as a reviewed move to another Album owned by the same Artist, not
+as a no-Album state. A cross-owner destination requires the existing reviewed
+ownership-transfer workflow. Removing a Track by deletion also removes it from
+the canonical Album order but retains the Album and Artist entities. Empty
+entities are never auto-deleted.
 
 ### Catalogue search, filtering and batch selection
 
@@ -696,6 +759,7 @@ from what remains structurally or physically unverified.
 | Library-session isolation, same-path reopen, stale async results, switch-time playback/state reset | Confirmed by deterministic Controller/GUI/TUI tests with disposable libraries; no filesystem-watcher or physical GUI-interaction validation |
 | Meaningful-listening accounting, seek/pause/recovery/transition attribution, history persistence and dashboard aggregates | Confirmed by deterministic Controller/GUI tests with injected positions and transitions; no acoustic measurement or physical-device timing validation |
 | Import discovery, decode validation, partial preparation, cancellation and folder traversal | Confirmed by deterministic filesystem/import tests; real native dialogs and cross-platform traversal remain unverified |
+| M2 Artist/Album/Track entities, synchronization, artwork inheritance, enriched atomic import and GUI/TUI navigation | Confirmed by deterministic canonical/Controller/GUI/TUI state, transaction-failure, artwork round-trip/move/delete and import conflict tests; no real mouse/window-manager or terminal-emulator interaction audit |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
@@ -1205,6 +1269,14 @@ second lyrics store was added. Audio tags are never read or written. Replacing
 or moving audio preserves the managed lyrics file through the existing track
 lifecycle/album-transfer transactions.
 
+Lyrics are owned by stable TrackId, not Album position, filename or audio path.
+Import review can attach an LRC/TXT file to a new or updated candidate; the
+content is validated before commit and published with the same transaction as
+the Track. The GUI lyrics library/editor can then replace or remove it. A failed
+replacement or import leaves the previous valid lyrics and catalogue state
+intact. The TUI displays the resulting lyrics state with `y`/row markers but does
+not import or edit them.
+
 The app-level lyrics model parses and serializes:
 
 - plain text with preserved line order, blank lines, UTF-8 and non-Latin text;
@@ -1256,27 +1328,40 @@ save dialog. All operations are offline; no remote services are used.
 The TUI exposes read-only lyrics inspection with `y` (scrollable, Esc returns)
 but no editing/import/export/karaoke. Those remain GUI workflows.
 
-### Album artwork
+### Album and Track artwork
 
-`set_cover` assigns or replaces the single managed cover file and cleans the
-previous cover only after commit. `remove_cover` clears the reference and
+`set_cover` assigns or replaces the single managed Album cover file and cleans
+the previous cover only after commit. `remove_cover` clears the reference and
 journal-cleans the file. Missing declared covers are reported in GUI detail and
 block album transfer; PNG/JPEG/WebP extension and a bound of 16 MiB are checked
 by the canonical assignment path.
+
+`set_track_artwork` writes an optional managed override under
+`track-artwork/track_<TrackId>.<ext>`. The root-level location is intentionally
+independent of the Album directory, so moving a Track between Albums preserves
+its override without rewriting the artwork path. `remove_track_artwork` clears
+the Track reference and journal-cleans the file. Track deletion removes its
+override as part of the reviewed managed-resource cleanup; deleting/moving the
+Track never deletes Album or Artist artwork. Changing Album artwork never edits
+Track records.
+
+Display inheritance is derived, not copied: a Track with an override renders it
+first; otherwise the GUI uses its Album cover; otherwise it shows the generated
+glyph. Removing the override therefore restores Album fallback immediately.
+Album cover replacement invalidates the Album cache, while Track overrides keep
+their own cache entries until replaced/removed.
 
 The GUI decodes managed PNG, JPEG and WebP artwork off the UI thread for display.
 Decoding rejects files over 32 MiB, dimensions over 4096 px on either side or
 16 million pixels, zero-sized images and unsupported formats. A 512 px preview
 is generated with preserved aspect ratio, rendered with cover cropping in
-library/player thumbnails and contain fitting in album detail. Missing, invalid
-or unsupported artwork falls back to the existing generated glyph; album detail
-shows the decode error without changing the managed file. The cache key includes
-album identity, cover path, modification time and length, so replacement or
-removal invalidates the preview and a fresh decode is scheduled. The cache is
-bounded to 128 album previews; crossing the bound clears it rather than growing
-without limit. The cache is
-bounded to 128 album previews; crossing the bound clears it rather than growing
-without limit.
+library/player thumbnails and contain fitting in detail pages. Missing, invalid
+or unsupported artwork falls back to the generated glyph; detail pages show the
+decode error without changing the managed file. Cache keys include owner,
+resource path, modification time and length, so replacement or removal
+invalidates the relevant preview. The cache is bounded to 128 Album previews
+(Artist/Track caches are independently keyed) and clears on pressure or library
+switch rather than growing without limit.
 
 ### Native file selection
 
@@ -1344,27 +1429,40 @@ compatibility imports retain their existing prepare/commit path.
 
 Cancellation during discovery or preparation performs no catalogue write and
 removes copies created by that copy run. Cancellation after the final copy is
-also detected before catalogue application. Import does not extract or copy
-embedded artwork or lyrics; managed artwork/lyrics on existing tracks are
-untouched. Re-importing the same content is deduplicated by canonical
-fingerprint, while an explicit **Import separately** decision creates a new
-TrackId and a unique managed path.
+also detected before catalogue application. Import does not extract embedded
+artwork or lyrics from audio tags; the GUI review may attach explicitly selected
+managed Album artwork, a Track artwork override and an LRC/TXT file. Attached
+image files are extension/size/signature-checked by the canonical path and
+decoded by the bounded GUI decoder before commit; lyrics must parse as supported
+LRC/TXT. Artwork/lyrics fingerprints are captured at review and rechecked at
+commit, so a changed source rejects the batch. Managed artwork/lyrics on
+unrelated existing tracks are untouched. Re-importing the same content is
+deduplicated by canonical fingerprint, while an explicit **Import separately**
+decision creates a new TrackId and a unique managed path.
 
 ### Atomic import and existing-album import
 
 Every canonical import path now stages the complete reviewed batch in one
 transaction: proposed artists, proposed albums, tracks, ordered credits,
-ownership, album ordering, catalogue references and approved existing-track
-metadata updates. No artist or album is
-created by a separate write before the import. If publication fails or the plan
-is stale, recovery yields either the complete old catalogue or the complete new
-catalogue; no proposed artist, album or track survives an uncommitted import.
+ownership, album ordering, catalogue references, optional Album/Track artwork,
+optional lyrics, and approved existing-track metadata updates. No artist, album
+or managed asset is created by a separate write before the import. If
+publication fails or the plan is stale, recovery yields either the complete old
+catalogue or the complete new catalogue; no proposed artist, album, track,
+artwork or lyrics file survives an uncommitted import. Conflicting artwork
+requests for one Album or a changed reviewed asset fail the whole batch before
+commit.
 
 Artist references distinguish existing stable IDs from proposed names. Exact
 unique existing names can resolve to an existing ID; ambiguous names require an
-explicit artist selection in review. Proposed artists with the same exact name
-are allocated one new ID within the batch. The physical owner remains one of the
-ordered credits, and an existing destination album must have the same owner.
+explicit artist selection in review. The review also offers an existing Album
+picker filtered to the selected owner Artist; selecting one sets the exact owner
+title reference rather than fuzzy-matching. Typing a title creates a new Album
+only when no exact owner/title match exists. Proposed artists with the same exact
+name are allocated one new ID within the batch. The physical owner remains one
+of the ordered credits, and an existing destination album must have the same
+owner. Per-candidate artwork/lyrics are supported; a bulk “apply to all selected
+candidates” helper is not implemented.
 
 The album detail view exposes **Add tracks…**, opening the existing Import
 Manager in fixed-target mode. The target carries AlbumId, owner, title, release

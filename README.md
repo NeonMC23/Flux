@@ -16,12 +16,15 @@ catalogues are migration sources only in the normal front-end workflows.
 
 The GUI includes a review-first Import Manager with native pickers,
 drag-and-drop, duplicate decisions, editable metadata, copy-only staging,
-progress and cancellation. Existing playback, seeking, queue behavior and the
-real-time oscilloscope continue to use the same engine. Managed artwork is
-decoded and displayed in album and player views. Dedicated canonical playlist
-management and an integrated lyrics library/editor/karaoke system are
-implemented; rating UI remains incomplete and is called out below rather than
-presented as finished.
+progress and cancellation, including explicit Album/Track artwork and lyrics
+attachment before the atomic commit. Existing playback, seeking, queue behavior
+and the real-time oscilloscope continue to use the same engine. Managed album
+and artist artwork plus optional per-Track artwork overrides are decoded and
+displayed throughout the library. Artists and Albums are first-class editable
+entities with detail pages, relationships and navigation to their Tracks.
+Dedicated canonical playlist management and an integrated
+lyrics library/editor/karaoke system are implemented; rating UI remains
+incomplete and is called out below rather than presented as finished.
 
 ## Canonical storage
 
@@ -45,13 +48,13 @@ selects or writes those backends.
 | Crate | Kind | Responsibility |
 |---|---|---|
 | `flux-core` | library | Backend-independent domain model: tracks, IDs, sources, the play queue with stable per-entry identities (duplicates allowed), repeat/playback states, and the shared error type. No UI, filesystem, database, audio-device, or network implementation. |
-| `flux-library` | library | Canonical self-contained library engine: stable artist/album/track/playlist IDs, relative managed paths, per-entity `.flux` metadata, transaction journal, copy verification, playlists/ratings/lyrics, and isolated migration from legacy/schema-v3 sources. The older in-memory scanner and portable store remain for compatibility tests and migration inventory. |
+| `flux-library` | library | Canonical self-contained library engine: stable artist/album/track/playlist IDs, relative managed paths, per-entity `.flux` metadata, transaction journal, copy verification, playlists/ratings/lyrics, album/artist images, per-Track artwork overrides, atomic enriched imports, and isolated migration from legacy/schema-v3 sources. The older in-memory scanner and portable store remain for compatibility tests and migration inventory. |
 | `flux-audio` | library | Playback, in two strictly separate layers: `Player`, the pure playback-control state machine and single authority for playback decisions; and a threaded engine that decodes WAV (hound), FLAC (claxon), MP3 (rmp3/minimp3), AAC in ADTS streams and MP4/M4A files (rusty_aac with the mp4 demuxer), and Ogg Vorbis and Opus (lewton and opus-pure over the ogg demuxer) on a worker thread and feeds an output backend (device-free `NullOutput`, or CPAL behind the non-default `cpal` feature) through a lock-free ring buffer. |
-| `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, duplicate decisions, copy-only publication, artist/album/track edits, playlist management, lyrics parsing/editing/import/export APIs, playlists/ratings/lyrics persistence, and the canonical migration workflow. Both front-ends use this one controller. |
+| `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, enriched import review, duplicate decisions, copy-only publication, artist/album/track edits, owned/credited relationships, playlist management, lyrics parsing/editing/import/export APIs, playlists/ratings/lyrics persistence, and the canonical migration workflow. Both front-ends use this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). Dialog output preserves spaces and Unix non-UTF-8 path bytes; Windows PowerShell output is forced to UTF-8. |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, metadata and stable-artist editing, reviewed track move/audio replacement, decoded managed album artwork, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart collections/rating controls, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
-| `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, copy-only quick import, folder import, track/artist edit keys, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, enriched artwork/lyrics attachment, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, dedicated Artist and Album detail pages, metadata/relationship/artwork editing, reviewed track move/audio replacement, decoded managed Album/Artist/Track artwork with override semantics, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart collections/rating controls, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
+| `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, copy-only quick import, folder import, track/artist edit keys, Artist/Album relationship inspection, inline artwork/lyrics markers, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. Rich artwork/lyrics/import review remains GUI-only and is documented below. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
 `flux-tui → flux-app + flux-core + crossterm`,
@@ -117,8 +120,15 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   playback highlighting, a line/timestamp editor, LRC/TXT import with preview,
   UTF-8 export with overwrite confirmation, and a karaoke view. The player has a
   Lyrics entry point and can follow current playback without changing audio.
-  Artist and album views
-  group canonical stable identities. The queue panel supports stable
+  Artist and album views group canonical stable identities. An Artist detail
+  page edits display name, description and managed image, lists owned and
+  credited Albums plus related Tracks, and navigates directly to those entities.
+  Album detail edits title/release metadata and cover artwork, shows owner and
+  ordered membership, and supports reorder, fixed-target import, transfer and
+  safe empty deletion. Track editing can move a Track to another Album owned by
+  the same Artist, correct ordered credits/owner and assign or remove a managed
+  Track artwork override; removing the override restores Album artwork. The
+  queue panel supports stable
   per-entry duplicate disambiguation, drag/keyboard reordering, removal and
   direct entry playback; the seek bar moves the decoder. Playback modes cycle
   Normal → Repeat All → Repeat One → Shuffle → Shuffle + Repeat All, with a
@@ -156,9 +166,13 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   resource paths. Album artwork is rendered from the canonical managed cover
   (PNG/JPEG/WebP) asynchronously with bounded dimensions and a fallback glyph;
   missing covers can be replaced or removed explicitly, with image validation
-  before publication. Native pickers cover general import, album-target import,
-  audio replacement and artwork selection; every selection still enters the
-  existing review/confirmation flow. Cancellation leaves the workflow unchanged.
+  before publication. Track artwork is an optional managed override stored by
+  stable TrackId; Track rows and the player use it first and fall back to Album
+  artwork. Album cover replacement does not alter Track overrides, and removing a
+  Track override restores the inherited Album image. Native pickers cover
+  general import, album-target import, audio replacement, Album/Artist/Track
+  artwork and lyrics selection; every selection still enters the existing
+  review/confirmation flow. Cancellation leaves the workflow unchanged.
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, and `q`/`Ctrl-C` quit; `Ctrl-C`
   quits from input, help, lyrics and queue views too. `/` searches tracks by
@@ -175,12 +189,19 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   first. This quick flow remains synchronous and has no review or cancel phase.
   `e` edits the selected track as
   `title|album|track|disc|artist-id|credit-ids`, `P` creates an artist, `Y`
-  renames an artist (`id|new-name`), `V` lists artist IDs, `X`
-  refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. `y` opens read-only managed lyrics.
+  renames an artist (`id|new-name`), `V` opens a scrollable Artist relationship
+  view, `E` opens the Album/order view, `D` shows the selected Track's Album,
+  `X` refreshes/validates the canonical library, and `M` runs the canonical
+  migration workflow. `y` opens read-only managed lyrics. Rows mark managed
+  Track artwork and lyrics; Album detail labels inherited versus Track-specific
+  artwork.
+  The TUI is inspection/limited-edit by design. Album metadata, cover,
+  reorder/membership/move and Track artwork pickers, rich import review with
+  artwork/lyrics attachment, description/image editing and ownership transfer
+  require the GUI. The TUI never fabricates a destructive shortcut for them.
   Global artist/album/track search, filters, multi-selection, playlist
   management, lyrics editing/import/export/karaoke and batch playlist/favorite
-  actions require the GUI.
+  actions also require the GUI.
 
   `Q` opens a queue-entry view: `Enter` plays the selected stable
   `QueueEntryId`, `Delete`/`d` removes it, and `Ctrl+↑`/`Ctrl+↓` reorders it.
@@ -210,7 +231,12 @@ player remains visible:
 - edit ordered credits, add existing or named artists, remove/reorder credits,
   and choose the physical owner from the credits; the first credit is the
   default owner;
-- review and edit every candidate, with incomplete metadata visibly marked;
+- select an existing stable Artist and an existing Album owned by that Artist,
+  or create a new Album by title; ambiguous/fuzzy names are never merged;
+- attach a validated managed Album cover, a Track-specific artwork override, and
+  an LRC/TXT lyrics file to individual candidates before commit;
+- review and edit every candidate, with incomplete metadata visibly marked and
+  inherited Album artwork distinguished from Track overrides;
 - validate each candidate by opening its decoder before review and again while
   preparing the copy; unsupported extensions, malformed audio, missing files
   and unreadable paths are itemized while unrelated valid files remain
@@ -226,11 +252,16 @@ player remains visible:
 
 Reference-only/external imports are not available in canonical mode. Review
 edits become canonical Flux metadata; audio tags and source files are never
-modified. The canonical transaction stages files inside the library and only
-publishes `catalog.flux` after every copy verifies. Managed covers are decoded
-asynchronously for display; no tag artwork extraction occurs. The TUI uses
-the same filename inference and copy-only application path via its quick-import
-keys; the full review UI is GUI-only.
+modified. The canonical transaction stages audio, cover/override artwork and
+lyrics inside the library and only publishes `catalog.flux` after every copy
+verifies. A changed artwork/lyrics source fingerprint or conflicting cover for
+one Album rejects the batch with complete-old state; no artist, Album, Track or
+managed asset is left partially published. Managed covers are decoded
+asynchronously for display; no tag artwork extraction occurs. The TUI uses the
+same filename inference and copy-only application path via its quick-import
+keys; rich review with artwork/lyrics attachment is GUI-only. Per-candidate
+attachment is implemented; a one-action “apply this cover/lyrics to all selected
+candidates” batch helper is not.
 
 Migration is explicit: *Library setup* accepts a legacy index file or portable
 schema-v3 folder, presents a read-only inventory and disk estimate, builds and
@@ -264,8 +295,12 @@ background staging for very large migrations is still future work.
 - **Stable identities and credits:** track, artist, album and playlist IDs and
   counters persist. A track stores ordered credits plus one physical owner;
   featuring artists appear in their own discographies without duplicate audio.
-  Artist/album renames are metadata-only because canonical directories derive
-  from IDs, so case-only renames cannot break paths. Single-track ownership
+  Artists own editable display name, optional description and managed image.
+  Albums own title/release/cover and canonical order. Track artwork is an
+  optional override keyed by TrackId; Album artwork is the display fallback and
+  replacing it never rewrites Track overrides. Artist/album renames are
+  metadata-only because canonical directories derive from IDs, so case-only
+  renames cannot break paths. Single-track ownership
   transfer uses an explicit destination release, copy-first verification and
   journal-owned cleanup; the GUI track editor exposes it, while the TUI refuses
   and points to the GUI. **Delete artist** opens the canonical multi-item
@@ -391,6 +426,16 @@ frequency/spectrum visualizers, more codecs, folder watching, streaming,
 accounts, installers and updaters remain future work. External reference
 imports are intentionally rejected in canonical mode. Rating storage APIs exist
 but are not yet exposed as a screen.
+
+M2 entity limitations are deliberate: every Track must belong to an Album, so
+the GUI supports moving a Track to another Album but not detaching it into a
+no-Album state. Album owner transfer is the authoritative way to change the
+Album's Artist association; cross-owner Track moves use the existing reviewed
+ownership-transfer workflow. The import manager attaches artwork/lyrics per
+candidate rather than applying one asset to a multi-selection. The TUI exposes
+inspection and safe rename/create operations, not Album/Track artwork pickers,
+rich import review or ownership transfer. Lyrics must be valid UTF-8 LRC/TXT;
+embedded audio tags are neither read nor written.
 Native dialogs and file-drop are implemented; cross-platform runtime
 verification remains limited to Linux/X11. Native picker parsing preserves
 leading/trailing spaces, Unicode, and non-UTF-8 Unix names; Windows PowerShell

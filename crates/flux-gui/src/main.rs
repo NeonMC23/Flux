@@ -1103,9 +1103,16 @@ struct PlaylistDrag {
     moved: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ArtworkOwner {
+    Album(AlbumId),
+    Artist(ArtistId),
+    Track(TrackId),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ArtworkKey {
-    album_id: AlbumId,
+    owner: ArtworkOwner,
     path: PathBuf,
     modified_ns: u128,
     len: u64,
@@ -1123,7 +1130,7 @@ struct ArtworkEntry {
     error: Option<String>,
 }
 
-fn artwork_key(album_id: AlbumId, path: PathBuf) -> ArtworkKey {
+fn artwork_key(owner: ArtworkOwner, path: PathBuf) -> ArtworkKey {
     let metadata = std::fs::metadata(&path).ok();
     let modified_ns = metadata
         .as_ref()
@@ -1132,7 +1139,7 @@ fn artwork_key(album_id: AlbumId, path: PathBuf) -> ArtworkKey {
         .map_or(0, |duration| duration.as_nanos());
     let len = metadata.map_or(0, |metadata| metadata.len());
     ArtworkKey {
-        album_id,
+        owner,
         path,
         modified_ns,
         len,
@@ -1856,6 +1863,9 @@ struct TrackEditor {
     replacement_source: String,
     replacement_picked: Option<PathBuf>,
     replacement_plan: Option<TrackAudioReplacementPlan>,
+    artwork_input: String,
+    artwork_picked: Option<PathBuf>,
+    artwork_remove_confirm: bool,
     deletion_plan: Option<TrackDeletionPlan>,
     move_destination: Option<AlbumChoice>,
     move_position: String,
@@ -1926,6 +1936,10 @@ struct ImportManager {
     edit_album: String,
     edit_track_number: String,
     edit_disc_number: String,
+    edit_artwork: String,
+    edit_album_artwork: String,
+    edit_lyrics_path: String,
+    asset_error: Option<String>,
     number_error: Option<String>,
 }
 
@@ -1956,6 +1970,10 @@ impl ImportManager {
             edit_album: String::new(),
             edit_track_number: String::new(),
             edit_disc_number: String::new(),
+            edit_artwork: String::new(),
+            edit_album_artwork: String::new(),
+            edit_lyrics_path: String::new(),
+            asset_error: None,
             number_error: None,
         }
     }
@@ -1986,6 +2004,7 @@ impl ImportManager {
         self.progress = Arc::new(Mutex::new(ImportProgress::default()));
         self.progress_view = ImportProgress::default();
         self.cancel = Arc::new(AtomicBool::new(false));
+        self.asset_error = None;
         self.number_error = None;
     }
 
@@ -2010,6 +2029,16 @@ impl ImportManager {
             .disc_number()
             .map(|number| number.to_string())
             .unwrap_or_default();
+        self.edit_artwork = candidate
+            .artwork_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.edit_album_artwork = candidate
+            .album_artwork_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.edit_lyrics_path.clear();
+        self.asset_error = None;
         self.number_error = None;
     }
 }
@@ -2068,7 +2097,14 @@ struct FluxReady {
     album_delete_confirm: bool,
     album_cover_remove_confirm: bool,
     artwork: BTreeMap<AlbumId, ArtworkEntry>,
+    artist_artwork: BTreeMap<ArtistId, ArtworkEntry>,
+    track_artwork: BTreeMap<TrackId, ArtworkEntry>,
     artwork_loading: HashSet<ArtworkKey>,
+    artist_detail_name_input: String,
+    artist_description_input: String,
+    artist_image_input: String,
+    artist_image_picked: Option<PathBuf>,
+    artist_image_remove_confirm: bool,
     last_reconcile: Option<ReconcileReport>,
     migrate_source: String,
     pending_plan: Option<CanonicalMigrationPlan>,
@@ -2154,6 +2190,19 @@ enum Message {
     AlbumCoverPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     AlbumCoverApply,
     AlbumCoverRemove,
+    ArtistDetailNameChanged(String),
+    ArtistDescriptionChanged(String),
+    ArtistMetadataSave,
+    ArtistImageChanged(String),
+    ArtistImageChoose,
+    ArtistImagePicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    ArtistImageApply,
+    ArtistImageRemove,
+    TrackArtworkChanged(String),
+    TrackArtworkChoose,
+    TrackArtworkPicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    TrackArtworkApply,
+    TrackArtworkRemove,
     ArtworkLoaded(u64, ArtworkKey, Result<ArtworkData, String>),
     AlbumTrackMove(TrackId, isize),
     AlbumDeletePressed,
@@ -2191,6 +2240,7 @@ enum Message {
     ImportTitleChanged(String),
     ImportArtistChanged(String),
     ImportAlbumChanged(String),
+    ImportAlbumPicked(Option<AlbumChoice>),
     ImportTrackNumberChanged(String),
     ImportDiscNumberChanged(String),
     ImportArtistPicked(Option<ArtistChoice>),
@@ -2200,6 +2250,19 @@ enum Message {
     ImportCreditMove(usize, isize),
     ImportCreditRemove(usize),
     ImportCreditSetOwner(usize),
+    ImportArtworkChanged(String),
+    ImportArtworkChoose,
+    ImportArtworkPicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    ImportArtworkApply,
+    ImportArtworkClear,
+    ImportAlbumArtworkChanged(String),
+    ImportAlbumArtworkChoose,
+    ImportAlbumArtworkPicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    ImportAlbumArtworkApply,
+    ImportAlbumArtworkClear,
+    ImportLyricsPathChanged(String),
+    ImportLyricsAttach,
+    ImportLyricsClear,
     ImportManualChanged(String),
     ImportManualAdd,
     ImportDropPath(PathBuf),
@@ -2224,6 +2287,8 @@ enum Message {
     SearchNavigateArtist(ArtistId),
     SearchNavigateAlbum(AlbumId),
     SearchNavigateTrack(TrackId),
+    OpenAlbum(AlbumId),
+    OpenArtist(ArtistId),
     TrackSelectionToggle(TrackId),
     TrackSelectionSelectAll,
     TrackSelectionClear,
@@ -2338,6 +2403,10 @@ impl Message {
         match self {
             Self::EditorReplacementPicked(session, _)
             | Self::AlbumCoverPicked(session, _)
+            | Self::ArtistImagePicked(session, _)
+            | Self::TrackArtworkPicked(session, _)
+            | Self::ImportArtworkPicked(session, _)
+            | Self::ImportAlbumArtworkPicked(session, _)
             | Self::ArtworkLoaded(session, _, _)
             | Self::ImportNativeFilesPicked(session, _)
             | Self::ImportNativeFolderPicked(session, _)
@@ -2353,6 +2422,10 @@ impl Message {
         match &mut self {
             Self::EditorReplacementPicked(current, _)
             | Self::AlbumCoverPicked(current, _)
+            | Self::ArtistImagePicked(current, _)
+            | Self::TrackArtworkPicked(current, _)
+            | Self::ImportArtworkPicked(current, _)
+            | Self::ImportAlbumArtworkPicked(current, _)
             | Self::ArtworkLoaded(current, _, _)
             | Self::ImportNativeFilesPicked(current, _)
             | Self::ImportNativeFolderPicked(current, _)
@@ -2426,7 +2499,14 @@ impl FluxReady {
             album_delete_confirm: false,
             album_cover_remove_confirm: false,
             artwork: BTreeMap::new(),
+            artist_artwork: BTreeMap::new(),
+            track_artwork: BTreeMap::new(),
             artwork_loading: HashSet::new(),
+            artist_detail_name_input: String::new(),
+            artist_description_input: String::new(),
+            artist_image_input: String::new(),
+            artist_image_picked: None,
+            artist_image_remove_confirm: false,
             last_reconcile: None,
             migrate_source: String::new(),
             pending_plan: None,
@@ -2517,7 +2597,14 @@ impl FluxReady {
             .map_or(0, |index| index / QUEUE_PAGE_SIZE);
         self.last_queue_current = current;
         self.artwork.clear();
+        self.artist_artwork.clear();
+        self.track_artwork.clear();
         self.artwork_loading.clear();
+        self.artist_detail_name_input.clear();
+        self.artist_description_input.clear();
+        self.artist_image_input.clear();
+        self.artist_image_picked = None;
+        self.artist_image_remove_confirm = false;
         *self.dashboard_cache.borrow_mut() = None;
         self.scope.reset();
         self.show_setup = false;
@@ -2682,6 +2769,15 @@ impl FluxReady {
         choices
     }
 
+    fn selected_artist_id(&self) -> Option<ArtistId> {
+        if self.view != LibraryView::Artists {
+            return None;
+        }
+        let key = self.selected_group.as_deref()?;
+        let (_, raw) = artist_key_parts(key);
+        raw.parse::<u64>().ok().map(ArtistId::new)
+    }
+
     fn selected_album_id(&self) -> Option<AlbumId> {
         if self.view != LibraryView::Albums {
             return None;
@@ -2713,6 +2809,26 @@ impl FluxReady {
             }
             Err(error) => self.lifecycle_msg = Some(error),
         }
+    }
+
+    fn sync_artist_editor(&mut self) {
+        self.artist_detail_name_input.clear();
+        self.artist_description_input.clear();
+        self.artist_image_input.clear();
+        self.artist_image_picked = None;
+        self.artist_image_remove_confirm = false;
+        let Some(id) = self.selected_artist_id() else {
+            return;
+        };
+        let Some(artist) = self.controller.artist(id) else {
+            return;
+        };
+        self.artist_detail_name_input = artist.name().to_owned();
+        self.artist_description_input = self
+            .controller
+            .artist_description(id)
+            .unwrap_or_default()
+            .to_owned();
     }
 
     fn sync_album_editor(&mut self) {
@@ -2837,12 +2953,30 @@ impl FluxReady {
             replacement_source: String::new(),
             replacement_picked: None,
             replacement_plan: None,
+            artwork_input: String::new(),
+            artwork_picked: None,
+            artwork_remove_confirm: false,
             deletion_plan: None,
             move_destination: None,
             move_position: "1".to_owned(),
             move_plan: None,
         });
         self.show_setup = false;
+    }
+
+    fn import_album_choices(&self, candidate: &flux_app::ImportCandidate) -> Vec<AlbumChoice> {
+        let Some(owner) = candidate.artist_id() else {
+            return Vec::new();
+        };
+        self.controller
+            .albums()
+            .into_iter()
+            .filter(|album| album.owner_artist_id == owner)
+            .map(|album| AlbumChoice {
+                id: album.id,
+                label: format!("{} · AlbumId {}", album.title, album.id),
+            })
+            .collect()
     }
 
     fn editor_move_album_choices(&self, track_id: TrackId) -> Vec<AlbumChoice> {
@@ -3659,6 +3793,7 @@ impl FluxReady {
         }
         self.view = view;
         self.selected_group = None;
+        self.sync_artist_editor();
         self.selected_playlist = None;
         self.collection = None;
         self.playlist_entry_selection.clear();
@@ -4213,22 +4348,43 @@ impl FluxReady {
             },
             Message::ArtworkLoaded(_, key, result) => {
                 self.artwork_loading.remove(&key);
-                let still_current = self
-                    .controller
-                    .album_cover_path(key.album_id)
-                    .is_some_and(|path| artwork_key(key.album_id, path) == key);
+                let still_current = match key.owner {
+                    ArtworkOwner::Album(album) => self
+                        .controller
+                        .album_cover_path(album)
+                        .is_some_and(|path| artwork_key(key.owner, path) == key),
+                    ArtworkOwner::Artist(artist) => self
+                        .controller
+                        .artist_image_path(artist)
+                        .is_some_and(|path| artwork_key(key.owner, path) == key),
+                    ArtworkOwner::Track(track) => self
+                        .controller
+                        .track_artwork_path(track)
+                        .is_some_and(|path| artwork_key(key.owner, path) == key),
+                };
                 if still_current {
                     let (handle, error) = match result {
                         Ok(data) => (Some(data.handle), None),
                         Err(error) => (None, Some(error)),
                     };
-                    if self.artwork.len() >= ARTWORK_CACHE_LIMIT
-                        && !self.artwork.contains_key(&key.album_id)
-                    {
-                        self.artwork.clear();
+                    let owner = key.owner;
+                    let entry = ArtworkEntry { key, handle, error };
+                    match owner {
+                        ArtworkOwner::Album(album) => {
+                            if self.artwork.len() >= ARTWORK_CACHE_LIMIT
+                                && !self.artwork.contains_key(&album)
+                            {
+                                self.artwork.clear();
+                            }
+                            self.artwork.insert(album, entry);
+                        }
+                        ArtworkOwner::Artist(artist) => {
+                            self.artist_artwork.insert(artist, entry);
+                        }
+                        ArtworkOwner::Track(track) => {
+                            self.track_artwork.insert(track, entry);
+                        }
                     }
-                    self.artwork
-                        .insert(key.album_id, ArtworkEntry { key, handle, error });
                 }
             }
             Message::AlbumCoverApply => {
@@ -4243,7 +4399,9 @@ impl FluxReady {
                     self.lifecycle_msg = Some("Choose a cover image path.".to_owned());
                     return Task::none();
                 }
-                if let Err(error) = decode_artwork(&artwork_key(album, path.clone())) {
+                if let Err(error) =
+                    decode_artwork(&artwork_key(ArtworkOwner::Album(album), path.clone()))
+                {
                     self.lifecycle_msg = Some(format!(
                         "Cover not assigned; the image was rejected: {error}"
                     ));
@@ -4279,6 +4437,198 @@ impl FluxReady {
                         self.artwork.remove(&album);
                         self.sync_album_editor();
                         self.lifecycle_msg = Some(format!("Removed cover for album {album}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::ArtistDetailNameChanged(value) => self.artist_detail_name_input = value,
+            Message::ArtistDescriptionChanged(value) => self.artist_description_input = value,
+            Message::ArtistMetadataSave => {
+                let Some(artist) = self.selected_artist_id() else {
+                    return Task::none();
+                };
+                match self.controller.update_artist_metadata(
+                    artist,
+                    &self.artist_detail_name_input,
+                    Some(self.artist_description_input.as_str()),
+                ) {
+                    Ok(()) => {
+                        self.invalidate_search_cache();
+                        *self.dashboard_cache.borrow_mut() = None;
+                        if let Some(updated) = self.controller.artist(artist) {
+                            self.selected_group =
+                                Some(format!("{}{ARTIST_KEY_SEPARATOR}{artist}", updated.name()));
+                        }
+                        self.sync_artist_editor();
+                        self.lifecycle_msg = Some(format!("Updated artist {artist}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::ArtistImageChanged(value) => {
+                self.artist_image_input = value;
+                self.artist_image_picked = None;
+                self.artist_image_remove_confirm = false;
+            }
+            Message::ArtistImageChoose => {
+                let start = self
+                    .selected_artist_id()
+                    .and_then(|artist| self.controller.artist_image_path(artist))
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+                    .or_else(|| self.controller.canonical_root().map(Path::to_path_buf));
+                let session = self.controller.library_session();
+                return Task::perform(
+                    async move { flux_platform::pick_image_files_in(start.as_deref()) },
+                    move |result| Message::ArtistImagePicked(session, result),
+                );
+            }
+            Message::ArtistImagePicked(_, result) => match result {
+                Ok(Some(paths)) => {
+                    if let Some(path) = paths.first() {
+                        self.artist_image_input = path.display().to_string();
+                        self.artist_image_picked = Some(path.clone());
+                        self.artist_image_remove_confirm = false;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.lifecycle_msg = Some(error),
+            },
+            Message::ArtistImageApply => {
+                let Some(artist) = self.selected_artist_id() else {
+                    return Task::none();
+                };
+                let path = self
+                    .artist_image_picked
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(self.artist_image_input.trim()));
+                if path.as_os_str().is_empty() {
+                    self.lifecycle_msg = Some("Choose an artist image path.".to_owned());
+                    return Task::none();
+                }
+                if let Err(error) =
+                    decode_artwork(&artwork_key(ArtworkOwner::Artist(artist), path.clone()))
+                {
+                    self.lifecycle_msg = Some(format!("Artist image rejected: {error}"));
+                    return Task::none();
+                }
+                match self.controller.set_artist_image(artist, &path) {
+                    Ok(()) => {
+                        self.artist_artwork.remove(&artist);
+                        self.artist_image_input.clear();
+                        self.artist_image_picked = None;
+                        self.sync_artist_editor();
+                        self.lifecycle_msg = Some(format!("Updated image for artist {artist}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::ArtistImageRemove => {
+                let Some(artist) = self.selected_artist_id() else {
+                    return Task::none();
+                };
+                if !self.artist_image_remove_confirm {
+                    self.artist_image_remove_confirm = true;
+                    self.lifecycle_msg = Some(
+                        "Click “Confirm remove image” again to remove the managed artist image."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                match self.controller.remove_artist_image(artist) {
+                    Ok(()) => {
+                        self.artist_artwork.remove(&artist);
+                        self.sync_artist_editor();
+                        self.lifecycle_msg = Some(format!("Removed image for artist {artist}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::TrackArtworkChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.artwork_input = value;
+                    editor.artwork_picked = None;
+                    editor.artwork_remove_confirm = false;
+                }
+            }
+            Message::TrackArtworkChoose => {
+                let Some(editor) = self.track_editor.as_ref() else {
+                    return Task::none();
+                };
+                let start = self
+                    .controller
+                    .track_artwork_path(editor.id)
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+                    .or_else(|| self.controller.canonical_root().map(Path::to_path_buf));
+                let session = self.controller.library_session();
+                return Task::perform(
+                    async move { flux_platform::pick_image_files_in(start.as_deref()) },
+                    move |result| Message::TrackArtworkPicked(session, result),
+                );
+            }
+            Message::TrackArtworkPicked(_, result) => match result {
+                Ok(Some(paths)) => {
+                    if let Some(path) = paths.first()
+                        && let Some(editor) = self.track_editor.as_mut()
+                    {
+                        editor.artwork_input = path.display().to_string();
+                        editor.artwork_picked = Some(path.clone());
+                        editor.artwork_remove_confirm = false;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.lifecycle_msg = Some(error),
+            },
+            Message::TrackArtworkApply => {
+                let Some(editor) = self.track_editor.as_ref() else {
+                    return Task::none();
+                };
+                let track = editor.id;
+                let path = editor
+                    .artwork_picked
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(editor.artwork_input.trim()));
+                if path.as_os_str().is_empty() {
+                    self.lifecycle_msg = Some("Choose a track artwork path.".to_owned());
+                    return Task::none();
+                }
+                if let Err(error) =
+                    decode_artwork(&artwork_key(ArtworkOwner::Track(track), path.clone()))
+                {
+                    self.lifecycle_msg = Some(format!("Track artwork rejected: {error}"));
+                    return Task::none();
+                }
+                match self.controller.set_track_artwork(track, &path) {
+                    Ok(()) => {
+                        self.track_artwork.remove(&track);
+                        if let Some(editor) = self.track_editor.as_mut() {
+                            editor.artwork_input.clear();
+                            editor.artwork_picked = None;
+                        }
+                        self.lifecycle_msg =
+                            Some(format!("Updated artwork override for track {track}."));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::TrackArtworkRemove => {
+                let Some(editor) = self.track_editor.as_mut() else {
+                    return Task::none();
+                };
+                if !editor.artwork_remove_confirm {
+                    editor.artwork_remove_confirm = true;
+                    self.lifecycle_msg =
+                        Some("Click “Confirm restore album artwork” again to remove this Track override.".to_owned());
+                    return Task::none();
+                }
+                let track = editor.id;
+                match self.controller.remove_track_artwork(track) {
+                    Ok(()) => {
+                        self.track_artwork.remove(&track);
+                        if let Some(editor) = self.track_editor.as_mut() {
+                            editor.artwork_remove_confirm = false;
+                        }
+                        self.lifecycle_msg =
+                            Some(format!("Restored album artwork for track {track}."));
                     }
                     Err(error) => self.lifecycle_msg = Some(error),
                 }
@@ -4607,6 +4957,31 @@ impl FluxReady {
                     }
                 }
             }
+            Message::ImportAlbumPicked(choice) => {
+                let Some(album_id) = choice.as_ref().map(|choice| choice.id) else {
+                    return Task::none();
+                };
+                let Some(album) = self.controller.album(album_id) else {
+                    return Task::none();
+                };
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && let Some(plan) = manager.plan.as_mut()
+                    && let Some(index) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    if candidate.artist_id() != Some(album.owner_artist_id) {
+                        manager.asset_error = Some(
+                            "That existing Album belongs to a different owner Artist. Select that Artist first."
+                                .to_owned(),
+                        );
+                        return Task::none();
+                    }
+                    candidate.set_album(Some(album.title.clone()));
+                    manager.edit_album = album.title;
+                    manager.asset_error = None;
+                }
+            }
             Message::ImportTrackNumberChanged(value) => {
                 if let Some(manager) = self.import_manager.as_mut()
                     && manager.stage == ImportUiStage::Review
@@ -4732,6 +5107,204 @@ impl FluxReady {
                 {
                     candidate.set_owner_index(index);
                     manager.edit_artist = candidate.artist_name().unwrap_or_default().to_owned();
+                }
+            }
+            Message::ImportArtworkChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.edit_artwork = value;
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportArtworkChoose => {
+                let start = self.controller.canonical_root().map(Path::to_path_buf);
+                let session = self.controller.library_session();
+                return Task::perform(
+                    async move { flux_platform::pick_image_files_in(start.as_deref()) },
+                    move |result| Message::ImportArtworkPicked(session, result),
+                );
+            }
+            Message::ImportArtworkPicked(_, result) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    match result {
+                        Ok(Some(paths)) => {
+                            if let Some(path) = paths.first() {
+                                manager.edit_artwork = path.display().to_string();
+                                manager.asset_error = None;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportArtworkApply => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let Some(index) = manager.selected else {
+                    return Task::none();
+                };
+                let path = PathBuf::from(manager.edit_artwork.trim());
+                if path.as_os_str().is_empty() {
+                    manager.asset_error = Some("Choose a Track artwork file.".to_owned());
+                    return Task::none();
+                }
+                if let Err(error) = decode_artwork(&artwork_key(
+                    ArtworkOwner::Track(TrackId::new(0)),
+                    path.clone(),
+                )) {
+                    manager.asset_error = Some(format!("Track artwork rejected: {error}"));
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut()
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    match candidate.set_artwork(&path) {
+                        Ok(()) => {
+                            manager.asset_error = None;
+                            manager.edit_artwork = path.display().to_string();
+                        }
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportArtworkClear => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.edit_artwork.clear();
+                    manager.asset_error = None;
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.clear_artwork();
+                    }
+                }
+            }
+            Message::ImportAlbumArtworkChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.edit_album_artwork = value;
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportAlbumArtworkChoose => {
+                let start = self.controller.canonical_root().map(Path::to_path_buf);
+                let session = self.controller.library_session();
+                return Task::perform(
+                    async move { flux_platform::pick_image_files_in(start.as_deref()) },
+                    move |result| Message::ImportAlbumArtworkPicked(session, result),
+                );
+            }
+            Message::ImportAlbumArtworkPicked(_, result) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    match result {
+                        Ok(Some(paths)) => {
+                            if let Some(path) = paths.first() {
+                                manager.edit_album_artwork = path.display().to_string();
+                                manager.asset_error = None;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportAlbumArtworkApply => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let Some(index) = manager.selected else {
+                    return Task::none();
+                };
+                let path = PathBuf::from(manager.edit_album_artwork.trim());
+                if path.as_os_str().is_empty() {
+                    manager.asset_error = Some("Choose an Album artwork file.".to_owned());
+                    return Task::none();
+                }
+                let album = manager.plan.as_ref().map_or(AlbumId::new(0), |plan| {
+                    plan.target_album
+                        .as_ref()
+                        .map_or(AlbumId::new(0), |target| target.album_id)
+                });
+                if let Err(error) =
+                    decode_artwork(&artwork_key(ArtworkOwner::Album(album), path.clone()))
+                {
+                    manager.asset_error = Some(format!("Album artwork rejected: {error}"));
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut()
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    match candidate.set_album_artwork(&path) {
+                        Ok(()) => {
+                            manager.asset_error = None;
+                            manager.edit_album_artwork = path.display().to_string();
+                        }
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportAlbumArtworkClear => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.edit_album_artwork.clear();
+                    manager.asset_error = None;
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.clear_album_artwork();
+                    }
+                }
+            }
+            Message::ImportLyricsPathChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.edit_lyrics_path = value;
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportLyricsAttach => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let Some(index) = manager.selected else {
+                    return Task::none();
+                };
+                let path = PathBuf::from(manager.edit_lyrics_path.trim());
+                if path.as_os_str().is_empty() {
+                    manager.asset_error = Some("Choose an LRC or text lyrics file.".to_owned());
+                    return Task::none();
+                }
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        manager.asset_error = Some(format!("Could not read lyrics file: {error}"));
+                        return Task::none();
+                    }
+                };
+                if text.trim().is_empty() {
+                    manager.asset_error = Some("Lyrics file is empty.".to_owned());
+                    return Task::none();
+                }
+                if let Err(error) = LyricsDocument::parse(&text) {
+                    manager.asset_error = Some(format!("Lyrics rejected: {error}"));
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut()
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    candidate.set_lyrics_text(Some(text));
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportLyricsClear => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.edit_lyrics_path.clear();
+                    manager.asset_error = None;
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.set_lyrics_text(None);
+                    }
                 }
             }
             Message::ImportManualChanged(value) => {
@@ -4904,9 +5477,13 @@ impl FluxReady {
                     self.view = LibraryView::Artists;
                     self.selected_group =
                         Some(format!("{}{ARTIST_KEY_SEPARATOR}{id}", artist.name()));
+                    self.selected_playlist = None;
+                    self.selected_lyrics = None;
+                    self.lyrics_follow_current = false;
                     self.search.clear();
                     self.selected_tracks.clear();
                     self.focused_track = None;
+                    self.sync_artist_editor();
                     self.page = 0;
                     self.show_setup = false;
                 }
@@ -4925,6 +5502,12 @@ impl FluxReady {
                     self.page = 0;
                     self.show_setup = false;
                 }
+            }
+            Message::OpenAlbum(id) => {
+                return self.update(Message::SearchNavigateAlbum(id));
+            }
+            Message::OpenArtist(id) => {
+                return self.update(Message::SearchNavigateArtist(id));
             }
             Message::SearchNavigateTrack(id) => {
                 if self.controller.track(id).is_some() {
@@ -5696,6 +6279,7 @@ impl FluxReady {
                 self.lyrics_follow_current = false;
                 self.selected_tracks.clear();
                 self.focused_track = None;
+                self.sync_artist_editor();
                 self.sync_album_editor();
                 self.page = 0;
                 self.show_setup = false;
@@ -7940,6 +8524,32 @@ impl FluxReady {
                     .style(input_style)
                     .width(Length::Fill),
             );
+            let album_choices = self.import_album_choices(candidate);
+            if candidate.artist_id().is_some() {
+                let selected_album = album_choices
+                    .iter()
+                    .find(|choice| {
+                        self.controller
+                            .album(choice.id)
+                            .is_some_and(|album| candidate.album() == Some(album.title.as_str()))
+                    })
+                    .cloned();
+                body = body.push(
+                    pick_list(album_choices, selected_album, |choice| {
+                        Message::ImportAlbumPicked(Some(choice))
+                    })
+                    .placeholder("Create a new Album from this title, or select an existing Album…")
+                    .text_size(10)
+                    .padding([5, 7])
+                    .width(Length::Fill),
+                );
+            } else {
+                body = body.push(
+                    text("Assign a stable Artist above before selecting an existing Album. Typing a title creates a new Album only when no exact match exists for that owner.")
+                        .size(8)
+                        .color(MUTED),
+                );
+            }
             if candidate.decision() == ImportDecision::UpdateExisting {
                 body = body.push(
                     text("Metadata updates preserve the existing album membership and managed audio.")
@@ -7964,6 +8574,110 @@ impl FluxReady {
         if let Some(error) = &manager.number_error {
             body = body.push(text(error).size(9).color(DANGER));
         }
+        body = body.push(text("TRACK ARTWORK OVERRIDE").size(8).color(MUTED));
+        body = body.push(
+            text_input("Optional Track artwork image path…", &manager.edit_artwork)
+                .on_input(Message::ImportArtworkChanged)
+                .on_submit(Message::ImportArtworkApply)
+                .style(input_style)
+                .width(Length::Fill),
+        );
+        body = body.push(
+            row![
+                button(text("Choose image…").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportArtworkChoose),
+                button(text("Attach path").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportArtworkApply),
+                button(text("Use Album artwork").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportArtworkClear),
+            ]
+            .spacing(6),
+        );
+        body = body.push(
+            text(if candidate.artwork_path().is_some() {
+                "Track-specific artwork attached. It overrides Album artwork for this Track."
+            } else {
+                "No override attached; the Track inherits Album artwork when available."
+            })
+            .size(8)
+            .color(MUTED),
+        );
+        body = body.push(text("ALBUM ARTWORK").size(8).color(MUTED));
+        body = body.push(
+            text_input(
+                "Optional Album artwork image path…",
+                &manager.edit_album_artwork,
+            )
+            .on_input(Message::ImportAlbumArtworkChanged)
+            .on_submit(Message::ImportAlbumArtworkApply)
+            .style(input_style)
+            .width(Length::Fill),
+        );
+        body = body.push(
+            row![
+                button(text("Choose image…").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportAlbumArtworkChoose),
+                button(text("Attach path").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportAlbumArtworkApply),
+                button(text("Clear").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportAlbumArtworkClear),
+            ]
+            .spacing(6),
+        );
+        body = body.push(
+            text("Album artwork is shared by all Tracks in that Album. Attaching it during import replaces existing Album artwork; Track overrides stay independent.")
+                .size(8)
+                .color(MUTED),
+        );
+        body = body.push(text("LYRICS FILE (LRC / TXT)").size(8).color(MUTED));
+        body = body.push(
+            text_input(
+                "Optional .lrc or .txt lyrics path…",
+                &manager.edit_lyrics_path,
+            )
+            .on_input(Message::ImportLyricsPathChanged)
+            .on_submit(Message::ImportLyricsAttach)
+            .style(input_style)
+            .width(Length::Fill),
+        );
+        body = body.push(
+            row![
+                button(text("Attach lyrics").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportLyricsAttach),
+                button(text("Clear").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportLyricsClear),
+            ]
+            .spacing(6),
+        );
+        if let Some(lyrics) = candidate.lyrics_text() {
+            body = body.push(
+                text(format!(
+                    "Lyrics attached during review ({} lines). Managed by TrackId after commit.",
+                    lyrics.lines().count()
+                ))
+                .size(8)
+                .color(ACCENT),
+            );
+        }
+        if let Some(error) = &manager.asset_error {
+            body = body.push(text(error).size(9).color(DANGER));
+        }
         if matches!(self.controller.storage_mode(), StorageMode::Canonical) {
             body = body.push(
                 text("Destination: assigned inside the canonical album directory at commit.")
@@ -7982,9 +8696,10 @@ impl FluxReady {
         }
         body = body.push(
             text(
-                "Metadata was inferred only from filenames and folders. Review edits become \
-                 canonical Flux metadata; audio tags are never read or written. Artwork \
-                 extraction/preview is not part of this build.",
+                "Metadata was inferred only from filenames and folders. Review edits, explicitly \
+                 attached artwork, and lyrics files become canonical Flux data in one atomic \
+                 commit; audio tags are never read or written. Artwork is not extracted from \
+                 embedded tags.",
             )
             .size(9)
             .color(MUTED),
@@ -8520,6 +9235,18 @@ impl FluxReady {
                     self.controller.playlists().len()
                 ),
             )
+        } else if let Some(artist_id) = self.selected_artist_id() {
+            let name = self
+                .controller
+                .artist(artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {artist_id}"));
+            let albums = self.controller.albums_owned_by(artist_id).len()
+                + self.controller.albums_credited_for(artist_id).len();
+            (
+                name,
+                format!("Artist detail · {albums} album association(s) · artist {artist_id}"),
+            )
         } else if let Some(group) = &self.selected_group {
             let rows = self.filtered_tracks();
             (
@@ -8807,6 +9534,11 @@ impl FluxReady {
         if self.view == LibraryView::Settings {
             return self.settings_view();
         }
+        if self.view == LibraryView::Artists
+            && let Some(artist) = self.selected_artist_id()
+        {
+            return self.artist_detail_view(artist);
+        }
         if self.controller.tracks().is_empty() {
             return self.empty_library();
         }
@@ -8882,6 +9614,38 @@ impl FluxReady {
         }
     }
 
+    fn artist_artwork<'a>(&'a self, artist_id: ArtistId, size: f32) -> Element<'a, Message> {
+        let seed = self
+            .controller
+            .artist(artist_id)
+            .map(|artist| artist.name().to_owned());
+        let handle = self
+            .artist_artwork
+            .get(&artist_id)
+            .and_then(|entry| entry.handle.as_ref());
+        match handle {
+            Some(handle) => artwork_image(handle, size, ContentFit::Cover),
+            None => fallback_artwork(seed.as_deref(), size),
+        }
+    }
+
+    fn track_artwork<'a>(
+        &'a self,
+        track_id: TrackId,
+        album_id: Option<AlbumId>,
+        size: f32,
+        content_fit: ContentFit,
+    ) -> Element<'a, Message> {
+        if let Some(handle) = self
+            .track_artwork
+            .get(&track_id)
+            .and_then(|entry| entry.handle.as_ref())
+        {
+            return artwork_image(handle, size, content_fit);
+        }
+        self.album_artwork(album_id, size, content_fit)
+    }
+
     fn album_artwork_error(&self, album_id: AlbumId) -> Option<&str> {
         self.artwork
             .get(&album_id)
@@ -8890,7 +9654,10 @@ impl FluxReady {
 
     fn artwork_targets(&self) -> Vec<AlbumId> {
         let mut targets = Vec::new();
-        if let Some(album_id) = self.selected_album_id() {
+        if let Some(artist_id) = self.selected_artist_id() {
+            targets.extend(self.controller.albums_owned_by(artist_id));
+            targets.extend(self.controller.albums_credited_for(artist_id));
+        } else if let Some(album_id) = self.selected_album_id() {
             targets.push(album_id);
         } else if self.view == LibraryView::Albums && self.selected_group.is_none() {
             let groups = self.groups_for(LibraryView::Albums);
@@ -8923,15 +9690,22 @@ impl FluxReady {
     fn ensure_artwork_tasks(&mut self) -> Task<Message> {
         self.artwork
             .retain(|album_id, _| self.controller.album(*album_id).is_some());
-        self.artwork_loading
-            .retain(|key| self.controller.album(key.album_id).is_some());
+        self.artist_artwork
+            .retain(|artist_id, _| self.controller.artist(*artist_id).is_some());
+        self.track_artwork
+            .retain(|track_id, _| self.controller.track(*track_id).is_some());
+        self.artwork_loading.retain(|key| match key.owner {
+            ArtworkOwner::Album(album) => self.controller.album(album).is_some(),
+            ArtworkOwner::Artist(artist) => self.controller.artist(artist).is_some(),
+            ArtworkOwner::Track(track) => self.controller.track(track).is_some(),
+        });
         let mut tasks = Vec::new();
         for album_id in self.artwork_targets() {
             let Some(path) = self.controller.album_cover_path(album_id) else {
                 self.artwork.remove(&album_id);
                 continue;
             };
-            let key = artwork_key(album_id, path);
+            let key = artwork_key(ArtworkOwner::Album(album_id), path);
             if self
                 .artwork
                 .get(&album_id)
@@ -8950,6 +9724,70 @@ impl FluxReady {
                 move |result| Message::ArtworkLoaded(session, message_key, result),
             ));
             if tasks.len() >= 6 {
+                break;
+            }
+        }
+        let mut extra_targets: Vec<(ArtworkOwner, PathBuf)> = Vec::new();
+        for track in self.visible_track_ids().into_iter().take(64) {
+            if let Some(path) = self.controller.track_artwork_path(track) {
+                extra_targets.push((ArtworkOwner::Track(track), path));
+            }
+        }
+        if let Some(artist) = self.selected_artist_id()
+            && let Some(path) = self.controller.artist_image_path(artist)
+        {
+            extra_targets.push((ArtworkOwner::Artist(artist), path));
+        }
+        if let Some(track) = self.controller.current_id()
+            && let Some(path) = self.controller.track_artwork_path(track)
+        {
+            extra_targets.push((ArtworkOwner::Track(track), path));
+        }
+        if let Some(editor) = &self.track_editor
+            && let Some(path) = self.controller.track_artwork_path(editor.id)
+        {
+            extra_targets.push((ArtworkOwner::Track(editor.id), path));
+        }
+        for (owner, path) in extra_targets {
+            let key = artwork_key(owner, path);
+            let cached = match owner {
+                ArtworkOwner::Album(album) => self
+                    .artwork
+                    .get(&album)
+                    .is_some_and(|entry| entry.key == key),
+                ArtworkOwner::Artist(artist) => self
+                    .artist_artwork
+                    .get(&artist)
+                    .is_some_and(|entry| entry.key == key),
+                ArtworkOwner::Track(track) => self
+                    .track_artwork
+                    .get(&track)
+                    .is_some_and(|entry| entry.key == key),
+            };
+            if cached {
+                continue;
+            }
+            match owner {
+                ArtworkOwner::Album(album) => {
+                    self.artwork.remove(&album);
+                }
+                ArtworkOwner::Artist(artist) => {
+                    self.artist_artwork.remove(&artist);
+                }
+                ArtworkOwner::Track(track) => {
+                    self.track_artwork.remove(&track);
+                }
+            }
+            if !self.artwork_loading.insert(key.clone()) {
+                continue;
+            }
+            let message_key = key.clone();
+            let session = self.controller.library_session();
+            tasks.push(Task::perform(
+                async move { decode_artwork(&key) },
+                move |result| Message::ArtworkLoaded(session, message_key, result),
+            ));
+            if tasks.len() >= 8 {
                 break;
             }
         }
@@ -9204,9 +10042,66 @@ impl FluxReady {
                     .color(MUTED),
             );
         }
+        body = body.push(text("TRACK ARTWORK").size(9).color(ACCENT));
+        let has_track_art = self.controller.track_artwork_path(editor.id).is_some();
+        body = body.push(
+            row![
+                self.track_artwork(
+                    editor.id,
+                    self.controller.track_album_id(editor.id),
+                    86.0,
+                    ContentFit::Cover
+                ),
+                column![
+                    text(if has_track_art {
+                        "Using a Track-specific artwork override."
+                    } else {
+                        "Using Album artwork fallback (no Track override)."
+                    })
+                    .size(10)
+                    .color(if has_track_art { TEXT } else { MUTED }),
+                    text("Managed PNG/JPEG/WebP override. Removing it restores Album artwork without changing album metadata.")
+                        .size(9)
+                        .color(MUTED),
+                ]
+                .spacing(3)
+                .width(Length::Fill),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        );
+        body = body.push(
+            row![
+                text_input("Track artwork path…", &editor.artwork_input)
+                    .on_input(Message::TrackArtworkChanged)
+                    .on_submit(Message::TrackArtworkApply)
+                    .style(input_style)
+                    .width(Length::Fill),
+                button(text("Choose image…").size(10))
+                    .style(accent_button_style)
+                    .padding([6, 9])
+                    .on_press(Message::TrackArtworkChoose),
+                button(text("Assign / replace").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::TrackArtworkApply),
+                button(
+                    text(if editor.artwork_remove_confirm {
+                        "Confirm restore album artwork"
+                    } else {
+                        "Remove override"
+                    })
+                    .size(10),
+                )
+                .style(danger_button_style)
+                .padding([6, 9])
+                .on_press_maybe(has_track_art.then_some(Message::TrackArtworkRemove)),
+            ]
+            .spacing(6),
+        );
         body = body.push(text("DELETE THIS TRACK").size(9).color(DANGER));
         body = body.push(
-            text("Removes this TrackId, its managed audio, metadata record, lyrics, rating and queue entries. The album and artist are retained even when empty. Other tracks and playlist order are preserved. This is not a bulk delete.")
+            text("Removes this TrackId, its managed audio, metadata record, lyrics, Track artwork override, rating and queue entries. The album, artist and inherited album artwork are retained even when empty. Other tracks and playlist order are preserved. This is not a bulk delete.")
                 .size(10)
                 .color(MUTED),
         );
@@ -12038,6 +12933,229 @@ impl FluxReady {
         body.height(Length::Fill).into()
     }
 
+    fn artist_detail_view(&self, artist_id: ArtistId) -> Element<'_, Message> {
+        let Some(artist) = self.controller.artist(artist_id) else {
+            return text("Artist is no longer in the library.")
+                .size(13)
+                .color(MUTED)
+                .into();
+        };
+        let mut album_ids = self.controller.albums_owned_by(artist_id);
+        album_ids.extend(self.controller.albums_credited_for(artist_id));
+        album_ids.sort_by_key(|id| id.get());
+        album_ids.dedup();
+        let tracks = self
+            .controller
+            .tracks()
+            .iter()
+            .filter(|(id, _)| {
+                self.controller.track_artist_id(*id) == Some(artist_id)
+                    || self.controller.track_credits(*id).contains(&artist_id)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+
+        let mut body = column![
+            row![
+                self.artist_artwork(artist_id, 112.0),
+                column![
+                    text(artist.name().to_owned()).size(22).color(TEXT),
+                    text(format!(
+                        "ArtistId {} · {} album(s) · {} track(s) · image {}",
+                        artist.id(),
+                        album_ids.len(),
+                        tracks.len(),
+                        if self.controller.artist_image_path(artist_id).is_some() {
+                            "managed"
+                        } else {
+                            "none"
+                        }
+                    ))
+                    .size(10)
+                    .color(MUTED),
+                    text(
+                        self.controller
+                            .artist_description(artist_id)
+                            .filter(|description| !description.is_empty())
+                            .unwrap_or("No description yet.")
+                    )
+                    .size(10)
+                    .color(MUTED),
+                ]
+                .spacing(3)
+                .width(Length::Fill),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+            container(
+                column![
+                    text("ARTIST METADATA").size(9).color(ACCENT),
+                    text_input("Artist display name…", &self.artist_detail_name_input)
+                        .on_input(Message::ArtistDetailNameChanged)
+                        .on_submit(Message::ArtistMetadataSave)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    text_input("Description (optional)…", &self.artist_description_input)
+                        .on_input(Message::ArtistDescriptionChanged)
+                        .on_submit(Message::ArtistMetadataSave)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Save artist metadata").size(10))
+                        .style(accent_button_style)
+                        .padding([6, 9])
+                        .on_press(Message::ArtistMetadataSave),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .style(card_style),
+            container(
+                column![
+                    text("ARTIST IMAGE").size(9).color(ACCENT),
+                    text("Managed PNG/JPEG/WebP image. It is validated before publication.")
+                        .size(9)
+                        .color(MUTED),
+                    row![
+                        text_input("Artist image path…", &self.artist_image_input)
+                            .on_input(Message::ArtistImageChanged)
+                            .on_submit(Message::ArtistImageApply)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text("Choose image…").size(10))
+                            .style(accent_button_style)
+                            .padding([6, 9])
+                            .on_press(Message::ArtistImageChoose),
+                        button(text("Assign / replace").size(10))
+                            .style(ghost_style)
+                            .padding([6, 9])
+                            .on_press(Message::ArtistImageApply),
+                        button(
+                            text(if self.artist_image_remove_confirm {
+                                "Confirm remove image"
+                            } else {
+                                "Remove image"
+                            })
+                            .size(10),
+                        )
+                        .style(danger_button_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            self.controller
+                                .artist_image_path(artist_id)
+                                .is_some()
+                                .then_some(Message::ArtistImageRemove),
+                        ),
+                    ]
+                    .spacing(6),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .style(card_style),
+            text("ALBUMS").size(9).color(ACCENT),
+        ];
+        if album_ids.is_empty() {
+            body = body.push(
+                text("No albums associated with this artist yet.")
+                    .size(11)
+                    .color(MUTED),
+            );
+        } else {
+            for album_id in album_ids {
+                let Some(album) = self.controller.album(album_id) else {
+                    continue;
+                };
+                body = body.push(
+                    button(
+                        row![
+                            self.album_artwork(Some(album_id), 34.0, ContentFit::Cover),
+                            column![
+                                text(album.title.clone()).size(12).color(TEXT),
+                                text(format!(
+                                    "{} · {} track(s) · owner {}",
+                                    release_type_label(album.release_type),
+                                    album.track_order.len(),
+                                    self.controller
+                                        .album_owner(album_id)
+                                        .and_then(|owner| self.controller.artist(owner))
+                                        .map(|owner| owner.name().to_owned())
+                                        .unwrap_or_else(|| "unknown".to_owned())
+                                ))
+                                .size(9)
+                                .color(MUTED),
+                            ]
+                            .spacing(1)
+                            .width(Length::Fill),
+                            text("›").size(18).color(MUTED),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding(7)
+                    .style(group_style)
+                    .on_press(Message::OpenAlbum(album_id)),
+                );
+            }
+        }
+        body = body.push(text("TRACKS").size(9).color(ACCENT));
+        if tracks.is_empty() {
+            body = body.push(
+                text("No tracks associated with this artist yet.")
+                    .size(11)
+                    .color(MUTED),
+            );
+        } else {
+            for track_id in tracks {
+                let Some(track) = self.controller.track(track_id) else {
+                    continue;
+                };
+                let album = self
+                    .controller
+                    .track_album_id(track_id)
+                    .and_then(|album| self.controller.album(album))
+                    .map(|album| album.title.clone())
+                    .unwrap_or_else(|| "Unknown album".to_owned());
+                body = body.push(
+                    row![
+                        self.track_artwork(
+                            track_id,
+                            self.controller.track_album_id(track_id),
+                            30.0,
+                            ContentFit::Cover
+                        ),
+                        column![
+                            text(track.title()).size(12).color(TEXT),
+                            text(format!("{} · {album}", self.credit_display(track_id)))
+                                .size(9)
+                                .color(MUTED),
+                        ]
+                        .spacing(1)
+                        .width(Length::Fill),
+                        button(text("Play").size(9))
+                            .style(ghost_style)
+                            .padding([5, 8])
+                            .on_press(Message::PlayTrack(track_id)),
+                        button(text("Edit").size(9))
+                            .style(ghost_style)
+                            .padding([5, 8])
+                            .on_press(Message::EditTrack(track_id)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .padding([5, 7]),
+                );
+            }
+        }
+        if let Some(message) = &self.lifecycle_msg {
+            body = body.push(text(message.clone()).size(9).color(MUTED));
+        }
+        container(scrollable(body).height(Length::Fill))
+            .padding(16)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn album_detail_view(&self, album_id: AlbumId) -> Element<'_, Message> {
         let Some(album) = self.controller.album(album_id) else {
             return text("Album is no longer in the library.")
@@ -12072,6 +13190,10 @@ impl FluxReady {
                 ]
                 .spacing(3)
                 .width(Length::Fill),
+                button(text("Open artist").size(10))
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press(Message::OpenArtist(album.owner_artist_id)),
                 button(text("Add tracks…").size(10))
                     .style(accent_button_style)
                     .padding([7, 10])
@@ -12239,6 +13361,9 @@ impl FluxReady {
                     }
                     None => {}
                 }
+                if self.controller.track_artwork_path(*track_id).is_some() {
+                    title_row = title_row.push(text("artwork").size(8).color(ACCENT));
+                }
                 list = list.push(
                     container(
                         row![
@@ -12246,6 +13371,7 @@ impl FluxReady {
                                 .size(10)
                                 .color(MUTED)
                                 .width(Length::Fixed(24.0)),
+                            self.track_artwork(*track_id, Some(album_id), 30.0, ContentFit::Cover),
                             column![
                                 title_row,
                                 text(self.credit_display(*track_id)).size(9).color(MUTED),
@@ -12839,9 +13965,13 @@ impl FluxReady {
                     .on_press(Message::ToggleQueue),
             );
         }
+        let now_art = current_entry.map_or_else(
+            || self.album_artwork(current_album, 176.0, ContentFit::Cover),
+            |entry| self.track_artwork(entry.track(), current_album, 176.0, ContentFit::Cover),
+        );
         let mut panel = column![
             heading,
-            container(self.album_artwork(current_album, 176.0, ContentFit::Cover))
+            container(now_art)
                 .width(Length::Fill)
                 .center_x(Length::Fill),
             text(title).size(16).color(TEXT),
@@ -13055,13 +14185,14 @@ impl FluxReady {
         let compact = self.window_width < 1_080.0;
         let current_album =
             current_entry.and_then(|entry| self.controller.track_album_id(entry.track()));
+        let player_art = current_entry.map_or_else(
+            || self.album_artwork(current_album, 54.0, ContentFit::Cover),
+            |entry| self.track_artwork(entry.track(), current_album, 54.0, ContentFit::Cover),
+        );
         let left = container(
-            row![
-                self.album_artwork(current_album, 54.0, ContentFit::Cover),
-                info,
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
+            row![player_art, info]
+                .spacing(12)
+                .align_y(Alignment::Center),
         )
         .width(Length::Fixed(if compact { 220.0 } else { 260.0 }));
 
@@ -13749,7 +14880,14 @@ mod tests {
             album_delete_confirm: false,
             album_cover_remove_confirm: false,
             artwork: BTreeMap::new(),
+            artist_artwork: BTreeMap::new(),
+            track_artwork: BTreeMap::new(),
             artwork_loading: HashSet::new(),
+            artist_detail_name_input: String::new(),
+            artist_description_input: String::new(),
+            artist_image_input: String::new(),
+            artist_image_picked: None,
+            artist_image_remove_confirm: false,
             last_reconcile: None,
             migrate_source: String::new(),
             pending_plan: None,
@@ -14182,6 +15320,30 @@ mod tests {
             gui.import_manager.as_ref().expect("manager").sources,
             vec![PathBuf::from("keep-current-selection")]
         );
+        gui.import_manager.as_mut().expect("manager").edit_artwork = "keep-track-art".to_owned();
+        let _ = gui.update(Message::ImportArtworkPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-track-art.png")])),
+        ));
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").edit_artwork,
+            "keep-track-art"
+        );
+        gui.import_manager
+            .as_mut()
+            .expect("manager")
+            .edit_album_artwork = "keep-album-art".to_owned();
+        let _ = gui.update(Message::ImportAlbumArtworkPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-album-art.png")])),
+        ));
+        assert_eq!(
+            gui.import_manager
+                .as_ref()
+                .expect("manager")
+                .edit_album_artwork,
+            "keep-album-art"
+        );
 
         send(&mut gui, Message::EditTrack(id));
         let editor_before = gui
@@ -14201,6 +15363,22 @@ mod tests {
                 .replacement_source,
             editor_before
         );
+        gui.track_editor.as_mut().expect("editor").artwork_input = "keep-track-override".to_owned();
+        let _ = gui.update(Message::TrackArtworkPicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-track-override.png")])),
+        ));
+        assert_eq!(
+            gui.track_editor.as_ref().expect("editor").artwork_input,
+            "keep-track-override"
+        );
+
+        gui.artist_image_input = "keep-artist-image".to_owned();
+        let _ = gui.update(Message::ArtistImagePicked(
+            old_session,
+            Ok(Some(vec![PathBuf::from("stale-artist-image.png")])),
+        ));
+        assert_eq!(gui.artist_image_input, "keep-artist-image");
 
         gui.album_cover_input = "keep-cover".to_owned();
         let _ = gui.update(Message::AlbumCoverPicked(
@@ -14217,7 +15395,7 @@ mod tests {
         assert!(gui.lyrics_import.is_none());
 
         let key = ArtworkKey {
-            album_id: AlbumId::new(1),
+            owner: ArtworkOwner::Album(AlbumId::new(1)),
             path: PathBuf::from("stale-cover.png"),
             modified_ns: 0,
             len: 0,
@@ -14298,7 +15476,7 @@ mod tests {
         send(&mut gui, Message::EditTrack(old_id));
         send(&mut gui, Message::LyricsSelect(old_id));
         gui.artwork_loading.insert(ArtworkKey {
-            album_id: AlbumId::new(1),
+            owner: ArtworkOwner::Album(AlbumId::new(1)),
             path: PathBuf::from("old-cover.png"),
             modified_ns: 0,
             len: 0,
@@ -14679,11 +15857,39 @@ mod tests {
             Message::ImportCreditNameChanged("Featured Artist".to_owned()),
         );
         send(&mut gui, Message::ImportCreditAddNamed);
+        let track_art = dir.path().join("import-track.png");
+        let album_art = dir.path().join("import-album.png");
+        write_test_png(&track_art, 48, 48);
+        write_test_png(&album_art, 64, 64);
+        send(
+            &mut gui,
+            Message::ImportArtworkPicked(0, Ok(Some(vec![track_art.clone()]))),
+        );
+        send(&mut gui, Message::ImportArtworkApply);
+        send(
+            &mut gui,
+            Message::ImportAlbumArtworkPicked(0, Ok(Some(vec![album_art.clone()]))),
+        );
+        send(&mut gui, Message::ImportAlbumArtworkApply);
+        let lyrics = dir.path().join("import.lrc");
+        std::fs::write(&lyrics, "[00:01.00]GUI imported lyrics\n").expect("lyrics");
+        send(
+            &mut gui,
+            Message::ImportLyricsPathChanged(lyrics.display().to_string()),
+        );
+        send(&mut gui, Message::ImportLyricsAttach);
         let plan = gui
             .import_manager
             .as_ref()
             .and_then(|manager| manager.plan.clone())
             .expect("plan");
+        let candidate = plan.candidates.first().expect("candidate");
+        assert_eq!(candidate.artwork_path(), Some(track_art.as_path()));
+        assert_eq!(candidate.album_artwork_path(), Some(album_art.as_path()));
+        assert_eq!(
+            candidate.lyrics_text(),
+            Some("[00:01.00]GUI imported lyrics\n")
+        );
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
         let prepared = prepare_import_files(&plan, progress, cancel);
@@ -14704,9 +15910,103 @@ mod tests {
                 .map(|artist| artist.name().to_owned()),
             Some("GUI import artist".to_owned())
         );
+        let imported_art = gui
+            .controller
+            .track_artwork_path(id)
+            .expect("imported track artwork");
+        assert!(imported_art.is_file());
+        let imported_album = gui.controller.track_album_id(id).expect("album");
+        assert!(
+            gui.controller
+                .album_cover_path(imported_album)
+                .is_some_and(|path| path.is_file())
+        );
+        assert_eq!(
+            gui.controller.track_lyrics(id).as_deref(),
+            Some("[00:01.00]GUI imported lyrics\n")
+        );
         assert_eq!(gui.controller.queue_len(), 1);
         assert_eq!(std::fs::read(&source).expect("source"), source_bytes);
         assert_ne!(track.source().path(), source);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn import_review_selects_existing_artist_and_album_without_duplicates() {
+        let dir = TempDir::new("gui-import-existing-entities");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create");
+        let source = dir.path().join("Incoming/New Song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("source dir");
+        std::fs::write(&source, minimal_wav()).expect("audio");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let artist = gui
+            .controller
+            .create_artist("Existing Artist")
+            .expect("artist");
+        let album = gui
+            .controller
+            .create_album(artist, "Existing Album", ReleaseType::Album)
+            .expect("album");
+        let request = ImportRequest {
+            sources: vec![source],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: root.clone(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
+            target_album: None,
+            generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
+        };
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(
+            &mut gui,
+            Message::ImportArtistPicked(Some(ArtistChoice {
+                id: Some(artist),
+                label: "Existing Artist".to_owned(),
+            })),
+        );
+        send(
+            &mut gui,
+            Message::ImportAlbumPicked(Some(AlbumChoice {
+                id: album,
+                label: "Existing Album".to_owned(),
+            })),
+        );
+        let plan = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.clone())
+            .expect("plan");
+        let candidate = plan.candidates.first().expect("candidate");
+        assert_eq!(candidate.artist_id(), Some(artist));
+        assert_eq!(candidate.album(), Some("Existing Album"));
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        let imported = gui.controller.tracks()[0].0;
+        assert_eq!(gui.controller.track_artist_id(imported), Some(artist));
+        assert_eq!(gui.controller.track_album_id(imported), Some(album));
+        assert_eq!(gui.controller.albums().len(), 1, "no duplicate Album");
+        assert_eq!(gui.controller.artists().len(), 1, "no duplicate Artist");
+        assert_eq!(gui.controller.album_tracks(album), vec![imported]);
         gui.controller.shutdown();
     }
 
@@ -15445,6 +16745,126 @@ mod tests {
     }
 
     #[test]
+    fn gui_artist_detail_and_track_artwork_workflows_are_end_to_end() {
+        let dir = TempDir::new("gui-artist-detail");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Entity Song",
+            "Entity Artist",
+            "Entity Album",
+            ReleaseType::Album,
+            1,
+        );
+        let artist = gui.controller.track_artist_id(id).expect("artist");
+        let album = gui.controller.track_album_id(id).expect("album");
+        send(&mut gui, Message::SearchNavigateArtist(artist));
+        assert_eq!(gui.view, LibraryView::Artists);
+        assert_eq!(gui.selected_artist_id(), Some(artist));
+
+        send(
+            &mut gui,
+            Message::ArtistDetailNameChanged("Renamed Entity Artist".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::ArtistDescriptionChanged("A user-authored description.".to_owned()),
+        );
+        send(&mut gui, Message::ArtistMetadataSave);
+        assert_eq!(
+            gui.controller
+                .artist(artist)
+                .map(|artist| artist.name().to_owned()),
+            Some("Renamed Entity Artist".to_owned())
+        );
+        assert_eq!(
+            gui.controller.artist_description(artist),
+            Some("A user-authored description.")
+        );
+        assert_eq!(
+            gui.controller.track(id).and_then(Track::artist),
+            Some("Renamed Entity Artist")
+        );
+        assert!(
+            gui.selected_group
+                .as_deref()
+                .is_some_and(|key| key.contains("Renamed Entity Artist")),
+            "artist detail selection follows the renamed display identity"
+        );
+
+        let artist_image = dir.path().join("artist-image.png");
+        write_test_png(&artist_image, 64, 64);
+        send(
+            &mut gui,
+            Message::ArtistImagePicked(0, Ok(Some(vec![artist_image]))),
+        );
+        send(&mut gui, Message::ArtistImageApply);
+        assert!(
+            gui.controller
+                .artist_image_path(artist)
+                .is_some_and(|path| path.is_file())
+        );
+        send(&mut gui, Message::ArtistImageRemove);
+        assert!(gui.controller.artist_image_path(artist).is_some());
+        send(&mut gui, Message::ArtistImageRemove);
+        assert!(gui.controller.artist_image_path(artist).is_none());
+
+        send(&mut gui, Message::OpenAlbum(album));
+        assert_eq!(gui.view, LibraryView::Albums);
+        assert_eq!(gui.selected_album_id(), Some(album));
+        send(&mut gui, Message::OpenArtist(artist));
+        assert_eq!(gui.view, LibraryView::Artists);
+        assert_eq!(gui.selected_artist_id(), Some(artist));
+
+        send(&mut gui, Message::EditTrack(id));
+        let invalid_art = dir.path().join("invalid-art.png");
+        std::fs::write(&invalid_art, b"not an image").expect("invalid art");
+        send(
+            &mut gui,
+            Message::TrackArtworkPicked(0, Ok(Some(vec![invalid_art]))),
+        );
+        send(&mut gui, Message::TrackArtworkApply);
+        assert!(
+            gui.controller.track_artwork_path(id).is_none(),
+            "invalid Track artwork must be rejected without changing the library"
+        );
+        let track_image = dir.path().join("track-image.png");
+        write_test_png(&track_image, 48, 48);
+        send(
+            &mut gui,
+            Message::TrackArtworkPicked(0, Ok(Some(vec![track_image]))),
+        );
+        send(&mut gui, Message::TrackArtworkApply);
+        let managed_track_art = gui
+            .controller
+            .track_artwork_path(id)
+            .expect("track artwork override");
+        assert!(managed_track_art.is_file());
+        let expected_art_name = format!("track_{}.png", id.get());
+        assert_eq!(
+            managed_track_art.file_name().and_then(|name| name.to_str()),
+            Some(expected_art_name.as_str())
+        );
+        send(&mut gui, Message::TrackArtworkRemove);
+        assert!(gui.controller.track_artwork_path(id).is_some());
+        send(&mut gui, Message::TrackArtworkRemove);
+        assert!(gui.controller.track_artwork_path(id).is_none());
+        assert!(
+            gui.controller.album_cover_path(album).is_none(),
+            "Track override removal does not fabricate Album artwork"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn gui_track_editor_reviews_and_deletes_one_track() {
         let dir = TempDir::new("gui-delete-track");
         let root = dir.path().join("library");
@@ -15999,7 +17419,7 @@ mod tests {
         let dir = TempDir::new("gui-artwork-decode");
         let png = dir.path().join("cover.png");
         write_test_png(&png, 600, 300);
-        let key = artwork_key(AlbumId::new(1), png.clone());
+        let key = artwork_key(ArtworkOwner::Album(AlbumId::new(1)), png.clone());
         let decoded = decode_artwork(&key).expect("png decodes");
         match decoded.handle {
             ImageHandle::Rgba { width, height, .. } => {
@@ -16013,27 +17433,44 @@ mod tests {
         image::RgbImage::from_pixel(64, 32, image::Rgb([120, 40, 80]))
             .save_with_format(&jpeg, image::ImageFormat::Jpeg)
             .expect("write jpeg");
-        assert!(decode_artwork(&artwork_key(AlbumId::new(1), jpeg)).is_ok());
+        assert!(decode_artwork(&artwork_key(ArtworkOwner::Album(AlbumId::new(1)), jpeg)).is_ok());
         let webp = dir.path().join("cover.webp");
         image::RgbImage::from_pixel(48, 48, image::Rgb([20, 120, 80]))
             .save_with_format(&webp, image::ImageFormat::WebP)
             .expect("write webp");
-        assert!(decode_artwork(&artwork_key(AlbumId::new(1), webp)).is_ok());
+        assert!(decode_artwork(&artwork_key(ArtworkOwner::Album(AlbumId::new(1)), webp)).is_ok());
 
-        let missing = artwork_key(AlbumId::new(1), dir.path().join("missing.png"));
+        let missing = artwork_key(
+            ArtworkOwner::Album(AlbumId::new(1)),
+            dir.path().join("missing.png"),
+        );
         assert!(decode_artwork(&missing).is_err());
 
         let invalid = dir.path().join("invalid.png");
         std::fs::write(&invalid, b"not an image").expect("invalid");
-        assert!(decode_artwork(&artwork_key(AlbumId::new(1), invalid)).is_err());
+        assert!(
+            decode_artwork(&artwork_key(ArtworkOwner::Album(AlbumId::new(1)), invalid)).is_err()
+        );
 
         let oversized = dir.path().join("oversized.png");
         write_test_png(&oversized, 5_000, 1);
-        assert!(decode_artwork(&artwork_key(AlbumId::new(1), oversized)).is_err());
+        assert!(
+            decode_artwork(&artwork_key(
+                ArtworkOwner::Album(AlbumId::new(1)),
+                oversized
+            ))
+            .is_err()
+        );
 
         let unsupported = dir.path().join("cover.bmp");
         std::fs::write(&unsupported, b"BM unsupported").expect("bmp");
-        assert!(decode_artwork(&artwork_key(AlbumId::new(1), unsupported)).is_err());
+        assert!(
+            decode_artwork(&artwork_key(
+                ArtworkOwner::Album(AlbumId::new(1)),
+                unsupported
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -16041,10 +17478,10 @@ mod tests {
         let dir = TempDir::new("gui-artwork-invalidation");
         let path = dir.path().join("cover.png");
         write_test_png(&path, 32, 32);
-        let first = artwork_key(AlbumId::new(1), path.clone());
+        let first = artwork_key(ArtworkOwner::Album(AlbumId::new(1)), path.clone());
         std::thread::sleep(Duration::from_millis(5));
         write_test_png(&path, 33, 33);
-        let second = artwork_key(AlbumId::new(1), path);
+        let second = artwork_key(ArtworkOwner::Album(AlbumId::new(1)), path);
         assert_ne!(first, second);
     }
 

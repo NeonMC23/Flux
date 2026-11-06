@@ -301,6 +301,9 @@ pub struct ImportCandidate {
     existing_match: Option<ExistingTrackMatch>,
     metadata_matches_existing: bool,
     source_fingerprint: Option<flux_library::canonical::ContentFingerprint>,
+    artwork: Option<flux_library::canonical::CanonicalImportAsset>,
+    album_artwork: Option<flux_library::canonical::CanonicalImportAsset>,
+    lyrics: Option<String>,
 }
 
 impl ImportCandidate {
@@ -539,6 +542,9 @@ impl ImportCandidate {
             || self.artist_id != self.base_artist_id
             || self.owner_index != 0
             || self.credits != self.base_credits
+            || self.artwork.is_some()
+            || self.album_artwork.is_some()
+            || self.lyrics.is_some()
     }
 
     /// Sets the reviewed title. An empty title means the display fallback.
@@ -566,6 +572,63 @@ impl ImportCandidate {
         self.album = album
             .map(|album| album.trim().to_owned())
             .filter(|album| !album.is_empty());
+    }
+
+    /// Optional Track artwork source selected for this candidate.
+    #[must_use]
+    pub fn artwork_path(&self) -> Option<&Path> {
+        self.artwork.as_ref().map(|asset| asset.source.as_path())
+    }
+
+    /// Optional Album artwork source selected for this candidate.
+    #[must_use]
+    pub fn album_artwork_path(&self) -> Option<&Path> {
+        self.album_artwork
+            .as_ref()
+            .map(|asset| asset.source.as_path())
+    }
+
+    /// Optional managed lyrics text attached during review.
+    #[must_use]
+    pub fn lyrics_text(&self) -> Option<&str> {
+        self.lyrics.as_deref()
+    }
+
+    /// Attaches or replaces a Track artwork source, capturing its fingerprint.
+    pub fn set_artwork(&mut self, source: &Path) -> Result<(), String> {
+        let fingerprint = flux_library::canonical::ContentFingerprint::of_file(source)
+            .map_err(|error| format!("Could not fingerprint track artwork: {error}"))?;
+        self.artwork = Some(flux_library::canonical::CanonicalImportAsset {
+            source: source.to_path_buf(),
+            fingerprint,
+        });
+        Ok(())
+    }
+
+    /// Removes the Track artwork selection.
+    pub fn clear_artwork(&mut self) {
+        self.artwork = None;
+    }
+
+    /// Attaches or replaces Album artwork, capturing its fingerprint.
+    pub fn set_album_artwork(&mut self, source: &Path) -> Result<(), String> {
+        let fingerprint = flux_library::canonical::ContentFingerprint::of_file(source)
+            .map_err(|error| format!("Could not fingerprint album artwork: {error}"))?;
+        self.album_artwork = Some(flux_library::canonical::CanonicalImportAsset {
+            source: source.to_path_buf(),
+            fingerprint,
+        });
+        Ok(())
+    }
+
+    /// Removes the Album artwork selection.
+    pub fn clear_album_artwork(&mut self) {
+        self.album_artwork = None;
+    }
+
+    /// Sets or clears managed lyrics text for the imported track.
+    pub fn set_lyrics_text(&mut self, lyrics: Option<String>) {
+        self.lyrics = lyrics.filter(|text| !text.trim().is_empty());
     }
 
     /// Sets the reviewed track number.
@@ -1317,6 +1380,9 @@ fn make_candidate(
         existing_match,
         metadata_matches_existing,
         source_fingerprint: flux_library::canonical::ContentFingerprint::of_file(&source_path).ok(),
+        artwork: None,
+        album_artwork: None,
+        lyrics: None,
     }
 }
 
@@ -2087,6 +2153,9 @@ fn apply_import_plan_canonical(
                     track_number: candidate.track_number(),
                     disc_number: candidate.disc_number(),
                     duration_ms: existing.duration_ms,
+                    artwork: candidate.artwork.clone(),
+                    album_artwork: candidate.album_artwork.clone(),
+                    lyrics: candidate.lyrics.clone(),
                 });
                 update_indices.push(index);
             }
@@ -2198,6 +2267,9 @@ fn apply_import_plan_canonical(
                     track_number: candidate.track_number(),
                     disc_number: candidate.disc_number(),
                     duration_ms: None,
+                    artwork: candidate.artwork.clone(),
+                    album_artwork: candidate.album_artwork.clone(),
+                    lyrics: candidate.lyrics.clone(),
                     allow_duplicate_content: matches!(
                         candidate.status(),
                         CandidateStatus::SameContent { .. }

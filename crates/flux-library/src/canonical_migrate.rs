@@ -366,6 +366,8 @@ pub fn plan_portable_v3(
             id: artist.id(),
             name: artist.name().to_owned(),
             aliases: artist.aliases().to_vec(),
+            description: None,
+            image: None,
         });
         artist_names
             .entry(artist.name().to_owned())
@@ -407,6 +409,8 @@ pub fn plan_portable_v3(
                         id,
                         name: name.clone(),
                         aliases: Vec::new(),
+                        description: None,
+                        image: None,
                     });
                     artist_names.insert(name, id);
                     id
@@ -501,6 +505,7 @@ pub fn plan_portable_v3(
                 disc_number: effective.disc_number,
                 duration_ms: effective.duration_ms,
                 lyrics: None,
+                artwork: None,
                 fingerprint: None,
                 created_unix_ms: 0,
             },
@@ -662,6 +667,8 @@ pub fn plan_legacy_index(
                 id,
                 name: artist_name,
                 aliases: Vec::new(),
+                description: None,
+                image: None,
             });
             id
         });
@@ -694,6 +701,7 @@ pub fn plan_legacy_index(
                 disc_number: record.disc_number,
                 duration_ms: record.duration_ms,
                 lyrics: None,
+                artwork: None,
                 fingerprint: None,
                 created_unix_ms: 0,
             },
