@@ -153,6 +153,7 @@ enum Mode {
 
 struct RowsCache {
     session: u64,
+    revision: u64,
     generation: u64,
     search: String,
     favorites_only: bool,
@@ -208,9 +209,11 @@ impl Tui {
     /// `Track` on each redraw was unnecessary work for large libraries.
     fn rows(&self) -> Rc<Vec<TrackId>> {
         let session = self.controller.library_session();
+        let revision = self.controller.library_revision();
         let generation = self.controller.generation();
         if let Some(cache) = self.rows_cache.borrow().as_ref()
             && cache.session == session
+            && cache.revision == revision
             && cache.generation == generation
             && cache.search == self.search
             && cache.favorites_only == self.favorites_only
@@ -233,6 +236,7 @@ impl Tui {
         );
         *self.rows_cache.borrow_mut() = Some(RowsCache {
             session,
+            revision,
             generation,
             search: self.search.clone(),
             favorites_only: self.favorites_only,

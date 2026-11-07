@@ -1515,6 +1515,7 @@ struct SearchCache {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrackRowsKey {
     session: u64,
+    revision: u64,
     generation: u64,
     history_generation: u64,
     view: LibraryView,
@@ -11651,6 +11652,7 @@ impl FluxReady {
         let album_mode = self.selected_album_id();
         let key = TrackRowsKey {
             session: self.controller.library_session(),
+            revision: self.controller.library_revision(),
             generation: self.controller.generation(),
             history_generation: self.controller.history_generation(),
             view: self.view,

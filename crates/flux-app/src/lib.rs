@@ -1473,6 +1473,9 @@ pub struct Controller {
     library: Option<Library>,
     /// Display/lookup snapshot of the library, refreshed on change.
     tracks: Vec<(TrackId, Track)>,
+    /// Monotonic snapshot revision for legacy/portable modes where the
+    /// canonical catalogue generation is unavailable.
+    library_revision: u64,
     player: Player,
     engine: EngineHandle,
     audio: AudioStatus,
@@ -1923,6 +1926,7 @@ impl Controller {
         *player.queue_mut() = queue;
         let controller = Self {
             tracks: snapshot(&library),
+            library_revision: 1,
             library: Some(library),
             player,
             engine,
@@ -3663,6 +3667,13 @@ impl Controller {
             .unwrap_or(0)
     }
 
+    /// Monotonic display-snapshot revision. Unlike the canonical generation,
+    /// this also advances for legacy and portable mutations/scans.
+    #[must_use]
+    pub fn library_revision(&self) -> u64 {
+        self.library_revision
+    }
+
     /// The active canonical library root, when canonical mode is active.
     #[must_use]
     pub fn canonical_root(&self) -> Option<&Path> {
@@ -4137,6 +4148,7 @@ impl Controller {
         self.stream_info = None;
 
         self.tracks = snapshot(&library);
+        self.library_revision = self.library_revision.wrapping_add(1);
         self.library = Some(library);
         self.storage = storage;
         self.library_lock = library_lock;
@@ -5563,6 +5575,7 @@ impl Controller {
     /// tracks are appended only while the queue is still auto-derived.
     fn install_library_snapshot(&mut self, library: Library) {
         self.tracks = snapshot(&library);
+        self.library_revision = self.library_revision.wrapping_add(1);
         self.library = Some(library);
     }
 
@@ -5754,6 +5767,7 @@ impl Controller {
         };
         let library = store.runtime_library();
         self.tracks = snapshot(&library);
+        self.library_revision = self.library_revision.wrapping_add(1);
         self.library = Some(library);
     }
 
@@ -7592,6 +7606,7 @@ impl Controller {
         match restored {
             Some(library) => {
                 self.tracks = snapshot(&library);
+                self.library_revision = self.library_revision.wrapping_add(1);
                 self.library = Some(library);
                 self.sync_default_queue();
                 true
@@ -7599,6 +7614,7 @@ impl Controller {
             None => {
                 self.library = Some(Library::new());
                 self.tracks.clear();
+                self.library_revision = self.library_revision.wrapping_add(1);
                 false
             }
         }
@@ -13873,10 +13889,15 @@ mod tests {
         let song = write_dc_wav(&outside, "café.wav", 4_410, 0.2);
         let other = write_dc_wav(&outside, "other.wav", 4_410, 0.3);
         let original_bytes = fs::read(&song).expect("read source");
+        let revision_before = controller.library_revision();
 
         let report = controller
             .import_files(&[song.clone(), other.clone()], true)
             .expect("copy imports");
+        assert!(
+            controller.library_revision() > revision_before,
+            "portable mutations advance the display-snapshot revision"
+        );
         assert_eq!(report.added, 2);
         assert_eq!(report.updated, 0);
         assert_eq!(report.deduplicated, 0);
