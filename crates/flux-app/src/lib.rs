@@ -4774,6 +4774,7 @@ impl Controller {
             .execute_ownership_transfer(plan)
             .map_err(|err| format!("Could not transfer ownership: {err}"))?;
         self.refresh_from_canonical();
+        self.invalidate_preload_for_track(report.track_id);
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(format!(
             "Track {} transferred from {} to {}.",
@@ -4818,6 +4819,7 @@ impl Controller {
             .execute_album_transfer(plan)
             .map_err(|err| format!("Could not transfer album: {err}"))?;
         self.refresh_from_canonical();
+        self.cancel_preload();
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(format!(
             "Album {} transferred from {} to {} ({} track(s)).",
@@ -4887,6 +4889,8 @@ impl Controller {
                 return Err(message);
             }
         };
+        // Transfers can move the prepared next entry's audio path.
+        self.cancel_preload();
         let mut queue_changed = false;
         for id in &deleted_tracks {
             queue_changed |= self.player.queue_mut().remove(*id) > 0;
@@ -5164,6 +5168,7 @@ impl Controller {
             .execute_track_move(plan)
             .map_err(|err| format!("Could not move track: {err}"))?;
         self.refresh_from_canonical();
+        self.invalidate_preload_for_track(report.track_id);
         self.sync_default_queue();
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(format!(
@@ -5227,6 +5232,7 @@ impl Controller {
             .execute_track_audio_replacement(&plan.inner)
             .map_err(|err| format!("Could not replace audio: {err}"))?;
         self.refresh_from_canonical();
+        self.invalidate_preload_for_track(report.track_id);
         self.sync_default_queue();
         self.outbox.push(ControllerEvent::LibraryChanged);
         self.report_status(if report.restored_missing_audio {
@@ -7065,6 +7071,22 @@ impl Controller {
             }
         }
         self.preload_next_queue_entry();
+    }
+
+    fn cancel_preload(&mut self) {
+        if self.preloaded_entry.take().is_some() {
+            self.engine.cancel_preload();
+        }
+    }
+
+    fn invalidate_preload_for_track(&mut self, id: TrackId) {
+        if self
+            .preloaded_entry
+            .is_some_and(|(_, track_id)| track_id == id)
+        {
+            self.preloaded_entry = None;
+            self.engine.cancel_preload();
+        }
     }
 
     fn preload_next_queue_entry(&mut self) {
@@ -15828,6 +15850,67 @@ mod tests {
             })
         );
         assert_eq!(controller.rating(solo), None);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn replacing_preloaded_audio_discards_the_prepared_old_decoder() {
+        let dir = TempDir::new("preload-replacement");
+        let root = dir.path().join("FluxLibrary");
+        create_canonical_library(&root).expect("create");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let artist = controller.create_artist("Artist").expect("artist");
+        for (name, level) in [("one.wav", 0.1), ("two.wav", 0.2)] {
+            let source = dir.path().join("source").join(name);
+            fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+            write_dc_wav(source.parent().expect("parent"), name, 4_410, level);
+            controller
+                .import_canonical_track(super::CanonicalImportedTrack {
+                    source,
+                    title: name.to_owned(),
+                    artist_id: Some(artist),
+                    artist_name: "Artist".to_owned(),
+                    credited_artist_ids: vec![artist],
+                    album_title: Some("Album".to_owned()),
+                    release_type: super::ReleaseType::Album,
+                    track_number: None,
+                    disc_number: None,
+                    duration_ms: None,
+                })
+                .expect("import");
+        }
+        let first = controller.tracks()[0].0;
+        let second = controller.tracks()[1].0;
+        let first_entry = controller.enqueue_track(first).expect("first queue entry");
+        controller
+            .enqueue_track(second)
+            .expect("second queue entry");
+        controller
+            .play_queue_entry(first_entry)
+            .expect("play first queue entry");
+        controller.preload_next_queue_entry();
+        let preloaded = controller
+            .preloaded_entry
+            .expect("next entry should be preloaded");
+        assert_eq!(preloaded.1, second);
+
+        let replacement = dir.path().join("source/replacement.wav");
+        write_dc_wav(
+            replacement.parent().expect("parent"),
+            "replacement.wav",
+            4_410,
+            0.8,
+        );
+        let plan = controller
+            .plan_track_audio_replacement(second, &replacement)
+            .expect("replacement plan");
+        controller
+            .execute_track_audio_replacement(&plan)
+            .expect("replace");
+        assert!(
+            controller.preloaded_entry.is_none(),
+            "old prepared decoder would otherwise play pre-replacement audio"
+        );
         controller.shutdown();
     }
 

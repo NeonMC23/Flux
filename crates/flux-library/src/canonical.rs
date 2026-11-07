@@ -7117,6 +7117,7 @@ pub struct OwnershipTransferPlan {
     new_record: RelPath,
     new_lyrics: Option<RelPath>,
     expected_fingerprint: Option<ContentFingerprint>,
+    generation: u64,
     no_op: bool,
 }
 
@@ -7269,6 +7270,7 @@ impl CanonicalLibrary {
                 new_record: self.track_records[&track_id].clone(),
                 new_lyrics: None,
                 expected_fingerprint: track.fingerprint,
+                generation: self.catalog.generation,
                 no_op: true,
             });
         }
@@ -7341,6 +7343,7 @@ impl CanonicalLibrary {
             new_record,
             new_lyrics,
             expected_fingerprint,
+            generation: self.catalog.generation,
             no_op: false,
         })
     }
@@ -7367,6 +7370,11 @@ impl CanonicalLibrary {
         if plan.no_op {
             return Ok(report);
         }
+        if plan.generation != self.catalog.generation {
+            return Err(CanonicalError::Invalid(
+                "the track changed after the transfer plan was built; re-plan".to_owned(),
+            ));
+        }
         let track = self.tracks.get(&plan.track_id).cloned().ok_or_else(|| {
             CanonicalError::Invalid("track disappeared before transfer".to_owned())
         })?;
@@ -7378,6 +7386,13 @@ impl CanonicalLibrary {
         if !track.credited_artist_ids.contains(&plan.to_owner) {
             return Err(CanonicalError::Invalid(
                 "the destination artist is no longer credited; re-plan".to_owned(),
+            ));
+        }
+        let current_old_lyrics =
+            plan_track_lyrics_rel(&self.track_records[&plan.track_id], track.lyrics.as_deref());
+        if current_old_lyrics != plan.old_lyrics {
+            return Err(CanonicalError::Invalid(
+                "the track lyrics changed after the transfer plan was built; re-plan".to_owned(),
             ));
         }
         if plan.new_album.is_none()
@@ -7717,6 +7732,55 @@ mod ownership_tests {
             Some("Back Home")
         );
         assert_eq!(library.tracks().count(), 1);
+    }
+
+    #[test]
+    fn ownership_transfer_rejects_lyrics_or_other_changes_after_review() {
+        let dir = TempDir::new("transfer-stale-lyrics");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let a = library.create_artist("A", Vec::new()).expect("A");
+        let b = library.create_artist("B", Vec::new()).expect("B");
+        let source = dir.write("source/song.wav", b"opaque stale transfer bytes");
+        let id = library
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: Some("Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: None,
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import");
+        library
+            .set_lyrics(id, Some("[00:00.00]before"))
+            .expect("lyrics");
+        let destination = library
+            .create_album(b, "Destination", ReleaseType::Album)
+            .expect("album");
+        let plan = library
+            .plan_ownership_transfer(id, b, OwnershipDestination::Existing(destination))
+            .expect("plan");
+        library
+            .set_lyrics(id, Some("[00:00.00]after review"))
+            .expect("new lyrics");
+        let error = library
+            .execute_ownership_transfer(&plan)
+            .expect_err("stale plan must be rejected");
+        assert!(error.to_string().contains("changed after"), "{error}");
+        assert_eq!(
+            library.track(id).map(|track| track.owner_artist_id),
+            Some(a)
+        );
+        assert_eq!(
+            fs::read_to_string(library.track_lyrics_path(id).expect("lyrics path"))
+                .expect("lyrics text"),
+            "[00:00.00]after review"
+        );
     }
 
     #[test]
