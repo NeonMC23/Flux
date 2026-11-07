@@ -136,8 +136,13 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   move a member between Albums owned by the same Artist, convert a member to
   standalone while retaining the Track and its empty source Album, correct
   ordered credits/owner and assign or remove a managed Track artwork override;
-  removing the override restores Album artwork or the standalone fallback. The
-  queue panel supports stable
+  removing the override restores Album artwork or the standalone fallback.
+  Entity navigation keeps a bounded back stack: **Back**, `Esc` and
+  search-result navigation restore the prior view, search query and entity
+  context instead of dropping the user into an unrelated list. Settings lists
+  the primary keyboard shortcuts, and keyboard `N`/`P` now follow the stable
+  current queue entry exactly like the transport buttons. The queue panel
+  supports stable
   per-entry duplicate disambiguation, drag/keyboard reordering, removal and
   direct entry playback; the seek bar moves the decoder. Playback modes cycle
   Normal → Repeat All → Repeat One → Shuffle → Shuffle + Repeat All, with a
@@ -255,7 +260,9 @@ player remains visible:
   an LRC/TXT lyrics file to individual candidates before commit; Album artwork
   never overwrites individual Track artwork overrides;
 - review and edit every candidate, with incomplete metadata visibly marked and
-  inherited Album artwork distinguished from Track overrides;
+  inherited Album artwork distinguished from Track overrides; in a fixed-target
+  Album import, Album membership controls are hidden because the target Album is
+  locked, while Artist and Album-artwork enrichment remain available;
 - validate each candidate by opening its decoder before review and again while
   preparing the copy; unsupported extensions, malformed audio, missing files
   and unreadable paths are itemized while unrelated valid files remain
@@ -267,7 +274,9 @@ player remains visible:
   and content hash inside the catalogue transaction, and never expose a
   partially copied file as a catalogue entry;
 - report progress and per-item failures, preserve successful items when later
-  items fail, and cancel before commit.
+  items fail, and cancel before commit. Completed reviews state that imported
+  items are already available in Tracks/Albums; failed transactions state that
+  no partial catalogue was published.
 
 Reference-only/external imports are not available in canonical mode. Review
 edits become canonical Flux metadata; audio tags and source files are never

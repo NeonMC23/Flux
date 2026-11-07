@@ -29,14 +29,14 @@ pub use track::{Track, TrackId, TrackSource};
 pub const APP_NAME: &str = "Flux";
 
 /// Latest milestone whose implementation is complete and validated.
-pub const MILESTONE: &str = "M5";
+pub const MILESTONE: &str = "M6";
 
 /// Startup text shared by the GUI and TUI binaries.
 ///
-/// Kept deliberately factual: as of M5 both applications are working
-/// local music players (library scanning plus playback for the common
-/// local formats); what is still missing (playlists, seeking, …) is
-/// listed in the README rather than hinted at here.
+/// Kept deliberately factual: both applications are working local music
+/// players with canonical library management, playback, queues, playlists,
+/// lyrics, artwork, import review and audio-device selection. Remaining
+/// limits are documented in the README rather than hinted at here.
 pub fn startup_message() -> String {
     format!("{APP_NAME} — {MILESTONE}. A local music player for your own library.")
 }

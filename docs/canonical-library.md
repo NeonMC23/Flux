@@ -116,6 +116,23 @@ distinguishable without opening setup.
 Keyboard navigation remains `1`–`0` for the primary views, `K` for Settings,
 `L` for Library setup, `Q` to toggle the queue and `/` to focus search. The
 sidebar hint reflects these keys rather than advertising a shorter subset.
+Settings includes the full primary shortcut list and a direct link to the audio
+output controls in Library setup. `N`/`P` use the same Controller next/previous
+path as the transport buttons, including queue-follow behavior.
+
+Entity navigation keeps a bounded (32-entry) presentation-only back stack.
+Opening an Artist, Album or Track from search or a detail page stores the prior
+view, search query, filters, page and entity context. **Back** or `Esc` restores
+that context; lateral sidebar/group navigation clears stale history. The stack
+contains no catalogue or playback authority.
+
+Transient GUI operation results appear in the main content area when no more
+specific controller status/error is active, with an explicit **Dismiss** action;
+album/artist/setup detail views retain their own inline feedback. In a
+fixed-target Album import, bulk Album/standalone controls are hidden because
+membership is locked; Artist and Album-artwork enrichment remain available.
+Completed import results state where published items can be reviewed, while
+failed transactions state that no partial catalogue was published.
 
 At widths of 1080 px or more the queue is an inline right-hand panel. On narrower
 windows the Queue button and `Q` open the same Controller-backed queue as an
@@ -825,6 +842,7 @@ from what remains structurally or physically unverified.
 | M3 optional Album membership, standalone artwork/lyrics/member transitions and bulk import enrichment | Confirmed by deterministic canonical/Controller/GUI/TUI tests for standalone import, attach/detach/move, resource preservation, empty-Album retention, shared Artist/Album/artwork plus individual overrides, and invalid Album-artwork rejection; no real multi-candidate GUI mouse interaction audit |
 | M4 playback/device UX hardening: explicit recovery retry and Stop/Play recovery position reset | Confirmed by deterministic Controller recovery tests and GUI/TUI message/help tests; actual CPAL device-open and short real-output smoke checks were run, but no listening/acoustic or physical hotplug validation |
 | M5 output enumeration, explicit selection, safe switching, persistence and recovery policy | Confirmed by deterministic fake-engine Controller/GUI/settings tests plus real Linux CPAL enumeration and explicit stream initialization on two backend IDs; no real in-window GUI switching, listening validation, physical hotplug, or Windows/macOS runtime validation |
+| M6 consolidated UX polish: contextual back navigation, keyboard queue-follow consistency, centralized transient feedback, fixed-target import clarity and settings discoverability | Confirmed by deterministic GUI state/message tests plus GUI/TUI startup/PTY probes; no full manual mouse/keyboard walkthrough, screen-reader audit, or cross-platform UI validation |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |

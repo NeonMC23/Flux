@@ -2262,7 +2262,10 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "Missing resources are retained; inaccessible paths are not treated as missing.".to_owned(),
         "The TUI never deletes external audio and never deletes library tracks.".to_owned(),
         "Track deletion, audio/artwork/lyrics repair, ownership/album/artist transfer,".to_owned(),
-        "playlists, batch actions and global filters require the GUI review workflows.".to_owned(),
+        "playlists, batch actions and global filters require the GUI review workflows."
+            .to_owned(),
+        "Audio-output enumeration and device selection are GUI-only; Play retries recovery here."
+            .to_owned(),
     ]
 }
 
@@ -2979,6 +2982,7 @@ mod tests {
         assert!(help.contains("bounded automatic recovery"), "{help}");
         assert!(help.contains("SAFETY AND LIMITS"), "{help}");
         assert!(help.contains("bounded automatic recovery"), "{help}");
+        assert!(help.contains("device selection are GUI-only"), "{help}");
         assert!(help.contains("GUI review workflows"), "{help}");
         assert!(help.contains("synchronous quick copy"), "{help}");
         key(&mut tui, KeyCode::Down);

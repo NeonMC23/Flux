@@ -2072,6 +2072,27 @@ impl ImportManager {
     }
 }
 
+#[derive(Debug, Clone)]
+struct NavigationSnapshot {
+    view: LibraryView,
+    selected_group: Option<String>,
+    selected_playlist: Option<PlaylistId>,
+    selected_lyrics: Option<TrackId>,
+    collection: Option<SmartCollection>,
+    search: String,
+    page: usize,
+    lyrics_mode: LyricsMode,
+    lyrics_follow_current: bool,
+    filter_favorites: bool,
+    filter_lyrics: TriFilter,
+    filter_artwork: TriFilter,
+    filter_release: ReleaseFilter,
+    sort_tracks: TrackSort,
+    sort_descending: bool,
+    filter_rating: RatingFilter,
+    focused_track: Option<TrackId>,
+}
+
 struct FluxReady {
     controller: Controller,
     search: String,
@@ -2141,6 +2162,7 @@ struct FluxReady {
     lifecycle_msg: Option<String>,
     view: LibraryView,
     selected_group: Option<String>,
+    navigation_stack: Vec<NavigationSnapshot>,
     page: usize,
     queue_page: usize,
     queue_drag: Option<QueueDrag>,
@@ -2340,6 +2362,7 @@ enum Message {
     SearchNavigateTrack(TrackId),
     OpenAlbum(AlbumId),
     OpenArtist(ArtistId),
+    NavigateBack,
     TrackSelectionToggle(TrackId),
     TrackSelectionSelectAll,
     TrackSelectionClear,
@@ -2582,6 +2605,7 @@ impl FluxReady {
             lifecycle_msg: None,
             view: LibraryView::Tracks,
             selected_group: None,
+            navigation_stack: Vec::new(),
             page: 0,
             queue_page,
             queue_drag: None,
@@ -2629,6 +2653,7 @@ impl FluxReady {
         self.batch_review = None;
         self.deletion_manager = None;
         self.album_transfer = None;
+        self.navigation_stack.clear();
         self.search.clear();
         self.selected_tracks.clear();
         self.focused_track = None;
@@ -3898,8 +3923,11 @@ impl FluxReady {
             );
             return;
         }
+        self.navigation_stack.clear();
         self.view = view;
         self.selected_group = None;
+        self.focused_track = None;
+        self.selected_tracks.clear();
         self.sync_artist_editor();
         self.selected_playlist = None;
         self.collection = None;
@@ -3913,6 +3941,7 @@ impl FluxReady {
         self.search.clear();
         self.page = 0;
         self.crossfade_preview = None;
+        self.lifecycle_msg = None;
         self.show_setup = false;
     }
 
@@ -3962,6 +3991,64 @@ impl FluxReady {
     fn toggle_setup(&mut self) {
         self.show_setup = !self.show_setup;
         self.page = 0;
+    }
+
+    fn navigation_snapshot(&self) -> NavigationSnapshot {
+        NavigationSnapshot {
+            view: self.view,
+            selected_group: self.selected_group.clone(),
+            selected_playlist: self.selected_playlist,
+            selected_lyrics: self.selected_lyrics,
+            collection: self.collection,
+            search: self.search.clone(),
+            page: self.page,
+            lyrics_mode: self.lyrics_mode,
+            lyrics_follow_current: self.lyrics_follow_current,
+            filter_favorites: self.filter_favorites,
+            filter_lyrics: self.filter_lyrics,
+            filter_artwork: self.filter_artwork,
+            filter_release: self.filter_release,
+            sort_tracks: self.sort_tracks,
+            sort_descending: self.sort_descending,
+            filter_rating: self.filter_rating,
+            focused_track: self.focused_track,
+        }
+    }
+
+    fn push_navigation_snapshot(&mut self) {
+        self.navigation_stack.push(self.navigation_snapshot());
+        if self.navigation_stack.len() > 32 {
+            self.navigation_stack.remove(0);
+        }
+    }
+
+    fn navigate_back(&mut self) {
+        let Some(snapshot) = self.navigation_stack.pop() else {
+            return;
+        };
+        self.view = snapshot.view;
+        self.selected_group = snapshot.selected_group;
+        self.selected_playlist = snapshot.selected_playlist;
+        self.selected_lyrics = snapshot.selected_lyrics;
+        self.collection = snapshot.collection;
+        self.search = snapshot.search;
+        self.page = snapshot.page;
+        self.lyrics_mode = snapshot.lyrics_mode;
+        self.lyrics_follow_current = snapshot.lyrics_follow_current;
+        self.filter_favorites = snapshot.filter_favorites;
+        self.filter_lyrics = snapshot.filter_lyrics;
+        self.filter_artwork = snapshot.filter_artwork;
+        self.filter_release = snapshot.filter_release;
+        self.sort_tracks = snapshot.sort_tracks;
+        self.sort_descending = snapshot.sort_descending;
+        self.filter_rating = snapshot.filter_rating;
+        self.focused_track = snapshot.focused_track;
+        self.selected_tracks.clear();
+        self.lifecycle_msg = None;
+        self.show_setup = false;
+        self.sync_album_editor();
+        self.sync_artist_editor();
+        self.invalidate_search_cache();
     }
 
     fn refresh_audio_devices(&mut self) -> Task<Message> {
@@ -5152,6 +5239,28 @@ impl FluxReady {
                     manager.asset_error = Some("Select one or more candidates first.".to_owned());
                     return Task::none();
                 }
+                if manager
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.target_album.is_some())
+                {
+                    manager.asset_error =
+                        Some("Album membership is fixed for this target-Album import.".to_owned());
+                    return Task::none();
+                }
+                if manager.plan.as_ref().is_some_and(|plan| {
+                    indices.iter().any(|index| {
+                        plan.candidates.get(*index).is_some_and(|candidate| {
+                            candidate.decision() == ImportDecision::UpdateExisting
+                        })
+                    })
+                }) {
+                    manager.asset_error = Some(
+                        "Bulk Album membership does not rewrite existing Tracks. Use the Track editor move workflow for those candidates."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
                 let title = manager.bulk_album_title.trim().to_owned();
                 if let Some(plan) = manager.plan.as_mut() {
                     plan.apply_album_to(&indices, (!title.is_empty()).then_some(title.as_str()));
@@ -5168,6 +5277,15 @@ impl FluxReady {
                 let indices = manager.checked_indices();
                 if indices.is_empty() {
                     manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                if manager
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.target_album.is_some())
+                {
+                    manager.asset_error =
+                        Some("Album membership is fixed for this target-Album import.".to_owned());
                     return Task::none();
                 }
                 if manager.plan.as_ref().is_some_and(|plan| {
@@ -5863,12 +5981,14 @@ impl FluxReady {
             }
             Message::RefreshPressed => self.controller.refresh(),
             Message::SearchChanged(value) => {
+                self.navigation_stack.clear();
                 self.search = value;
                 self.page = 0;
                 self.selected_tracks.clear();
                 self.focused_track = None;
             }
             Message::ClearSearch => {
+                self.navigation_stack.clear();
                 self.search.clear();
                 self.page = 0;
                 self.selected_tracks.clear();
@@ -5876,6 +5996,7 @@ impl FluxReady {
             }
             Message::SearchNavigateArtist(id) => {
                 if let Some(artist) = self.controller.artist(id) {
+                    self.push_navigation_snapshot();
                     self.view = LibraryView::Artists;
                     self.selected_group =
                         Some(format!("{}{ARTIST_KEY_SEPARATOR}{id}", artist.name()));
@@ -5892,6 +6013,7 @@ impl FluxReady {
             }
             Message::SearchNavigateAlbum(id) => {
                 if let Some(album) = self.controller.album(id) {
+                    self.push_navigation_snapshot();
                     self.view = LibraryView::Albums;
                     self.selected_playlist = None;
                     self.selected_lyrics = None;
@@ -5911,8 +6033,10 @@ impl FluxReady {
             Message::OpenArtist(id) => {
                 return self.update(Message::SearchNavigateArtist(id));
             }
+            Message::NavigateBack => self.navigate_back(),
             Message::SearchNavigateTrack(id) => {
                 if self.controller.track(id).is_some() {
+                    self.push_navigation_snapshot();
                     let index = self
                         .controller
                         .tracks()
@@ -6039,6 +6163,7 @@ impl FluxReady {
             }
             Message::PlaylistSelect(id) => {
                 if self.controller.playlist(id).cloned().is_some() {
+                    self.navigation_stack.clear();
                     self.view = LibraryView::Playlists;
                     self.selected_playlist = Some(id);
                     self.selected_group = None;
@@ -6390,6 +6515,7 @@ impl FluxReady {
                     return Task::none();
                 }
                 if self.controller.track(id).is_some() {
+                    self.navigation_stack.clear();
                     self.view = LibraryView::Lyrics;
                     self.selected_lyrics = Some(id);
                     self.selected_playlist = None;
@@ -6587,6 +6713,7 @@ impl FluxReady {
             Message::LyricsExport(format) => self.export_lyrics(&format),
             Message::LyricsOpenAlbum(album_id) => {
                 if let Some(album) = self.controller.album(album_id) {
+                    self.push_navigation_snapshot();
                     self.view = LibraryView::Albums;
                     self.selected_playlist = None;
                     self.selected_lyrics = None;
@@ -6598,6 +6725,7 @@ impl FluxReady {
             }
             Message::LyricsOpenArtist(artist_id) => {
                 if let Some(artist) = self.controller.artist(artist_id) {
+                    self.push_navigation_snapshot();
                     self.view = LibraryView::Artists;
                     self.selected_playlist = None;
                     self.selected_lyrics = None;
@@ -6619,6 +6747,7 @@ impl FluxReady {
                 self.selected_tracks.clear();
             }
             Message::CollectionSelect(collection) => {
+                self.navigation_stack.clear();
                 self.view = LibraryView::Collections;
                 self.collection = Some(collection);
                 self.selected_group = None;
@@ -6667,11 +6796,13 @@ impl FluxReady {
                 }
             }
             Message::SelectView(view) => {
+                self.navigation_stack.clear();
                 self.selected_tracks.clear();
                 self.focused_track = None;
                 self.select_view(view);
             }
             Message::SelectGroup(group) => {
+                self.navigation_stack.clear();
                 if group.is_none() {
                     self.search.clear();
                 }
@@ -6684,6 +6815,7 @@ impl FluxReady {
                 self.sync_artist_editor();
                 self.sync_album_editor();
                 self.page = 0;
+                self.lifecycle_msg = None;
                 self.show_setup = false;
             }
             Message::ToggleSetup => {
@@ -6928,9 +7060,12 @@ impl FluxReady {
                 }
                 match key.as_ref() {
                     Key::Named(Named::Space) => self.controller.toggle_play_pause(),
-                    Key::Character("n") => self.controller.next(),
-                    Key::Character("p") => self.controller.previous(),
-                    Key::Character("s") => self.controller.stop(),
+                    Key::Character("n") => return self.update(Message::Next),
+                    Key::Character("p") => return self.update(Message::Previous),
+                    Key::Character("s") => {
+                        self.seek_preview = None;
+                        self.controller.stop();
+                    }
                     Key::Character("q") => self.toggle_queue(),
                     Key::Character("e") => {
                         if let Some(id) = self.controller.current_id() {
@@ -6978,8 +7113,13 @@ impl FluxReady {
                             self.cancel_lyrics_editor();
                             return Task::none();
                         }
+                        if !self.navigation_stack.is_empty() {
+                            self.navigate_back();
+                            return Task::none();
+                        }
                         self.cancel_queue_drag();
                         self.playlist_drag = None;
+                        self.navigation_stack.clear();
                         self.search.clear();
                         self.selected_tracks.clear();
                         self.focused_track = None;
@@ -8905,6 +9045,34 @@ impl FluxReady {
 
         let editable = manager.stage == ImportUiStage::Review;
         let bulk_artists = self.artist_choices();
+        let fixed_target = plan.target_album.is_some();
+        let album_bulk_control: Element<'_, Message> = if fixed_target {
+            text("Album membership is fixed for this import. Album artwork below still applies to the locked target Album.")
+                .size(8)
+                .color(MUTED)
+                .into()
+        } else {
+            row![
+                text_input(
+                    "Album title for checked candidates…",
+                    &manager.bulk_album_title
+                )
+                .on_input(Message::ImportBulkAlbumChanged)
+                .on_submit(Message::ImportBulkApplyAlbum)
+                .style(input_style)
+                .width(Length::Fill),
+                button(text("Apply Album").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkApplyAlbum),
+                button(text("Make standalone").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkMakeStandalone),
+            ]
+            .spacing(6)
+            .into()
+        };
         let mut bulk = column![
             text(format!(
                 "BULK APPLY · {} checked",
@@ -8912,9 +9080,13 @@ impl FluxReady {
             ))
             .size(9)
             .color(ACCENT),
-            text("Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; Track artwork overrides and lyrics remain individual.")
-                .size(8)
-                .color(MUTED),
+            text(if fixed_target {
+                "Bulk Artist changes apply to checked candidates; Album membership stays locked. Per-candidate edits made afterward win."
+            } else {
+                "Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; Track artwork overrides and lyrics remain individual."
+            })
+            .size(8)
+            .color(MUTED),
             row![
                 pick_list(bulk_artists, manager.bulk_artist.clone(), |choice| {
                     Message::ImportBulkArtistPicked(Some(choice))
@@ -8941,27 +9113,19 @@ impl FluxReady {
                     .on_press(Message::ImportBulkApplyNewArtist),
             ]
             .spacing(6),
+            album_bulk_control,
             row![
-                text_input("Album title for checked candidates…", &manager.bulk_album_title)
-                    .on_input(Message::ImportBulkAlbumChanged)
-                    .on_submit(Message::ImportBulkApplyAlbum)
-                    .style(input_style)
-                    .width(Length::Fill),
-                button(text("Apply Album").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkApplyAlbum),
-                button(text("Make standalone").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkMakeStandalone),
-            ]
-            .spacing(6),
-            row![
-                text_input("Album artwork path…", &manager.bulk_album_artwork_path)
-                    .on_input(Message::ImportBulkAlbumArtworkChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
+                text_input(
+                    if fixed_target {
+                        "Artwork path for the locked target Album…"
+                    } else {
+                        "Album artwork path for checked candidates…"
+                    },
+                    &manager.bulk_album_artwork_path
+                )
+                .on_input(Message::ImportBulkAlbumArtworkChanged)
+                .style(input_style)
+                .width(Length::Fill),
                 button(text("Choose…").size(9))
                     .style(ghost_style)
                     .padding([5, 7])
@@ -9460,6 +9624,11 @@ impl FluxReady {
                     .width(Length::Fill)
                     .style(error_banner_style),
             );
+            body = body.push(
+                text("A failed transaction publishes no partial catalogue or managed-resource changes. Review the issue, then choose again or close.")
+                    .size(10)
+                    .color(MUTED),
+            );
         }
         if let Some(report) = &manager.report {
             body = body.push(
@@ -9469,6 +9638,11 @@ impl FluxReady {
                 ))
                 .size(16)
                 .color(TEXT),
+            );
+            body = body.push(
+                text("Imported items are now in the canonical library. Close this manager to review them in Tracks or Albums.")
+                    .size(10)
+                    .color(MUTED),
             );
             for item in &report.items {
                 let (state, color) = match item.state {
@@ -9776,10 +9950,31 @@ impl FluxReady {
             .height(Length::Fill)
             .width(Length::Fill),
         );
-        if let Some(status) = self.controller.last_status()
-            && self.controller.last_error().is_none()
-        {
-            content = content.push(text(status).size(10).color(MUTED));
+        if self.controller.last_error().is_none() {
+            let detail_owns_message = self.show_setup
+                || self.selected_album_id().is_some()
+                || self.selected_artist_id().is_some();
+            if let Some(message) = &self.lifecycle_msg
+                && !detail_owns_message
+                && self.controller.last_status().is_none()
+            {
+                content = content.push(
+                    row![
+                        text(message.clone())
+                            .size(10)
+                            .color(MUTED)
+                            .width(Length::Fill),
+                        button(text("Dismiss").size(9))
+                            .style(ghost_style)
+                            .padding([3, 6])
+                            .on_press(Message::DismissNotice),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            } else if let Some(status) = self.controller.last_status() {
+                content = content.push(text(status).size(10).color(MUTED));
+            }
         }
 
         container(content)
@@ -9929,7 +10124,14 @@ impl FluxReady {
         let subtitle = truncate_label(&subtitle, if compact { 72 } else { 120 });
 
         let mut bar = row![].spacing(10).align_y(Alignment::Center);
-        if self.selected_group.is_some() && !self.show_setup {
+        if !self.navigation_stack.is_empty() && !self.show_setup && self.track_editor.is_none() {
+            bar = bar.push(
+                button(text("‹ Back").size(11))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::NavigateBack),
+            );
+        } else if self.selected_group.is_some() && !self.show_setup && self.track_editor.is_none() {
             bar = bar.push(
                 button(text("‹ Back").size(11))
                     .style(ghost_style)
@@ -10154,10 +10356,76 @@ impl FluxReady {
         .max_width(680.0)
         .style(card_style);
 
-        column![text("PLAYBACK").size(9).color(MUTED), card,]
-            .spacing(10)
-            .width(Length::Fill)
-            .into()
+        let active_output = self.controller.active_audio_device().map_or_else(
+            || "No active output reported".to_owned(),
+            |device| {
+                format!(
+                    "{}{}",
+                    device.name,
+                    if device.is_default { " · default" } else { "" }
+                )
+            },
+        );
+        let output_policy = if self.controller.selected_audio_device().is_some() {
+            "explicit device"
+        } else {
+            "system default"
+        };
+        let audio_card = container(
+            column![
+                text(active_output).size(13).color(TEXT),
+                text(format!(
+                    "Policy: {output_policy}. Device enumeration, refresh, selection and recovery are managed in Library setup."
+                ))
+                .size(10)
+                .color(MUTED),
+                button(text("Manage output devices…").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::ToggleSetup),
+            ]
+            .spacing(8),
+        )
+        .padding(16)
+        .width(Length::Fill)
+        .max_width(680.0)
+        .style(card_style);
+
+        let shortcut_card = container(
+            column![
+                text("Space · play/pause    N/P · next/previous    S · stop")
+                    .size(10)
+                    .color(TEXT),
+                text("←/→ · seek 5 s    Shift+←/→ · seek 30 s    Q · queue")
+                    .size(10)
+                    .color(TEXT),
+                text("1–0 · primary views    K · settings    L · library setup    / · search")
+                    .size(10)
+                    .color(TEXT),
+                text(
+                    "E · edit current track    Esc · cancel/clear    Ctrl+↑/↓ · reorder queue entry"
+                )
+                .size(10)
+                .color(TEXT),
+            ]
+            .spacing(5),
+        )
+        .padding(16)
+        .width(Length::Fill)
+        .max_width(680.0)
+        .style(card_style);
+
+        column![
+            text("PLAYBACK").size(9).color(MUTED),
+            card,
+            text("AUDIO OUTPUT").size(9).color(MUTED),
+            audio_card,
+            text("KEYBOARD").size(9).color(MUTED),
+            shortcut_card,
+        ]
+        .spacing(10)
+        .width(Length::Fill)
+        .into()
     }
 
     fn library_view(&self) -> Element<'_, Message> {
@@ -13839,7 +14107,20 @@ impl FluxReady {
             }
         }
         if let Some(message) = &self.lifecycle_msg {
-            body = body.push(text(message.clone()).size(9).color(MUTED));
+            body = body.push(
+                row![
+                    text(message.clone())
+                        .size(9)
+                        .color(MUTED)
+                        .width(Length::Fill),
+                    button(text("Dismiss").size(9))
+                        .style(ghost_style)
+                        .padding([3, 6])
+                        .on_press(Message::DismissNotice),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
         }
         container(scrollable(body).height(Length::Fill))
             .padding(16)
@@ -14105,7 +14386,20 @@ impl FluxReady {
             );
         }
         if let Some(message) = &self.lifecycle_msg {
-            body = body.push(text(message.clone()).size(9).color(MUTED));
+            body = body.push(
+                row![
+                    text(message.clone())
+                        .size(9)
+                        .color(MUTED)
+                        .width(Length::Fill),
+                    button(text("Dismiss").size(9))
+                        .style(ghost_style)
+                        .padding([3, 6])
+                        .on_press(Message::DismissNotice),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
         }
         container(scrollable(body).height(Length::Fill))
             .padding(16)
@@ -14770,10 +15064,20 @@ impl FluxReady {
 
         if let Some(message) = &self.lifecycle_msg {
             setup = setup.push(
-                container(text(message).size(11).color(MUTED))
-                    .padding(12)
-                    .width(Length::Fill)
-                    .style(card_style),
+                container(
+                    row![
+                        text(message).size(11).color(MUTED).width(Length::Fill),
+                        button(text("Dismiss").size(9))
+                            .style(ghost_style)
+                            .padding([3, 6])
+                            .on_press(Message::DismissNotice),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(card_style),
             );
         }
 
@@ -15786,6 +16090,7 @@ mod tests {
             lifecycle_msg: None,
             view: LibraryView::Tracks,
             selected_group: None,
+            navigation_stack: Vec::new(),
             page: 0,
             queue_page: 0,
             queue_drag: None,
@@ -18103,6 +18408,126 @@ mod tests {
     }
 
     #[test]
+    fn entity_navigation_back_restores_search_and_previous_entity_context() {
+        let dir = TempDir::new("gui-navigation-back");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Navigation Song",
+            "Navigation Artist",
+            "Navigation Album",
+            ReleaseType::Album,
+            1,
+        );
+        let artist = gui.controller.track_artist_id(id).expect("artist");
+        let album = gui.controller.track_album_id(id).expect("album");
+        gui.search = "Navigation".to_owned();
+        gui.view = LibraryView::Tracks;
+        gui.selected_group = None;
+
+        send(&mut gui, Message::SearchNavigateAlbum(album));
+        assert_eq!(gui.view, LibraryView::Albums);
+        assert_eq!(gui.navigation_stack.len(), 1);
+        assert_eq!(gui.search, "");
+        send(&mut gui, Message::OpenArtist(artist));
+        assert_eq!(gui.view, LibraryView::Artists);
+        assert_eq!(gui.navigation_stack.len(), 2);
+
+        send(&mut gui, Message::NavigateBack);
+        assert_eq!(gui.view, LibraryView::Albums);
+        assert_eq!(gui.selected_album_id(), Some(album));
+        assert_eq!(gui.navigation_stack.len(), 1);
+        send(&mut gui, Message::NavigateBack);
+        assert_eq!(gui.view, LibraryView::Tracks);
+        assert_eq!(gui.search, "Navigation");
+        assert!(gui.navigation_stack.is_empty());
+
+        send(&mut gui, Message::SearchNavigateAlbum(album));
+        assert!(!gui.navigation_stack.is_empty());
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert_eq!(gui.view, LibraryView::Tracks);
+        assert_eq!(gui.search, "Navigation");
+        assert!(gui.navigation_stack.is_empty());
+
+        send(&mut gui, Message::SearchNavigateAlbum(album));
+        assert!(!gui.navigation_stack.is_empty());
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("1".into()), Modifiers::default()),
+        );
+        assert!(
+            gui.navigation_stack.is_empty(),
+            "lateral keyboard navigation discards stale back history"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn keyboard_next_and_previous_follow_stable_queue_entries_like_transport_buttons() {
+        let dir = TempDir::new("gui-keyboard-transport");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Keyboard Song",
+            "Keyboard Artist",
+            "Keyboard Album",
+            ReleaseType::Album,
+            1,
+        );
+        let second = import_named_track(
+            &mut gui,
+            &dir,
+            "Keyboard Song Two",
+            "Keyboard Artist",
+            "Keyboard Album Two",
+            ReleaseType::Album,
+            2,
+        );
+        gui.controller.play_track(id);
+        gui.controller
+            .enqueue_track(second)
+            .expect("enqueue second");
+        let first_entry = gui.controller.current_queue_entry_id();
+        gui.last_queue_current = first_entry;
+        assert_eq!(gui.controller.queue_len(), 2);
+
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("n".into()), Modifiers::default()),
+        );
+        let next_entry = gui.controller.current_queue_entry_id();
+        assert_ne!(next_entry, first_entry);
+        assert_eq!(gui.last_queue_current, next_entry);
+
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("p".into()), Modifiers::default()),
+        );
+        assert_eq!(gui.controller.current_queue_entry_id(), first_entry);
+        assert_eq!(gui.last_queue_current, first_entry);
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn gui_track_editor_reviews_and_deletes_one_track() {
         let dir = TempDir::new("gui-delete-track");
         let root = dir.path().join("library");
@@ -18568,6 +18993,22 @@ mod tests {
         send(
             &mut gui,
             Message::ImportPlanReady(0, Box::new(plan.clone())),
+        );
+        send(&mut gui, Message::ImportCheckAll);
+        send(
+            &mut gui,
+            Message::ImportBulkAlbumChanged("Wrong target".to_owned()),
+        );
+        send(&mut gui, Message::ImportBulkApplyAlbum);
+        assert!(
+            gui.import_manager
+                .as_ref()
+                .and_then(|manager| manager.asset_error.as_deref())
+                .is_some_and(|error| error.contains("fixed")),
+            "{:?}",
+            gui.import_manager
+                .as_ref()
+                .and_then(|manager| manager.asset_error.as_deref())
         );
         let prepared = prepare_import_files(
             &plan,
