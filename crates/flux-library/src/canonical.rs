@@ -53,7 +53,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flux_core::{ArtistId, TrackId};
 use serde::{Deserialize, Serialize};
 
-use crate::fs_ops::is_link_or_reparse;
+use crate::fs_ops::{is_link_or_reparse, write_atomic as write_atomic_shared};
 use crate::portable::{PathValidationError, RelPath};
 
 /// Version of the canonical library format written by this build.
@@ -1056,9 +1056,14 @@ impl CanonicalLibrary {
                 ));
             }
             Ok(metadata) if metadata.is_dir() => {
-                let mut entries = fs::read_dir(root)?;
-                if entries.next().is_some() {
-                    return Err(CanonicalError::AlreadyExists(root.to_path_buf()));
+                // The creation workflow holds `<root>/.flux.lock` before it
+                // validates emptiness. The lease file is not library content
+                // and must not make first-run creation fail.
+                for entry in fs::read_dir(root)? {
+                    let entry = entry?;
+                    if entry.file_name() != ".flux.lock" {
+                        return Err(CanonicalError::AlreadyExists(root.to_path_buf()));
+                    }
                 }
             }
             Ok(_) => return Err(CanonicalError::AlreadyExists(root.to_path_buf())),
@@ -1754,18 +1759,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CanonicalError> {
         .parent()
         .ok_or_else(|| CanonicalError::Invalid("file has no parent directory".to_owned()))?;
     fs::create_dir_all(parent)?;
-    let temp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("flux")
-    ));
-    let mut file = fs::File::create(&temp)?;
-    use std::io::Write;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temp, path)?;
-    sync_directory(parent)?;
+    write_atomic_shared(path, bytes)?;
     Ok(())
 }
 

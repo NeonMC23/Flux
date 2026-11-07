@@ -231,6 +231,11 @@ fn validate_and_build(index: IndexFile) -> Result<Library, StoreError> {
             "next_id counter is 0 (IDs start at 1)".to_owned(),
         ));
     }
+    if index.next_id == u64::MAX {
+        return Err(StoreError::InvalidIndex(
+            "next_id counter is u64::MAX and cannot allocate another ID".to_owned(),
+        ));
+    }
 
     let mut seen_ids: HashSet<u64> = HashSet::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
@@ -357,6 +362,11 @@ pub(crate) fn load_legacy_index_data(path: &Path) -> Result<LegacyIndexData, Sto
     if index.next_id == 0 {
         return Err(StoreError::InvalidIndex(
             "next_id counter is 0 (IDs start at 1)".to_owned(),
+        ));
+    }
+    if index.next_id == u64::MAX {
+        return Err(StoreError::InvalidIndex(
+            "next_id counter is u64::MAX and cannot allocate another ID".to_owned(),
         ));
     }
 
@@ -605,6 +615,13 @@ mod tests {
                 Err(StoreError::InvalidIndex(_))
             ),
             "next_id 0"
+        );
+        assert!(
+            matches!(
+                load_raw(&dir, &index_json(u64::MAX, vec![])),
+                Err(StoreError::InvalidIndex(_))
+            ),
+            "next_id u64::MAX cannot safely allocate another ID"
         );
         assert!(
             matches!(

@@ -1283,7 +1283,28 @@ pub fn execute_legacy_migration(plan: &MigrationPlan) -> Result<MigrationReport,
 /// `root` may be absent or empty directories. Existing non-empty data is
 /// refused; the source is never repaired or overwritten automatically.
 pub fn create_canonical_library(root: &Path) -> Result<CreatedLibrary, CreateLibraryError> {
-    let created = CanonicalLibrary::create(root)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(root)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(CreateLibraryError::RootInvalid {
+            root: root.to_owned(),
+            reason: "the library root must not be a symbolic link".to_owned(),
+        });
+    }
+    std::fs::create_dir_all(root).map_err(|err| CreateLibraryError::RootInvalid {
+        root: root.to_owned(),
+        reason: format!("it cannot be created or inspected: {err}"),
+    })?;
+    let canonical = std::fs::canonicalize(root).map_err(|err| CreateLibraryError::RootInvalid {
+        root: root.to_owned(),
+        reason: format!("it cannot be canonicalized: {err}"),
+    })?;
+    // Serialize first-run creation with every ordinary canonical open. The
+    // emptiness check and the manifest/catalog publication must happen under
+    // the same lease or two processes can interleave into an unopenable mix.
+    let _lease =
+        LibraryLock::acquire_portable_root(&canonical).map_err(CreateLibraryError::Lock)?;
+    let created = CanonicalLibrary::create(&canonical)?;
     let library_id = created.library_id().to_owned();
     let root = created.root().to_path_buf();
     drop(created);
@@ -1830,15 +1851,27 @@ impl Controller {
                 "no per-user data directory is available for a canonical library".to_owned(),
             )
         })?;
-        if !root.exists() {
-            if let Some(parent) = root.parent() {
-                std::fs::create_dir_all(parent).map_err(|err| {
-                    ControllerOpenError::Canonical(format!(
-                        "could not create {}: {err}",
-                        parent.display()
-                    ))
-                })?;
+        let needs_initialization = match std::fs::read_dir(&root) {
+            Ok(entries) => {
+                let mut any = false;
+                for entry in entries {
+                    let entry = entry.map_err(|err| {
+                        ControllerOpenError::Canonical(format!(
+                            "could not inspect the default library at {}: {err}",
+                            root.display()
+                        ))
+                    })?;
+                    if entry.file_name() != ".flux.lock" {
+                        any = true;
+                        break;
+                    }
+                }
+                !any
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if needs_initialization {
             create_canonical_library(&root).map_err(|err| {
                 ControllerOpenError::Canonical(format!(
                     "could not create the default canonical library: {err}"
@@ -17133,6 +17166,32 @@ mod tests {
                 "shuffle avoids adjacent same-track entries when possible"
             );
         }
+    }
+
+    #[test]
+    fn canonical_creation_accepts_empty_or_lock_only_roots_but_not_partial_data() {
+        let dir = TempDir::new("canonical-create-empty-root");
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).expect("empty root");
+        let created = create_canonical_library(&empty).expect("empty root creation");
+        assert!(created.root().join("library.flux").is_file());
+
+        let lock_only = dir.path().join("lock-only");
+        fs::create_dir_all(&lock_only).expect("lock root");
+        fs::write(lock_only.join(".flux.lock"), b"").expect("lock fixture");
+        create_canonical_library(&lock_only).expect("lock-only root creation");
+
+        let partial = dir.path().join("partial");
+        fs::create_dir_all(&partial).expect("partial root");
+        fs::write(partial.join("unrelated.txt"), b"keep").expect("partial fixture");
+        assert!(
+            create_canonical_library(&partial).is_err(),
+            "non-empty roots must never be initialized over"
+        );
+        assert_eq!(
+            fs::read(partial.join("unrelated.txt")).expect("preserved"),
+            b"keep"
+        );
     }
 
     #[test]

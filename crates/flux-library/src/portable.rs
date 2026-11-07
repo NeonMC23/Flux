@@ -2223,6 +2223,11 @@ impl PortableStore {
             });
         }
         let now = now_unix_ms();
+        let next_track_id = self.next_track_id.checked_add(1).ok_or_else(|| {
+            PortableStoreError::InvalidCounter {
+                reason: "track ID counter overflow".to_owned(),
+            }
+        })?;
         let id = TrackId::new(self.next_track_id);
         let record = StoredTrack {
             id,
@@ -2242,7 +2247,7 @@ impl PortableStore {
         segment.estimated_bytes = segment.estimated_bytes.saturating_add(estimate);
         segment.dirty = true;
         let segment_id = segment.id;
-        self.next_track_id += 1;
+        self.next_track_id = next_track_id;
         self.track_segment.insert(id, segment_id);
         self.path_index.insert(key, id);
         Ok(id)
@@ -2349,6 +2354,11 @@ impl PortableStore {
                      ({} < {})",
                     next_track_id, self.next_track_id
                 ),
+            });
+        }
+        if next_track_id == u64::MAX {
+            return Err(PortableStoreError::InvalidCounter {
+                reason: "import would exhaust the track ID counter".to_owned(),
             });
         }
         if next_track_id <= greatest_id {
@@ -2833,14 +2843,29 @@ fn load_generation(
             reason: "next_track_id is 0 (IDs start at 1)".to_owned(),
         });
     }
+    if catalog.next_track_id == u64::MAX {
+        return Err(PortableStoreError::InvalidCounter {
+            reason: "next_track_id is u64::MAX and cannot allocate another ID".to_owned(),
+        });
+    }
     if catalog.next_segment_id == 0 {
         return Err(PortableStoreError::InvalidCounter {
             reason: "next_segment_id is 0 (segment IDs start at 1)".to_owned(),
         });
     }
+    if catalog.next_segment_id == u64::MAX {
+        return Err(PortableStoreError::InvalidCounter {
+            reason: "next_segment_id is u64::MAX and cannot allocate another segment".to_owned(),
+        });
+    }
     if catalog.next_artist_id == 0 {
         return Err(PortableStoreError::InvalidCounter {
             reason: "next_artist_id is 0 (artist IDs start at 1)".to_owned(),
+        });
+    }
+    if catalog.next_artist_id == u64::MAX {
+        return Err(PortableStoreError::InvalidCounter {
+            reason: "next_artist_id is u64::MAX and cannot allocate another ID".to_owned(),
         });
     }
 
@@ -4667,6 +4692,16 @@ mod tests {
             matches!(err, PortableStoreError::InvalidCounter { .. }),
             "got: {err}"
         );
+
+        let err = load_err_after("portable_exhausted_track_counter", 3, |dir| {
+            mutate_catalog(dir, |cat| {
+                cat["next_track_id"] = serde_json::json!(u64::MAX)
+            });
+        });
+        assert!(
+            matches!(err, PortableStoreError::InvalidCounter { .. }),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -5841,6 +5876,11 @@ mod tests {
         let err = store
             .import_tracks(vec![imported(5, "five.flac")], 5)
             .unwrap_err();
+        assert!(
+            matches!(err, PortableStoreError::InvalidCounter { .. }),
+            "{err:?}"
+        );
+        let err = store.import_tracks(Vec::new(), u64::MAX).unwrap_err();
         assert!(
             matches!(err, PortableStoreError::InvalidCounter { .. }),
             "{err:?}"
