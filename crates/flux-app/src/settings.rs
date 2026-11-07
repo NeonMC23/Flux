@@ -217,7 +217,7 @@ impl SettingsStore {
             return Err(SettingsError::Protected(self.path.clone()));
         }
         let crossfade = crossfade.normalized();
-        let mut root = match self.document.take() {
+        let mut root = match self.document.clone() {
             Value::Object(map) => map,
             _ => Map::new(),
         };
@@ -255,7 +255,7 @@ impl SettingsStore {
         if self.write_protected {
             return Err(SettingsError::Protected(self.path.clone()));
         }
-        let mut root = match self.document.take() {
+        let mut root = match self.document.clone() {
             Value::Object(map) => map,
             _ => Map::new(),
         };
@@ -619,6 +619,38 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).expect("preserved"), original);
         assert!(!dir.path().join("settings.json.tmp").exists());
+    }
+
+    #[test]
+    fn failed_save_does_not_poison_later_successful_saves() {
+        let dir = TempDir::new("save-retry-preserves-document");
+        let path = dir.path().join("settings.json");
+        let original = br#"{"version":1,"audio_output":{"device_id":"alsa:test"},"theme":{"accent":"pink"},"future":{"kept":true}}"#;
+        fs::write(&path, original).expect("seed settings");
+        let mut store = SettingsStore::load(&path).store;
+        fs::remove_file(&path).expect("remove seed");
+        fs::create_dir_all(&path).expect("blocking directory");
+        assert!(
+            store
+                .save(CrossfadeSettings {
+                    enabled: true,
+                    duration_ms: 2_000,
+                })
+                .is_err()
+        );
+        fs::remove_dir(&path).expect("remove blocker");
+        store
+            .save(CrossfadeSettings {
+                enabled: true,
+                duration_ms: 2_500,
+            })
+            .expect("retry saves");
+        let saved: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read saved settings")).expect("json");
+        assert_eq!(saved["theme"]["accent"], "pink");
+        assert_eq!(saved["future"]["kept"], true);
+        assert_eq!(saved["audio_output"]["device_id"], "alsa:test");
+        assert_eq!(saved["crossfade"]["duration_ms"], 2_500);
     }
 
     #[test]
