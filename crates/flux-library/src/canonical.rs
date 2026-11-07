@@ -8628,6 +8628,11 @@ impl CanonicalLibrary {
                         &self.track_records[&current.id],
                         current.lyrics.as_deref(),
                     ));
+                    if let Some(artwork) = &current.artwork {
+                        cleanup.push(RelPath::from_utf8(&format!(
+                            "{TRACK_ARTWORK_DIR_NAME}/{artwork}"
+                        ))?);
+                    }
                     ratings.remove(&current.id);
                     tracks.remove(&current.id);
                     catalog.tracks.retain(|entry| entry.id != current.id.get());
@@ -8811,6 +8816,17 @@ impl CanonicalLibrary {
             "{}/artist.flux",
             artist_rel_path.display_lossy()
         ))?);
+        if let Some(image) = self
+            .artists
+            .get(&plan.artist_id)
+            .and_then(|artist| artist.image.as_deref())
+        {
+            cleanup.push(RelPath::from_utf8(&format!(
+                "{}/{}",
+                artist_rel_path.display_lossy(),
+                image
+            ))?);
+        }
         catalog
             .artists
             .retain(|artist| artist.id != plan.artist_id.get());
@@ -11453,6 +11469,22 @@ mod artist_deletion_tests {
     #[test]
     fn artist_deletion_transfers_retains_and_deletes_in_one_commit() {
         let mut fx = fixture("artist-delete");
+        let artist_image_source = fx._dir.write("artist.png", b"\x89PNG\r\n\x1a\nartist");
+        fx.library
+            .set_artist_image(fx.deleted, &artist_image_source, "png")
+            .expect("artist image");
+        let managed_artist_image = fx
+            .library
+            .artist_image_path(fx.deleted)
+            .expect("managed artist image");
+        let track_art_source = fx._dir.write("track.png", b"\x89PNG\r\n\x1a\ntrack");
+        fx.library
+            .set_track_artwork(fx.non_collaborative, &track_art_source, "png")
+            .expect("track artwork");
+        let managed_track_art = fx
+            .library
+            .track_artwork_path(fx.non_collaborative)
+            .expect("managed track artwork");
         let plan = fx.library.plan_artist_deletion(fx.deleted).expect("plan");
         assert!(!plan.is_ready());
         let mut plan = plan;
@@ -11491,6 +11523,8 @@ mod artist_deletion_tests {
         assert!(fx.library.artist(fx.deleted).is_none());
         assert!(!old_collab_audio.exists());
         assert!(!old_solo_audio.exists());
+        assert!(!managed_artist_image.exists(), "artist image cleanup");
+        assert!(!managed_track_art.exists(), "deleted track artwork cleanup");
         assert!(
             old_guest_audio.is_file(),
             "credited-only audio is not moved"

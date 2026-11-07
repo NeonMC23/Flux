@@ -4871,6 +4871,9 @@ impl Controller {
         let deleted_tracks = plan.deleted_track_ids();
         let current = self.current_id();
         let current_deleted = current.is_some_and(|id| deleted_tracks.contains(&id));
+        // Finalize the current listening session before the catalogue commit so
+        // a completed meaningful play is not lost with the deleted track.
+        self.update_playback_history();
         let Some(store) = self.canonical_store.as_mut() else {
             let message = "Artist deletion requires a canonical library.".to_owned();
             self.report_error(message.clone());
@@ -4895,13 +4898,28 @@ impl Controller {
             self.engine_entry = None;
             self.engine_session = None;
             self.engine_loaded_session = None;
+            self.preloaded_entry = None;
             self.stream_info = None;
         }
         self.refresh_from_canonical();
+        let mut history_changed = false;
+        for id in &deleted_tracks {
+            history_changed |= self.playback_history.remove(*id).is_some();
+        }
+        if history_changed {
+            self.history_generation = self.history_generation.wrapping_add(1);
+            self.persist_history();
+        }
         if queue_changed {
             self.after_queue_change();
         }
+        if current_deleted {
+            self.reset_play_session_for_current(0);
+        }
         self.outbox.push(ControllerEvent::LibraryChanged);
+        if history_changed {
+            self.outbox.push(ControllerEvent::HistoryChanged);
+        }
         if current_deleted {
             self.outbox.push(ControllerEvent::PlaybackChanged);
         }
@@ -15756,8 +15774,10 @@ mod tests {
             .expect("rating");
         controller.enqueue_track(collab).expect("enqueue collab");
         controller.play_track(solo);
+        controller.playback_history.record(solo, 123_456);
         assert_eq!(controller.queue_len(), 2, "queue entries before deletion");
         assert_eq!(controller.current_id(), Some(solo));
+        assert!(controller.playback_history.entry(solo).is_some());
         let mut plan = controller.plan_artist_deletion(a).expect("plan");
         plan.set_transfer(
             collab,
@@ -15787,6 +15807,10 @@ mod tests {
                 .queue_entries()
                 .iter()
                 .all(|entry| entry.track() != solo)
+        );
+        assert!(
+            controller.playback_history.entry(solo).is_none(),
+            "deleted track history is removed"
         );
         assert_eq!(
             controller
