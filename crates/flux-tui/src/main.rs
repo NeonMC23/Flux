@@ -1654,7 +1654,7 @@ impl Tui {
             if raw_height > 1 && raw_width > 0 {
                 self.line(
                     out,
-                    u16::from(raw_height - 1),
+                    raw_height - 1,
                     "q/Ctrl-C quit",
                     usize::from(raw_width),
                     false,
