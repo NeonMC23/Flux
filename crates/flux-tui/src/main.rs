@@ -49,9 +49,11 @@
 //! explicit keys above, and a failed/cancelled switch leaves the active
 //! library untouched.
 
+use std::cell::RefCell;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -149,6 +151,14 @@ enum Mode {
     ConfirmAcknowledgeRecovery,
 }
 
+struct RowsCache {
+    session: u64,
+    generation: u64,
+    search: String,
+    favorites_only: bool,
+    ids: Rc<Vec<TrackId>>,
+}
+
 struct Tui {
     controller: Controller,
     /// Cursor position within the currently visible (filtered) rows.
@@ -160,6 +170,8 @@ struct Tui {
     input: String,
     /// The active library filter (empty = everything).
     search: String,
+    /// Cached visible IDs for the current library/search/favorites key.
+    rows_cache: RefCell<Option<RowsCache>>,
     /// Show only favorite tracks.
     favorites_only: bool,
     /// Legacy index file chosen at migration step 1.
@@ -194,19 +206,39 @@ impl Tui {
     /// IDs of the visible rows. Only IDs are collected; track metadata
     /// is looked up for the handful of rows actually drawn. Cloning every
     /// `Track` on each redraw was unnecessary work for large libraries.
-    fn rows(&self) -> Vec<TrackId> {
-        self.controller
-            .search(&self.search)
-            .into_iter()
-            .filter(|(id, _)| {
-                !self.favorites_only
-                    || self
-                        .controller
-                        .rating(*id)
-                        .is_some_and(|rating| rating.favorite)
-            })
-            .map(|(id, _)| id)
-            .collect()
+    fn rows(&self) -> Rc<Vec<TrackId>> {
+        let session = self.controller.library_session();
+        let generation = self.controller.generation();
+        if let Some(cache) = self.rows_cache.borrow().as_ref()
+            && cache.session == session
+            && cache.generation == generation
+            && cache.search == self.search
+            && cache.favorites_only == self.favorites_only
+        {
+            return Rc::clone(&cache.ids);
+        }
+        let ids = Rc::new(
+            self.controller
+                .search(&self.search)
+                .into_iter()
+                .filter(|(id, _)| {
+                    !self.favorites_only
+                        || self
+                            .controller
+                            .rating(*id)
+                            .is_some_and(|rating| rating.favorite)
+                })
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+        );
+        *self.rows_cache.borrow_mut() = Some(RowsCache {
+            session,
+            generation,
+            search: self.search.clone(),
+            favorites_only: self.favorites_only,
+            ids: Rc::clone(&ids),
+        });
+        ids
     }
 
     fn library_full_identity(&self) -> String {
@@ -541,23 +573,6 @@ impl Tui {
                     }
                 } else {
                     self.lifecycle_msg = Some("Select a track to play next.".to_owned());
-                }
-            }
-            KeyCode::Delete => {
-                if let Some(entry) = self.controller.current_queue_entry_id() {
-                    match self.controller.remove_queue_entry(entry) {
-                        Ok(true) => {
-                            self.lifecycle_msg =
-                                Some(format!("Removed current queue entry #{entry}."));
-                        }
-                        Ok(false) => {
-                            self.lifecycle_msg =
-                                Some("That queue entry was already removed.".to_owned());
-                        }
-                        Err(error) => self.lifecycle_msg = Some(error),
-                    }
-                } else {
-                    self.lifecycle_msg = Some("The queue is empty.".to_owned());
                 }
             }
             KeyCode::Char('s') => self.controller.stop(),
@@ -1065,9 +1080,16 @@ impl Tui {
                 self.input.clone_from(&self.search);
             }
             KeyCode::Esc => {
-                self.search.clear();
-                self.cursor = 0;
-                self.lifecycle_msg = Some("Search cleared.".to_owned());
+                if self.search.is_empty() {
+                    self.lifecycle_msg = Some(
+                        "No active search. Esc cancels an input or closes a view; / starts a search."
+                            .to_owned(),
+                    );
+                } else {
+                    self.search.clear();
+                    self.cursor = 0;
+                    self.lifecycle_msg = Some("Search cleared.".to_owned());
+                }
             }
             KeyCode::Char(command) => {
                 self.lifecycle_msg =
@@ -1299,7 +1321,13 @@ impl Tui {
                                 self.lifecycle_msg = Some("The selected track is gone.".to_owned());
                             }
                         }
-                        Err(err) => self.lifecycle_msg = Some(err),
+                        Err(err) => {
+                            self.lifecycle_msg = Some(format!(
+                                "{err} The edit form remains open so you can correct it."
+                            ));
+                            self.input = text;
+                            next = Mode::TrackEditInput;
+                        }
                     },
                     Mode::ArtistCreateInput => {
                         if let Err(err) = self.controller.create_artist(text.trim()) {
@@ -1310,9 +1338,13 @@ impl Tui {
                     }
                     Mode::ArtistRenameInput => {
                         let Some((id, name)) = text.split_once('|') else {
-                            self.lifecycle_msg =
-                                Some("Use artist-id|new name for rename.".to_owned());
-                            self.mode = Mode::Normal;
+                            self.lifecycle_msg = Some(
+                                "Use artist-id|new name for rename. The form remains open."
+                                    .to_owned(),
+                            );
+                            self.input = text;
+                            next = Mode::ArtistRenameInput;
+                            self.mode = next;
                             return false;
                         };
                         match id.trim().parse::<u64>() {
@@ -1327,8 +1359,12 @@ impl Tui {
                                 }
                             }
                             Err(_) => {
-                                self.lifecycle_msg =
-                                    Some("Artist ID must be a whole number.".to_owned());
+                                self.lifecycle_msg = Some(
+                                    "Artist ID must be a whole number. The form remains open."
+                                        .to_owned(),
+                                );
+                                self.input = text;
+                                next = Mode::ArtistRenameInput;
                             }
                         }
                     }
@@ -1571,6 +1607,29 @@ impl Tui {
 
     fn draw(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         let (raw_width, raw_height) = terminal::size().unwrap_or((80, 24));
+        if terminal_too_small(raw_width, raw_height) {
+            queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+            if raw_width > 0 {
+                self.line(
+                    out,
+                    0,
+                    "Terminal too small — resize to at least 20x6.",
+                    usize::from(raw_width),
+                    true,
+                )?;
+            }
+            if raw_height > 1 && raw_width > 0 {
+                self.line(
+                    out,
+                    u16::from(raw_height - 1),
+                    "q/Ctrl-C quit",
+                    usize::from(raw_width),
+                    false,
+                )?;
+            }
+            out.flush()?;
+            return Ok(());
+        }
         let (width, height) = clamp_terminal_size(raw_width, raw_height);
         // A fresh pty can report 0 columns; lay out for at least a
         // minimal sane width rather than dividing the void.
@@ -2108,6 +2167,10 @@ fn resource_label(state: Option<flux_app::ResourceState>) -> Option<&'static str
     }
 }
 
+fn terminal_too_small(width: u16, height: u16) -> bool {
+    width < 20 || height < 6
+}
+
 fn clamp_terminal_size(width: u16, height: u16) -> (usize, usize) {
     (usize::from(width.max(20)), usize::from(height.max(6)))
 }
@@ -2343,6 +2406,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         },
         input: String::new(),
         search: String::new(),
+        rows_cache: RefCell::new(None),
         favorites_only: false,
         migrate_source: PathBuf::new(),
         lyrics_lines: Vec::new(),
@@ -2375,9 +2439,11 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 mod tests {
     use super::{
         Mode, StorageMode, Track, Tui, clamp_terminal_size, detail_view_fits, display_width,
-        fit_input_line, help_lines, normal_help, pad_with_right, resource_label, truncate_to_width,
+        fit_input_line, help_lines, normal_help, pad_with_right, resource_label,
+        terminal_too_small, truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct TempDir(std::path::PathBuf);
@@ -2423,6 +2489,7 @@ mod tests {
             mode: Mode::Normal,
             input: String::new(),
             search: String::new(),
+            rows_cache: RefCell::new(None),
             favorites_only: false,
             migrate_source: std::path::PathBuf::new(),
             lyrics_lines: Vec::new(),
@@ -2561,7 +2628,12 @@ mod tests {
         tui.info_lines = vec!["stale info".to_owned()];
         type_path(&mut tui, &root);
         assert_eq!(tui.mode, Mode::Normal);
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
+        assert_eq!(
+            tui.controller.storage_mode(),
+            StorageMode::Canonical,
+            "{:?}",
+            tui.lifecycle_msg
+        );
         assert_ne!(tui.controller.library_session(), old_session);
         assert!(tui.search.is_empty());
         assert!(tui.input.is_empty());
@@ -2600,7 +2672,12 @@ mod tests {
 
         key(&mut tui, KeyCode::Char('C'));
         type_path(&mut tui, &root);
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
+        assert_eq!(
+            tui.controller.storage_mode(),
+            StorageMode::Canonical,
+            "{:?}",
+            tui.lifecycle_msg
+        );
 
         key(&mut tui, KeyCode::Char('i'));
         assert_eq!(tui.mode, Mode::ImportInput);
@@ -2640,6 +2717,25 @@ mod tests {
         assert_eq!(track.artist(), Some("Tui Artist"));
         assert_eq!(tui.controller.track_artist_id(id), Some(artist));
         assert_eq!(tui.controller.track_credits(id), vec![artist]);
+
+        key(&mut tui, KeyCode::Char('e'));
+        let invalid = format!("Bad Title | Album | not-a-number | 1 | {artist} | {artist}");
+        tui.input.clone_from(&invalid);
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(
+            tui.mode,
+            Mode::TrackEditInput,
+            "invalid input keeps the edit form open"
+        );
+        assert_eq!(
+            tui.input, invalid,
+            "typed fields survive a validation error"
+        );
+        assert_eq!(
+            tui.controller.track(id).map(Track::title),
+            Some("Tui Title")
+        );
+        key(&mut tui, KeyCode::Esc);
 
         key(&mut tui, KeyCode::Char('V'));
         assert_eq!(tui.mode, Mode::InfoView);
@@ -2926,16 +3022,18 @@ mod tests {
             "a appends the selected track"
         );
 
+        key(&mut tui, KeyCode::Char('Q'));
         key(&mut tui, KeyCode::Delete);
         assert_eq!(
             tui.controller.queue_len(),
             2,
-            "Delete removes the current queue entry"
+            "Delete removes the selected queue entry from the queue view"
         );
         assert_eq!(
             tui.controller.player_state(),
             flux_core::PlaybackState::Stopped
         );
+        key(&mut tui, KeyCode::Esc);
 
         key(&mut tui, KeyCode::Char('x'));
         assert_eq!(
@@ -2961,6 +3059,29 @@ mod tests {
             "reordering keeps the current entry identity"
         );
         assert_eq!(tui.controller.queue_entry_index(current), Some(before + 1));
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tiny_terminals_are_detected_before_clamping() {
+        assert!(terminal_too_small(19, 24));
+        assert!(terminal_too_small(80, 5));
+        assert!(!terminal_too_small(20, 6));
+        assert!(!terminal_too_small(120, 40));
+    }
+
+    #[test]
+    fn escape_without_a_search_does_not_reset_the_cursor() {
+        let dir = TempDir::new("escape-no-search");
+        let mut tui = tui(&dir);
+        tui.cursor = 3;
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.cursor, 3);
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("No active search"))
+        );
         tui.controller.shutdown();
     }
 
