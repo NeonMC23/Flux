@@ -11808,6 +11808,7 @@ impl FluxReady {
         ids
     }
 
+    #[cfg(test)]
     fn filtered_tracks(&self) -> Vec<(TrackId, &Track)> {
         self.filtered_track_ids()
             .iter()

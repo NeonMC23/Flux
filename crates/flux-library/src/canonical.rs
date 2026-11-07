@@ -2553,6 +2553,8 @@ pub struct TrackMetadataUpdatePlan {
     pub album_id: Option<AlbumId>,
     /// Existing physical owner, which must not change.
     pub owner_artist_id: ArtistId,
+    /// Originating canonical library identity.
+    pub library_id: String,
     /// Catalogue generation at review.
     pub generation: u64,
     /// Expected title.
@@ -2618,6 +2620,8 @@ pub struct TrackMovePlan {
     pub destination_audio_path: RelPath,
     /// Destination record path.
     pub destination_record_path: RelPath,
+    /// Originating canonical library identity.
+    pub library_id: String,
     /// Catalogue generation at review.
     pub generation: u64,
 }
@@ -2830,6 +2834,16 @@ impl CanonicalLibrary {
         writes: Vec<PendingWrite>,
     ) -> Result<(), CanonicalError> {
         self.commit_writes_with_cleanup(new_catalog, writes, Vec::new())
+    }
+
+    fn ensure_plan_library(&self, library_id: &str) -> Result<(), CanonicalError> {
+        if library_id != self.manifest.library_id {
+            return Err(CanonicalError::Invalid(
+                "that review plan belongs to a different canonical library; re-plan in the active library"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_no_pending_transactions(&self) -> Result<(), CanonicalError> {
@@ -4160,6 +4174,7 @@ impl CanonicalLibrary {
             track_id: id,
             album_id: track.album_id,
             owner_artist_id: track.owner_artist_id,
+            library_id: self.manifest.library_id.clone(),
             generation: self.catalog.generation,
             expected_title: track.title.clone(),
             expected_credited_artist_ids: track.credited_artist_ids.clone(),
@@ -4183,6 +4198,7 @@ impl CanonicalLibrary {
         album_title: Option<String>,
     ) -> Result<(), CanonicalError> {
         self.ensure_writable()?;
+        self.ensure_plan_library(&plan.library_id)?;
         if plan.generation != self.catalog.generation {
             return Err(CanonicalError::Invalid(
                 "metadata edit plan is stale: catalogue generation changed; reopen the editor"
@@ -4429,6 +4445,7 @@ impl CanonicalLibrary {
             lyrics_fingerprint,
             destination_audio_path,
             destination_record_path,
+            library_id: self.manifest.library_id.clone(),
             generation: self.catalog.generation,
         })
     }
@@ -4441,6 +4458,7 @@ impl CanonicalLibrary {
     ) -> Result<TrackMoveReport, CanonicalError> {
         self.ensure_writable()?;
         self.ensure_no_pending_transactions()?;
+        self.ensure_plan_library(&plan.library_id)?;
         if plan.generation != self.catalog.generation {
             return Err(CanonicalError::Invalid(
                 "track move plan is stale: catalogue generation changed; re-plan".to_owned(),
@@ -7111,6 +7129,7 @@ pub struct OwnershipTransferPlan {
     new_record: RelPath,
     new_lyrics: Option<RelPath>,
     expected_fingerprint: Option<ContentFingerprint>,
+    library_id: String,
     generation: u64,
     no_op: bool,
 }
@@ -7264,6 +7283,7 @@ impl CanonicalLibrary {
                 new_record: self.track_records[&track_id].clone(),
                 new_lyrics: None,
                 expected_fingerprint: track.fingerprint,
+                library_id: self.manifest.library_id.clone(),
                 generation: self.catalog.generation,
                 no_op: true,
             });
@@ -7337,6 +7357,7 @@ impl CanonicalLibrary {
             new_record,
             new_lyrics,
             expected_fingerprint,
+            library_id: self.manifest.library_id.clone(),
             generation: self.catalog.generation,
             no_op: false,
         })
@@ -7354,6 +7375,7 @@ impl CanonicalLibrary {
         plan: &OwnershipTransferPlan,
     ) -> Result<OwnershipTransferReport, CanonicalError> {
         self.ensure_writable()?;
+        self.ensure_plan_library(&plan.library_id)?;
         let report = OwnershipTransferReport {
             track_id: plan.track_id,
             from_owner: plan.from_owner,
@@ -7589,6 +7611,39 @@ mod ownership_tests {
         );
         assert_eq!(library.tracks().count(), 1);
         assert_eq!(library.track_audio_paths().count(), 1);
+    }
+
+    #[test]
+    fn review_plans_are_bound_to_their_originating_library_identity() {
+        let dir = TempDir::new("plan-library-identity");
+        let root_a = dir.path().join("A");
+        let mut a = CanonicalLibrary::create(&root_a).expect("A");
+        let artist = a.create_artist("Artist", Vec::new()).expect("artist");
+        let source = dir.write("source/song.wav", b"opaque identity bytes");
+        let track = a
+            .import_track(CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(artist),
+                artist_name: "Artist".to_owned(),
+                credited_artist_ids: vec![artist],
+                album_title: Some("Album".to_owned()),
+                release_type: ReleaseType::Album,
+                track_number: None,
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import");
+        let plan = a.plan_track_metadata_update(track).expect("plan");
+        let root_b = dir.path().join("B");
+        let mut b = CanonicalLibrary::create(&root_b).expect("B");
+        let error = b
+            .execute_track_metadata_update(&plan, "Wrong library", Vec::new(), None, None, None)
+            .expect_err("cross-library plan must be rejected");
+        assert!(
+            error.to_string().contains("different canonical library"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -7966,6 +8021,8 @@ pub struct ArtistDeletionPlan {
     pub artist_id: ArtistId,
     /// Display name at plan time.
     pub artist_name: String,
+    /// Originating canonical library identity.
+    pub library_id: String,
     /// Catalogue generation captured by the plan.
     pub generation: u64,
     /// Owned album IDs.
@@ -8373,6 +8430,7 @@ impl CanonicalLibrary {
         let mut plan = ArtistDeletionPlan {
             artist_id,
             artist_name: artist.name.clone(),
+            library_id: self.manifest.library_id.clone(),
             generation: self.catalog.generation,
             owned_albums,
             albums,
@@ -8399,6 +8457,7 @@ impl CanonicalLibrary {
     ) -> Result<ArtistDeletionReport, CanonicalError> {
         self.ensure_writable()?;
         self.ensure_no_pending_transactions()?;
+        self.ensure_plan_library(&plan.library_id)?;
         let album_for = self
             .artists
             .get(&plan.artist_id)
@@ -11947,6 +12006,8 @@ pub struct AlbumTransferPlan {
     pub track_order: Vec<TrackId>,
     /// Per-track snapshots and credit decisions.
     pub tracks: Vec<AlbumTransferTrack>,
+    /// Originating canonical library identity.
+    pub library_id: String,
     /// Catalogue generation captured by the plan.
     pub generation: u64,
     /// Blocking issues.
@@ -12180,6 +12241,7 @@ impl CanonicalLibrary {
             cover_fingerprint,
             track_order: album.track_order.clone(),
             tracks,
+            library_id: self.manifest.library_id.clone(),
             generation: self.catalog.generation,
             issues: Vec::new(),
             snapshot_issues: issues,
@@ -12198,6 +12260,7 @@ impl CanonicalLibrary {
     ) -> Result<AlbumTransferReport, CanonicalError> {
         self.ensure_writable()?;
         self.ensure_no_pending_transactions()?;
+        self.ensure_plan_library(&plan.library_id)?;
         if plan.generation != self.catalog.generation {
             return Err(CanonicalError::Invalid(
                 "album transfer plan is stale: catalogue generation changed; re-plan".to_owned(),
