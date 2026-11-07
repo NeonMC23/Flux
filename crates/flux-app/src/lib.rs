@@ -4080,11 +4080,20 @@ impl Controller {
             history_write_protected,
         } = seed;
         // Finalize the outgoing library's legitimate evidence and persist it
-        // to the outgoing history store before replacing the instance.
+        // to the outgoing history store before replacing the instance. A
+        // failed save must remain visible after the switch rather than being
+        // erased together with the outgoing transient status.
+        let same_history_path = self.history_store.as_ref().map(|store| store.path())
+            == history_store.as_ref().map(|store| store.path());
+        let previous_error = self.last_error.clone();
         self.update_playback_history();
-        self.persist_history();
+        let history_error = self.try_persist_history().or_else(|| {
+            (self.last_error != previous_error)
+                .then(|| self.last_error.clone())
+                .flatten()
+        });
         self.outbox.clear();
-        self.last_error = None;
+        self.last_error = history_error;
         self.last_status = None;
         self.player.stop();
         self.engine.stop();
@@ -4106,9 +4115,11 @@ impl Controller {
         self.queue_store = queue_store;
         self.queue_write_protected = queue_write_protected;
         self.queue_auto_library = queue_auto_library;
-        self.playback_history = playback_history;
+        if !same_history_path {
+            self.playback_history = playback_history;
+            self.history_write_protected = history_write_protected;
+        }
         self.history_store = history_store;
-        self.history_write_protected = history_write_protected;
         self.history_generation = self.history_generation.wrapping_add(1);
         self.shuffle = false;
         self.shuffle_order.clear();
@@ -5544,6 +5555,7 @@ impl Controller {
             .import_track(imported)
             .map_err(|err| format!("Could not import track: {err}"))?;
         self.refresh_from_canonical();
+        self.sync_default_queue();
         self.outbox.push(ControllerEvent::LibraryChanged);
         Ok(id)
     }
@@ -6454,10 +6466,28 @@ impl Controller {
         if let Some(rx) = self.scan_rx.take()
             && let Ok(outcome) = rx.recv()
         {
-            self.library = Some(outcome.library);
-            if let ScanPersistence::Portable(store) = outcome.persistence {
+            let ScanOutcome {
+                library,
+                persistence,
+                ..
+            } = outcome;
+            self.library = Some(library);
+            if let ScanPersistence::Portable(store) = persistence {
                 self.portable_store = Some(*store);
             }
+            let library = match self.rebuilt_from_store() {
+                Some(report) => report.library,
+                None => self
+                    .library
+                    .take()
+                    .expect("scan library was just installed"),
+            };
+            self.install_library_snapshot(library);
+            // The pre-shutdown snapshot was written before this scan finished.
+            // Reconcile the auto-derived queue with the final library and write
+            // it without re-entering the normal post-shutdown guard.
+            self.sync_default_queue();
+            self.persist_queue_snapshot();
         }
         let (placeholder, _control) = EngineHandle::spawn_null(48_000, 2);
         let engine = std::mem::replace(&mut self.engine, placeholder);
@@ -6513,18 +6543,24 @@ impl Controller {
     }
 
     fn persist_history(&mut self) {
+        if let Some(message) = self.try_persist_history() {
+            self.report_error(message);
+        }
+    }
+
+    fn try_persist_history(&mut self) -> Option<String> {
         if self.shutdown || self.history_write_protected {
-            return;
+            return None;
         }
         let Some(store) = &self.history_store else {
-            return;
+            return None;
         };
-        if let Err(error) = store.save(&self.playback_history) {
-            self.report_error(format!(
+        store.save(&self.playback_history).err().map(|error| {
+            format!(
                 "Could not save playback history ({}): {error}. The in-memory history remains available.",
                 store.path().display()
-            ));
-        }
+            )
+        })
     }
 
     /// Updates the meaningful-play accumulator from the actual engine clock.
@@ -6925,7 +6961,14 @@ impl Controller {
     }
 
     fn persist_queue(&mut self) {
-        if self.shutdown || !self.queue_persistence_allowed() {
+        if self.shutdown {
+            return;
+        }
+        self.persist_queue_snapshot();
+    }
+
+    fn persist_queue_snapshot(&mut self) {
+        if !self.queue_persistence_allowed() {
             return;
         }
         let Some(store) = &self.queue_store else {
@@ -7957,7 +8000,16 @@ fn load_queue(
         return (default_queue(library), true, false, None);
     };
     match store.load() {
-        Ok(Some(loaded)) => (loaded.queue, loaded.auto_library, false, None),
+        Ok(Some(loaded)) => {
+            let (queue, dropped) = filter_queue_for_library(loaded.queue, library);
+            let warning = (dropped > 0).then(|| {
+                format!(
+                    "Removed {dropped} saved queue entr{} that referenced tracks no longer in this library.",
+                    if dropped == 1 { "y" } else { "ies" }
+                )
+            });
+            (queue, loaded.auto_library, false, warning)
+        }
         Ok(None) => (default_queue(library), true, false, None),
         Err(error) => (
             default_queue(library),
@@ -7971,6 +8023,29 @@ fn load_queue(
             )),
         ),
     }
+}
+
+/// Drops persisted queue entries whose TrackId is no longer in the active
+/// library. A stale current selection advances to the first surviving entry;
+/// stable QueueEntryIds and the persisted counter are otherwise preserved.
+fn filter_queue_for_library(queue: Queue, library: &Library) -> (Queue, usize) {
+    let entries = queue
+        .entries()
+        .iter()
+        .copied()
+        .filter(|entry| library.contains(entry.track()))
+        .collect::<Vec<_>>();
+    let dropped = queue.entries().len().saturating_sub(entries.len());
+    if dropped == 0 {
+        return (queue, 0);
+    }
+    let current = queue.current_entry_id();
+    let current = current
+        .filter(|id| entries.iter().any(|entry| entry.id() == *id))
+        .or_else(|| entries.first().map(|entry| entry.id()));
+    let filtered = Queue::from_entries(entries, queue.next_entry_id(), current)
+        .expect("filtering valid queue entries preserves queue invariants");
+    (filtered, dropped)
 }
 
 fn canonical_library_root(library_root: &Path) -> Result<PathBuf, CanonicalOpenError> {
@@ -8140,7 +8215,9 @@ mod tests {
 
     use flux_audio::engine::{EngineError, EngineEvent, EngineHandle};
     use flux_audio::output::NullControl;
-    use flux_core::{PlaybackState, Queue, QueueEntryId, RepeatMode, Track, TrackId};
+    use flux_core::{
+        PlaybackState, Queue, QueueEntry, QueueEntryId, RepeatMode, Track, TrackId, TrackSource,
+    };
     use flux_library::QueueStore;
 
     use super::{
@@ -10894,6 +10971,11 @@ mod tests {
             controller2.tracks().len(),
             4,
             "scan saved its index before shutdown"
+        );
+        assert_eq!(
+            controller2.queue_len(),
+            4,
+            "shutdown reconciles and persists the auto-derived queue with the completed scan"
         );
         controller2.shutdown();
     }
@@ -14642,6 +14724,7 @@ mod tests {
         let id = controller.tracks()[0].0;
         controller.play_track(id);
         controller.stop();
+        controller.playback_history.record(id, 123_456);
         let before_session = controller.library_session();
         let before_entry = controller.current_queue_entry_id();
         let queue_path = root.join("queue.flux");
@@ -14659,6 +14742,11 @@ mod tests {
         assert_eq!(controller.current_queue_entry_id(), before_entry);
         assert_eq!(controller.player_state(), PlaybackState::Paused);
         assert_eq!(controller.engine_loaded, None, "reopen must not autoplay");
+        assert_eq!(
+            controller.track_play_count(id),
+            1,
+            "same-path reopen keeps the finalized in-memory history"
+        );
         assert_eq!(
             fs::read(&queue_path).expect("queue after reopen"),
             queue_before,
@@ -15881,13 +15969,12 @@ mod tests {
         }
         let first = controller.tracks()[0].0;
         let second = controller.tracks()[1].0;
-        let first_entry = controller.enqueue_track(first).expect("first queue entry");
-        controller
-            .enqueue_track(second)
-            .expect("second queue entry");
-        controller
-            .play_queue_entry(first_entry)
-            .expect("play first queue entry");
+        assert_eq!(
+            controller.queue_len(),
+            2,
+            "auto-derived queue follows canonical imports"
+        );
+        controller.play_track(first);
         controller.preload_next_queue_entry();
         let preloaded = controller
             .preloaded_entry
@@ -17046,5 +17133,34 @@ mod tests {
                 "shuffle avoids adjacent same-track entries when possible"
             );
         }
+    }
+
+    #[test]
+    fn stale_saved_queue_entries_are_dropped_without_reusing_entry_ids() {
+        let mut library = flux_library::Library::new();
+        let valid = library.insert(Track::new(
+            "Still here",
+            TrackSource::local("/tmp/still-here.wav"),
+        ));
+        let entries = vec![
+            QueueEntry::new(QueueEntryId::new(1), valid),
+            QueueEntry::new(QueueEntryId::new(2), TrackId::new(999)),
+        ];
+        let queue = Queue::from_entries(entries, 3, Some(QueueEntryId::new(2)))
+            .expect("valid pre-filter queue");
+        let (filtered, dropped) = super::filter_queue_for_library(queue, &library);
+        assert_eq!(dropped, 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.current_entry().map(QueueEntry::track), Some(valid));
+        assert_eq!(
+            filtered.current_entry_id().map(QueueEntryId::get),
+            Some(1),
+            "stale selection advances to the first surviving entry"
+        );
+        assert_eq!(
+            filtered.next_entry_id(),
+            3,
+            "entry IDs are never reused after filtering"
+        );
     }
 }
