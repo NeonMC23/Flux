@@ -2226,16 +2226,28 @@ fn apply_import_plan_canonical(
                     });
                     continue;
                 }
-                let refs = match resolve_import_artist_refs(controller, candidate) {
-                    Ok(refs) => refs,
-                    Err(message) => {
-                        report.items.push(AppliedImportItem {
-                            index,
-                            track_id: Some(existing.track_id),
-                            state: ImportItemState::Failed,
-                            message,
-                        });
-                        continue;
+                let mut refs = if candidate.credits == candidate.base_credits {
+                    // The review only changed non-credit metadata. Preserve the
+                    // complete existing collaboration credits rather than
+                    // rebuilding them from the single editor base credit.
+                    existing
+                        .credited_artist_ids
+                        .iter()
+                        .copied()
+                        .map(CanonicalImportArtistRef::Existing)
+                        .collect::<Vec<_>>()
+                } else {
+                    match resolve_import_artist_refs(controller, candidate) {
+                        Ok(refs) => refs,
+                        Err(message) => {
+                            report.items.push(AppliedImportItem {
+                                index,
+                                track_id: Some(existing.track_id),
+                                state: ImportItemState::Failed,
+                                message,
+                            });
+                            continue;
+                        }
                     }
                 };
                 let Some(owner) = existing.owner_artist_id else {
@@ -2247,7 +2259,6 @@ fn apply_import_plan_canonical(
                     });
                     continue;
                 };
-                let mut refs = refs;
                 if !refs.contains(&CanonicalImportArtistRef::Existing(owner)) {
                     // Metadata approval never changes physical ownership. Preserve
                     // the existing owner even when the incoming metadata inferred a
@@ -3594,6 +3605,63 @@ mod tests {
                 .artists()
                 .iter()
                 .any(|artist| artist.name() == "Other")
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_metadata_only_update_preserves_existing_collaboration_credits() {
+        let dir = TempDir::new("canonical-update-preserves-credits");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let owner = controller.create_artist("Owner").expect("owner");
+        let featured = controller.create_artist("Featured").expect("featured");
+        let source = wav(&root, "source/song.wav", 4_410, 0.2);
+        let imported = flux_library::canonical::CanonicalImportedTrack {
+            source,
+            title: "Song".to_owned(),
+            artist_id: Some(owner),
+            artist_name: "Owner".to_owned(),
+            credited_artist_ids: vec![owner, featured],
+            album_title: None,
+            release_type: crate::ReleaseType::Album,
+            track_number: None,
+            disc_number: None,
+            duration_ms: None,
+        };
+        let id = controller
+            .import_canonical_track(imported)
+            .expect("canonical import");
+        assert_eq!(controller.track_credits(id), vec![owner, featured]);
+        let managed = controller
+            .track(id)
+            .map(|track| track.source().path().to_path_buf())
+            .expect("managed audio");
+
+        let request = canonical_request(&controller, &root, vec![managed], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            plan.candidates[0].status(),
+            CandidateStatus::ExistingPath(existing) if *existing == id
+        ));
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        plan.candidates[0].set_title("Renamed only");
+        let report = controller
+            .apply_import_plan(&plan, &prepared_for(&plan))
+            .expect("metadata-only update");
+        assert_eq!(report.updated, 1);
+        assert_eq!(
+            controller.track(id).map(|track| track.title()),
+            Some("Renamed only")
+        );
+        assert_eq!(
+            controller.track_credits(id),
+            vec![owner, featured],
+            "credit review was untouched, so the full existing credit list must survive"
         );
         controller.shutdown();
     }
