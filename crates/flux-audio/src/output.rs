@@ -28,6 +28,22 @@ pub struct OutputConfig {
     pub channels: u16,
 }
 
+/// One output device reported by the active backend host.
+///
+/// `id` is the backend-provided identity and is the only field suitable for
+/// equality or persistence. Display names are labels and may be duplicated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputDeviceInfo {
+    /// Stable backend device identifier, when the backend provides one.
+    pub id: Option<String>,
+    /// Human-readable device label.
+    pub name: String,
+    /// Whether this is the current system default output.
+    pub is_default: bool,
+    /// Whether a default output configuration could be queried now.
+    pub can_open: bool,
+}
+
 /// An asynchronous output-stream report from a backend thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputIssue {

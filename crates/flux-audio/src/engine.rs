@@ -82,6 +82,8 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use crate::decode::{DecodeError, Decoder, StreamInfo, open_decoder};
+#[cfg(feature = "cpal")]
+use crate::output::OutputDeviceInfo;
 use crate::output::{FillCallback, NullControl, NullOutput, OutputBackend, OutputConfig};
 
 /// Frames decoded per worker iteration (per channel).
@@ -752,9 +754,32 @@ impl EngineHandle {
     /// stream cannot be opened/started.
     #[cfg(feature = "cpal")]
     pub fn spawn_cpal_default() -> Result<Self, EngineError> {
-        Self::spawn(|| -> Result<Box<dyn OutputBackend>, EngineError> {
-            Ok(Box::new(crate::cpal_output::CpalOutput::open_default()?))
-        })
+        Self::spawn_cpal_device(None).map(|(engine, _info)| engine)
+    }
+
+    /// Spawns an engine on one explicitly selected CPAL output device, or the
+    /// current system default when `device_id` is `None`. Returns the opened
+    /// device metadata alongside the engine.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Output`] when the selected device is missing,
+    /// disconnected, unsupported, or fails to open/start.
+    #[cfg(feature = "cpal")]
+    pub fn spawn_cpal_device(
+        device_id: Option<&str>,
+    ) -> Result<(Self, OutputDeviceInfo), EngineError> {
+        let selected = device_id.map(str::to_owned);
+        let (info_tx, info_rx) = std::sync::mpsc::sync_channel::<OutputDeviceInfo>(1);
+        let engine = Self::spawn(move || -> Result<Box<dyn OutputBackend>, EngineError> {
+            let output = crate::cpal_output::CpalOutput::open_device(selected.as_deref())?;
+            let _ = info_tx.send(output.device_info());
+            Ok(Box::new(output))
+        })?;
+        let info = info_rx.recv().map_err(|_| {
+            EngineError::Output("opened output device did not report its identity".to_owned())
+        })?;
+        Ok((engine, info))
     }
 
     /// The backend's output format, fixed for the engine's lifetime.

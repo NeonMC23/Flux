@@ -2199,11 +2199,26 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         AudioStatus::Recovering(reason) => format!("recovering — {reason}"),
         other => other.reason().unwrap_or("unknown").to_owned(),
     };
+    let active = controller.active_audio_device().map_or_else(
+        || "unknown device".to_owned(),
+        |device| {
+            format!(
+                "{}{}",
+                device.name,
+                if device.is_default { " (default)" } else { "" }
+            )
+        },
+    );
+    let policy = if controller.selected_audio_device().is_some() {
+        "explicit selection"
+    } else {
+        "system default"
+    };
     vec![
         "Flux TUI quick reference".to_owned(),
         format!("Active library: {library}"),
         format!(
-            "Audio output: {audio} · queue {} · playback mode {}",
+            "Audio output: {audio} · {active} · policy {policy} · queue {} · playback mode {}",
             controller.queue_len(),
             controller.playback_mode().label()
         ),
@@ -2960,6 +2975,8 @@ mod tests {
         let help = tui.info_lines.join("\n");
         assert!(help.contains("Q queue view"), "{help}");
         assert!(help.contains("Active library:"), "{help}");
+        assert!(help.contains("policy system default"), "{help}");
+        assert!(help.contains("bounded automatic recovery"), "{help}");
         assert!(help.contains("SAFETY AND LIMITS"), "{help}");
         assert!(help.contains("bounded automatic recovery"), "{help}");
         assert!(help.contains("GUI review workflows"), "{help}");

@@ -173,7 +173,8 @@ const AUDIO_RECOVERY_BACKOFF_MS: [u64; 3] = [250, 750, 1_500];
 
 /// Opens a fresh default output engine. Kept as a closure so tests can
 /// inject deterministic engines while production only opens CPAL.
-type AudioRecoveryFactory = Arc<dyn Fn() -> Result<EngineHandle, String> + Send + Sync>;
+type AudioRecoveryResult = Result<(EngineHandle, Option<AudioOutputDevice>), String>;
+type AudioRecoveryFactory = Arc<dyn Fn() -> AudioRecoveryResult + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioRecoveryPhase {
@@ -192,7 +193,7 @@ struct AudioRecovery {
     phase: AudioRecoveryPhase,
     attempts: u32,
     next_attempt: Option<Instant>,
-    result_rx: Option<Receiver<Result<EngineHandle, String>>>,
+    result_rx: Option<Receiver<AudioRecoveryResult>>,
     join: Option<std::thread::JoinHandle<()>>,
     /// Delivered playback position captured from the failed stream.
     position_ms: u64,
@@ -945,6 +946,96 @@ struct ScanOutcome {
     sync_report: Option<PortableSyncReport>,
 }
 
+/// One output device as exposed by the shared application layer. Backend
+/// handles and CPAL types never cross this boundary.
+pub use flux_audio::output::OutputDeviceInfo as AudioOutputDevice;
+
+/// An output engine opened asynchronously for an explicit device switch.
+/// The engine is consumed once by [`Controller::install_audio_output`].
+#[derive(Clone)]
+pub struct OpenedAudioOutput {
+    engine: std::sync::Arc<std::sync::Mutex<Option<EngineHandle>>>,
+    device: AudioOutputDevice,
+    requested_device_id: Option<String>,
+}
+
+impl std::fmt::Debug for OpenedAudioOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenedAudioOutput")
+            .field("device", &self.device)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenedAudioOutput {
+    fn take_engine(&self) -> Option<EngineHandle> {
+        self.engine.lock().ok()?.take()
+    }
+
+    #[cfg(test)]
+    fn from_test(
+        engine: EngineHandle,
+        device: AudioOutputDevice,
+        requested_device_id: Option<String>,
+    ) -> Self {
+        Self {
+            engine: Arc::new(std::sync::Mutex::new(Some(engine))),
+            device,
+            requested_device_id,
+        }
+    }
+
+    /// Metadata for the device that was successfully opened.
+    #[must_use]
+    pub fn device(&self) -> &AudioOutputDevice {
+        &self.device
+    }
+}
+
+/// Enumerates output devices through the shared application boundary.
+///
+/// # Errors
+///
+/// A user-facing error when the build has no output backend or the backend
+/// cannot enumerate devices.
+pub fn enumerate_audio_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
+    #[cfg(feature = "cpal")]
+    {
+        flux_audio::cpal_output::list_output_devices().map_err(|error| error.to_string())
+    }
+    #[cfg(not(feature = "cpal"))]
+    {
+        Err("This build has no audio-output backend; device selection is unavailable.".to_owned())
+    }
+}
+
+/// Opens an output engine for `device_id`, or the system default when `None`.
+/// This may block while the backend opens a device and is intended to run off
+/// the UI thread.
+///
+/// # Errors
+///
+/// A user-facing error when the build has no backend, the device is missing,
+/// or initialization fails. Opening is explicit and never falls back silently.
+pub fn open_audio_output(device_id: Option<String>) -> Result<OpenedAudioOutput, String> {
+    #[cfg(feature = "cpal")]
+    {
+        let (engine, device) = EngineHandle::spawn_cpal_device(device_id.as_deref())
+            .map_err(|error| error.to_string())?;
+        Ok(OpenedAudioOutput {
+            engine: std::sync::Arc::new(std::sync::Mutex::new(Some(engine))),
+            device,
+            requested_device_id: device_id,
+        })
+    }
+    #[cfg(not(feature = "cpal"))]
+    {
+        let _ = device_id;
+        Err("This build has no audio-output backend; device selection is unavailable.".to_owned())
+    }
+}
+
 /// Creates the engine a Flux application should use, together with its
 /// honest [`AudioStatus`].
 ///
@@ -954,19 +1045,26 @@ struct ScanOutcome {
 /// returns [`AudioStatus::BuildWithoutBackend`]. In both cases the
 /// application can still browse while telling the user exactly why
 /// playback will not work. [`Controller::open_default`] additionally
-/// enables bounded runtime recovery for the default device. The null engine is never presented as a
-/// real device — playback commands check the status first.
+/// enables bounded runtime recovery for the default device. The null engine
+/// is never presented as a real device — playback commands check the status
+/// first.
 #[must_use]
 pub fn default_engine() -> (EngineHandle, AudioStatus) {
+    let (engine, status, _device) = default_engine_with_device();
+    (engine, status)
+}
+
+fn default_engine_with_device() -> (EngineHandle, AudioStatus, Option<AudioOutputDevice>) {
     #[cfg(feature = "cpal")]
     {
-        match EngineHandle::spawn_cpal_default() {
-            Ok(engine) => return (engine, AudioStatus::Ready),
+        match EngineHandle::spawn_cpal_device(None) {
+            Ok((engine, device)) => return (engine, AudioStatus::Ready, Some(device)),
             Err(err) => {
                 let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
                 return (
                     engine,
                     AudioStatus::DeviceUnavailable(format!("audio output unavailable: {err}")),
+                    None,
                 );
             }
         }
@@ -974,13 +1072,97 @@ pub fn default_engine() -> (EngineHandle, AudioStatus) {
     #[allow(unreachable_code)]
     {
         let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
-        (engine, AudioStatus::BuildWithoutBackend)
+        (engine, AudioStatus::BuildWithoutBackend, None)
     }
 }
 
 #[cfg(feature = "cpal")]
-fn cpal_audio_recovery_factory() -> AudioRecoveryFactory {
-    Arc::new(|| EngineHandle::spawn_cpal_default().map_err(|err| err.to_string()))
+fn cpal_audio_recovery_factory(device_id: Option<String>) -> AudioRecoveryFactory {
+    Arc::new(move || {
+        EngineHandle::spawn_cpal_device(device_id.as_deref())
+            .map(|(engine, device)| (engine, Some(device)))
+            .map_err(|err| err.to_string())
+    })
+}
+
+struct StartupAudio {
+    engine: EngineHandle,
+    status: AudioStatus,
+    active: Option<AudioOutputDevice>,
+    selected: Option<String>,
+    warning: Option<String>,
+}
+
+fn startup_audio(preferred: Option<String>) -> StartupAudio {
+    #[cfg(feature = "cpal")]
+    {
+        if let Some(preferred_id) = preferred.clone() {
+            match EngineHandle::spawn_cpal_device(Some(&preferred_id)) {
+                Ok((engine, active)) => {
+                    return StartupAudio {
+                        engine,
+                        status: AudioStatus::Ready,
+                        active: Some(active),
+                        selected: Some(preferred_id),
+                        warning: None,
+                    };
+                }
+                Err(selected_error) => {
+                    // Never silently replace an explicit preference with the
+                    // system default. Keep the selection, start unavailable,
+                    // and let bounded recovery retry the saved device or the
+                    // user explicitly choose the default.
+                    let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
+                    return StartupAudio {
+                        engine,
+                        status: AudioStatus::DeviceUnavailable(format!(
+                            "saved audio output {preferred_id} is unavailable: {selected_error}"
+                        )),
+                        active: None,
+                        selected: Some(preferred_id.clone()),
+                        warning: Some(format!(
+                            "Saved audio output {preferred_id} is unavailable ({selected_error}). \
+                             Flux kept the selection; retry it or choose another output in \
+                             Library setup."
+                        )),
+                    };
+                }
+            }
+        }
+        match EngineHandle::spawn_cpal_device(None) {
+            Ok((engine, active)) => StartupAudio {
+                engine,
+                status: AudioStatus::Ready,
+                active: Some(active),
+                selected: None,
+                warning: None,
+            },
+            Err(error) => {
+                let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
+                StartupAudio {
+                    engine,
+                    status: AudioStatus::DeviceUnavailable(format!(
+                        "audio output unavailable: {error}"
+                    )),
+                    active: None,
+                    selected: None,
+                    warning: None,
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "cpal"))]
+    {
+        let _ = preferred;
+        let (engine, _control) = EngineHandle::spawn_null(48_000, 2);
+        StartupAudio {
+            engine,
+            status: AudioStatus::BuildWithoutBackend,
+            active: None,
+            selected: None,
+            warning: None,
+        }
+    }
 }
 
 /// The default library-index path: `library-index.json` inside the
@@ -1273,9 +1455,17 @@ pub struct Controller {
     player: Player,
     engine: EngineHandle,
     audio: AudioStatus,
+    /// Explicit user-selected device ID, or `None` for the system default.
+    selected_audio_device: Option<String>,
+    /// Device metadata for the currently installed output engine.
+    active_audio_device: Option<AudioOutputDevice>,
     /// Background default-device recovery policy, enabled by
     /// `open_default` and disabled for caller-supplied engines.
     audio_recovery: Option<AudioRecovery>,
+    /// True when recovery uses the production CPAL factory and should follow
+    /// the current explicit/default output selection.
+    #[cfg_attr(not(feature = "cpal"), allow(dead_code))]
+    audio_recovery_default: bool,
     /// Sync ledger: the track this controller last asked the engine to
     /// load. Not a selection — `Player` owns that; this only decides
     /// "resume vs. load" when syncing.
@@ -1655,12 +1845,23 @@ impl Controller {
                 ))
             })?;
         }
-        let (engine, audio) = default_engine();
-        let mut controller = Self::new_canonical(engine, audio, &root)
+        let settings_path = SettingsStore::default_path();
+        let loaded_settings = settings_path.map(SettingsStore::load);
+        let preferred = loaded_settings
+            .as_ref()
+            .and_then(|loaded| loaded.audio_output_device.clone());
+        let startup = startup_audio(preferred.clone());
+        let startup_warning = startup.warning.clone();
+        let mut controller = Self::new_canonical(startup.engine, startup.status, &root)
             .map_err(|err| ControllerOpenError::Canonical(err.to_string()))?;
+        controller.active_audio_device = startup.active;
+        controller.selected_audio_device = startup.selected;
         controller.enable_default_audio_recovery();
-        if let Some(path) = SettingsStore::default_path() {
-            controller.load_settings_from_path(path);
+        if let Some(loaded) = loaded_settings {
+            controller.apply_loaded_settings(loaded);
+        }
+        if let Some(warning) = startup_warning {
+            controller.report_error(warning);
         }
         Ok(controller)
     }
@@ -1693,7 +1894,10 @@ impl Controller {
             player,
             engine,
             audio,
+            selected_audio_device: None,
+            active_audio_device: None,
             audio_recovery: None,
+            audio_recovery_default: false,
             engine_loaded: None,
             engine_entry: None,
             engine_session: None,
@@ -2757,11 +2961,16 @@ impl Controller {
     /// before playback, and binds future saves to the same file. Malformed
     /// files are preserved and reported; defaults remain usable.
     pub fn load_settings_from_path(&mut self, path: impl Into<PathBuf>) -> Option<String> {
+        self.apply_loaded_settings(SettingsStore::load(path))
+    }
+
+    fn apply_loaded_settings(&mut self, loaded: LoadedSettings) -> Option<String> {
         let LoadedSettings {
             store,
             crossfade,
+            audio_output_device: _,
             warning,
-        } = SettingsStore::load(path);
+        } = loaded;
         self.crossfade_enabled = crossfade.enabled;
         self.crossfade_duration_ms = crossfade.duration_ms;
         self.engine.set_crossfade_ms(crossfade.effective_ms());
@@ -2914,13 +3123,148 @@ impl Controller {
         self.retry_audio_recovery_if_failed()
     }
 
+    /// The explicit selected output-device ID, or `None` when following the
+    /// system default.
+    #[must_use]
+    pub fn selected_audio_device(&self) -> Option<&str> {
+        self.selected_audio_device.as_deref()
+    }
+
+    /// Metadata for the currently installed output device.
+    #[must_use]
+    pub fn active_audio_device(&self) -> Option<&AudioOutputDevice> {
+        self.active_audio_device.as_ref()
+    }
+
+    /// Installs an output engine opened by [`open_audio_output`] as one
+    /// controlled switch. The caller must have opened it from a background
+    /// task; this method never opens a device. On success the previous stream
+    /// is stopped only after the new one exists, queue identity and playback
+    /// intent are preserved, and the current position is reapplied.
+    ///
+    /// # Errors
+    ///
+    /// Rejects shutdown, a concurrently active recovery cycle, or an already
+    /// consumed handle. A failed selection is left to the caller: the previous
+    /// engine remains installed until this method succeeds.
+    pub fn install_audio_output(&mut self, opened: OpenedAudioOutput) -> Result<(), String> {
+        if self.shutdown {
+            return Err("Playback is shutting down.".to_owned());
+        }
+        if self.audio_recovery_active() {
+            return Err(
+                "Audio recovery is in progress; wait for it to finish before switching outputs."
+                    .to_owned(),
+            );
+        }
+        let Some(engine) = opened.take_engine() else {
+            return Err("The opened audio output was already consumed.".to_owned());
+        };
+        let was_playing = self.player.state() == PlaybackState::Playing;
+        let was_paused = self.player.state() == PlaybackState::Paused;
+        let current_id = self.player.current_track();
+        let position_ms = self
+            .position_for_current_entry()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.update_playback_history_at(position_ms);
+
+        self.engine.stop();
+        let previous = std::mem::replace(&mut self.engine, engine);
+        drop(previous);
+        self.engine.set_volume(self.volume);
+        self.engine.set_crossfade_ms(if self.crossfade_enabled {
+            self.crossfade_duration_ms
+        } else {
+            0
+        });
+        self.audio = AudioStatus::Ready;
+        self.active_audio_device = Some(opened.device.clone());
+        self.selected_audio_device = opened.requested_device_id.clone();
+        self.engine_loaded = None;
+        self.engine_entry = None;
+        self.engine_session = None;
+        self.engine_loaded_session = None;
+        self.stream_info = None;
+        self.preloaded_entry = None;
+        self.clear_restored_position();
+        if let Some(recovery) = self.audio_recovery.as_mut() {
+            recovery.phase = AudioRecoveryPhase::Idle;
+            recovery.attempts = 0;
+            recovery.next_attempt = None;
+            recovery.result_rx = None;
+            recovery.last_reason = None;
+        }
+        #[cfg(feature = "cpal")]
+        if self.audio_recovery_default {
+            // Future automatic recovery must reopen the explicit selection,
+            // never silently fall back to the system default.
+            self.audio_recovery = Some(AudioRecovery::new(cpal_audio_recovery_factory(
+                self.selected_audio_device.clone(),
+            )));
+        }
+        if self
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("audio output"))
+        {
+            self.last_error = None;
+        }
+
+        if let Err(error) = self.persist_audio_output_selection() {
+            self.report_error(error);
+        }
+        if (was_playing || was_paused)
+            && let Some(id) = current_id
+        {
+            if let Err(message) = self.load_into_engine(id, false) {
+                self.fail_playback(message);
+                return Err(
+                    "The new output opened but the current track could not be loaded.".to_owned(),
+                );
+            }
+            if position_ms > 0 {
+                let session = self.engine.seek(Duration::from_millis(position_ms));
+                self.engine_session = Some(session);
+            }
+            if was_playing {
+                self.engine.play();
+            }
+            self.set_play_session_baseline(position_ms);
+            self.preload_next_queue_entry();
+        }
+        self.report_status(format!(
+            "Audio output switched to {} ({}).",
+            opened.device.name,
+            if opened.device.is_default {
+                "system default"
+            } else {
+                "explicit selection"
+            }
+        ));
+        self.outbox.push(ControllerEvent::PlaybackChanged);
+        Ok(())
+    }
+
+    fn persist_audio_output_selection(&mut self) -> Result<(), String> {
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        store
+            .save_audio_output_device(self.selected_audio_device.as_deref())
+            .map_err(|error| format!("Could not save the audio output selection: {error}"))
+    }
+
     /// Enables bounded recovery on the current default output device.
     /// Caller-supplied engines deliberately keep their existing fatal
     /// behavior; only Flux's normal default-device setup opts in.
     fn enable_default_audio_recovery(&mut self) {
         #[cfg(feature = "cpal")]
         {
-            self.audio_recovery = Some(AudioRecovery::new(cpal_audio_recovery_factory()));
+            self.audio_recovery_default = true;
+            self.audio_recovery = Some(AudioRecovery::new(cpal_audio_recovery_factory(
+                self.selected_audio_device.clone(),
+            )));
             if !self.audio.is_ready() {
                 let reason = self
                     .audio
@@ -2934,6 +3278,7 @@ impl Controller {
 
     #[cfg(test)]
     fn enable_test_audio_recovery(&mut self, factory: AudioRecoveryFactory) {
+        self.audio_recovery_default = false;
         self.audio_recovery = Some(AudioRecovery::new(factory));
     }
 
@@ -3014,7 +3359,7 @@ impl Controller {
             return;
         }
         let factory = Arc::clone(&recovery.factory);
-        let (tx, rx) = std::sync::mpsc::channel::<Result<EngineHandle, String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<AudioRecoveryResult>();
         let spawned = std::thread::Builder::new()
             .name("flux-audio-recovery".to_owned())
             .spawn(move || {
@@ -3040,7 +3385,7 @@ impl Controller {
     fn poll_audio_recovery_at(&mut self, now: Instant) {
         enum Action {
             Start,
-            Success(EngineHandle),
+            Success(EngineHandle, Option<AudioOutputDevice>),
             Failure(String),
         }
         let mut action = None;
@@ -3068,7 +3413,7 @@ impl Controller {
                             let _ = join.join();
                         }
                         action = Some(match result {
-                            Ok(engine) => Action::Success(engine),
+                            Ok((engine, device)) => Action::Success(engine, device),
                             Err(message) => Action::Failure(message),
                         });
                     }
@@ -3078,7 +3423,9 @@ impl Controller {
         }
         match action {
             Some(Action::Start) => self.start_audio_recovery_attempt(now),
-            Some(Action::Success(engine)) => self.finish_audio_recovery_success(engine),
+            Some(Action::Success(engine, device)) => {
+                self.finish_audio_recovery_success(engine, device)
+            }
             Some(Action::Failure(message)) => self.audio_recovery_attempt_failed(now, message),
             None => {}
         }
@@ -3120,7 +3467,11 @@ impl Controller {
         self.outbox.push(ControllerEvent::PlaybackChanged);
     }
 
-    fn finish_audio_recovery_success(&mut self, engine: EngineHandle) {
+    fn finish_audio_recovery_success(
+        &mut self,
+        engine: EngineHandle,
+        active_device: Option<AudioOutputDevice>,
+    ) {
         let Some(recovery) = self.audio_recovery.as_ref() else {
             engine.shutdown();
             return;
@@ -3154,6 +3505,9 @@ impl Controller {
             0
         });
         self.audio = AudioStatus::Ready;
+        if active_device.is_some() {
+            self.active_audio_device = active_device;
+        }
         self.engine_loaded = None;
         self.engine_entry = None;
         self.engine_session = None;
@@ -7750,11 +8104,11 @@ mod tests {
     use flux_library::QueueStore;
 
     use super::{
-        AudioDiagnostics, AudioRecoveryFactory, AudioStatus, Controller, ControllerEvent,
-        CreateLibraryError, PlaybackMode, PortableOpenError, ResourceState, ScanOutcome,
-        StorageMode, SwitchError, TrackMetadataEdit, create_canonical_library,
-        create_portable_library, execute_legacy_migration, is_track_playable,
-        migrate_legacy_library, plan_legacy_migration, same_library_path,
+        AudioDiagnostics, AudioOutputDevice, AudioRecoveryFactory, AudioStatus, Controller,
+        ControllerEvent, CreateLibraryError, OpenedAudioOutput, PlaybackMode, PortableOpenError,
+        ResourceState, ScanOutcome, SettingsStore, StorageMode, SwitchError, TrackMetadataEdit,
+        create_canonical_library, create_portable_library, execute_legacy_migration,
+        is_track_playable, migrate_legacy_library, plan_legacy_migration, same_library_path,
     };
 
     struct TempDir(PathBuf);
@@ -7830,6 +8184,31 @@ mod tests {
         )
     }
 
+    fn test_output_device(id: &str, name: &str, is_default: bool) -> AudioOutputDevice {
+        AudioOutputDevice {
+            id: Some(id.to_owned()),
+            name: name.to_owned(),
+            is_default,
+            can_open: true,
+        }
+    }
+
+    fn opened_test_output(
+        sample_rate: u32,
+        channels: u16,
+        id: &str,
+    ) -> (OpenedAudioOutput, NullControl) {
+        let (engine, control) = EngineHandle::spawn_null(sample_rate, channels);
+        (
+            OpenedAudioOutput::from_test(
+                engine,
+                test_output_device(id, "Test output", false),
+                Some(id.to_owned()),
+            ),
+            control,
+        )
+    }
+
     fn blocking_recovery_factory(
         sample_rate: u32,
         channels: u16,
@@ -7853,7 +8232,14 @@ mod tests {
                 .lock()
                 .expect("recovery controls mutex")
                 .push(control);
-            Ok(engine)
+            Ok((
+                engine,
+                Some(test_output_device(
+                    "test:recovered",
+                    "Recovered default",
+                    true,
+                )),
+            ))
         });
         (factory, release_tx, controls)
     }
@@ -9031,6 +9417,13 @@ mod tests {
 
         release.send(()).expect("release recovery");
         wait_for_audio_ready(&mut controller);
+        assert_eq!(
+            controller
+                .active_audio_device()
+                .and_then(|device| device.id.as_deref()),
+            Some("test:recovered"),
+            "recovery must refresh active-device metadata"
+        );
         let recovered = last_recovery_control(&controls);
         for _ in 0..4 {
             recovered.drain_frames(128);
@@ -9041,6 +9434,200 @@ mod tests {
             "Stop then Play must restart from the beginning, got {:?} (stale {:?})",
             controller.position(),
             stale_position
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn explicit_output_switch_preserves_playing_entry_position_queue_and_audio() {
+        let dir = TempDir::new("output-switch-playing");
+        let fx = fixtures(&dir);
+        let (mut controller, old_control) = boot(&dir);
+        scanned(&mut controller, &old_control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &old_control, |c, _| {
+            c.audio_diagnostics().played_frames > 4_000
+        });
+        let entry = controller.current_queue_entry_id();
+        let position = controller.position();
+        let queue_len = controller.queue_len();
+        let history_len = controller.playback_history().len();
+        let total_plays = controller.playback_history().total_plays();
+        let (opened, new_control) = opened_test_output(44_100, 1, "test:output-b");
+        controller
+            .install_audio_output(opened)
+            .expect("switch output");
+
+        assert_eq!(controller.audio_status(), &AudioStatus::Ready);
+        assert_eq!(controller.selected_audio_device(), Some("test:output-b"));
+        assert_eq!(
+            controller
+                .active_audio_device()
+                .and_then(|device| device.id.as_deref()),
+            Some("test:output-b")
+        );
+        assert_eq!(controller.current_id(), Some(a));
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        assert_eq!(controller.queue_len(), queue_len);
+        assert_eq!(controller.playback_history().len(), history_len);
+        assert!(
+            controller.position().abs_diff(position) < Duration::from_millis(30),
+            "position moved unexpectedly: {:?} -> {:?}",
+            position,
+            controller.position()
+        );
+        assert!(!old_control.is_running(), "old output stream was stopped");
+        drive(&mut controller, &new_control, |_, _| {
+            new_control
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001)
+        });
+        assert!(
+            new_control
+                .captured()
+                .iter()
+                .any(|sample| sample.abs() > 0.001),
+            "new output must receive playback samples"
+        );
+        assert_eq!(
+            controller.playback_history().total_plays(),
+            total_plays,
+            "device switching must not create another play"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn output_switch_after_shutdown_is_rejected_without_publishing_engine() {
+        let dir = TempDir::new("output-switch-shutdown");
+        let (mut controller, _control) = boot(&dir);
+        controller.shutdown_in_place();
+        let (opened, new_control) = opened_test_output(44_100, 1, "test:after-shutdown");
+        assert!(controller.install_audio_output(opened).is_err());
+        assert!(!new_control.is_running());
+    }
+
+    #[cfg(feature = "cpal")]
+    #[test]
+    fn missing_saved_output_starts_unavailable_without_silent_default_fallback() {
+        let startup = super::startup_audio(Some("not-a-device-id".to_owned()));
+        assert_eq!(startup.selected.as_deref(), Some("not-a-device-id"));
+        assert!(startup.active.is_none());
+        assert!(matches!(startup.status, AudioStatus::DeviceUnavailable(_)));
+        assert!(
+            startup
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("kept the selection")),
+            "{:?}",
+            startup.warning
+        );
+        startup.engine.shutdown();
+    }
+
+    #[test]
+    fn output_switch_preserves_paused_and_stopped_intent() {
+        let dir = TempDir::new("output-switch-paused");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let a = id_of(&controller, &fx.a);
+        controller.play_track(a);
+        drive(&mut controller, &control, |c, _| {
+            c.audio_diagnostics().played_frames > 2_000
+        });
+        controller.pause();
+        let paused_position = controller.position();
+        let (opened, paused_control) = opened_test_output(44_100, 1, "test:paused");
+        controller
+            .install_audio_output(opened)
+            .expect("paused switch");
+        assert_eq!(controller.player_state(), PlaybackState::Paused);
+        assert!(controller.position().abs_diff(paused_position) < Duration::from_millis(10));
+        for _ in 0..8 {
+            paused_control.drain_frames(256);
+            let _ = controller.poll();
+        }
+        assert!(
+            paused_control
+                .captured()
+                .iter()
+                .all(|sample| *sample == 0.0),
+            "a paused switch must not start audible playback"
+        );
+
+        controller.stop();
+        let (opened, stopped_control) = opened_test_output(44_100, 1, "test:stopped");
+        controller
+            .install_audio_output(opened)
+            .expect("stopped switch");
+        assert_eq!(controller.player_state(), PlaybackState::Stopped);
+        assert_eq!(controller.engine_loaded, None);
+        for _ in 0..4 {
+            stopped_control.drain_frames(256);
+            let _ = controller.poll();
+        }
+        assert!(
+            stopped_control
+                .captured()
+                .iter()
+                .all(|sample| *sample == 0.0),
+            "a stopped switch must not start playback"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn output_switch_rejects_active_recovery_and_keeps_selection_persisted() {
+        let dir = TempDir::new("output-switch-recovery");
+        let fx = fixtures(&dir);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fx.root.clone());
+        let (factory, release, _controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated loss before switch");
+        let entry = controller.current_queue_entry_id();
+        let (opened, _new_control) = opened_test_output(44_100, 1, "test:recovery-switch");
+        assert!(controller.install_audio_output(opened).is_err());
+        assert!(controller.audio_recovery_active());
+        assert_eq!(controller.current_queue_entry_id(), entry);
+        release.send(()).expect("release recovery");
+        wait_for_audio_ready(&mut controller);
+
+        let settings = dir.path().join("settings.json");
+        controller.load_settings_from_path(&settings);
+        let (opened, _new_control) = opened_test_output(44_100, 1, "test:persisted");
+        controller
+            .install_audio_output(opened)
+            .expect("persisted switch");
+        assert_eq!(
+            SettingsStore::load(&settings)
+                .audio_output_device
+                .as_deref(),
+            Some("test:persisted")
+        );
+        let (opened, _new_control) = opened_test_output(44_100, 1, "test:persisted");
+        // A handle is one-shot; the fresh handle above is intentionally
+        // dropped to verify failed consumption does not alter selection.
+        drop(opened);
+        assert_eq!(controller.selected_audio_device(), Some("test:persisted"));
+
+        let (default_engine, _default_control) = EngineHandle::spawn_null(44_100, 1);
+        controller
+            .install_audio_output(OpenedAudioOutput::from_test(
+                default_engine,
+                test_output_device("test:default", "System default", true),
+                None,
+            ))
+            .expect("switch to system default");
+        assert_eq!(controller.selected_audio_device(), None);
+        assert_eq!(
+            SettingsStore::load(&settings).audio_output_device,
+            None,
+            "system default clears the persisted explicit selection"
         );
         controller.shutdown();
     }
@@ -9169,7 +9756,7 @@ mod tests {
                     .lock()
                     .expect("recovery controls mutex")
                     .push(control);
-                Ok(engine)
+                Ok((engine, None))
             }
         });
         controller.enable_test_audio_recovery(factory);
@@ -9474,6 +10061,15 @@ mod tests {
         assert_eq!(controller.current_queue_entry_id(), entry);
         assert_eq!(controller.tracks().len(), track_count);
         controller.shutdown();
+    }
+
+    #[cfg(not(feature = "cpal"))]
+    #[test]
+    fn no_cpal_device_apis_report_unavailable_without_fake_devices() {
+        let error = super::enumerate_audio_output_devices().expect_err("no backend");
+        assert!(error.contains("no audio-output backend"), "{error}");
+        let error = super::open_audio_output(None).expect_err("no backend");
+        assert!(error.contains("no audio-output backend"), "{error}");
     }
 
     #[test]

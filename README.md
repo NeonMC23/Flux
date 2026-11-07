@@ -400,10 +400,38 @@ attempt fails, the UI reports the output as unavailable and exposes
 an explicit **Retry audio output** action in Library setup; Play also
 starts a fresh bounded retry. The GUI player bar distinguishes
 recovering, retryable failure and build-without-backend states, and
-transient error banners can be dismissed after reading them. Flux
-does not persist an explicit device choice, does not switch to a
-user-selected device, and does not claim gapless continuity across a
-device loss.
+transient error banners can be dismissed after reading them.
+
+Library setup now lists the current output device and available CPAL outputs.
+**Follow system default** remains a distinct policy; selecting a named device
+turns that backend ID into an explicit preference. Refreshing the list never
+changes the selection. Duplicate display names remain distinct by their
+backend IDs, and a device that cannot currently be opened is shown as
+unavailable rather than silently chosen. Selecting a device opens it on a
+worker before stopping the previous stream; if opening fails, the previous
+output and playback remain active and the error is reported. A successful
+switch preserves the current queue entry/TrackId and playback intent, reapplies
+the delivered position, and does not add listening time. Because the new stream
+opens before the old one is stopped, exclusive-access backends may reject a
+same-device switch; Flux preserves the previous stream and reports it. Device
+switching is a controlled interruption, not a claimed gapless transition.
+
+The explicit device ID is stored in `settings.json` using the backend-provided
+CPAL identifier, never a device handle or display name, and is written through
+the existing schema-protected atomic settings path. If that saved device is
+missing at startup, Flux keeps the explicit preference, starts in a truthful
+unavailable state and retries it through bounded recovery instead of silently
+falling back to another output; the user can choose the system default or
+another device in Library setup. Builds without CPAL expose no fake device
+list. The TUI reports the active/default policy and recovery guidance but keeps
+device selection in the GUI.
+
+On the Linux validation host (PulseAudio on PipeWire 1.6.9), CPAL enumerated 37
+output endpoints, identified `alsa:default` as the system default, opened it at
+48 kHz stereo, and completed a one-second WAV. Explicit initialization on a
+second endpoint (`alsa:pipewire`) also succeeded and completed playback; an
+invalid explicit ID failed without falling back. These were stream
+initialization/completion checks, not listening or acoustic-switching tests.
 
 One build prerequisite joined with MP3 support: the minimp3 decoder
 is C (bundled by the `rmp3` crate) and is compiled at build time, so
@@ -427,6 +455,8 @@ file (e.g. an MP3 named `.ogg`) errors instead of crashing, and that
 with all output devices disabled the app reports the missing device.
 A minimal no-UI check is also available:
 `cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.mp3`.
+Append an enumerated `host:device-id` argument to verify explicit device
+initialization instead of the default output.
 
 An automated low-amplitude Linux CPAL probe validated real 48 kHz stereo
 device delivery, pause/seek/stop/restart, gapless/crossfade transitions and

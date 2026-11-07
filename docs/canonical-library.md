@@ -732,12 +732,17 @@ that is normally `$XDG_CONFIG_HOME/flux/settings.json` (falling back to
   "crossfade": {
     "enabled": false,
     "duration_ms": 3000
+  },
+  "audio_output": {
+    "device_id": "alsa:hw:1,0"
   }
 }
 ```
 
-Missing and empty files use defaults. Unknown root/crossfade fields are
-preserved when crossfade is saved. Invalid durations are clamped or replaced by
+`audio_output` is optional; omitting `device_id` means follow the system
+default. The ID is a backend-provided CPAL identifier, never a handle or display
+name. Missing and empty files use defaults. Unknown root/crossfade/audio-output
+fields are preserved when either known setting is saved. Invalid durations are clamped or replaced by
 the default; malformed or unreadable files are preserved byte-for-byte, reported
 to the user, and write-protected for the session, matching the queue/history
 persistence convention. Saves use a sibling temporary file, flush, and atomic
@@ -819,6 +824,7 @@ from what remains structurally or physically unverified.
 | M2 Artist/Album/Track entities, synchronization, artwork inheritance, enriched atomic import and GUI/TUI navigation | Confirmed by deterministic canonical/Controller/GUI/TUI state, transaction-failure, artwork round-trip/move/delete and import conflict tests; no real mouse/window-manager or terminal-emulator interaction audit |
 | M3 optional Album membership, standalone artwork/lyrics/member transitions and bulk import enrichment | Confirmed by deterministic canonical/Controller/GUI/TUI tests for standalone import, attach/detach/move, resource preservation, empty-Album retention, shared Artist/Album/artwork plus individual overrides, and invalid Album-artwork rejection; no real multi-candidate GUI mouse interaction audit |
 | M4 playback/device UX hardening: explicit recovery retry and Stop/Play recovery position reset | Confirmed by deterministic Controller recovery tests and GUI/TUI message/help tests; actual CPAL device-open and short real-output smoke checks were run, but no listening/acoustic or physical hotplug validation |
+| M5 output enumeration, explicit selection, safe switching, persistence and recovery policy | Confirmed by deterministic fake-engine Controller/GUI/settings tests plus real Linux CPAL enumeration and explicit stream initialization on two backend IDs; no real in-window GUI switching, listening validation, physical hotplug, or Windows/macOS runtime validation |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
@@ -828,7 +834,7 @@ from what remains structurally or physically unverified.
 | Real-time callback content (ring pop, gain, silence) | Audited structurally, exercised through `NullOutput`, and exercised through a real CPAL stream on one Linux host |
 | CPAL stream construction, sample formats, error propagation | Real 48 kHz stereo stream validated on one Linux/PipeWire host; fatal/notice classification tested deterministically; no physical hotplug validation |
 | Device callback-size compatibility | Adaptive gate verified with simulated and real callbacks from 256 to 16,384 frames on one Linux host; sizes above that, hardware callback-size changes and callbacks larger than the output ring are unverified |
-| Device loss and bounded recovery | Default-output recovery implemented and tested with injected stream failures, blocked opens, repeated loss, pause/stop/reselection, configuration change and bounded exhaustion; no physical unplug or audio-server restart tested; no explicit device selection |
+| Device enumeration, selection, loss and bounded recovery | Enumeration, default identification, explicit-device opening and selection switching are implemented with fake-engine/Controller tests plus real Linux CPAL endpoint checks; recovery covers injected losses, blocked opens, repeated loss, pause/stop/reselection, configuration change and bounded exhaustion. No physical unplug, audio-server restart, Windows/macOS runtime or real in-window device switch was tested |
 | Hardware underrun, latency and long-duration CPU/memory | Real callback-size runs, a ~60 s probe and post-fix 5/30-minute runs reported zero underruns; latency and multi-hour CPU/memory not measured |
 | Non-finite decoded samples | Confirmed defect fixed at conversion boundary |
 
@@ -1170,10 +1176,10 @@ Implemented semantics:
   an atomic failure flag, so it cannot reopen on the dead stream. Repeated
   fatal reports increment `output_errors` but do not flood the event channel or
   restart recovery.
-- Flux's normal default-device entry point (`Controller::open_default`) enables
-  bounded recovery. Caller-supplied engines keep the prior explicit-failure
-  behavior. No device-selection preference exists; recovery always opens the
-  current default output device.
+- Flux's normal entry point (`Controller::open_default`) enables bounded
+  recovery. Caller-supplied engines keep the prior explicit-failure behavior.
+  Recovery opens the current explicit selection when one exists, otherwise the
+  current system default; it never substitutes a different device silently.
 - A fatal output failure preserves the `Player` queue, current `TrackId` and
   stable `QueueEntryId`, and playback intent (`Playing`/`Paused`/`Stopped`)
   while `AudioStatus::Recovering` separately reports that no valid output is
@@ -1230,16 +1236,44 @@ re-prebuffers. No physical disconnect, default-device switch or audio-server
 restart was performed; recovery itself was exercised only with injected
 backends.
 
-Known lifecycle limits: Flux supports only the backend default output device and
-does not persist a device identifier or offer device selection. CPAL/PipeWire
-may report `DeviceChanged` and reroute a default-device stream; that is
-surfaced as a notice and the stream is retained. On backends such as Linux ALSA
-that do not follow default-device changes, a still-valid stream continues on
-the old device; Flux does not poll and reopen just because the system default
-changed. Recovery therefore occurs after a reported fatal stream failure, not
-proactively. Engine diagnostics are per engine instance and reset when the
-failed engine is replaced; Controller status/last-error events retain the
-lifecycle outcome. Recovery restores the last delivered position, not the
+M5 device management uses CPAL's backend `DeviceId` where the host provides it.
+`flux-audio` enumerates output devices and reports `{id, name, is_default,
+can_open}` without exposing CPAL objects. Display names may duplicate; IDs are
+the selection/persistence identity. Enumeration skips devices that disappear
+during inspection rather than inventing a name-based identity. `can_open`
+reflects a successful default-output-config query, not a full stream test.
+
+The GUI Library setup section shows the active device, whether policy is
+**system default** or an explicit selection, the refreshed device list, and
+switching errors. Selecting a device (or following default) opens a fresh engine
+on a background thread first. Only after that succeeds does the Controller stop
+the previous stream and install the new one; a failed open leaves the previous
+engine, queue, entry and playback intent untouched. The install path preserves
+TrackId/QueueEntryId, playback state and delivered position, clears stale audio
+errors, and performs no extra listening credit. If recovery is actively opening
+a device, a second switch is refused. Because the new stream is opened while the
+old one remains alive, a backend that requires exclusive access to a device may
+reject switching to that same device; Flux then keeps the previous stream and
+reports the initialization error. This is a controlled interruption, not
+gapless switching.
+
+Selection is persisted in `settings.json` under `audio_output.device_id` via the
+existing versioned atomic store; handles and display names are never persisted.
+Selecting system default removes the ID. At startup a saved ID is opened
+explicitly. If it is unavailable, Flux keeps the preference, starts with
+`AudioStatus::DeviceUnavailable`, and subjects it to bounded recovery; it does
+not silently replace the user's choice with the system default. The GUI can
+then select the default or another device, while TUI exposes status/policy and
+recovery guidance but keeps selection GUI-only.
+
+CPAL/PipeWire may report `DeviceChanged` and reroute a default-device stream;
+that is surfaced as a notice and the stream is retained. On backends such as
+Linux ALSA that do not follow default-device changes, a still-valid stream
+continues on the old device; Flux does not poll and reopen just because the
+system default changed. Recovery therefore occurs after a reported fatal stream
+failure, not proactively. Engine diagnostics are per engine instance and reset
+when the failed engine is replaced; Controller status/last-error events retain
+the lifecycle outcome. Recovery restores the last delivered position, not the
 elapsed wall-clock time during the outage, and never claims gapless continuity
 across the disconnection.
 

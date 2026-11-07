@@ -2148,6 +2148,12 @@ struct FluxReady {
     scope: FlowScope,
     seek_preview: Option<f32>,
     crossfade_preview: Option<u64>,
+    audio_devices: Vec<flux_app::AudioOutputDevice>,
+    audio_devices_loading: bool,
+    audio_devices_error: Option<String>,
+    audio_switch_token: u64,
+    audio_switch_pending: Option<String>,
+    audio_switch_error: Option<String>,
     show_setup: bool,
     queue_visible: bool,
     queue_overlay_open: bool,
@@ -2427,6 +2433,15 @@ enum Message {
     Stop,
     RetryAudioOutput,
     DismissNotice,
+    RefreshAudioDevices,
+    AudioDevicesLoaded(u64, Result<Vec<flux_app::AudioOutputDevice>, String>),
+    SelectAudioDevice(Option<String>),
+    AudioOutputOpened(
+        u64,
+        u64,
+        String,
+        Result<flux_app::OpenedAudioOutput, String>,
+    ),
     Next,
     Previous,
     CycleRepeat,
@@ -2460,7 +2475,9 @@ impl Message {
             | Self::ImportNativeFolderPicked(session, _)
             | Self::ImportPlanReady(session, _)
             | Self::ImportPrepared(session, _)
-            | Self::LyricsImportPicked(session, _) => Some(*session),
+            | Self::LyricsImportPicked(session, _)
+            | Self::AudioDevicesLoaded(session, _)
+            | Self::AudioOutputOpened(session, _, _, _) => Some(*session),
             _ => None,
         }
     }
@@ -2480,7 +2497,9 @@ impl Message {
             | Self::ImportNativeFolderPicked(current, _)
             | Self::ImportPlanReady(current, _)
             | Self::ImportPrepared(current, _)
-            | Self::LyricsImportPicked(current, _) => *current = session,
+            | Self::LyricsImportPicked(current, _)
+            | Self::AudioDevicesLoaded(current, _)
+            | Self::AudioOutputOpened(current, _, _, _) => *current = session,
             _ => {}
         }
         self
@@ -2570,6 +2589,12 @@ impl FluxReady {
             scope: FlowScope::default(),
             seek_preview: None,
             crossfade_preview: None,
+            audio_devices: Vec::new(),
+            audio_devices_loading: false,
+            audio_devices_error: None,
+            audio_switch_token: 0,
+            audio_switch_pending: None,
+            audio_switch_error: None,
             show_setup,
             queue_visible: true,
             queue_overlay_open: false,
@@ -3937,6 +3962,39 @@ impl FluxReady {
     fn toggle_setup(&mut self) {
         self.show_setup = !self.show_setup;
         self.page = 0;
+    }
+
+    fn refresh_audio_devices(&mut self) -> Task<Message> {
+        self.audio_devices_loading = true;
+        self.audio_devices_error = None;
+        let session = self.controller.library_session();
+        Task::perform(
+            async move { flux_app::enumerate_audio_output_devices() },
+            move |result| Message::AudioDevicesLoaded(session, result),
+        )
+    }
+
+    fn select_audio_device(&mut self, target: Option<String>, label: String) -> Task<Message> {
+        if matches!(self.controller.audio_status(), AudioStatus::Recovering(_)) {
+            self.audio_switch_error =
+                Some("Wait for the current audio recovery attempt to finish.".to_owned());
+            return Task::none();
+        }
+        if self.controller.audio_status().is_ready()
+            && self.controller.selected_audio_device().map(str::to_owned) == target
+        {
+            self.lifecycle_msg = Some(format!("{label} is already the active output."));
+            return Task::none();
+        }
+        self.audio_switch_token = self.audio_switch_token.wrapping_add(1);
+        let token = self.audio_switch_token;
+        self.audio_switch_pending = Some(label.clone());
+        self.audio_switch_error = None;
+        let session = self.controller.library_session();
+        Task::perform(
+            async move { flux_app::open_audio_output(target) },
+            move |result| Message::AudioOutputOpened(session, token, label, result),
+        )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -6628,7 +6686,12 @@ impl FluxReady {
                 self.page = 0;
                 self.show_setup = false;
             }
-            Message::ToggleSetup => self.toggle_setup(),
+            Message::ToggleSetup => {
+                self.toggle_setup();
+                if self.show_setup {
+                    return self.refresh_audio_devices();
+                }
+            }
             Message::ToggleQueue => self.toggle_queue(),
             Message::PagePrev => {
                 self.page = self.page.saturating_sub(1);
@@ -6748,6 +6811,72 @@ impl FluxReady {
             Message::DismissNotice => {
                 self.controller.dismiss_notice();
                 self.lifecycle_msg = None;
+            }
+            Message::RefreshAudioDevices => return self.refresh_audio_devices(),
+            Message::AudioDevicesLoaded(_, result) => {
+                self.audio_devices_loading = false;
+                match result {
+                    Ok(devices) => {
+                        self.audio_devices = devices;
+                        self.audio_devices_error = None;
+                    }
+                    Err(error) => {
+                        // Keep the previous list: a transient enumeration
+                        // failure must not invalidate an explicit selection.
+                        self.audio_devices_error = Some(error);
+                    }
+                }
+            }
+            Message::SelectAudioDevice(target) => {
+                let label = target
+                    .as_ref()
+                    .and_then(|id| {
+                        self.audio_devices
+                            .iter()
+                            .find(|device| device.id.as_deref() == Some(id.as_str()))
+                            .map(|device| {
+                                let duplicate = self
+                                    .audio_devices
+                                    .iter()
+                                    .filter(|candidate| candidate.name == device.name)
+                                    .count()
+                                    > 1;
+                                if duplicate {
+                                    format!(
+                                        "{} [{}]",
+                                        device.name,
+                                        device.id.as_deref().unwrap_or("no stable id")
+                                    )
+                                } else {
+                                    device.name.clone()
+                                }
+                            })
+                    })
+                    .unwrap_or_else(|| "System default output".to_owned());
+                return self.select_audio_device(target, label);
+            }
+            Message::AudioOutputOpened(_, token, label, result) => {
+                if token != self.audio_switch_token {
+                    return Task::none();
+                }
+                self.audio_switch_pending = None;
+                match result {
+                    Ok(opened) => match self.controller.install_audio_output(opened) {
+                        Ok(()) => {
+                            self.audio_switch_error = None;
+                            self.lifecycle_msg = Some(format!("Audio output switched to {label}."));
+                            return self.refresh_audio_devices();
+                        }
+                        Err(error) => {
+                            self.audio_switch_error = Some(error);
+                        }
+                    },
+                    Err(error) => {
+                        self.audio_switch_error = Some(format!(
+                            "Could not open {label}; the previous output remains active: {error}"
+                        ));
+                    }
+                }
             }
             Message::Next => {
                 self.seek_preview = None;
@@ -14137,7 +14266,7 @@ impl FluxReady {
                         .on_press(Message::RetryAudioOutput),
                     text(
                         "Automatic recovery attempts were exhausted. Retry reopens the \
-                         current default device; Play is not required.",
+                         current selected device; Play is not required.",
                     )
                     .size(9)
                     .color(MUTED),
@@ -14145,6 +14274,172 @@ impl FluxReady {
                 .spacing(8)
                 .align_y(Alignment::Center),
             );
+        }
+        let active = self.controller.active_audio_device();
+        let active_id = active.and_then(|device| device.id.as_deref());
+        let selected_id = self.controller.selected_audio_device();
+        let active_label = active.map_or_else(
+            || "No active output device is reported.".to_owned(),
+            |device| {
+                let duplicate = self
+                    .audio_devices
+                    .iter()
+                    .filter(|candidate| candidate.name == device.name)
+                    .count()
+                    > 1;
+                format!(
+                    "Active: {}{}{}",
+                    device.name,
+                    if duplicate {
+                        device
+                            .id
+                            .as_deref()
+                            .map_or_else(String::new, |id| format!(" [{id}]"))
+                    } else {
+                        String::new()
+                    },
+                    if device.is_default {
+                        " · system default"
+                    } else {
+                        " · explicit device"
+                    }
+                )
+            },
+        );
+        audio_status = audio_status.push(text(active_label).size(10).color(TEXT));
+        audio_status = audio_status.push(
+            text(if selected_id.is_some() {
+                "Policy: explicit device selection. A disappearing device is not silently replaced."
+            } else {
+                "Policy: follow the current system default output."
+            })
+            .size(9)
+            .color(MUTED),
+        );
+        if let Some(selected) = selected_id
+            && !self
+                .audio_devices
+                .iter()
+                .any(|device| device.id.as_deref() == Some(selected))
+            && !self.audio_devices_loading
+        {
+            audio_status = audio_status.push(
+                text(format!(
+                    "Selected output {selected} is not currently enumerated. It is retained; retry, refresh, or choose another output."
+                ))
+                .size(9)
+                .color(DANGER),
+            );
+        }
+        audio_status = audio_status.push(
+            row![
+                button(text("Refresh devices").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::RefreshAudioDevices),
+                if self.audio_devices_loading {
+                    Element::from(text("Refreshing device list…").size(9).color(ACCENT))
+                } else {
+                    Element::from(text("").size(9))
+                },
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        if let Some(error) = &self.audio_devices_error {
+            audio_status = audio_status.push(text(error).size(9).color(DANGER));
+        }
+        if let Some(pending) = &self.audio_switch_pending {
+            audio_status = audio_status.push(
+                text(format!("Switching to {pending}… playback continues on the current output until the new device opens."))
+                    .size(9)
+                    .color(ACCENT),
+            );
+        }
+        if let Some(error) = &self.audio_switch_error {
+            audio_status = audio_status.push(text(error).size(9).color(DANGER));
+        }
+        let switch_enabled = self.audio_switch_pending.is_none()
+            && !matches!(self.controller.audio_status(), AudioStatus::Recovering(_));
+        audio_status = audio_status.push(
+            row![
+                button(text("Follow system default").size(10))
+                    .style(nav_style(selected_id.is_none()))
+                    .padding([6, 9])
+                    .on_press_maybe(switch_enabled.then_some(Message::SelectAudioDevice(None))),
+                text(if selected_id.is_none() {
+                    "current policy"
+                } else {
+                    "select default"
+                })
+                .size(8)
+                .color(MUTED),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        );
+        if self.audio_devices.is_empty() {
+            if !self.audio_devices_loading {
+                audio_status = audio_status.push(
+                    text("No output devices are listed. Refreshing is safe; a no-CPAL build does not expose fake devices.")
+                        .size(9)
+                        .color(MUTED),
+                );
+            }
+        } else {
+            let mut name_counts = BTreeMap::new();
+            for device in &self.audio_devices {
+                *name_counts.entry(device.name.clone()).or_insert(0usize) += 1;
+            }
+            let mut list = column![].spacing(3);
+            for device in &self.audio_devices {
+                let duplicate = name_counts.get(&device.name).copied().unwrap_or(0) > 1;
+                let label = format!(
+                    "{}{}{}{}",
+                    device.name,
+                    if duplicate {
+                        device
+                            .id
+                            .as_deref()
+                            .map_or_else(String::new, |id| format!(" · {id}"))
+                    } else {
+                        String::new()
+                    },
+                    if device.is_default { " · default" } else { "" },
+                    if device.id.as_deref() == active_id {
+                        " · active"
+                    } else {
+                        ""
+                    }
+                );
+                let label = if device.id.is_none() {
+                    format!("{label} · no stable device id")
+                } else {
+                    label
+                };
+                let selectable = switch_enabled
+                    && device.can_open
+                    && device.id.is_some()
+                    && device.id.as_deref() != selected_id;
+                let select_id = device.id.clone();
+                list = list.push(
+                    button(
+                        text(if device.can_open {
+                            label
+                        } else {
+                            format!("{label} · unavailable")
+                        })
+                        .size(10),
+                    )
+                    .width(Length::Fill)
+                    .style(nav_style(
+                        device.id.as_deref() == active_id || device.id.as_deref() == selected_id,
+                    ))
+                    .padding([6, 8])
+                    .on_press_maybe(selectable.then_some(Message::SelectAudioDevice(select_id))),
+                );
+            }
+            audio_status = audio_status.push(list);
         }
         setup = setup.push(setup_card(
             "AUDIO OUTPUT",
@@ -15498,6 +15793,12 @@ mod tests {
             scope: FlowScope::default(),
             seek_preview: None,
             crossfade_preview: None,
+            audio_devices: Vec::new(),
+            audio_devices_loading: false,
+            audio_devices_error: None,
+            audio_switch_token: 0,
+            audio_switch_pending: None,
+            audio_switch_error: None,
             show_setup: false,
             queue_visible: true,
             queue_overlay_open: false,
@@ -15798,6 +16099,107 @@ mod tests {
             gui.controller.audio_status(),
             AudioStatus::Recovering(_)
         ));
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn audio_device_list_and_failed_switch_preserve_previous_output_state() {
+        let dir = TempDir::new("gui-audio-devices");
+        let mut gui = gui(&dir);
+        let devices = vec![
+            flux_app::AudioOutputDevice {
+                id: Some("test:one".to_owned()),
+                name: "Speakers".to_owned(),
+                is_default: true,
+                can_open: true,
+            },
+            flux_app::AudioOutputDevice {
+                id: Some("test:two".to_owned()),
+                name: "Speakers".to_owned(),
+                is_default: false,
+                can_open: true,
+            },
+        ];
+        send(
+            &mut gui,
+            Message::AudioDevicesLoaded(0, Ok(devices.clone())),
+        );
+        assert_eq!(gui.audio_devices, devices);
+        assert!(!gui.audio_devices_loading);
+        assert!(gui.audio_devices_error.is_none());
+        gui.show_setup = true;
+        let _ = gui.setup_view();
+
+        let before = gui.controller.audio_status().clone();
+        send(
+            &mut gui,
+            Message::SelectAudioDevice(Some("test:two".to_owned())),
+        );
+        assert_eq!(gui.audio_switch_token, 1);
+        assert!(
+            gui.audio_switch_pending
+                .as_deref()
+                .is_some_and(|label| label.contains("Speakers") && label.contains("test:two"))
+        );
+        let token = gui.audio_switch_token;
+        send(
+            &mut gui,
+            Message::AudioOutputOpened(
+                0,
+                token,
+                "Speakers".to_owned(),
+                Err("simulated open failure".to_owned()),
+            ),
+        );
+        assert!(gui.audio_switch_pending.is_none());
+        assert!(
+            gui.audio_switch_error
+                .as_deref()
+                .is_some_and(|error| error.contains("previous output remains active"))
+        );
+        assert_eq!(gui.controller.audio_status(), &before);
+        assert_eq!(
+            gui.audio_devices, devices,
+            "failure preserves the device list"
+        );
+
+        send(
+            &mut gui,
+            Message::SelectAudioDevice(Some("test:one".to_owned())),
+        );
+        let stale_token = gui.audio_switch_token;
+        send(&mut gui, Message::SelectAudioDevice(None));
+        gui.audio_switch_error = None;
+        send(
+            &mut gui,
+            Message::AudioOutputOpened(
+                0,
+                stale_token,
+                "stale".to_owned(),
+                Err("stale result".to_owned()),
+            ),
+        );
+        assert!(
+            gui.audio_switch_error.is_none(),
+            "a stale open result must not alter the newest switch"
+        );
+
+        send(
+            &mut gui,
+            Message::AudioDevicesLoaded(0, Err("simulated enumeration failure".to_owned())),
+        );
+        assert_eq!(
+            gui.audio_devices, devices,
+            "a failed refresh must preserve the previous valid list"
+        );
+        assert!(
+            gui.audio_devices_error
+                .as_deref()
+                .is_some_and(|error| error.contains("enumeration failure"))
+        );
+        send(&mut gui, Message::AudioDevicesLoaded(0, Ok(Vec::new())));
+        assert!(gui.audio_devices.is_empty());
+        let _ = gui.setup_view();
         gui.controller.shutdown();
     }
 

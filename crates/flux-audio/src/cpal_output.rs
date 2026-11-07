@@ -15,11 +15,13 @@
 //! allocates, or performs I/O. Fatal stream errors and nonfatal route
 //! notices are classified for the engine's lifecycle policy.
 
+use std::str::FromStr;
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig};
 
 use crate::engine::EngineError;
-use crate::output::{FillCallback, OutputBackend, OutputConfig, OutputIssue};
+use crate::output::{FillCallback, OutputBackend, OutputConfig, OutputDeviceInfo, OutputIssue};
 
 /// Frames handed to the engine per scratch window. Larger device buffers
 /// are processed as multiple frame-aligned chunks without allocating.
@@ -29,6 +31,7 @@ const CALLBACK_CHUNK_FRAMES: usize = 4_096;
 pub struct CpalOutput {
     device: cpal::Device,
     supported: SupportedStreamConfig,
+    info: OutputDeviceInfo,
     stream: Option<cpal::Stream>,
 }
 
@@ -42,16 +45,69 @@ impl CpalOutput {
     /// [`EngineError::Output`] when no default output device exists or
     /// the device offers no usable configuration.
     pub fn open_default() -> Result<Self, EngineError> {
+        Self::open_device(None)
+    }
+
+    /// Opens an explicitly identified output device, or the current system
+    /// default when `device_id` is `None`.
+    ///
+    /// Selection never falls back implicitly: an unknown or disconnected ID is
+    /// reported as an error so the caller can preserve its previous output.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Output`] when no device is available, the selected ID is
+    /// missing/disconnected, or the device has no usable configuration.
+    pub fn open_device(device_id: Option<&str>) -> Result<Self, EngineError> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or_else(|| {
-            EngineError::Output("no default audio output device is available".to_owned())
-        })?;
+        let default_id = host
+            .default_output_device()
+            .and_then(|device| device.id().ok())
+            .map(|id| id.to_string());
+        let device = match device_id {
+            Some(id) => {
+                let parsed = cpal::DeviceId::from_str(id).map_err(|error| {
+                    EngineError::Output(format!("invalid audio device identifier {id:?}: {error}"))
+                })?;
+                host.device_by_id(&parsed).ok_or_else(|| {
+                    EngineError::Output(format!(
+                        "selected audio output device is unavailable: {id}"
+                    ))
+                })?
+            }
+            None => host.default_output_device().ok_or_else(|| {
+                EngineError::Output("no default audio output device is available".to_owned())
+            })?,
+        };
         let supported = select_config(&device)?;
+        let id = device.id().ok().map(|id| id.to_string());
+        let is_default = match (&id, &default_id) {
+            (Some(id), Some(default)) => id == default,
+            _ => device_id.is_none(),
+        };
+        let name = device
+            .description()
+            .map(|description| description.name().to_owned())
+            .or_else(|_| device.id().map(|id| id.id().to_owned()))
+            .unwrap_or_else(|_| device.to_string());
+        let info = OutputDeviceInfo {
+            id,
+            name,
+            is_default,
+            can_open: true,
+        };
         Ok(Self {
             device,
             supported,
+            info,
             stream: None,
         })
+    }
+
+    /// Metadata describing the opened device.
+    #[must_use]
+    pub fn device_info(&self) -> OutputDeviceInfo {
+        self.info.clone()
     }
 
     fn build<T>(
@@ -193,6 +249,52 @@ fn select_config(device: &cpal::Device) -> Result<SupportedStreamConfig, EngineE
         }
     }
     Ok(default)
+}
+
+/// Enumerates output devices from the current CPAL host. Names may duplicate;
+/// callers must identify entries by `OutputDeviceInfo::id`, when present.
+///
+/// # Errors
+///
+/// [`EngineError::Output`] when the host cannot enumerate devices.
+pub fn list_output_devices() -> Result<Vec<OutputDeviceInfo>, EngineError> {
+    let host = cpal::default_host();
+    let default_id = host
+        .default_output_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string());
+    let devices = host.output_devices().map_err(|error| {
+        EngineError::Output(format!("could not enumerate output devices: {error}"))
+    })?;
+    let mut result = Vec::new();
+    for device in devices {
+        let Ok(id) = device.id() else {
+            // A device that disappeared during enumeration is omitted rather
+            // than inventing a name-based identity.
+            continue;
+        };
+        let id = id.to_string();
+        let name = device
+            .description()
+            .map(|description| description.name().to_owned())
+            .or_else(|_| device.id().map(|device_id| device_id.id().to_owned()))
+            .unwrap_or_else(|_| device.to_string());
+        let can_open = device.default_output_config().is_ok();
+        result.push(OutputDeviceInfo {
+            is_default: default_id.as_deref() == Some(id.as_str()),
+            id: Some(id),
+            name,
+            can_open,
+        });
+    }
+    result.sort_by(|left, right| {
+        right
+            .is_default
+            .cmp(&left.is_default)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(result)
 }
 
 #[cfg(test)]

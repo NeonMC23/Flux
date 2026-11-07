@@ -71,6 +71,8 @@ pub struct LoadedSettings {
     pub store: SettingsStore,
     /// Crossfade values recovered from the document.
     pub crossfade: CrossfadeSettings,
+    /// Persisted explicit output-device ID, or `None` for system default.
+    pub audio_output_device: Option<String>,
     /// A malformed/unreadable file diagnostic. The original file is left
     /// untouched and `store.write_protected()` is true.
     pub warning: Option<String>,
@@ -153,6 +155,7 @@ impl SettingsStore {
             }
         }
         let crossfade = recover_crossfade(root.get("crossfade"));
+        let audio_output_device = recover_audio_output_device(root.get("audio_output"));
         LoadedSettings {
             store: Self {
                 path,
@@ -160,6 +163,7 @@ impl SettingsStore {
                 write_protected: false,
             },
             crossfade,
+            audio_output_device,
             warning: None,
         }
     }
@@ -176,6 +180,7 @@ impl SettingsStore {
                 write_protected: false,
             },
             crossfade,
+            audio_output_device: None,
             warning,
         }
     }
@@ -188,6 +193,7 @@ impl SettingsStore {
                 write_protected: true,
             },
             crossfade,
+            audio_output_device: None,
             warning: Some(warning),
         }
     }
@@ -238,6 +244,59 @@ impl SettingsStore {
         self.document = document;
         Ok(())
     }
+
+    /// Atomically updates only the explicit audio-output preference while
+    /// preserving crossfade values and unknown fields. `None` selects the
+    /// system default and removes the stored device ID.
+    pub fn save_audio_output_device(
+        &mut self,
+        device_id: Option<&str>,
+    ) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let mut root = match self.document.take() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let output = root
+            .entry("audio_output")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !output.is_object() {
+            *output = Value::Object(Map::new());
+        }
+        let output = output.as_object_mut().expect("object inserted");
+        match device_id {
+            Some(device_id) => {
+                output.insert("device_id".to_owned(), Value::from(device_id));
+            }
+            None => {
+                output.remove("device_id");
+            }
+        }
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+}
+
+fn recover_audio_output_device(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("device_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|device| !device.is_empty())
+        .map(str::to_owned)
 }
 
 fn recover_crossfade(value: Option<&Value>) -> CrossfadeSettings {
@@ -453,6 +512,47 @@ mod tests {
             assert_eq!(loaded.crossfade, defaults());
             assert!(loaded.warning.is_none());
         }
+    }
+
+    #[test]
+    fn audio_output_selection_round_trips_without_resetting_crossfade() {
+        let dir = TempDir::new("audio-output");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{
+                "version": 1,
+                "crossfade": {"enabled": true, "duration_ms": 4200},
+                "audio_output": {"device_id": "alsa:hw:0,0", "label": "desk"}
+            }"#,
+        )
+        .expect("seed settings");
+        let loaded = SettingsStore::load(&path);
+        assert_eq!(loaded.audio_output_device.as_deref(), Some("alsa:hw:0,0"));
+        assert_eq!(loaded.crossfade.duration_ms, 4200);
+        let mut store = loaded.store;
+        store
+            .save_audio_output_device(Some("alsa:hw:1,0"))
+            .expect("save selected output");
+        let document: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(document["audio_output"]["device_id"], "alsa:hw:1,0");
+        assert_eq!(document["audio_output"]["label"], "desk");
+        assert_eq!(document["crossfade"]["enabled"], true);
+        assert_eq!(document["crossfade"]["duration_ms"], 4200);
+
+        store
+            .save_audio_output_device(None)
+            .expect("save system default");
+        let document: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert!(document["audio_output"].get("device_id").is_none());
+        assert_eq!(document["audio_output"]["label"], "desk");
+        assert_eq!(
+            SettingsStore::load(&path).audio_output_device,
+            None,
+            "system default is the absence of an explicit selection"
+        );
     }
 
     #[test]

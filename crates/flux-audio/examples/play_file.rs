@@ -9,7 +9,11 @@
 //!
 //! ```sh
 //! cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.flac
+//! cargo run -p flux-audio --features cpal --example play_file -- /path/to/file.flac alsa:hw:1,0
 //! ```
+//!
+//! The optional second argument selects an enumerated device ID; otherwise the
+//! current system default is used.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,14 +22,38 @@ use flux_audio::engine::{EngineEvent, EngineHandle};
 use flux_core::TrackId;
 
 fn main() -> std::process::ExitCode {
-    let Some(path) = std::env::args_os().nth(1) else {
-        eprintln!("usage: play_file <audio-file (wav|flac|mp3|aac|ogg|oga|opus|m4a|m4b|mp4)>");
+    let mut args = std::env::args_os().skip(1);
+    let Some(path) = args.next() else {
+        eprintln!(
+            "usage: play_file <audio-file (wav|flac|mp3|aac|ogg|oga|opus|m4a|m4b|mp4)> [device-id]"
+        );
         return std::process::ExitCode::FAILURE;
     };
     let path = PathBuf::from(path);
+    let requested_device = args
+        .next()
+        .map(|value| value.to_string_lossy().into_owned());
 
-    let engine = match EngineHandle::spawn_cpal_default() {
-        Ok(engine) => engine,
+    match flux_audio::cpal_output::list_output_devices() {
+        Ok(devices) => {
+            println!("detected {} output device(s):", devices.len());
+            for device in &devices {
+                println!(
+                    "  {}{}{}",
+                    device.name,
+                    device
+                        .id
+                        .as_deref()
+                        .map_or_else(String::new, |id| format!(" [{id}]")),
+                    if device.is_default { " · default" } else { "" }
+                );
+            }
+        }
+        Err(error) => println!("device enumeration failed: {error}"),
+    }
+
+    let (engine, active) = match EngineHandle::spawn_cpal_device(requested_device.as_deref()) {
+        Ok(pair) => pair,
         Err(err) => {
             eprintln!("could not open audio output: {err}");
             return std::process::ExitCode::FAILURE;
@@ -33,7 +61,9 @@ fn main() -> std::process::ExitCode {
     };
     let config = engine.output_config();
     println!(
-        "output: {} Hz, {} channel(s); playing {}",
+        "output: {} [{}] · {} Hz, {} channel(s); playing {}",
+        active.name,
+        active.id.as_deref().unwrap_or("no stable id"),
         config.sample_rate,
         config.channels,
         path.display()
