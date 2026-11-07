@@ -763,6 +763,39 @@ impl Tui {
                 self.controller.dismiss_notice();
                 self.lifecycle_msg = None;
             }
+            KeyCode::Char('f') => {
+                if let Some(id) = self.rows().get(self.cursor).copied() {
+                    match self.controller.toggle_track_favorite(id) {
+                        Ok(favorite) => {
+                            *self.rows_cache.borrow_mut() = None;
+                            self.lifecycle_msg = Some(format!(
+                                "Track {id} {} favorite.",
+                                if favorite { "marked" } else { "removed from" }
+                            ));
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a track to toggle favorite.".to_owned());
+                }
+            }
+            KeyCode::Char(digit @ '0'..='5') => {
+                if let Some(id) = self.rows().get(self.cursor).copied() {
+                    let rating = (digit != '0').then(|| digit.to_digit(10).unwrap_or(0) as u8);
+                    match self.controller.set_track_rating(id, rating) {
+                        Ok(()) => {
+                            *self.rows_cache.borrow_mut() = None;
+                            self.lifecycle_msg = Some(match rating {
+                                Some(stars) => format!("Rated track {id} {stars}★."),
+                                None => format!("Cleared rating for track {id}."),
+                            });
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a track to rate.".to_owned());
+                }
+            }
             KeyCode::Char('F') => {
                 self.favorites_only = !self.favorites_only;
                 self.cursor = 0;
@@ -2156,7 +2189,7 @@ fn format_lyrics_timestamp(timestamp_ms: u64) -> String {
 }
 
 fn normal_help() -> &'static str {
-    "↑/↓ move · Enter play · Space pause · / search · Q queue · ? help · q quit"
+    "↑/↓ move · Enter play · / search · f favorite · 0–5 rate · Q queue · ? help · q quit"
 }
 
 fn resource_label(state: Option<flux_app::ResourceState>) -> Option<&'static str> {
@@ -2312,7 +2345,9 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         String::new(),
         "NAVIGATION".to_owned(),
         "↑/↓ or k/j move · PgUp/PgDn · g/G first/last".to_owned(),
-        "/ search · Esc clears the active search · F favorites · c clears notice".to_owned(),
+        "/ search · Esc clears the active search · F favorites-only filter · c clears notice"
+            .to_owned(),
+        "f toggles the selected favorite · 0 clears rating · 1–5 sets stars".to_owned(),
         "Q queue view · ? help · q or Ctrl-C quits".to_owned(),
         String::new(),
         "PLAYBACK".to_owned(),
@@ -2688,6 +2723,23 @@ mod tests {
         let artist = tui.controller.track_artist_id(id).expect("inferred artist");
         let source_message = tui.lifecycle_msg.clone().expect("import summary");
         assert!(source_message.contains("1 added"), "{source_message}");
+
+        key(&mut tui, KeyCode::Char('f'));
+        assert!(
+            tui.controller
+                .rating(id)
+                .is_some_and(|rating| rating.favorite)
+        );
+        key(&mut tui, KeyCode::Char('4'));
+        assert_eq!(
+            tui.controller.rating(id).and_then(|rating| rating.rating),
+            Some(4)
+        );
+        key(&mut tui, KeyCode::Char('0'));
+        assert_eq!(
+            tui.controller.rating(id).and_then(|rating| rating.rating),
+            None
+        );
 
         key(&mut tui, KeyCode::Char('D'));
         assert_eq!(tui.mode, Mode::InfoView);
