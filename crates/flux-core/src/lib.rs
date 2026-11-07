@@ -29,7 +29,7 @@ pub use track::{Track, TrackId, TrackSource};
 pub const APP_NAME: &str = "Flux";
 
 /// Latest milestone whose implementation is complete and validated.
-pub const MILESTONE: &str = "M6";
+pub const MILESTONE: &str = "M8";
 
 /// Startup text shared by the GUI and TUI binaries.
 ///

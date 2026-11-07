@@ -257,7 +257,7 @@ with a compile-only macOS x86_64 cross-check. CPAL all-target compilation and
 CPAL GUI/TUI binary linking are checked on all matrix entries; no CI runner
 supplies a physical audio device.
 
-| Target | CI coverage defined | Locally executed in M7 | Runtime status |
+| Target | CI coverage defined | Locally executed in M7/M8 | Runtime status |
 |---|---|---|---|
 | Linux x86_64 | Native tests/build, Clippy, CPAL check | Yes | GUI/TUI startup, TUI PTY, CPAL enumeration, explicit stream open and short WAV completion; no listening/hotplug |
 | Linux ARM64 | Native tests/build, CPAL check | No | Unverified locally |
@@ -521,6 +521,9 @@ Search results are cached per query and catalogue generation to avoid rebuilding
 the same match set on every repaint. Results are limited to 20 items per entity
 type; the empty/partial query behavior and grouped type indicators stay
 deterministic. Artist and album renames explicitly invalidate the cache.
+Filtered/sorted TrackIds are cached by library session, catalogue and history
+generation, view/group, filters and sort key; only the visible page resolves
+Track metadata, so waveform ticks do not repeat full-library filtering.
 
 Track views support these filters:
 
@@ -867,6 +870,7 @@ from what remains structurally or physically unverified.
 | M5 output enumeration, explicit selection, safe switching, persistence and recovery policy | Confirmed by deterministic fake-engine Controller/GUI/settings tests plus real Linux CPAL enumeration and explicit stream initialization on two backend IDs; no real in-window GUI switching, listening validation, physical hotplug, or Windows/macOS runtime validation |
 | M6 consolidated UX polish: contextual back navigation, keyboard queue-follow consistency, centralized transient feedback, fixed-target import clarity and settings discoverability | Confirmed by deterministic GUI state/message tests plus GUI/TUI startup/PTY probes; no full manual mouse/keyboard walkthrough, screen-reader audit, or cross-platform UI validation |
 | M7 platform audit: path/reparse safety, TUI display width, CI matrix, target/architecture documentation | Linux native gates and runtime checks confirmed here; TUI width/combining/wide-character tests added; Windows/macOS targets were not installed and their CI jobs were not executed in this session, so those rows remain compile-contract/runtime-unverified |
+| M8 product hardening: settings retry safety, canonical creation lease, import-credit preservation, stale import/preload rejection, queue/history reconciliation, TUI editing/rating safety and row/artwork caching | Confirmed by deterministic settings, import, Controller, canonical, GUI and TUI regressions plus the six Linux gates; GUI/TUI runtime probes remain Linux-only and no new platform claim is made |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
@@ -1398,8 +1402,10 @@ favorites, rating, play count, last played, date added and duration with an
 ascending/descending toggle and stable TrackId tie-breaks. Filters include
 favorites, lyrics, artwork, release type and minimum rating. Reset clears all
 filters/direction. Remove/clear actions never delete tracks. The TUI exposes
-read-only `F` favorites-only browsing and `H` most-played history summaries;
-Dashboard/Smart Collections/rating/batch editing are GUI-only.
+`F` favorites-only browsing, `f` favorite toggling, `0–5` rating controls and
+`H` most-played history summaries. Dashboard, Smart Collections, global
+search/filtering, multi-selection and batch rating/favorite editing remain
+GUI-only.
 
 ### Lyrics
 
@@ -1503,9 +1509,9 @@ library/player thumbnails and contain fitting in detail pages. Missing, invalid
 or unsupported artwork falls back to the generated glyph; detail pages show the
 decode error without changing the managed file. Cache keys include owner,
 resource path, modification time and length, so replacement or removal
-invalidates the relevant preview. The cache is bounded to 128 Album previews
-(Artist/Track caches are independently keyed) and clears on pressure or library
-switch rather than growing without limit.
+invalidates the relevant preview. Album, Artist and Track previews each use the
+same 128-entry bound and clear on pressure or library switch rather than growing
+without limit.
 
 ### Native file selection
 
@@ -2139,9 +2145,11 @@ cleanup.
 5. Artwork selection has native PNG/JPEG/WebP pickers in addition to path entry.
    Decoding is bounded as documented above; animated formats and tag artwork
    are not supported.
-6. Ratings/favorites have canonical Controller APIs and persistence tests, but
-   only favorites are exposed in a batch GUI action; no dedicated rating screen
-   exists. Lyrics have dedicated GUI and read-only TUI views.
+6. Ratings/favorites are editable per Track in both the GUI and TUI, and the
+   GUI exposes rating filters, deterministic sorts, batch favorite/rating
+   actions and Highly Rated/Favorites collections. A dedicated full-screen
+   rating editor does not exist. Lyrics have dedicated GUI and read-only TUI
+   views.
 7. Automatic catalogue-backup rollback is not generation-consistent and is
    disabled; transaction-journal recovery is implemented and test-injected at
    every listed boundary. A recovery-required malformed journal requires manual
@@ -2171,10 +2179,11 @@ cleanup.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.
-17. Global search/filtering/multi-selection, playlist management and batch
-    playlist/favorite actions are GUI-only; the TUI retains its existing track
-    search and safe single-track operations. Range selection, library-to-playlist
-    drag, batch queue mutation and batch album moves are not implemented.
+17. Global artist/album/track search, filtering, multi-selection, playlist
+    management and batch playlist/favorite/rating actions are GUI-only; the TUI
+    retains track search and safe single-track operations, including per-Track
+    favorite and 0–5 rating edits. Range selection, library-to-playlist drag,
+    batch queue mutation and batch album moves are not implemented.
 18. Search is substring matching only, not fuzzy; results are capped at 20 per
     entity type. Track lists retain the existing page-based rendering rather than
     adding a new virtualization layer.

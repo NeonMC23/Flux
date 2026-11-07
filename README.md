@@ -27,8 +27,9 @@ remain fully functional without a placeholder Album. Import review supports
 multi-candidate selection, shared Artist/Album assignment and shared Album
 artwork while preserving per-Track overrides. Dedicated canonical playlist
 management and an integrated lyrics library/editor/karaoke system are
-implemented; rating UI remains incomplete and is called out below rather than
-presented as finished.
+implemented. Favorites and 0–5 star ratings are editable per Track in both the
+GUI and TUI, with GUI filters, deterministic rating sorts, batch rating and
+favorite actions, and dedicated Highly Rated/Favorites collections.
 
 ## Canonical storage
 
@@ -190,8 +191,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
 - **TUI:** `↑/↓` or `j/k` move, `Enter` plays, `Space` pauses, `s`
   stops, `n/p` skip, `+/-` volume, `R` repeat, and `q`/`Ctrl-C` quit; `Ctrl-C`
   quits from input, help, lyrics and queue views too. `/` searches tracks by
-  title, artist or album, `F` toggles favorites-only, and `H` reports local
-  play statistics. `?` opens the full scrollable command/safety reference
+  title, artist or album, `F` toggles the favorites-only filter, `f` toggles
+  the selected Track favorite, `0` clears its rating and `1–5` set stars, and
+  `H` reports local play statistics. `?` opens the full scrollable command/safety reference
   instead of relying on a clipped one-line help bar. The header identifies the
   active library, view, queue length, playback mode and active search/favorite
   filter; long paths/inputs are bounded and input lines keep their trailing
@@ -217,7 +219,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   require the GUI. The TUI never fabricates a destructive shortcut for them.
   Global artist/album/track search, filters, multi-selection, playlist
   management, lyrics editing/import/export/karaoke and batch playlist/favorite
-  actions also require the GUI.
+  actions also require the GUI; the TUI edits one selected Track's favorite and
+  rating at a time.
 
   `Q` opens a queue-entry view: `Enter` plays the selected stable
   `QueueEntryId`, `Delete`/`d` removes it, and `Ctrl+↑`/`Ctrl+↓` reorders it.
@@ -485,11 +488,12 @@ limitations.
 
 ## What does not exist yet
 
-Rating UI, EQ,
-frequency/spectrum visualizers, more codecs, folder watching, streaming,
-accounts, installers and updaters remain future work. External reference
-imports are intentionally rejected in canonical mode. Rating storage APIs exist
-but are not yet exposed as a screen.
+A dedicated full-screen rating editor, EQ, frequency/spectrum visualizers, more
+codecs, folder watching, streaming, accounts, installers and updaters remain
+future work. Favorites and ratings are nonetheless editable in place in both
+front-ends, and the GUI exposes rating filters, sorts, batch actions and Highly
+Rated/Favorites collections. External reference imports are intentionally
+rejected in canonical mode.
 
 Optional Album membership is canonical, but Album owner transfer and Track
 ownership transfer still require an Album destination; standalone ownership
@@ -547,9 +551,10 @@ so compilation there is never evidence of audible playback.
 | macOS ARM64 | Native tests/build + CPAL check | No | Source audited only; no macOS runtime |
 | macOS x86_64 | Compile-only cross-check | No | No standard GitHub runner; compile-only CI path |
 
-M7's local Linux row was executed on Fedora 44, kernel 7.3.0 / x86_64,
-Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. No Windows/macOS Rust
-target or SDK is installed on that host, so no cross-compilation was claimed.
+The local Linux rows in M7 and M8 were executed on Fedora 44, kernel 7.3.0 /
+x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. No Windows/macOS
+Rust target or SDK is installed on that host, so no cross-compilation or native
+runtime validation is claimed for M8.
 
 The current Windows audit includes UTF-16/UNC path handling, PowerShell UTF-8
 dialog output, case-insensitive comparison fallback, reserved-name/long-path
