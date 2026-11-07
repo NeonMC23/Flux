@@ -1697,7 +1697,7 @@ impl Controller {
             .as_ref()
             .map(|lock| QueueStore::new(legacy_queue_path(lock.identity())));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
-            load_queue(queue_store.as_ref(), &library);
+            load_queue(queue_store.as_ref(), &library, !write_protected);
         let mut controller = Self::assemble(
             engine,
             audio,
@@ -1758,7 +1758,7 @@ impl Controller {
         let recovery = opened.recovery;
         let queue_store = Some(QueueStore::new(portable_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
-            load_queue(queue_store.as_ref(), &library);
+            load_queue(queue_store.as_ref(), &library, recovery.is_none());
 
         let mut controller = Self::assemble(
             engine,
@@ -1804,7 +1804,7 @@ impl Controller {
         let library = store.runtime_library();
         let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
-            load_queue(queue_store.as_ref(), &library);
+            load_queue(queue_store.as_ref(), &library, true);
         let restored_playback = queue_store
             .as_ref()
             .and_then(|store| store.load().ok().flatten())
@@ -3766,7 +3766,7 @@ impl Controller {
         let library = store.runtime_library();
         let queue_store = Some(QueueStore::new(canonical_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
-            load_queue(queue_store.as_ref(), &library);
+            load_queue(queue_store.as_ref(), &library, true);
         let restored_playback = queue_store
             .as_ref()
             .and_then(|store| store.load().ok().flatten())
@@ -3903,7 +3903,7 @@ impl Controller {
         let recovery = opened.recovery;
         let queue_store = Some(QueueStore::new(portable_queue_path(&root)));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
-            load_queue(queue_store.as_ref(), &library);
+            load_queue(queue_store.as_ref(), &library, recovery.is_none());
         self.install_library(LibrarySeed {
             library,
             storage: StorageBackend::Portable { root: root.clone() },
@@ -4054,7 +4054,7 @@ impl Controller {
             .as_ref()
             .map(|lock| QueueStore::new(legacy_queue_path(lock.identity())));
         let (queue, queue_auto_library, queue_write_protected, queue_error) =
-            load_queue(queue_store.as_ref(), &library);
+            load_queue(queue_store.as_ref(), &library, true);
         let shown = index_path
             .as_ref()
             .map(|path| format!(" at {}", path.display()))
@@ -8028,13 +8028,18 @@ fn default_queue(library: &Library) -> Queue {
 fn load_queue(
     store: Option<&QueueStore>,
     library: &Library,
+    filter_stale_tracks: bool,
 ) -> (Queue, bool, bool, Option<String>) {
     let Some(store) = store else {
         return (default_queue(library), true, false, None);
     };
     match store.load() {
         Ok(Some(loaded)) => {
-            let (queue, dropped) = filter_queue_for_library(loaded.queue, library);
+            let (queue, dropped) = if filter_stale_tracks {
+                filter_queue_for_library(loaded.queue, library)
+            } else {
+                (loaded.queue, 0)
+            };
             let warning = (dropped > 0).then(|| {
                 format!(
                     "Removed {dropped} saved queue entr{} that referenced tracks no longer in this library.",
@@ -13701,29 +13706,33 @@ mod tests {
         }
 
         let (mut controller, _control) = boot(&dir);
-        assert_eq!(controller.queue_len(), 2);
+        assert_eq!(
+            controller.queue_len(),
+            1,
+            "stale TrackIds are removed while surviving queue entries remain"
+        );
         assert_eq!(
             controller.current_queue_entry_id(),
-            Some(QueueEntryId::new(2))
+            Some(QueueEntryId::new(1)),
+            "a stale current selection advances to the first surviving entry"
         );
-        assert!(controller.current_queue_entry_id().is_some());
-        assert_eq!(controller.current_track(), None);
+        assert!(
+            controller.current_track().is_some(),
+            "the surviving current selection resolves to a real track"
+        );
         assert!(
             controller
                 .queue_entries()
                 .iter()
-                .any(|entry| entry.track() == TrackId::new(999))
+                .all(|entry| entry.track() != TrackId::new(999))
         );
         let a = id_of(&controller, &fx.a);
         controller
+            .remove_queue_entry(QueueEntryId::new(1))
+            .expect("remove");
+        controller
             .enqueue_track(a)
             .expect("existing track still addable");
-        assert!(
-            controller
-                .queue_entries()
-                .iter()
-                .any(|entry| entry.track() == TrackId::new(999))
-        );
         controller.shutdown();
     }
 
@@ -15918,7 +15927,11 @@ mod tests {
         controller.enqueue_track(collab).expect("enqueue collab");
         controller.play_track(solo);
         controller.playback_history.record(solo, 123_456);
-        assert_eq!(controller.queue_len(), 2, "queue entries before deletion");
+        assert_eq!(
+            controller.queue_len(),
+            4,
+            "three auto-populated imports plus one explicit enqueue precede deletion"
+        );
         assert_eq!(controller.current_id(), Some(solo));
         assert!(controller.playback_history.entry(solo).is_some());
         let mut plan = controller.plan_artist_deletion(a).expect("plan");
@@ -15941,8 +15954,8 @@ mod tests {
         assert!(controller.track(solo).is_none());
         assert_eq!(
             controller.current_id(),
-            Some(collab),
-            "queue advances to surviving entry"
+            Some(guest),
+            "queue advances to the next surviving auto-queue entry"
         );
         assert_eq!(controller.player_state(), flux_core::PlaybackState::Stopped);
         assert!(
