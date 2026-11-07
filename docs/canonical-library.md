@@ -521,9 +521,10 @@ Search results are cached per query and catalogue generation to avoid rebuilding
 the same match set on every repaint. Results are limited to 20 items per entity
 type; the empty/partial query behavior and grouped type indicators stay
 deterministic. Artist and album renames explicitly invalidate the cache.
-Filtered/sorted TrackIds are cached by library session, catalogue and history
-generation, view/group, filters and sort key; only the visible page resolves
-Track metadata, so waveform ticks do not repeat full-library filtering.
+Filtered/sorted TrackIds are cached by library session, display-snapshot
+revision, catalogue and history generation, view/group, filters and sort key;
+only the visible page resolves Track metadata, so waveform ticks do not repeat
+full-library filtering and legacy/portable mutations cannot leave stale rows.
 
 Track views support these filters:
 
