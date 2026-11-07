@@ -2180,6 +2180,7 @@ struct FluxReady {
     queue_visible: bool,
     queue_overlay_open: bool,
     window_width: f32,
+    close_confirm: bool,
     closed: bool,
 }
 
@@ -2345,7 +2346,6 @@ enum Message {
     ImportCancel,
     OpenLibraryPressed,
     CreateLibraryPressed,
-    UseLegacyIndexPressed,
     AcknowledgeRecoveryPressed,
     ReplaceLegacyIndexPressed,
     MigrateSourceChanged(String),
@@ -2623,6 +2623,7 @@ impl FluxReady {
             queue_visible: true,
             queue_overlay_open: false,
             window_width: 1_180.0,
+            close_confirm: false,
             closed: false,
         }
     }
@@ -2708,6 +2709,13 @@ impl FluxReady {
         self.scope.reset();
         self.show_setup = false;
         self.external_drag_hover = false;
+        // Device work belongs to the outgoing library interaction. Its late
+        // result is rejected by the session guard, so clear the visible pending
+        // state here or device selection can remain permanently disabled.
+        self.audio_switch_token = self.audio_switch_token.wrapping_add(1);
+        self.audio_switch_pending = None;
+        self.audio_switch_error = None;
+        self.audio_devices_loading = false;
         self.select_view(LibraryView::Tracks);
     }
 
@@ -3911,6 +3919,20 @@ impl FluxReady {
         }
     }
 
+    fn block_if_lyrics_editor_is_dirty(&mut self, action: &str) -> bool {
+        let Some(editor) = self.lyrics_editor.as_mut() else {
+            return false;
+        };
+        if !editor.dirty {
+            return false;
+        }
+        editor.discard_confirm = true;
+        editor.error = Some(format!(
+            "Save or cancel the lyrics edits before {action}. Unsaved text would otherwise be hidden and discarded."
+        ));
+        true
+    }
+
     fn select_view(&mut self, view: LibraryView) {
         if let Some(editor) = self.lyrics_editor.as_mut()
             && editor.dirty
@@ -4087,6 +4109,9 @@ impl FluxReady {
     fn update(&mut self, message: Message) -> Task<Message> {
         if self.closed {
             return Task::none();
+        }
+        if !matches!(&message, Message::WindowCloseRequested(_)) {
+            self.close_confirm = false;
         }
         if message
             .library_session()
@@ -5901,13 +5926,6 @@ impl FluxReady {
                     self.after_switch();
                 }
             }
-            Message::UseLegacyIndexPressed => {
-                self.lifecycle_msg = Some(
-                    "Legacy runtime switching is disabled. Use the migration workflow to \
-                     carry an existing index into a canonical library."
-                        .to_owned(),
-                );
-            }
             Message::AcknowledgeRecoveryPressed => {
                 if let Err(err) = self.controller.acknowledge_portable_recovery() {
                     self.lifecycle_msg = Some(err);
@@ -5981,6 +5999,9 @@ impl FluxReady {
             }
             Message::RefreshPressed => self.controller.refresh(),
             Message::SearchChanged(value) => {
+                if self.block_if_lyrics_editor_is_dirty("searching") {
+                    return Task::none();
+                }
                 self.navigation_stack.clear();
                 self.search = value;
                 self.page = 0;
@@ -5988,6 +6009,9 @@ impl FluxReady {
                 self.focused_track = None;
             }
             Message::ClearSearch => {
+                if self.block_if_lyrics_editor_is_dirty("clearing the search") {
+                    return Task::none();
+                }
                 self.navigation_stack.clear();
                 self.search.clear();
                 self.page = 0;
@@ -7113,6 +7137,35 @@ impl FluxReady {
                             self.cancel_lyrics_editor();
                             return Task::none();
                         }
+                        if self.lyrics_import.is_some() {
+                            self.lyrics_import = None;
+                            return Task::none();
+                        }
+                        if self.playlist_create_open {
+                            self.playlist_create_open = false;
+                            self.playlist_create_name.clear();
+                            self.playlist_error = None;
+                            return Task::none();
+                        }
+                        if self.queue_overlay_open {
+                            self.queue_overlay_open = false;
+                            return Task::none();
+                        }
+                        if self.selected_playlist.is_some() {
+                            self.selected_playlist = None;
+                            self.playlist_entry_selection.clear();
+                            self.playlist_drag = None;
+                            self.playlist_error = None;
+                            return Task::none();
+                        }
+                        if self.view == LibraryView::Lyrics && self.selected_lyrics.is_some() {
+                            self.selected_lyrics = None;
+                            self.lyrics_mode = LyricsMode::Read;
+                            self.lyrics_follow_current = false;
+                            self.lyrics_error = None;
+                            self.lyrics_export_pending = None;
+                            return Task::none();
+                        }
                         if !self.navigation_stack.is_empty() {
                             self.navigate_back();
                             return Task::none();
@@ -7184,6 +7237,18 @@ impl FluxReady {
                 }
             }
             Message::WindowCloseRequested(id) => {
+                if let Some(editor) = self.lyrics_editor.as_mut()
+                    && editor.dirty
+                    && !self.close_confirm
+                {
+                    self.close_confirm = true;
+                    editor.discard_confirm = true;
+                    editor.error = Some(
+                        "Unsaved lyrics changes will be lost. Close the window again to discard them, or save/cancel the editor first."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
                 self.closed = true;
                 let _ = self.controller.save_index();
                 self.controller.shutdown_in_place();
@@ -9727,25 +9792,14 @@ impl FluxReady {
     }
 
     fn nav_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
-        let mut artists: HashSet<String> = HashSet::new();
-        let mut albums: HashSet<Option<&str>> = HashSet::new();
         let mut folders: HashSet<Option<&Path>> = HashSet::new();
-        for (id, track) in self.controller.tracks() {
-            let album = track
-                .album()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            artists.insert(artist_group_key(
-                self.controller.track_artist_id(*id),
-                track,
-            ));
-            albums.insert(album);
+        for (_, track) in self.controller.tracks() {
             folders.insert(track.source().path().parent());
         }
         (
             self.controller.tracks().len(),
-            artists.len(),
-            albums.len(),
+            self.controller.artists().len(),
+            self.controller.albums().len(),
             folders.len(),
             self.controller.playlists().len(),
             self.controller
@@ -10461,7 +10515,16 @@ impl FluxReady {
         {
             return self.artist_detail_view(artist);
         }
-        if self.controller.tracks().is_empty() {
+        if self.controller.tracks().is_empty()
+            && matches!(
+                self.view,
+                LibraryView::Tracks
+                    | LibraryView::Folders
+                    | LibraryView::MostPlayed
+                    | LibraryView::RecentlyAdded
+                    | LibraryView::RecentlyPlayed
+            )
+        {
             return self.empty_library();
         }
 
@@ -11282,6 +11345,19 @@ impl FluxReady {
         for (id, track) in self.controller.tracks() {
             for key in self.group_keys_for(view, *id, track) {
                 *groups.entry(key).or_default() += 1;
+            }
+        }
+        if view == LibraryView::Artists {
+            // Canonical artists are first-class entities even before they own
+            // or are credited on a track. Keep empty artists discoverable.
+            for artist in self.controller.artists() {
+                groups
+                    .entry(format!(
+                        "{}{ARTIST_KEY_SEPARATOR}{}",
+                        artist.name(),
+                        artist.id()
+                    ))
+                    .or_default();
             }
         }
         groups.into_iter().collect()
@@ -14818,10 +14894,12 @@ impl FluxReady {
 
         if self.controller.storage_mode() == StorageMode::Portable {
             portable_body = portable_body.push(
-                button(text("Use app index").size(11))
-                    .style(ghost_style)
-                    .padding([6, 10])
-                    .on_press_maybe((!scanning).then_some(Message::UseLegacyIndexPressed)),
+                text(
+                    "The legacy app index is an import-only migration source now. \
+                     Open a canonical library folder to switch.",
+                )
+                .size(9)
+                .color(MUTED),
             );
         }
         if self.controller.portable_recovery().is_some() {
@@ -16108,6 +16186,7 @@ mod tests {
             queue_visible: true,
             queue_overlay_open: false,
             window_width: 1_180.0,
+            close_confirm: false,
             closed: false,
         }
     }
@@ -16144,6 +16223,139 @@ mod tests {
         assert_eq!(gui.controller.queue_len(), queue_len);
         assert_eq!(gui.controller.current_queue_entry_id(), current);
         assert!(gui.controller.poll().is_empty());
+    }
+
+    #[test]
+    fn empty_canonical_artists_and_albums_remain_in_navigation_counts_and_groups() {
+        let dir = TempDir::new("gui-empty-entities");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let artist = gui
+            .controller
+            .create_artist("Empty Artist")
+            .expect("artist");
+        gui.controller
+            .create_album(artist, "Empty Album", ReleaseType::Album)
+            .expect("album");
+        assert!(gui.controller.tracks().is_empty());
+
+        let counts = gui.nav_counts();
+        assert_eq!(counts.0, 0);
+        assert_eq!(counts.1, 1, "empty artists are counted");
+        assert_eq!(counts.2, 1, "empty albums are counted");
+        assert!(
+            gui.groups_for(LibraryView::Artists)
+                .iter()
+                .any(|(key, count)| *count == 0 && key.contains("Empty Artist")),
+            "empty artist group is listed"
+        );
+        assert!(
+            gui.groups_for(LibraryView::Albums)
+                .iter()
+                .any(|(key, count)| *count == 0 && key.contains("Empty Album")),
+            "empty album group is listed"
+        );
+        gui.view = LibraryView::Albums;
+        let _ = gui.library_view();
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn escape_dismisses_transient_overlays_and_detail_views() {
+        let dir = TempDir::new("gui-escape-overlays");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let playlist = gui
+            .controller
+            .set_playlist(None, "List", Vec::new())
+            .expect("playlist");
+
+        gui.queue_overlay_open = true;
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(!gui.queue_overlay_open, "queue overlay closes on Escape");
+
+        gui.playlist_create_open = true;
+        gui.playlist_create_name = "draft".to_owned();
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(!gui.playlist_create_open);
+        assert!(gui.playlist_create_name.is_empty());
+
+        gui.view = LibraryView::Playlists;
+        gui.selected_playlist = Some(playlist);
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(gui.selected_playlist.is_none());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn library_switch_clears_pending_audio_switch_state() {
+        let dir = TempDir::new("gui-audio-switch-reset");
+        let mut gui = gui(&dir);
+        gui.audio_switch_pending = Some("Slow Device".to_owned());
+        gui.audio_switch_error = Some("previous error".to_owned());
+        gui.audio_devices_loading = true;
+        let token = gui.audio_switch_token;
+        gui.after_switch();
+        assert!(gui.audio_switch_pending.is_none());
+        assert!(gui.audio_switch_error.is_none());
+        assert!(!gui.audio_devices_loading);
+        assert_eq!(gui.audio_switch_token, token + 1);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn dirty_lyrics_block_search_and_first_window_close() {
+        let dir = TempDir::new("gui-dirty-lyrics-guard");
+        let mut gui = gui(&dir);
+        gui.search = "kept".to_owned();
+        gui.lyrics_editor = Some(LyricsEditorState {
+            track_id: TrackId::new(1),
+            expected_text: None,
+            metadata: Vec::new(),
+            lines: Vec::new(),
+            original_synced: false,
+            allow_plain_conversion: true,
+            dirty: true,
+            discard_confirm: false,
+            remove_confirm: false,
+            error: None,
+        });
+        send(&mut gui, Message::SearchChanged("hidden".to_owned()));
+        assert_eq!(gui.search, "kept");
+        assert!(
+            gui.lyrics_editor
+                .as_ref()
+                .and_then(|editor| editor.error.as_deref())
+                .is_some_and(|error| error.contains("Save or cancel"))
+        );
+        let _ = gui.update(Message::WindowCloseRequested(iced::window::Id::unique()));
+        assert!(!gui.closed);
+        assert!(!gui.controller.is_shutdown());
+        assert!(gui.close_confirm);
+        gui.controller.shutdown();
     }
 
     #[test]
