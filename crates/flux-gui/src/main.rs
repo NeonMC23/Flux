@@ -14,6 +14,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -77,6 +78,16 @@ const OSC_COLOR: Color = Color::from_rgb8(0xff, 0x66, 0xcc);
 const OSC_GLOW: Color = Color::from_rgba8(0xff, 0x66, 0xcc, 0.16);
 const OSC_GUIDE: Color = Color::from_rgba8(0xff, 0x66, 0xcc, 0.12);
 const ARTWORK_CACHE_LIMIT: usize = 128;
+
+/// Inserts into a preview cache and applies the same global bound to every
+/// artwork owner type. Clearing at the cap keeps memory bounded without a
+/// second LRU index; visible targets are re-requested by the next update.
+fn insert_bounded_artwork<K: Ord, V>(map: &mut BTreeMap<K, V>, key: K, value: V) {
+    if map.len() >= ARTWORK_CACHE_LIMIT && !map.contains_key(&key) {
+        map.clear();
+    }
+    map.insert(key, value);
+}
 
 fn flux_theme() -> Theme {
     Theme::custom(
@@ -1501,6 +1512,29 @@ struct SearchCache {
     track_ids: Vec<TrackId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackRowsKey {
+    session: u64,
+    generation: u64,
+    history_generation: u64,
+    view: LibraryView,
+    selected_group: Option<String>,
+    album: Option<AlbumId>,
+    collection: Option<SmartCollection>,
+    favorites_only: bool,
+    lyrics: TriFilter,
+    artwork: TriFilter,
+    release: ReleaseFilter,
+    rating: RatingFilter,
+    sort: TrackSort,
+    descending: bool,
+}
+
+struct TrackRowsCache {
+    key: TrackRowsKey,
+    ids: Rc<Vec<TrackId>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TrackSort {
     #[default]
@@ -2099,6 +2133,7 @@ struct FluxReady {
     controller: Controller,
     search: String,
     search_cache: RefCell<SearchCache>,
+    track_rows_cache: RefCell<Option<TrackRowsCache>>,
     selected_tracks: Vec<TrackId>,
     focused_track: Option<TrackId>,
     filter_favorites: bool,
@@ -2543,6 +2578,7 @@ impl FluxReady {
             controller,
             search: String::new(),
             search_cache: RefCell::new(SearchCache::default()),
+            track_rows_cache: RefCell::new(None),
             selected_tracks: Vec::new(),
             focused_track: None,
             filter_favorites: false,
@@ -2695,6 +2731,7 @@ impl FluxReady {
         self.playlist_error = None;
         self.last_reconcile = None;
         self.search_cache.borrow_mut().generation = u64::MAX;
+        *self.track_rows_cache.borrow_mut() = None;
         let current = self.controller.current_queue_entry_id();
         self.queue_page = current
             .and_then(|entry| self.controller.queue_entry_index(entry))
@@ -4634,18 +4671,13 @@ impl FluxReady {
                     let entry = ArtworkEntry { key, handle, error };
                     match owner {
                         ArtworkOwner::Album(album) => {
-                            if self.artwork.len() >= ARTWORK_CACHE_LIMIT
-                                && !self.artwork.contains_key(&album)
-                            {
-                                self.artwork.clear();
-                            }
-                            self.artwork.insert(album, entry);
+                            insert_bounded_artwork(&mut self.artwork, album, entry);
                         }
                         ArtworkOwner::Artist(artist) => {
-                            self.artist_artwork.insert(artist, entry);
+                            insert_bounded_artwork(&mut self.artist_artwork, artist, entry);
                         }
                         ArtworkOwner::Track(track) => {
-                            self.track_artwork.insert(track, entry);
+                            insert_bounded_artwork(&mut self.track_artwork, track, entry);
                         }
                     }
                 }
@@ -10093,7 +10125,7 @@ impl FluxReady {
                 collection.label().to_owned(),
                 format!(
                     "Smart collection · {} track(s) · {}",
-                    self.filtered_tracks().len(),
+                    self.filtered_track_ids().len(),
                     collection.description()
                 ),
             )
@@ -10110,7 +10142,7 @@ impl FluxReady {
                 self.view.label().to_owned(),
                 format!(
                     "{} track(s) · deterministic ordering",
-                    self.filtered_tracks().len()
+                    self.filtered_track_ids().len()
                 ),
             )
         } else if let Some(track_id) = self.selected_lyrics {
@@ -10163,7 +10195,7 @@ impl FluxReady {
                 format!("Artist detail · {albums} album association(s) · artist {artist_id}"),
             )
         } else if let Some(group) = &self.selected_group {
-            let rows = self.filtered_tracks();
+            let rows = self.filtered_track_ids();
             (
                 group_title(self.view, group),
                 format!(
@@ -10181,7 +10213,7 @@ impl FluxReady {
                     if self.search.trim().is_empty() {
                         String::new()
                     } else {
-                        format!(" · {} match(es)", self.filtered_tracks().len())
+                        format!(" · {} match(es)", self.filtered_track_ids().len())
                     }
                 ),
             )
@@ -10553,7 +10585,7 @@ impl FluxReady {
         if self.view == LibraryView::MostPlayed {
             column![
                 self.most_played_breakdown(),
-                self.track_list(self.filtered_tracks()),
+                self.track_list(self.filtered_track_ids()),
             ]
             .spacing(8)
             .height(Length::Fill)
@@ -10562,11 +10594,11 @@ impl FluxReady {
             self.view,
             LibraryView::RecentlyAdded | LibraryView::RecentlyPlayed | LibraryView::Collections
         ) {
-            self.track_list(self.filtered_tracks())
+            self.track_list(self.filtered_track_ids())
         } else if self.view != LibraryView::Tracks && self.selected_group.is_none() {
             self.group_list()
         } else {
-            self.track_list(self.filtered_tracks())
+            self.track_list(self.filtered_track_ids())
         }
     }
 
@@ -11615,8 +11647,29 @@ impl FluxReady {
         }
     }
 
-    fn filtered_tracks(&self) -> Vec<(TrackId, &Track)> {
+    fn filtered_track_ids(&self) -> Rc<Vec<TrackId>> {
         let album_mode = self.selected_album_id();
+        let key = TrackRowsKey {
+            session: self.controller.library_session(),
+            generation: self.controller.generation(),
+            history_generation: self.controller.history_generation(),
+            view: self.view,
+            selected_group: self.selected_group.clone(),
+            album: album_mode,
+            collection: self.collection,
+            favorites_only: self.filter_favorites,
+            lyrics: self.filter_lyrics,
+            artwork: self.filter_artwork,
+            release: self.filter_release,
+            rating: self.filter_rating,
+            sort: self.sort_tracks,
+            descending: self.sort_descending,
+        };
+        if let Some(cache) = self.track_rows_cache.borrow().as_ref()
+            && cache.key == key
+        {
+            return Rc::clone(&cache.ids);
+        }
         let special_ids = match self.view {
             LibraryView::Collections => self
                 .collection
@@ -11747,7 +11800,19 @@ impl FluxReady {
                 ordering.then_with(|| left_id.cmp(right_id))
             });
         }
-        rows
+        let ids = Rc::new(rows.into_iter().map(|(id, _)| id).collect::<Vec<_>>());
+        *self.track_rows_cache.borrow_mut() = Some(TrackRowsCache {
+            key,
+            ids: Rc::clone(&ids),
+        });
+        ids
+    }
+
+    fn filtered_tracks(&self) -> Vec<(TrackId, &Track)> {
+        self.filtered_track_ids()
+            .iter()
+            .filter_map(|id| self.controller.track(*id).map(|track| (*id, track)))
+            .collect()
     }
 
     fn visible_track_ids(&self) -> Vec<TrackId> {
@@ -11760,12 +11825,12 @@ impl FluxReady {
                 .copied()
                 .collect();
         }
-        let rows = self.filtered_tracks();
+        let rows = self.filtered_track_ids();
         let pages = rows.len().div_ceil(TRACK_PAGE_SIZE).max(1);
         let page = self.page.min(pages - 1);
         let start = page * TRACK_PAGE_SIZE;
         let end = (start + TRACK_PAGE_SIZE).min(rows.len());
-        rows[start..end].iter().map(|(id, _)| *id).collect()
+        rows[start..end].to_vec()
     }
 
     fn playlist_choices(&self) -> Vec<PlaylistChoice> {
@@ -14505,7 +14570,7 @@ impl FluxReady {
             .into()
     }
 
-    fn track_list<'a>(&'a self, rows: Vec<(TrackId, &'a Track)>) -> Element<'a, Message> {
+    fn track_list<'a>(&'a self, rows: Rc<Vec<TrackId>>) -> Element<'a, Message> {
         if let Some(album_id) = self.selected_album_id() {
             return self.album_detail_view(album_id);
         }
@@ -14561,7 +14626,10 @@ impl FluxReady {
         .padding([2, 10]);
 
         let mut list = column![].spacing(1);
-        for (offset, (id, track)) in rows[start..end].iter().enumerate() {
+        for (offset, id) in rows[start..end].iter().enumerate() {
+            let Some(track) = self.controller.track(*id) else {
+                continue;
+            };
             let resource = resource_badge(self.controller.track_audio_resource_state(*id));
             list = list.push(track_row(
                 start + offset + 1,
@@ -16125,6 +16193,7 @@ mod tests {
             controller,
             search: String::new(),
             search_cache: RefCell::new(SearchCache::default()),
+            track_rows_cache: RefCell::new(None),
             selected_tracks: Vec::new(),
             focused_track: None,
             filter_favorites: false,
@@ -18737,10 +18806,13 @@ mod tests {
             ReleaseType::Album,
             2,
         );
+        assert!(
+            gui.controller
+                .queue_entries()
+                .iter()
+                .any(|entry| entry.track() == second)
+        );
         gui.controller.play_track(id);
-        gui.controller
-            .enqueue_track(second)
-            .expect("enqueue second");
         let first_entry = gui.controller.current_queue_entry_id();
         gui.last_queue_current = first_entry;
         assert_eq!(gui.controller.queue_len(), 2);
@@ -20852,6 +20924,49 @@ mod tests {
                 .is_some_and(|rating| rating.favorite)
         );
         gui.controller.shutdown();
+    }
+
+    #[test]
+    fn track_row_cache_is_reused_until_its_query_changes() {
+        let dir = TempDir::new("gui-track-row-cache");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("source/song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let first = gui.filtered_track_ids();
+        let again = gui.filtered_track_ids();
+        assert!(Rc::ptr_eq(&first, &again), "same query reused its IDs");
+        gui.filter_favorites = true;
+        let changed = gui.filtered_track_ids();
+        assert!(
+            !Rc::ptr_eq(&first, &changed),
+            "a filter change invalidates the row cache"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn every_artwork_cache_obeys_the_same_bound() {
+        let mut map = BTreeMap::new();
+        for key in 0..ARTWORK_CACHE_LIMIT {
+            insert_bounded_artwork(&mut map, key, key);
+        }
+        assert_eq!(map.len(), ARTWORK_CACHE_LIMIT);
+        insert_bounded_artwork(&mut map, ARTWORK_CACHE_LIMIT, ARTWORK_CACHE_LIMIT);
+        assert_eq!(map.len(), 1, "the cache was cleared at the bound");
+        insert_bounded_artwork(&mut map, ARTWORK_CACHE_LIMIT + 1, 0);
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
