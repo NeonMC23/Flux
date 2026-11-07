@@ -136,6 +136,28 @@ impl LibraryLock {
         acquire(identity, lock_path)
     }
 
+    /// Serializes first-run creation of a canonical library at `root`.
+    ///
+    /// The lock file lives beside the root rather than inside it, so the
+    /// creator can validate/install an otherwise-empty directory and the
+    /// subsequent normal open does not conflict with its own creation lease.
+    pub fn acquire_creation(root: &Path) -> Result<Self, LibraryLockError> {
+        let identity = fs::canonicalize(root).map_err(|error| LibraryLockError::Io {
+            identity: root.to_owned(),
+            lock_path: None,
+            error,
+        })?;
+        let name = identity
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "flux-library".to_owned());
+        let lock_path = identity
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".{name}.flux-create.lock"));
+        acquire(identity, lock_path)
+    }
+
     /// The canonical library identity this lease protects.
     #[must_use]
     pub fn identity(&self) -> &Path {
@@ -281,6 +303,28 @@ mod tests {
             lock_path.exists(),
             "the lock file remains; its presence is not ownership"
         );
+    }
+
+    #[test]
+    fn creation_lease_is_separate_from_the_opened_library_lease() {
+        let dir = TempDir::new("lock-creation");
+        let root = dir.path().join("FluxLibrary");
+        fs::create_dir_all(&root).expect("root");
+        let creation = LibraryLock::acquire_creation(&root).expect("creation lease");
+        let lock_path = creation.lock_path().to_owned();
+        assert_eq!(
+            lock_path.file_name().and_then(|name| name.to_str()),
+            Some(".FluxLibrary.flux-create.lock")
+        );
+        assert!(busy(
+            LibraryLock::acquire_creation(&root).expect_err("one creator")
+        ));
+        let opened = LibraryLock::acquire_portable_root(&root)
+            .expect("normal open lock uses a different file");
+        drop(opened);
+        drop(creation);
+        let reacquired = LibraryLock::acquire_creation(&root).expect("released");
+        drop(reacquired);
     }
 
     #[test]

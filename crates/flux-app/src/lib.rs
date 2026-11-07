@@ -1302,8 +1302,7 @@ pub fn create_canonical_library(root: &Path) -> Result<CreatedLibrary, CreateLib
     // Serialize first-run creation with every ordinary canonical open. The
     // emptiness check and the manifest/catalog publication must happen under
     // the same lease or two processes can interleave into an unopenable mix.
-    let _lease =
-        LibraryLock::acquire_portable_root(&canonical).map_err(CreateLibraryError::Lock)?;
+    let lease = LibraryLock::acquire_creation(&canonical).map_err(CreateLibraryError::Lock)?;
     let created = CanonicalLibrary::create(&canonical)?;
     let library_id = created.library_id().to_owned();
     let root = created.root().to_path_buf();
@@ -1320,6 +1319,7 @@ pub fn create_canonical_library(root: &Path) -> Result<CreatedLibrary, CreateLib
                 .to_owned(),
         });
     }
+    drop(lease);
     Ok(CreatedLibrary { root, library_id })
 }
 
@@ -17166,6 +17166,36 @@ mod tests {
                 "shuffle avoids adjacent same-track entries when possible"
             );
         }
+    }
+
+    #[test]
+    fn canonical_creation_releases_its_lease_for_immediate_switch() {
+        let dir = TempDir::new("canonical-create-then-switch");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let (engine, audio) = super::default_engine();
+        let mut controller =
+            Controller::new(engine, audio, Some(dir.path().join("library-index.json")))
+                .expect("legacy controller");
+        let created = create_canonical_library(&root).expect("create");
+        let probe = flux_library::LibraryLock::acquire_portable_root(created.root())
+            .expect("immediate lease reacquire");
+        drop(probe);
+        controller
+            .switch_to_canonical(created.root())
+            .expect("switch under the released creation lease");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_creation_releases_its_lease_for_immediate_open() {
+        let dir = TempDir::new("canonical-create-then-open");
+        let root = dir.path().join("library");
+        let created = create_canonical_library(&root).expect("create");
+        let (engine, audio) = super::default_engine();
+        let controller = Controller::new_canonical(engine, audio, created.root())
+            .expect("immediate open after creation");
+        controller.shutdown();
     }
 
     #[test]
