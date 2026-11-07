@@ -22,3 +22,4 @@ cpal = ["flux-app/cpal"]
 flux-core.workspace = true
 flux-app.workspace = true
 crossterm.workspace = true
+unicode-width.workspace = true

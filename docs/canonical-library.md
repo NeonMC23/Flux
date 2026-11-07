@@ -176,7 +176,9 @@ empty search, and favourites-only search with no matches.
 `?` opens a scrollable help/details view containing the complete keys and
 limitations; normal mode keeps only a short help line so it is not clipped on
 ordinary terminals. Input lines retain their trailing path/cursor when longer
-than the terminal by showing an ellipsis and the tail. Terminal dimensions are
+than the terminal by showing an ellipsis and the tail. Truncation/padding use
+terminal display width rather than Unicode scalar count, so wide CJK
+characters, combining marks and emoji do not overrun or misalign rows. Terminal dimensions are
 clamped to safe minimums for tiny/0-column pseudo-terminals; detail/queue/lyrics
 views below 8 rows show an explicit resize message instead of overlapping the
 status line. All terminal restoration/panic paths remain unchanged. Ctrl-C
@@ -249,13 +251,34 @@ selected `PathBuf` separately from the editable display text, so a non-UTF-8 Uni
 selection is not corrupted by a path-string round trip. TUI path input remains
 Unicode text by design.
 
-CI runs formatting/Clippy/license checks on Linux and native tests/builds for
-Linux x86_64/ARM64, Windows x86_64/ARM64 and macOS ARM64, with a compile-only
-macOS x86_64 cross-check. CPAL is compile-checked on all matrix entries; no CI
-runner supplies a physical audio device. The local CP1 audit executed on Linux
-only. Windows/macOS native dialogs, window managers, terminals, filesystems,
-locking behavior and hardware audio remain unverified unless a future CI runtime
-job explicitly reports them.
+CI is configured for formatting/Clippy/license checks on Linux and native
+tests/builds for Linux x86_64/ARM64, Windows x86_64/ARM64 and macOS ARM64,
+with a compile-only macOS x86_64 cross-check. CPAL all-target compilation and
+CPAL GUI/TUI binary linking are checked on all matrix entries; no CI runner
+supplies a physical audio device.
+
+| Target | CI coverage defined | Locally executed in M7 | Runtime status |
+|---|---|---|---|
+| Linux x86_64 | Native tests/build, Clippy, CPAL check | Yes | GUI/TUI startup, TUI PTY, CPAL enumeration, explicit stream open and short WAV completion; no listening/hotplug |
+| Linux ARM64 | Native tests/build, CPAL check | No | Unverified locally |
+| Windows x86_64/ARM64 | Native tests/build, CPAL check | No | Compile-contract/source audit only; native runtime unverified |
+| macOS ARM64 | Native tests/build, CPAL check | No | Source audit only; native runtime unverified |
+| macOS x86_64 | Compile-only cross-check | No | No standard GitHub runner |
+
+The Linux row was executed on Fedora 44/x86_64, kernel 7.3.0, Rust/Cargo
+1.99.0, with PulseAudio on PipeWire 1.6.9. The Windows/macOS rows are
+configuration promises, not evidence that a current CI run succeeded. CPAL IDs are backend-provided and may not survive every
+OS/driver change; an unavailable saved device is retained and reported rather
+than silently replaced. Reparse points are rejected like symbolic links in
+canonical, portable, migration and scan paths. Windows has no standard
+directory-fsync, so that durability step is a no-op there; file content is
+flushed and journal/backup recovery remains authoritative. Actual case-sensitive
+APFS/NTFS volume probing is not implemented; the portable fallback uses
+case-insensitive comparison keys on Windows/macOS, which can report a collision
+but never split one physical file into two identities. Native Windows/macOS
+dialogs, window managers, terminals, filesystem crash recovery and hardware
+audio remain unverified here. The Windows/macOS native dialogs currently ignore
+the caller-provided starting-directory hint (Linux honors it).
 
 ## Canonical layout
 
@@ -843,6 +866,7 @@ from what remains structurally or physically unverified.
 | M4 playback/device UX hardening: explicit recovery retry and Stop/Play recovery position reset | Confirmed by deterministic Controller recovery tests and GUI/TUI message/help tests; actual CPAL device-open and short real-output smoke checks were run, but no listening/acoustic or physical hotplug validation |
 | M5 output enumeration, explicit selection, safe switching, persistence and recovery policy | Confirmed by deterministic fake-engine Controller/GUI/settings tests plus real Linux CPAL enumeration and explicit stream initialization on two backend IDs; no real in-window GUI switching, listening validation, physical hotplug, or Windows/macOS runtime validation |
 | M6 consolidated UX polish: contextual back navigation, keyboard queue-follow consistency, centralized transient feedback, fixed-target import clarity and settings discoverability | Confirmed by deterministic GUI state/message tests plus GUI/TUI startup/PTY probes; no full manual mouse/keyboard walkthrough, screen-reader audit, or cross-platform UI validation |
+| M7 platform audit: path/reparse safety, TUI display width, CI matrix, target/architecture documentation | Linux native gates and runtime checks confirmed here; TUI width/combining/wide-character tests added; Windows/macOS targets were not installed and their CI jobs were not executed in this session, so those rows remain compile-contract/runtime-unverified |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |

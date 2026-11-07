@@ -53,6 +53,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flux_core::{ArtistId, TrackId};
 use serde::{Deserialize, Serialize};
 
+use crate::fs_ops::is_link_or_reparse;
 use crate::portable::{PathValidationError, RelPath};
 
 /// Version of the canonical library format written by this build.
@@ -920,7 +921,7 @@ fn reject_symlink_escape(root: &Path, rel: &RelPath) -> Result<(), CanonicalErro
         };
         current.push(component);
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if is_link_or_reparse(&metadata) => {
                 return Err(CanonicalError::Invalid(format!(
                     "path {} contains a symbolic link",
                     rel.display_lossy()
@@ -1049,9 +1050,9 @@ impl CanonicalLibrary {
     /// never overwritten; use an explicit migration/repair workflow instead.
     pub fn create(root: &Path) -> Result<Self, CanonicalError> {
         match fs::symlink_metadata(root) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if is_link_or_reparse(&metadata) => {
                 return Err(CanonicalError::Invalid(
-                    "the library root must not be a symbolic link".to_owned(),
+                    "the library root must not be a symbolic link or reparse point".to_owned(),
                 ));
             }
             Ok(metadata) if metadata.is_dir() => {

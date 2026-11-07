@@ -64,6 +64,7 @@ use flux_app::{
     TrackMetadataEdit, format_duration, is_track_playable,
 };
 use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
+use unicode_width::UnicodeWidthChar;
 
 fn main() -> ExitCode {
     let initial_dir = std::env::args_os().nth(1).map(PathBuf::from);
@@ -1626,7 +1627,7 @@ impl Tui {
             header.push_str(" [favorites]");
         }
         if !self.search.trim().is_empty() {
-            let search = self.search.chars().take(24).collect::<String>();
+            let search = truncate_to_width(&self.search, 24);
             header.push_str(&format!(" [search \"{search}\"]"));
         }
         if self.controller.portable_recovery().is_some() {
@@ -1886,7 +1887,7 @@ impl Tui {
         width: usize,
         bold: bool,
     ) -> std::io::Result<()> {
-        let text: String = text.chars().take(width).collect();
+        let text = truncate_to_width(text, width);
         queue!(out, MoveTo(0, y), Clear(ClearType::UntilNewLine))?;
         if bold {
             queue!(
@@ -2115,26 +2116,49 @@ fn detail_view_fits(height: usize) -> bool {
     height >= 8
 }
 
+fn char_width(character: char) -> usize {
+    character.width().unwrap_or(0)
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let next = char_width(character);
+        if used.saturating_add(next) > width {
+            break;
+        }
+        output.push(character);
+        used = used.saturating_add(next);
+    }
+    output
+}
+
 fn fit_input_line(prefix: &str, input: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
     let line = format!("{prefix}{input}_");
-    if line.chars().count() <= width {
+    if display_width(&line) <= width {
         return line;
     }
     let keep = width.saturating_sub(1);
-    let mut tail = line
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    if width > 0 {
-        tail.insert(0, '…');
+    let mut used = 0usize;
+    let mut tail = Vec::new();
+    for character in line.chars().rev() {
+        let next = char_width(character);
+        if used.saturating_add(next) > keep {
+            break;
+        }
+        used = used.saturating_add(next);
+        tail.push(character);
     }
+    let mut tail = tail.into_iter().rev().collect::<String>();
+    tail.insert(0, '…');
     tail
 }
 
@@ -2273,12 +2297,15 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
 /// Degenerate widths (a 0-column pty, `right` wider than the line)
 /// degrade to just the truncated left text instead of panicking.
 fn pad_with_right(left: &str, right: &str, width: usize) -> String {
-    if right.is_empty() || right.chars().count() >= width {
-        return left.chars().take(width).collect();
+    let right_width = display_width(right);
+    if right.is_empty() || right_width >= width {
+        return truncate_to_width(left, width);
     }
-    let room = width - right.chars().count() - 1;
-    let left: String = left.chars().take(room).collect();
-    let pad = width - left.chars().count() - right.chars().count();
+    let room = width.saturating_sub(right_width).saturating_sub(1);
+    let left = truncate_to_width(left, room);
+    let pad = width
+        .saturating_sub(display_width(&left))
+        .saturating_sub(right_width);
     format!("{left}{}{right}", " ".repeat(pad.max(1)))
 }
 
@@ -2347,8 +2374,8 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Mode, StorageMode, Track, Tui, clamp_terminal_size, detail_view_fits, fit_input_line,
-        help_lines, normal_help, pad_with_right, resource_label,
+        Mode, StorageMode, Track, Tui, clamp_terminal_size, detail_view_fits, display_width,
+        fit_input_line, help_lines, normal_help, pad_with_right, resource_label, truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2947,6 +2974,13 @@ mod tests {
             pad_with_right("a longer title here", "3:45", 10),
             "a lon 3:45"
         );
+        assert_eq!(display_width("界"), 2);
+        assert_eq!(display_width("e\u{301}"), 1);
+        assert_eq!(truncate_to_width("界界界", 5), "界界");
+        assert_eq!(display_width(&pad_with_right("界界", "x", 5)), 5);
+        let tail = fit_input_line("", "界界界", 4);
+        assert!(display_width(&tail) <= 4, "{tail}");
+        assert!(tail.starts_with('…'), "{tail}");
     }
 
     #[test]
@@ -2981,7 +3015,6 @@ mod tests {
         assert!(help.contains("policy system default"), "{help}");
         assert!(help.contains("bounded automatic recovery"), "{help}");
         assert!(help.contains("SAFETY AND LIMITS"), "{help}");
-        assert!(help.contains("bounded automatic recovery"), "{help}");
         assert!(help.contains("device selection are GUI-only"), "{help}");
         assert!(help.contains("GUI review workflows"), "{help}");
         assert!(help.contains("synchronous quick copy"), "{help}");

@@ -13,6 +13,27 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// Whether metadata describes a symbolic link or a Windows reparse point.
+///
+/// `FileType::is_symlink` does not classify every Windows reparse point (for
+/// example directory junctions). Flux treats those as links too so managed-path
+/// containment cannot be bypassed by a junction.
+pub(crate) fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Replaces `target` with `temp` in one filesystem rename.
 ///
 /// `fs::rename` replaces an existing file on Unix and on Windows (the
@@ -96,7 +117,7 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 mod tests {
     use std::fs;
 
-    use super::{replace_file, write_atomic};
+    use super::{is_link_or_reparse, replace_file, write_atomic};
     use crate::test_support::TempDir;
 
     fn staging_files(dir: &TempDir, target_name: &str) -> Vec<std::path::PathBuf> {
@@ -227,5 +248,24 @@ mod tests {
         let error = write_atomic(&target, b"new").expect_err("parent must exist");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(!dir.path().join("missing").exists());
+    }
+
+    #[test]
+    fn regular_files_are_not_treated_as_links() {
+        let dir = TempDir::new("fs-ops-link-classification");
+        let file = dir.write("regular.flux", b"data");
+        let metadata = fs::symlink_metadata(&file).expect("metadata");
+        assert!(!is_link_or_reparse(&metadata));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_symlinks_are_classified_as_links() {
+        let dir = TempDir::new("fs-ops-symlink-classification");
+        let target = dir.write("target.flux", b"data");
+        let link = dir.path().join("link.flux");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let metadata = fs::symlink_metadata(&link).expect("metadata");
+        assert!(is_link_or_reparse(&metadata));
     }
 }

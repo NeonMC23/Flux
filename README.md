@@ -195,8 +195,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   instead of relying on a clipped one-line help bar. The header identifies the
   active library, view, queue length, playback mode and active search/favorite
   filter; long paths/inputs are bounded and input lines keep their trailing
-  path visible. `c` clears a transient status/error notice without changing
-  playback or library state.
+  path visible. Display-width-aware truncation keeps wide CJK characters,
+  combining marks and emoji from breaking alignment; `c` clears a transient
+  status/error notice without changing playback or library state.
   `o` recursively copy-imports a folder, and `i` copy-imports
   paths separated by `;` into the canonical library. Import summaries include
   added, updated, already-indexed, copied and issue counts; any per-path errors
@@ -531,20 +532,38 @@ cargo run -p flux-tui --features cpal -- ~/Music
 ## Supported targets and CI
 
 Flux targets Linux, Windows 10/11, and macOS on x86_64 and ARM64. CI
-(`.github/workflows/ci.yml`) runs formatting, Clippy, license checks,
-tests, and builds natively on Linux x86_64/ARM64, Windows x86_64/ARM64,
-and macOS ARM64; macOS x86_64 gets a compile-only cross-check (no
-standard GitHub runner exists for it). The `cpal` feature is
-compile-checked (and Clippy-linted on Linux) on every platform — CI
-runners have no usable audio device, so that never constitutes a
-playback test.
+(`.github/workflows/ci.yml`) is configured to run formatting, Clippy, license
+checks, native tests/builds, CPAL all-target compilation and CPAL binary
+linking on Linux x86_64/ARM64, Windows x86_64/ARM64 and macOS ARM64; macOS
+x86_64 has a compile-only cross-check. CI runners have no usable audio device,
+so compilation there is never evidence of audible playback.
 
-Local interactive/runtime verification in this repository is Linux/X11 only.
-The Windows and macOS CI jobs execute native tests/builds when GitHub
-providers are available, but no Windows/macOS native dialog, window-manager,
-terminal-emulator, audio device or filesystem crash-recovery behavior is
-claimed from Linux testing. macOS x86_64 is compile-only. Cross-platform
-runtime results are limited to what the CI platform actually reports.
+| Platform | Configured CI | Executed in this session | Runtime/hardware evidence |
+|---|---|---|---|
+| Linux x86_64 | Native tests/build + CPAL check | Yes, all six gates | GUI start, TUI PTY, CPAL device enumeration/stream initialization and short WAV completion on this host; no listening/hotplug test |
+| Linux ARM64 | Native tests/build + CPAL check | No | Not locally available |
+| Windows x86_64 | Native tests/build + CPAL check | No | Source audited only; no Windows target installed or Windows runtime |
+| Windows ARM64 | Native tests/build + CPAL check | No | Source audited only; no Windows target installed or Windows runtime |
+| macOS ARM64 | Native tests/build + CPAL check | No | Source audited only; no macOS runtime |
+| macOS x86_64 | Compile-only cross-check | No | No standard GitHub runner; compile-only CI path |
+
+M7's local Linux row was executed on Fedora 44, kernel 7.3.0 / x86_64,
+Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. No Windows/macOS Rust
+target or SDK is installed on that host, so no cross-compilation was claimed.
+
+The current Windows audit includes UTF-16/UNC path handling, PowerShell UTF-8
+dialog output, case-insensitive comparison fallback, reserved-name/long-path
+limitations, and reparse-point rejection for managed paths. macOS source uses
+CoreAudio through CPAL, standard Application Support directories, case-insensitive
+path fallback until per-volume probing exists, and compile-checked native
+dialogs. Native pickers honor a caller-provided starting directory on Linux;
+the macOS and Windows dialog scripts currently ignore that hint. These are
+source/CI-contract checks unless the table above says runtime executed.
+
+Local interactive/runtime verification remains limited to Linux/X11 (plus the
+TUI PTY). Windows/macOS native dialogs, window managers, terminals, filesystems,
+locking behavior and hardware audio remain unverified here. Windows/macOS
+case-sensitive-volume behavior is a known limitation.
 
 ## License
 
@@ -553,7 +572,7 @@ governed by `deny.toml`, which allows only permissive licenses (MIT,
 Apache-2.0, Zlib, BSD, ISC, BSL-1.0, CC0-1.0, Unlicense,
 Unicode-3.0); the stack — Iced, CPAL, the format decoders (claxon,
 hound, rmp3, lewton, ogg, opus-pure, rusty_aac, mp4), ringbuf, lofty,
-crossterm — stays within that permissive set (MIT, Apache-2.0, and,
+crossterm and Unicode display-width accounting — stays within that permissive set (MIT, Apache-2.0, and,
 among the decoders, BSD-3-Clause and CC0-1.0). Verify with
 `cargo deny check licenses`.
 

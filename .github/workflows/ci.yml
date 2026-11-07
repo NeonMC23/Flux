@@ -109,14 +109,18 @@ jobs:
           rustup target add ${{ matrix.target }}
           rustc --version
           cargo --version
+      - name: Check all targets (native)
+        run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
       - name: Test workspace (native)
         run: cargo test --workspace --locked --target ${{ matrix.target }}
       - name: Build workspace (native)
         run: cargo build --workspace --locked --target ${{ matrix.target }}
-      # Compile-check only: runners have no usable audio device, so this
-      # step never constitutes a playback test.
+      # Compile/link only: runners have no usable audio device, so these
+      # steps never constitute a playback test.
       - name: Compile-check CPAL features
         run: cargo check -p flux-audio -p flux-app -p flux-gui -p flux-tui --features cpal --all-targets --locked --target ${{ matrix.target }}
+      - name: Build CPAL binaries (compile/link only)
+        run: cargo build -p flux-gui -p flux-tui --features cpal --locked --target ${{ matrix.target }}
 
   macos-x86_64-cross-check:
     name: Compile-only cross-check (macOS x86_64)

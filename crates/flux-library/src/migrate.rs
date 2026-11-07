@@ -112,6 +112,7 @@ use std::path::{Component, Path, PathBuf};
 
 use flux_core::{ArtistId, TrackId};
 
+use crate::fs_ops::is_link_or_reparse;
 use crate::library_lock::{LibraryLock, LibraryLockError};
 use crate::portable::{
     Availability, CATALOG_BACKUP_FILE_NAME, CATALOG_FILE_NAME, FLUX_DIR_NAME, FileFingerprint,
@@ -846,8 +847,8 @@ fn check_destination(root: &Path, case_policy: PathCasePolicy) -> Result<PathBuf
         Err(err) => Err(partial(format!(
             "the .flux storage directory cannot be inspected: {err}"
         ))),
-        Ok(metadata) if !metadata.is_dir() => Err(partial(
-            ".flux exists but is not a directory (or is a symlink); \
+        Ok(metadata) if is_link_or_reparse(&metadata) || !metadata.is_dir() => Err(partial(
+            ".flux exists but is not a directory (or is a symlink/reparse point); \
              refusing to treat it as storage"
                 .to_owned(),
         )),
@@ -998,7 +999,7 @@ fn classify(original: &LegacyPath, root: &RootContext) -> Classified {
             // The final component is inspected without following it:
             // a symlinked track file is never managed content.
             match fs::symlink_metadata(&candidate) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
+                Ok(metadata) if is_link_or_reparse(&metadata) => {
                     Classified::Excluded(ExclusionReason::SymlinkedFile)
                 }
                 Ok(metadata) if metadata.is_file() => Classified::Inside {

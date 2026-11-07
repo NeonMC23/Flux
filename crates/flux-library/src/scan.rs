@@ -29,6 +29,7 @@
 //! - Overlapping or repeated roots are safe: the same path encountered
 //!   twice is added once and then counted as deduplicated (or updated).
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,6 +37,7 @@ use flux_core::{Track, TrackSource};
 use lofty::prelude::*;
 
 use crate::Library;
+use crate::fs_ops::is_link_or_reparse;
 
 /// File extensions treated as audio candidates (compared ASCII
 /// case-insensitively). This list mirrors the containers `lofty` can
@@ -141,15 +143,25 @@ impl Library {
             for entry in walkdir::WalkDir::new(root).follow_links(false) {
                 match entry {
                     Ok(entry) => {
-                        let file_type = entry.file_type();
-                        if file_type.is_symlink() {
+                        let metadata = match fs::symlink_metadata(entry.path()) {
+                            Ok(metadata) => metadata,
+                            Err(error) => {
+                                report.skipped.push(ScanIssue::new(
+                                    entry.into_path(),
+                                    format!("entry metadata could not be inspected: {error}"),
+                                ));
+                                continue;
+                            }
+                        };
+                        if is_link_or_reparse(&metadata) {
                             report.skipped.push(ScanIssue::new(
                                 entry.into_path(),
-                                "symbolic link (links are never followed or imported)".to_owned(),
+                                "symbolic link or reparse point (links are never followed or imported)"
+                                    .to_owned(),
                             ));
-                        } else if file_type.is_dir() {
+                        } else if metadata.is_dir() {
                             // Traversal continues into it; nothing to record.
-                        } else if file_type.is_file() {
+                        } else if metadata.is_file() {
                             let path = entry.into_path();
                             if is_supported_audio_path(&path) {
                                 candidates.push(path);

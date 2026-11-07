@@ -122,7 +122,7 @@ use flux_core::{ArtistId, Track, TrackId, TrackSource};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Library;
-use crate::fs_ops::replace_file;
+use crate::fs_ops::{is_link_or_reparse, replace_file};
 
 /// The `.flux` schema version this build writes. (The legacy single-file
 /// index in [`crate::store`] is an independent format with its own version
@@ -3634,12 +3634,12 @@ enum Observation {
 fn inspect_recorded_file(path: &Path) -> Observation {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
+            if is_link_or_reparse(&metadata) {
                 Observation::Error(
-                    "the path is now a symbolic link; links are never followed".to_owned(),
+                    "the path is now a symbolic link or reparse point; links are never followed"
+                        .to_owned(),
                 )
-            } else if !file_type.is_file() {
+            } else if !metadata.is_file() {
                 Observation::Error("the path exists but is not a regular file".to_owned())
             } else {
                 Observation::File {
@@ -3852,8 +3852,10 @@ pub fn reconcile_portable_store(
                     continue;
                 }
             };
-            let file_type = entry.file_type();
-            if file_type.is_symlink() || !file_type.is_file() {
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if is_link_or_reparse(&metadata) || !metadata.is_file() {
                 continue;
             }
             let Ok(relative_os) = entry.path().strip_prefix(&root) else {

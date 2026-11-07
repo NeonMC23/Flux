@@ -997,6 +997,7 @@ dependencies = [
  "crossterm",
  "flux-app",
  "flux-core",
+ "unicode-width",
 ]
 
 [[package]]
