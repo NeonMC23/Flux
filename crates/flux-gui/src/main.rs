@@ -1913,6 +1913,7 @@ struct FileBrowser {
 #[derive(Debug)]
 struct ImportManager {
     stage: ImportUiStage,
+    request_id: u64,
     target_album: Option<ImportAlbumTarget>,
     sources: Vec<PathBuf>,
     recursive: bool,
@@ -1952,6 +1953,7 @@ impl ImportManager {
     fn new() -> Self {
         Self {
             stage: ImportUiStage::Choose,
+            request_id: 0,
             target_album: None,
             sources: Vec::new(),
             recursive: true,
@@ -2132,6 +2134,7 @@ struct FluxReady {
     lib_input: String,
     track_editor: Option<TrackEditor>,
     import_manager: Option<ImportManager>,
+    import_request_seq: u64,
     deletion_manager: Option<DeletionManager>,
     album_transfer: Option<AlbumTransferManager>,
     external_drag_hover: bool,
@@ -2289,8 +2292,8 @@ enum Message {
     ImportBrowserPathChanged(String),
     ImportBrowserPathSubmit,
     ImportRecursiveToggled,
-    ImportPlanReady(u64, Box<ImportPlan>),
-    ImportPrepared(u64, Box<PreparedImport>),
+    ImportPlanReady(u64, u64, Box<ImportPlan>),
+    ImportPrepared(u64, u64, Box<PreparedImport>),
     ImportSelect(usize),
     ImportToggleChecked(usize),
     ImportCheckAll,
@@ -2496,8 +2499,8 @@ impl Message {
             | Self::ArtworkLoaded(session, _, _)
             | Self::ImportNativeFilesPicked(session, _)
             | Self::ImportNativeFolderPicked(session, _)
-            | Self::ImportPlanReady(session, _)
-            | Self::ImportPrepared(session, _)
+            | Self::ImportPlanReady(session, _, _)
+            | Self::ImportPrepared(session, _, _)
             | Self::LyricsImportPicked(session, _)
             | Self::AudioDevicesLoaded(session, _)
             | Self::AudioOutputOpened(session, _, _, _) => Some(*session),
@@ -2518,8 +2521,8 @@ impl Message {
             | Self::ArtworkLoaded(current, _, _)
             | Self::ImportNativeFilesPicked(current, _)
             | Self::ImportNativeFolderPicked(current, _)
-            | Self::ImportPlanReady(current, _)
-            | Self::ImportPrepared(current, _)
+            | Self::ImportPlanReady(current, _, _)
+            | Self::ImportPrepared(current, _, _)
             | Self::LyricsImportPicked(current, _)
             | Self::AudioDevicesLoaded(current, _)
             | Self::AudioOutputOpened(current, _, _, _) => *current = session,
@@ -2575,6 +2578,7 @@ impl FluxReady {
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
+            import_request_seq: 0,
             deletion_manager: None,
             album_transfer: None,
             external_drag_hover: false,
@@ -3633,12 +3637,15 @@ impl FluxReady {
         };
         manager.reset_for_selection();
         manager.stage = ImportUiStage::Scanning;
+        self.import_request_seq = self.import_request_seq.wrapping_add(1);
+        let request_id = self.import_request_seq;
+        manager.request_id = request_id;
         let progress = Arc::clone(&manager.progress);
         let cancel = Arc::clone(&manager.cancel);
         let session = self.controller.library_session();
         Task::perform(
             async move { prepare_import_plan(request, progress, cancel) },
-            move |plan| Message::ImportPlanReady(session, Box::new(plan)),
+            move |plan| Message::ImportPlanReady(session, request_id, Box::new(plan)),
         )
     }
 
@@ -3734,12 +3741,15 @@ impl FluxReady {
             ..ImportProgress::default()
         };
         manager.cancel = Arc::new(AtomicBool::new(false));
+        self.import_request_seq = self.import_request_seq.wrapping_add(1);
+        let request_id = self.import_request_seq;
+        manager.request_id = request_id;
         let progress = Arc::clone(&manager.progress);
         let cancel = Arc::clone(&manager.cancel);
         let session = self.controller.library_session();
         Task::perform(
             async move { prepare_import_files(&plan, progress, cancel) },
-            move |prepared| Message::ImportPrepared(session, Box::new(prepared)),
+            move |prepared| Message::ImportPrepared(session, request_id, Box::new(prepared)),
         )
     }
 
@@ -5097,10 +5107,13 @@ impl FluxReady {
                     manager.recursive = !manager.recursive;
                 }
             }
-            Message::ImportPlanReady(_, plan) => {
+            Message::ImportPlanReady(_, request_id, plan) => {
                 let Some(manager) = self.import_manager.as_mut() else {
                     return Task::none();
                 };
+                if manager.request_id != request_id {
+                    return Task::none();
+                }
                 manager.progress_view = manager
                     .progress
                     .lock()
@@ -5131,7 +5144,16 @@ impl FluxReady {
                     manager.select_candidate(0);
                 }
             }
-            Message::ImportPrepared(_, prepared) => self.apply_import_review(*prepared),
+            Message::ImportPrepared(_, request_id, prepared) => {
+                if self
+                    .import_manager
+                    .as_ref()
+                    .is_none_or(|manager| manager.request_id != request_id)
+                {
+                    return Task::none();
+                }
+                self.apply_import_review(*prepared)
+            }
             Message::ImportSelect(index) => {
                 if let Some(manager) = self.import_manager.as_mut() {
                     manager.select_candidate(index);
@@ -16138,6 +16160,7 @@ mod tests {
             lib_input: String::new(),
             track_editor: None,
             import_manager: None,
+            import_request_seq: 0,
             deletion_manager: None,
             album_transfer: None,
             external_drag_hover: false,
@@ -16844,8 +16867,8 @@ mod tests {
         assert_eq!(gui.controller.tracks()[0].0, id);
 
         send(&mut gui, Message::ImportOpen);
-        let _ = gui.update(Message::ImportPlanReady(old_session, Box::new(old_plan)));
-        let _ = gui.update(Message::ImportPrepared(old_session, Box::default()));
+        let _ = gui.update(Message::ImportPlanReady(old_session, 0, Box::new(old_plan)));
+        let _ = gui.update(Message::ImportPrepared(old_session, 0, Box::default()));
         let manager = gui.import_manager.as_ref().expect("new manager");
         assert!(manager.plan.is_none());
         assert_eq!(manager.stage, ImportUiStage::Choose);
@@ -17389,7 +17412,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let plan = prepare_import_plan(request, progress, cancel);
         send(&mut gui, Message::ImportOpen);
-        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(&mut gui, Message::ImportPlanReady(0, 0, Box::new(plan)));
         let manager = gui.import_manager.as_ref().expect("manager open");
         assert_eq!(manager.stage, ImportUiStage::Review);
         assert_eq!(manager.selected, Some(0));
@@ -17447,7 +17470,7 @@ mod tests {
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
         let prepared = prepare_import_files(&plan, progress, cancel);
-        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
         let manager = gui.import_manager.as_ref().expect("manager");
         assert_eq!(manager.stage, ImportUiStage::Completed);
         let track = gui.controller.tracks()[0].1.clone();
@@ -17518,7 +17541,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         send(&mut gui, Message::ImportOpen);
-        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(&mut gui, Message::ImportPlanReady(0, 0, Box::new(plan)));
         send(&mut gui, Message::ImportAlbumChanged(String::new()));
         let plan = gui
             .import_manager
@@ -17532,7 +17555,7 @@ mod tests {
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
         let id = gui.controller.tracks()[0].0;
         assert_eq!(gui.controller.track_album_id(id), None);
         assert_eq!(gui.controller.albums().len(), 0);
@@ -17594,7 +17617,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         send(&mut gui, Message::ImportOpen);
-        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(&mut gui, Message::ImportPlanReady(0, 0, Box::new(plan)));
         send(&mut gui, Message::ImportToggleChecked(0));
         send(&mut gui, Message::ImportToggleChecked(1));
         send(
@@ -17642,7 +17665,7 @@ mod tests {
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
         let albums = gui.controller.albums();
         assert_eq!(albums.len(), 1);
         assert_eq!(gui.controller.album_tracks(albums[0].id).len(), 2);
@@ -17696,7 +17719,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         send(&mut gui, Message::ImportOpen);
-        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(&mut gui, Message::ImportPlanReady(0, 0, Box::new(plan)));
         send(
             &mut gui,
             Message::ImportArtistPicked(Some(ArtistChoice {
@@ -17724,7 +17747,7 @@ mod tests {
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
         let imported = gui.controller.tracks()[0].0;
         assert_eq!(gui.controller.track_artist_id(imported), Some(artist));
         assert_eq!(gui.controller.track_album_id(imported), Some(album));
@@ -17800,7 +17823,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         send(&mut gui, Message::ImportOpen);
-        send(&mut gui, Message::ImportPlanReady(0, Box::new(plan)));
+        send(&mut gui, Message::ImportPlanReady(0, 0, Box::new(plan)));
         assert!(matches!(
             gui.import_manager
                 .as_ref()
@@ -17830,7 +17853,7 @@ mod tests {
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
         let manager = gui.import_manager.as_ref().expect("manager");
         assert_eq!(manager.stage, ImportUiStage::Completed);
         assert_eq!(
@@ -19204,7 +19227,7 @@ mod tests {
         );
         send(
             &mut gui,
-            Message::ImportPlanReady(0, Box::new(plan.clone())),
+            Message::ImportPlanReady(0, 0, Box::new(plan.clone())),
         );
         send(&mut gui, Message::ImportCheckAll);
         send(
@@ -19227,7 +19250,7 @@ mod tests {
             Arc::new(Mutex::new(ImportProgress::default())),
             Arc::new(AtomicBool::new(false)),
         );
-        send(&mut gui, Message::ImportPrepared(0, Box::new(prepared)));
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
         assert_eq!(
             gui.import_manager.as_ref().expect("manager").stage,
             ImportUiStage::Completed
@@ -19278,7 +19301,7 @@ mod tests {
         );
         send(
             &mut gui,
-            Message::ImportPlanReady(0, Box::new(stale_plan.clone())),
+            Message::ImportPlanReady(0, 0, Box::new(stale_plan.clone())),
         );
         let stale_prepared = prepare_import_files(
             &stale_plan,
@@ -19287,7 +19310,7 @@ mod tests {
         );
         send(
             &mut gui,
-            Message::ImportPrepared(0, Box::new(stale_prepared)),
+            Message::ImportPrepared(0, 0, Box::new(stale_prepared)),
         );
         assert!(
             gui.controller.album_tracks(album).len() == 2,
@@ -20828,6 +20851,59 @@ mod tests {
                 .rating(high)
                 .is_some_and(|rating| rating.favorite)
         );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn stale_import_request_cannot_replace_a_newer_review_in_the_same_session() {
+        let dir = TempDir::new("gui-stale-import-request");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("source/song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        send(&mut gui, Message::ImportOpen);
+        gui.import_manager.as_mut().expect("manager").request_id = 11;
+
+        let request = ImportRequest {
+            sources: vec![source],
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: root,
+            existing_tracks: Vec::new(),
+            existing_artists: Vec::new(),
+            existing_credits: Vec::new(),
+            existing_album_ids: Vec::new(),
+            target_album: None,
+            generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
+        };
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let session = gui.controller.library_session();
+        let _ = gui.update(Message::ImportPlanReady(
+            session,
+            10,
+            Box::new(plan.clone()),
+        ));
+        let manager = gui.import_manager.as_ref().expect("manager");
+        assert!(manager.plan.is_none(), "stale request replaced the review");
+        assert_eq!(manager.stage, ImportUiStage::Choose);
+
+        let _ = gui.update(Message::ImportPlanReady(session, 11, Box::new(plan)));
+        let manager = gui.import_manager.as_ref().expect("manager");
+        assert!(manager.plan.is_some());
+        assert_eq!(manager.stage, ImportUiStage::Review);
         gui.controller.shutdown();
     }
 }
