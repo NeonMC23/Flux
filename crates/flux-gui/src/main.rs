@@ -1020,6 +1020,14 @@ fn deletion_decision_label(decision: &flux_app::ArtistDeletionDecision) -> Strin
     }
 }
 
+fn entity_name_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 fn display_artist(track: &Track) -> String {
     nonempty(track.artist()).unwrap_or_else(|| "Unknown artist".to_owned())
 }
@@ -1905,6 +1913,15 @@ struct TrackEditor {
     move_destination: Option<AlbumChoice>,
     move_position: String,
     move_plan: Option<TrackMovePlan>,
+    dirty: bool,
+    discard_confirm: bool,
+}
+
+impl TrackEditor {
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.discard_confirm = false;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3122,6 +3139,8 @@ impl FluxReady {
             move_destination: None,
             move_position: "1".to_owned(),
             move_plan: None,
+            dirty: false,
+            discard_confirm: false,
         });
         self.show_setup = false;
     }
@@ -3172,6 +3191,7 @@ impl FluxReady {
         editor.credits.push(artist);
         editor.credit_artist = None;
         editor.error = None;
+        editor.mark_dirty();
     }
 
     fn move_editor_credit(&mut self, index: usize, delta: isize) {
@@ -3186,6 +3206,7 @@ impl FluxReady {
             return;
         }
         editor.credits.swap(index, target as usize);
+        editor.mark_dirty();
     }
 
     fn remove_editor_credit(&mut self, index: usize) {
@@ -3201,6 +3222,7 @@ impl FluxReady {
             return;
         }
         editor.credits.remove(index);
+        editor.mark_dirty();
     }
 
     fn plan_editor_replacement(&mut self) {
@@ -3429,6 +3451,21 @@ impl FluxReady {
                 }
             }
         }
+    }
+
+    fn cancel_track_editor(&mut self) {
+        let Some(editor) = self.track_editor.as_mut() else {
+            return;
+        };
+        if editor.dirty && !editor.discard_confirm {
+            editor.discard_confirm = true;
+            editor.error = Some(
+                "Unsaved metadata edits will be discarded. Press Cancel or Esc again to discard them."
+                    .to_owned(),
+            );
+            return;
+        }
+        self.track_editor = None;
     }
 
     fn save_track_editor(&mut self) {
@@ -4186,37 +4223,43 @@ impl FluxReady {
             Message::EditorTitleChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.title = value;
+                    editor.mark_dirty();
                 }
             }
             Message::EditorAlbumChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.album = value;
+                    editor.mark_dirty();
                 }
             }
             Message::EditorTrackNumberChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.track_number = value;
+                    editor.mark_dirty();
                 }
             }
             Message::EditorDiscNumberChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.disc_number = value;
+                    editor.mark_dirty();
                 }
             }
             Message::EditorArtistChanged(choice) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.artist_id = choice.and_then(|choice| choice.id);
+                    editor.mark_dirty();
                 }
             }
             Message::EditorNewArtistChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.new_artist = value;
+                    editor.mark_dirty();
                 }
             }
             Message::EditorCreateArtist => self.create_artist_from_editor(),
             Message::EditorSave => self.save_track_editor(),
             Message::EditorTransferOwner => self.transfer_track_editor_owner(),
-            Message::EditorCancel => self.track_editor = None,
+            Message::EditorCancel => self.cancel_track_editor(),
             Message::EditorCreditSelected(choice) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.credit_artist = choice.and_then(|choice| choice.id);
@@ -4230,6 +4273,7 @@ impl FluxReady {
                     editor.replacement_source = value;
                     editor.replacement_picked = None;
                     editor.replacement_plan = None;
+                    editor.mark_dirty();
                 }
             }
             Message::EditorReplacementChoose => {
@@ -7276,7 +7320,8 @@ impl FluxReady {
                     Key::Character("k") => self.select_view(LibraryView::Settings),
                     Key::Character("l") => self.toggle_setup(),
                     Key::Named(Named::Escape) => {
-                        if self.track_editor.take().is_some() {
+                        if self.track_editor.is_some() {
+                            self.cancel_track_editor();
                             return Task::none();
                         }
                         if self.lyrics_editor.is_some() {
@@ -7391,6 +7436,18 @@ impl FluxReady {
                     editor.discard_confirm = true;
                     editor.error = Some(
                         "Unsaved lyrics changes will be lost. Close the window again to discard them, or save/cancel the editor first."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                if let Some(editor) = self.track_editor.as_mut()
+                    && editor.dirty
+                    && !self.close_confirm
+                {
+                    self.close_confirm = true;
+                    editor.discard_confirm = true;
+                    editor.error = Some(
+                        "Unsaved metadata edits will be lost. Close the window again to discard them, or save/cancel the editor first."
                             .to_owned(),
                     );
                     return Task::none();
@@ -9593,12 +9650,10 @@ impl FluxReady {
                 );
             }
             if let (Some(owner), Some(title)) = (candidate.artist_id(), candidate.album()) {
-                if let Some(existing) = self
-                    .controller
-                    .albums()
-                    .into_iter()
-                    .find(|album| album.owner_artist_id == owner && album.title == title)
-                {
+                if let Some(existing) = self.controller.albums().into_iter().find(|album| {
+                    album.owner_artist_id == owner
+                        && entity_name_key(&album.title) == entity_name_key(title)
+                }) {
                     body = body.push(
                         text(format!(
                             "Reuses existing AlbumId {} · owner {}",
@@ -11040,6 +11095,15 @@ impl FluxReady {
                 .size(10)
                 .color(MUTED),
             text(source_path).size(10).color(MUTED),
+            if editor.dirty {
+                Element::from(
+                    text("Unsaved metadata edits · Save to publish or Cancel twice to discard.")
+                        .size(10)
+                        .color(ACCENT),
+                )
+            } else {
+                Element::from(iced::widget::Space::new().height(0))
+            },
         ]
         .spacing(6);
         if missing {
@@ -16582,6 +16646,59 @@ mod tests {
         assert!(gui.audio_switch_error.is_none());
         assert!(!gui.audio_devices_loading);
         assert_eq!(gui.audio_switch_token, token + 1);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn dirty_track_editor_requires_explicit_discard_or_close_confirmation() {
+        let dir = TempDir::new("gui-dirty-track-editor");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("source/song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = gui.controller.tracks()[0].0;
+
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorTitleChanged("Unsaved title".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(gui.track_editor.is_some());
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .and_then(|editor| editor.error.as_deref())
+                .is_some_and(|error| error.contains("Unsaved metadata"))
+        );
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(gui.track_editor.is_none());
+
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorAlbumChanged("Another Album".to_owned()),
+        );
+        let _ = gui.update(Message::WindowCloseRequested(iced::window::Id::unique()));
+        assert!(!gui.closed);
+        assert!(gui.close_confirm);
+        assert!(gui.track_editor.is_some());
         gui.controller.shutdown();
     }
 
