@@ -1657,8 +1657,7 @@ pub(crate) fn discover_sidecars(
                 .collect::<Vec<_>>();
             files.sort();
             files
-        })
-        .clone();
+        });
     let Some(stem) = audio.file_stem().and_then(|stem| stem.to_str()) else {
         return discovery;
     };

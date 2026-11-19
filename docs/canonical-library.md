@@ -2209,8 +2209,10 @@ cleanup.
     safety and fingerprints only; it does not decode the audio or read tags.
 15. On platforms that block deleting an open file, replacing or moving the
     currently playing track may leave old-file cleanup pending until playback
-    releases the handle. The catalogue commit remains authoritative and recovery
-    retries the journal-owned cleanup.
+    releases the handle. Catalogue changes remain authoritative; journal-owned
+    cleanup retries on reopen. Single-track deletion uses its own reported
+    best-effort cleanup rather than the journal, so an unresolvable obstacle is
+    surfaced without automatic retry.
 16. ENOSPC and a true second mounted filesystem were not available for testing.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
@@ -2275,10 +2277,10 @@ cleanup.
 30. TUI track deletion, audio/artwork/lyrics repair, ownership and album/artist
     transfer, playlists, batch actions and global filters remain GUI-only. The
     TUI does not expose a queue clear/bulk-removal operation.
-31. TUI truncation is character-based rather than display-cell-based. Combining
-    marks and double-width East Asian glyphs may occupy different terminal
-    cells; no `unicode-width` dependency was added, and broad terminal-emulator
-    compatibility was not exhaustively tested.
+31. TUI truncation uses Unicode display-cell width for combining marks and
+    wide characters. Complex emoji ZWJ sequences may still be conservatively
+    approximated; broad terminal-emulator compatibility was not exhaustively
+    tested.
 32. TUI runtime validation covers deterministic key/Controller behavior plus a
     pseudo-terminal startup/help/quit probe. Real terminal multiplexers,
     accessibility tooling and remote-terminal latency were not exercised.
@@ -2289,7 +2291,12 @@ cleanup.
 34. Portable path case policy defaults to insensitive on Windows/macOS. Actual
     volume/directory case-sensitivity probing is not implemented, so a
     case-sensitive APFS/NTFS directory may see a conservative duplicate policy.
-35. Native pickers preserve spaces and non-UTF-8 Unix bytes. Multi-selection
+36. Automatic sidecar discovery is local-only and deterministic: same-stem
+    LRC/TXT and Track images, plus conventional Album cover sidecars. It does
+    not inspect embedded tags, search remote services, infer Artist images
+    automatically, or merge conflicting candidates; review edits override every
+    suggestion.
+37. Native pickers preserve spaces and non-UTF-8 Unix bytes. Multi-selection
     dialogs use newline as the record separator, so a selected filename containing
     a literal newline cannot be represented safely there; the single-folder path
     retains embedded newlines by treating the whole output (minus one trailing
