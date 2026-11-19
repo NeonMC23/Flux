@@ -13016,16 +13016,37 @@ impl FluxReady {
             self.lyrics_error = Some("Enter an export destination path.".to_owned());
             return;
         }
-        match path.extension().and_then(|extension| extension.to_str()) {
-            None => {
-                path.set_extension(expected_extension);
-            }
-            Some(extension) if extension.eq_ignore_ascii_case(expected_extension) => {}
-            Some(_) => {
-                self.lyrics_error = Some(format!(
-                    "Export .{format} requires a .{expected_extension} destination."
-                ));
-                return;
+        if path.is_dir() {
+            let track = self.controller.track(id);
+            let mut name = track.map_or_else(
+                || format!("track-{id}"),
+                |track| format!("{} - {}", display_artist(track), track.title()),
+            );
+            name.retain(|character| {
+                !character.is_control()
+                    && !matches!(
+                        character,
+                        '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+                    )
+            });
+            let name = name.trim().trim_end_matches('.').trim();
+            path.push(if name.is_empty() {
+                format!("track-{id}.{expected_extension}")
+            } else {
+                format!("{name}.{expected_extension}")
+            });
+        } else {
+            match path.extension().and_then(|extension| extension.to_str()) {
+                None => {
+                    path.set_extension(expected_extension);
+                }
+                Some(extension) if extension.eq_ignore_ascii_case(expected_extension) => {}
+                Some(_) => {
+                    self.lyrics_error = Some(format!(
+                        "Export .{format} requires a .{expected_extension} destination."
+                    ));
+                    return;
+                }
             }
         }
         let pending =
@@ -13047,7 +13068,7 @@ impl FluxReady {
         } else {
             document.to_plain_text()
         };
-        match std::fs::write(&path, content.as_bytes()) {
+        match flux_app::write_atomic(&path, content.as_bytes()) {
             Ok(()) => {
                 self.lyrics_export_pending = None;
                 self.lyrics_error = None;
@@ -20753,6 +20774,24 @@ mod tests {
         assert!(
             std::fs::read_to_string(&export_path)
                 .expect("overwrite")
+                .contains("Café")
+        );
+
+        let export_dir = dir.path().join("lyrics-export-directory");
+        std::fs::create_dir_all(&export_dir).expect("export directory");
+        send(
+            &mut gui,
+            Message::LyricsExportPathChanged(export_dir.display().to_string()),
+        );
+        send(&mut gui, Message::LyricsExport("lrc".to_owned()));
+        let safe_export = export_dir.join("Lyrics Artist - IO Track.lrc");
+        assert!(
+            safe_export.is_file(),
+            "directory export uses a safe Track-derived filename"
+        );
+        assert!(
+            std::fs::read_to_string(&safe_export)
+                .expect("directory export")
                 .contains("Café")
         );
 

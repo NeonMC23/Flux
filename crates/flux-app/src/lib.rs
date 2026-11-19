@@ -119,6 +119,7 @@ pub use flux_library::canonical_migrate::{
     CanonicalMigrationReport, CanonicalSourceFormat,
 };
 pub use flux_library::migrate::{MigrationError, MigrationPlan, MigrationReport, MigrationStage};
+pub use flux_library::write_atomic;
 pub use flux_library::{
     Artist, Availability, MetadataOverrides, PortableStoreError, ReconcileOutcome, ReconcileReport,
     RecoveryInfo, RelPath, RelinkCandidates, RelinkError, StoreError, is_supported_audio_path,
