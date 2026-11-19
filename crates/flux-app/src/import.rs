@@ -581,6 +581,7 @@ impl ImportCandidate {
         self.owner_index = index;
         self.artist_name = Some(self.credits[index].name.clone());
         self.artist_id = self.credits[index].artist_id;
+        self.provenance.artist = MetadataSource::Manual;
         true
     }
 
@@ -592,6 +593,7 @@ impl ImportCandidate {
             if index == self.owner_index {
                 self.artist_id = Some(artist_id);
                 self.artist_name = Some(self.credits[index].name.clone());
+                self.provenance.artist = MetadataSource::Manual;
             }
         }
     }

@@ -4297,6 +4297,7 @@ impl FluxReady {
                         editor.replacement_source = path.display().to_string();
                         editor.replacement_picked = Some(path.clone());
                         editor.replacement_plan = None;
+                        editor.mark_dirty();
                     }
                 }
                 Ok(None) => {}
@@ -4327,6 +4328,7 @@ impl FluxReady {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.move_position = value;
                     editor.move_plan = None;
+                    editor.mark_dirty();
                 }
             }
             Message::EditorPlanMove => self.plan_editor_move(),
@@ -4901,6 +4903,7 @@ impl FluxReady {
                     editor.artwork_input = value;
                     editor.artwork_picked = None;
                     editor.artwork_remove_confirm = false;
+                    editor.mark_dirty();
                 }
             }
             Message::TrackArtworkChoose => {
