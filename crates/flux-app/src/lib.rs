@@ -7871,14 +7871,30 @@ fn collect_audio_files(
 
 /// Conservative filename/folder inference for quick imports. It never opens
 /// the audio file or reads tags.
+pub(crate) struct CanonicalImportInference {
+    pub track: CanonicalImportedTrack,
+    pub title_source: crate::import::MetadataSource,
+    pub artist_source: crate::import::MetadataSource,
+    pub album_source: Option<crate::import::MetadataSource>,
+    pub track_number_source: Option<crate::import::MetadataSource>,
+    pub disc_number_source: Option<crate::import::MetadataSource>,
+    pub conflicts: Vec<String>,
+}
+
 fn infer_canonical_import(path: &Path) -> Option<CanonicalImportedTrack> {
+    infer_canonical_import_detailed(path).map(|inference| inference.track)
+}
+
+fn infer_canonical_import_detailed(path: &Path) -> Option<CanonicalImportInference> {
+    use crate::import::MetadataSource;
+
     let stem = path.file_stem()?.to_str()?.trim();
     if stem.is_empty() {
         return None;
     }
     let mut title = stem.to_owned();
     let mut track_number = None;
-    let mut artist_name = None;
+    let mut filename_artist = None;
     // Numeric track prefix: "01 - Title", "01. Title", "01 Title".
     if let Some((prefix, rest)) = stem.split_once(['-', '.', ' '])
         && let Ok(number) = prefix.trim().parse::<u32>()
@@ -7894,7 +7910,7 @@ fn infer_canonical_import(path: &Path) -> Option<CanonicalImportedTrack> {
         let left = left.trim();
         let right = right.trim();
         if !left.is_empty() && !right.is_empty() {
-            artist_name = Some(left.to_owned());
+            filename_artist = Some(left.to_owned());
             title = right.to_owned();
         }
     }
@@ -7911,28 +7927,55 @@ fn infer_canonical_import(path: &Path) -> Option<CanonicalImportedTrack> {
                 "music" | "Music" | "audio" | "Audio" | "Downloads"
             )
         });
-    if artist_name.is_none() {
-        artist_name = parent
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(ToOwned::to_owned);
+    let folder_artist = parent
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned);
+    let mut conflicts = Vec::new();
+    if let (Some(filename), Some(folder)) = (&filename_artist, &folder_artist)
+        && normalize_import_name(filename) != normalize_import_name(folder)
+    {
+        conflicts.push(format!(
+            "Filename artist {filename:?} differs from parent-folder artist {folder:?}; the filename value is proposed."
+        ));
     }
-    let artist_name = artist_name.unwrap_or_else(|| "Unknown Artist".to_owned());
-    Some(CanonicalImportedTrack {
-        source: path.to_path_buf(),
-        title,
-        artist_id: None,
-        artist_name,
-        credited_artist_ids: Vec::new(),
-        album_title: album,
-        release_type: ReleaseType::Album,
-        track_number,
-        disc_number: None,
-        duration_ms: None,
+    let (artist_name, artist_source) = match (filename_artist, folder_artist) {
+        (Some(artist), _) => (artist, MetadataSource::Filename),
+        (None, Some(artist)) => (artist, MetadataSource::Folder),
+        (None, None) => ("Unknown Artist".to_owned(), MetadataSource::Fallback),
+    };
+    let album_source = album.as_ref().map(|_| MetadataSource::Folder);
+    Some(CanonicalImportInference {
+        track: CanonicalImportedTrack {
+            source: path.to_path_buf(),
+            title,
+            artist_id: None,
+            artist_name,
+            credited_artist_ids: Vec::new(),
+            album_title: album,
+            release_type: ReleaseType::Album,
+            track_number,
+            disc_number: None,
+            duration_ms: None,
+        },
+        title_source: MetadataSource::Filename,
+        artist_source,
+        album_source,
+        track_number_source: track_number.map(|_| MetadataSource::Filename),
+        disc_number_source: None,
+        conflicts,
     })
+}
+
+fn normalize_import_name(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn legacy_queue_path(canonical_index: &Path) -> PathBuf {

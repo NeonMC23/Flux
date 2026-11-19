@@ -19,6 +19,7 @@
 //! audio tags; user edits become sparse Flux overrides.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -219,6 +220,107 @@ pub struct ImportAlbumTarget {
     pub generation: u64,
 }
 
+/// Where one reviewed metadata value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataSource {
+    /// Parsed from the audio filename.
+    Filename,
+    /// Inferred from the containing folder or its parent.
+    Folder,
+    /// Carried over from an existing canonical Track.
+    ExistingLibrary,
+    /// Read from a same-stem LRC/TXT sidecar.
+    SidecarLyrics,
+    /// Read from a local image sidecar.
+    SidecarArtwork,
+    /// Changed by the user during review.
+    Manual,
+    /// Safe placeholder rather than discovered information.
+    Fallback,
+}
+
+impl MetadataSource {
+    /// Compact review label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Filename => "filename",
+            Self::Folder => "folder",
+            Self::ExistingLibrary => "existing library",
+            Self::SidecarLyrics => "lyrics sidecar",
+            Self::SidecarArtwork => "artwork sidecar",
+            Self::Manual => "manual review",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Inspectable provenance for the editable material in one import candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataProvenance {
+    /// Title source.
+    pub title: MetadataSource,
+    /// Artist source.
+    pub artist: MetadataSource,
+    /// Album source, when an Album is proposed.
+    pub album: Option<MetadataSource>,
+    /// Track-number source, when known.
+    pub track_number: Option<MetadataSource>,
+    /// Disc-number source, when known.
+    pub disc_number: Option<MetadataSource>,
+    /// Lyrics source, when attached.
+    pub lyrics: Option<MetadataSource>,
+    /// Track-artwork source, when attached.
+    pub artwork: Option<MetadataSource>,
+    /// Album-artwork source, when attached.
+    pub album_artwork: Option<MetadataSource>,
+}
+
+impl Default for MetadataProvenance {
+    fn default() -> Self {
+        Self {
+            title: MetadataSource::Filename,
+            artist: MetadataSource::Fallback,
+            album: None,
+            track_number: None,
+            disc_number: None,
+            lyrics: None,
+            artwork: None,
+            album_artwork: None,
+        }
+    }
+}
+
+impl MetadataProvenance {
+    /// Human-readable one-line summary for review surfaces.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut fields = vec![
+            format!("title {}", self.title.label()),
+            format!("artist {}", self.artist.label()),
+        ];
+        if let Some(source) = self.album {
+            fields.push(format!("album {}", source.label()));
+        }
+        if let Some(source) = self.track_number {
+            fields.push(format!("track {}", source.label()));
+        }
+        if let Some(source) = self.disc_number {
+            fields.push(format!("disc {}", source.label()));
+        }
+        if let Some(source) = self.lyrics {
+            fields.push(format!("lyrics {}", source.label()));
+        }
+        if let Some(source) = self.artwork {
+            fields.push(format!("track art {}", source.label()));
+        }
+        if let Some(source) = self.album_artwork {
+            fields.push(format!("album art {}", source.label()));
+        }
+        fields.join(" · ")
+    }
+}
+
 /// One ordered credit in the import review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportCredit {
@@ -304,6 +406,10 @@ pub struct ImportCandidate {
     artwork: Option<flux_library::canonical::CanonicalImportAsset>,
     album_artwork: Option<flux_library::canonical::CanonicalImportAsset>,
     lyrics: Option<String>,
+    lyrics_source: Option<PathBuf>,
+    provenance: MetadataProvenance,
+    conflicts: Vec<String>,
+    sidecar_notes: Vec<String>,
 }
 
 impl ImportCandidate {
@@ -534,6 +640,30 @@ impl ImportCandidate {
         self.metadata_incomplete
     }
 
+    /// Inspectable metadata provenance.
+    #[must_use]
+    pub fn provenance(&self) -> &MetadataProvenance {
+        &self.provenance
+    }
+
+    /// Conflicting evidence found during discovery or existing-entity matching.
+    #[must_use]
+    pub fn conflicts(&self) -> &[String] {
+        &self.conflicts
+    }
+
+    /// Informational notes about discovered sidecar files.
+    #[must_use]
+    pub fn sidecar_notes(&self) -> &[String] {
+        &self.sidecar_notes
+    }
+
+    /// Local lyrics sidecar used for the current proposal, when applicable.
+    #[must_use]
+    pub fn lyrics_source_path(&self) -> Option<&Path> {
+        self.lyrics_source.as_deref()
+    }
+
     /// Whether any reviewed field differs from its source/base value.
     #[must_use]
     pub fn is_edited(&self) -> bool {
@@ -553,6 +683,7 @@ impl ImportCandidate {
     /// Sets the reviewed title. An empty title means the display fallback.
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
+        self.provenance.title = MetadataSource::Manual;
     }
 
     /// Sets the reviewed artist display name. The stable relationship is
@@ -568,6 +699,7 @@ impl ImportCandidate {
                 .unwrap_or_else(|| "Unknown Artist".to_owned());
             credit.artist_id = self.artist_id;
         }
+        self.provenance.artist = MetadataSource::Manual;
     }
 
     /// Sets the reviewed album.
@@ -575,6 +707,7 @@ impl ImportCandidate {
         self.album = album
             .map(|album| album.trim().to_owned())
             .filter(|album| !album.is_empty());
+        self.provenance.album = self.album.as_ref().map(|_| MetadataSource::Manual);
     }
 
     /// Optional Track artwork source selected for this candidate.
@@ -599,49 +732,80 @@ impl ImportCandidate {
 
     /// Attaches or replaces a Track artwork source, capturing its fingerprint.
     pub fn set_artwork(&mut self, source: &Path) -> Result<(), String> {
+        self.set_artwork_with_source(source, MetadataSource::Manual)
+    }
+
+    fn set_artwork_with_source(
+        &mut self,
+        source: &Path,
+        metadata_source: MetadataSource,
+    ) -> Result<(), String> {
         let fingerprint = flux_library::canonical::ContentFingerprint::of_file(source)
             .map_err(|error| format!("Could not fingerprint track artwork: {error}"))?;
         self.artwork = Some(flux_library::canonical::CanonicalImportAsset {
             source: source.to_path_buf(),
             fingerprint,
         });
+        self.provenance.artwork = Some(metadata_source);
         Ok(())
     }
 
     /// Removes the Track artwork selection.
     pub fn clear_artwork(&mut self) {
         self.artwork = None;
+        self.provenance.artwork = None;
     }
 
     /// Attaches or replaces Album artwork, capturing its fingerprint.
     pub fn set_album_artwork(&mut self, source: &Path) -> Result<(), String> {
+        self.set_album_artwork_with_source(source, MetadataSource::Manual)
+    }
+
+    fn set_album_artwork_with_source(
+        &mut self,
+        source: &Path,
+        metadata_source: MetadataSource,
+    ) -> Result<(), String> {
         let fingerprint = flux_library::canonical::ContentFingerprint::of_file(source)
             .map_err(|error| format!("Could not fingerprint album artwork: {error}"))?;
         self.album_artwork = Some(flux_library::canonical::CanonicalImportAsset {
             source: source.to_path_buf(),
             fingerprint,
         });
+        self.provenance.album_artwork = Some(metadata_source);
         Ok(())
     }
 
     /// Removes the Album artwork selection.
     pub fn clear_album_artwork(&mut self) {
         self.album_artwork = None;
+        self.provenance.album_artwork = None;
     }
 
     /// Sets or clears managed lyrics text for the imported track.
     pub fn set_lyrics_text(&mut self, lyrics: Option<String>) {
         self.lyrics = lyrics.filter(|text| !text.trim().is_empty());
+        self.lyrics_source = None;
+        self.provenance.lyrics = self.lyrics.as_ref().map(|_| MetadataSource::Manual);
+    }
+
+    /// Attaches validated lyrics discovered beside the source file.
+    fn set_sidecar_lyrics(&mut self, source: PathBuf, lyrics: String) {
+        self.lyrics = Some(lyrics).filter(|text| !text.trim().is_empty());
+        self.lyrics_source = self.lyrics.as_ref().map(|_| source);
+        self.provenance.lyrics = self.lyrics.as_ref().map(|_| MetadataSource::SidecarLyrics);
     }
 
     /// Sets the reviewed track number.
     pub fn set_track_number(&mut self, number: Option<u32>) {
         self.track_number = number;
+        self.provenance.track_number = number.map(|_| MetadataSource::Manual);
     }
 
     /// Sets the reviewed disc number.
     pub fn set_disc_number(&mut self, number: Option<u32>) {
         self.disc_number = number;
+        self.provenance.disc_number = number.map(|_| MetadataSource::Manual);
     }
 
     /// Selects an existing stable artist identity and optionally updates the
@@ -654,6 +818,7 @@ impl ImportCandidate {
             credit.artist_id = artist_id;
             self.artist_name = Some(credit.name.clone());
         }
+        self.provenance.artist = MetadataSource::Manual;
     }
 
     /// Forces the fixed album target: owner, album title and owner credit.
@@ -671,6 +836,8 @@ impl ImportCandidate {
         self.base_artist_name = Some(target.owner_name.clone());
         self.base_artist_id = Some(target.owner_artist_id);
         self.base_credits = self.credits.clone();
+        self.provenance.album = Some(MetadataSource::Manual);
+        self.provenance.artist = MetadataSource::Manual;
     }
 
     /// Chooses what to do with this candidate.
@@ -808,6 +975,7 @@ impl ImportPlan {
             for duplicate_index in duplicate.into_iter().rev() {
                 candidate.remove_credit(duplicate_index);
             }
+            candidate.provenance.artist = MetadataSource::Manual;
         }
     }
 
@@ -839,6 +1007,7 @@ impl ImportPlan {
             }
             candidate.artist_id = None;
             candidate.artist_name = Some(name.to_owned());
+            candidate.provenance.artist = MetadataSource::Manual;
         }
     }
 
@@ -875,6 +1044,7 @@ impl ImportPlan {
         for index in indices {
             if let Some(candidate) = self.candidates.get_mut(*index) {
                 candidate.album_artwork = Some(asset.clone());
+                candidate.provenance.album_artwork = Some(MetadataSource::Manual);
             }
         }
         Ok(())
@@ -1269,12 +1439,18 @@ fn collect_sources(
     candidates
 }
 
+struct ProbedCandidate {
+    path: PathBuf,
+    track: Track,
+    inference: crate::CanonicalImportInference,
+}
+
 fn probe_candidates(
     paths: Vec<PathBuf>,
     cancel: &AtomicBool,
     progress: &Mutex<ImportProgress>,
     issues: &mut Vec<ImportIssue>,
-) -> Vec<(PathBuf, Track)> {
+) -> Vec<ProbedCandidate> {
     let total = paths.len();
     resize_progress_items(progress, total);
     update_progress(
@@ -1291,7 +1467,7 @@ fn probe_candidates(
             break;
         }
         set_progress_item(progress, index, ImportItemState::Scanning);
-        if let Some(inferred) = crate::infer_canonical_import(&path) {
+        if let Some(inference) = crate::infer_canonical_import_detailed(&path) {
             if let Err(error) = flux_audio::decode::open_decoder(&path) {
                 issues.push(ImportIssue {
                     path,
@@ -1299,10 +1475,13 @@ fn probe_candidates(
                 });
                 set_progress_item(progress, index, ImportItemState::Failed);
             } else {
-                let mut track = Track::new(inferred.title, TrackSource::local(path.clone()));
-                track = track.with_artist(inferred.artist_name);
-                if let Some(album) = inferred.album_title {
-                    track = track.with_album(album);
+                let inferred = &inference.track;
+                let mut track =
+                    Track::new(inferred.title.clone(), TrackSource::local(path.clone()));
+
+                track = track.with_artist(inferred.artist_name.clone());
+                if let Some(album) = &inferred.album_title {
+                    track = track.with_album(album.clone());
                 }
                 if let Some(number) = inferred.track_number {
                     track = track.with_track_number(number);
@@ -1310,7 +1489,11 @@ fn probe_candidates(
                 if let Some(disc) = inferred.disc_number {
                     track = track.with_disc_number(disc);
                 }
-                candidates.push((path, track));
+                candidates.push(ProbedCandidate {
+                    path,
+                    track,
+                    inference,
+                });
                 set_progress_item(progress, index, ImportItemState::Ready);
             }
         } else {
@@ -1347,6 +1530,14 @@ fn filename_stem(path: &Path) -> String {
 
 fn normalized(value: Option<&str>) -> String {
     value.map(str::trim).unwrap_or_default().to_lowercase()
+}
+
+fn normalized_entity_name(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn same_metadata(left: &Track, right: &Track) -> bool {
@@ -1404,6 +1595,202 @@ fn base_for_existing(
     Some((track, artist))
 }
 
+struct SidecarDiscovery {
+    lyrics: Option<(PathBuf, String)>,
+    track_artwork: Option<PathBuf>,
+    album_artwork: Option<PathBuf>,
+    notes: Vec<String>,
+}
+
+fn discover_sidecars(
+    audio: &Path,
+    directory_files: &mut HashMap<PathBuf, Vec<PathBuf>>,
+) -> SidecarDiscovery {
+    let mut discovery = SidecarDiscovery {
+        lyrics: None,
+        track_artwork: None,
+        album_artwork: None,
+        notes: Vec::new(),
+    };
+    let Some(parent) = audio.parent() else {
+        return discovery;
+    };
+    let files = directory_files
+        .entry(parent.to_path_buf())
+        .or_insert_with(|| {
+            let mut files = std::fs::read_dir(parent)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        })
+        .clone();
+    let Some(stem) = audio.file_stem().and_then(|stem| stem.to_str()) else {
+        return discovery;
+    };
+    let stem = stem.to_lowercase();
+    let mut lyrics = files
+        .iter()
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.to_lowercase() == stem)
+        })
+        .filter_map(|path| {
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())?
+                .to_ascii_lowercase();
+            matches!(extension.as_str(), "lrc" | "txt").then(|| (extension, path.clone()))
+        })
+        .collect::<Vec<_>>();
+    lyrics.sort_by_key(|(extension, path)| (extension != "lrc", path.clone()));
+    if lyrics.len() > 1 {
+        discovery.notes.push(format!(
+            "Multiple lyrics sidecars match this track; using {}.",
+            lyrics[0].1.display()
+        ));
+    }
+    for (_, path) in lyrics {
+        match read_lyrics_sidecar(&path) {
+            Ok(text) => {
+                discovery.lyrics = Some((path, text));
+                break;
+            }
+            Err(error) => discovery.notes.push(format!(
+                "Ignored lyrics sidecar {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    let mut track_art = files
+        .iter()
+        .filter(|path| is_image_sidecar(path))
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.to_lowercase() == stem)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    track_art.sort();
+    if track_art.len() > 1 {
+        discovery.notes.push(format!(
+            "Multiple Track-artwork sidecars match this track; using {}.",
+            track_art[0].display()
+        ));
+    }
+    discovery.track_artwork =
+        track_art
+            .into_iter()
+            .find(|path| match path_valid_image_sidecar(path) {
+                Ok(()) => true,
+                Err(error) => {
+                    discovery.notes.push(format!(
+                        "Ignored Track-artwork sidecar {}: {error}",
+                        path.display()
+                    ));
+                    false
+                }
+            });
+
+    let mut album_art = files
+        .iter()
+        .filter(|path| is_image_sidecar(path))
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|value| {
+                    matches!(value.as_str(), "cover" | "folder" | "front" | "album")
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    album_art.sort_by_key(|path| {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let rank = match stem.as_str() {
+            "cover" => 0,
+            "folder" => 1,
+            "front" => 2,
+            _ => 3,
+        };
+        (rank, path.clone())
+    });
+    if album_art.len() > 1 {
+        discovery.notes.push(format!(
+            "Multiple Album-cover sidecars found; using {} as a suggestion.",
+            album_art[0].display()
+        ));
+    }
+    discovery.album_artwork =
+        album_art
+            .into_iter()
+            .find(|path| match path_valid_image_sidecar(path) {
+                Ok(()) => true,
+                Err(error) => {
+                    discovery.notes.push(format!(
+                        "Ignored Album-cover sidecar {}: {error}",
+                        path.display()
+                    ));
+                    false
+                }
+            });
+    discovery
+}
+
+fn is_image_sidecar(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn read_lyrics_sidecar(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() == 0 || metadata.len() > 2 * 1024 * 1024 {
+        return Err("lyrics file must be between 1 byte and 2 MiB".to_owned());
+    }
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let text = String::from_utf8(bytes).map_err(|_| "lyrics file is not valid UTF-8".to_owned())?;
+    crate::LyricsDocument::parse(&text)
+        .map_err(|error| format!("lyrics are not valid LRC/TXT: {error}"))?;
+    Ok(text)
+}
+
+fn path_valid_image_sidecar(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() == 0 || metadata.len() > 16 * 1024 * 1024 {
+        return Err("image must be between 1 byte and 16 MiB".to_owned());
+    }
+    let mut header = [0u8; 12];
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let read = file.read(&mut header).map_err(|error| error.to_string())?;
+    let header = &header[..read];
+    let valid = header.starts_with(b"\x89PNG\r\n\x1a\n")
+        || header.starts_with(&[0xff, 0xd8, 0xff])
+        || (header.starts_with(b"RIFF") && header.get(8..12) == Some(b"WEBP"));
+    if valid {
+        Ok(())
+    } else {
+        Err("image header is not PNG, JPEG, or WebP".to_owned())
+    }
+}
+
 fn make_candidate(
     source_path: PathBuf,
     source_track: Track,
@@ -1412,6 +1799,8 @@ fn make_candidate(
     artist_links: &[(TrackId, ArtistId)],
     credit_links: &[(TrackId, Vec<ArtistId>)],
     album_links: &[(TrackId, AlbumId)],
+    inference: &crate::CanonicalImportInference,
+    directory_files: &mut HashMap<PathBuf, Vec<PathBuf>>,
 ) -> ImportCandidate {
     let existing_match = status.matched_track().and_then(|id| {
         let (_, track) = existing.iter().find(|(track_id, _)| *track_id == id)?;
@@ -1493,7 +1882,42 @@ fn make_candidate(
             .unwrap_or_else(|| "Unknown Artist".to_owned()),
         false,
     )];
-    ImportCandidate {
+    let mut provenance = MetadataProvenance {
+        title: inference.title_source,
+        artist: inference.artist_source,
+        album: if base_album.is_some() {
+            inference.album_source
+        } else {
+            None
+        },
+        track_number: base_track_number.and(inference.track_number_source),
+        disc_number: base_disc_number.and(inference.disc_number_source),
+        ..MetadataProvenance::default()
+    };
+    let mut conflicts = inference.conflicts.clone();
+    if matches!(status, CandidateStatus::ExistingPath(_)) {
+        provenance.title = MetadataSource::ExistingLibrary;
+        provenance.artist = MetadataSource::ExistingLibrary;
+        provenance.album = base_album.as_ref().map(|_| MetadataSource::ExistingLibrary);
+        provenance.track_number = base_track_number.map(|_| MetadataSource::ExistingLibrary);
+    } else if let Some(existing) = &existing_match {
+        if normalized(Some(&base_title)) != normalized(Some(&existing.title)) {
+            conflicts.push(format!(
+                "Incoming title {:?} differs from existing canonical title {:?}.",
+                base_title, existing.title
+            ));
+        }
+        if normalized(base_artist_name.as_deref()) != normalized(existing.artist_name.as_deref()) {
+            conflicts
+                .push("Incoming artist differs from the existing canonical artist.".to_owned());
+        }
+        if normalized(base_album.as_deref()) != normalized(existing.album_title.as_deref()) {
+            conflicts.push("Incoming album differs from the existing canonical album.".to_owned());
+        }
+    }
+    let sidecars = discover_sidecars(&source_path, directory_files);
+    conflicts.extend(sidecars.notes.iter().cloned());
+    let mut candidate = ImportCandidate {
         source_path: source_path.clone(),
         source_track,
         file_size: file_size(&source_path).unwrap_or(0),
@@ -1524,7 +1948,23 @@ fn make_candidate(
         artwork: None,
         album_artwork: None,
         lyrics: None,
+        lyrics_source: None,
+        provenance,
+        conflicts,
+        sidecar_notes: sidecars.notes,
+    };
+    if let Some((path, text)) = sidecars.lyrics {
+        candidate.set_sidecar_lyrics(path, text);
     }
+    if let Some(path) = sidecars.track_artwork {
+        let _ = candidate.set_artwork_with_source(&path, MetadataSource::SidecarArtwork);
+    }
+    if candidate.album.is_some()
+        && let Some(path) = sidecars.album_artwork
+    {
+        let _ = candidate.set_album_artwork_with_source(&path, MetadataSource::SidecarArtwork);
+    }
+    candidate
 }
 
 fn duplicate_status(
@@ -1698,11 +2138,17 @@ pub fn prepare_import_plan(
         HashMap::new();
     let mut candidate_hashes: HashMap<flux_library::canonical::ContentFingerprint, PathBuf> =
         HashMap::new();
-    for (index, (path, track)) in candidates.drain(..).enumerate() {
+    let mut directory_files: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for (index, probed) in candidates.drain(..).enumerate() {
         if is_cancelled(&cancel) {
             plan.cancelled = true;
             break;
         }
+        let ProbedCandidate {
+            path,
+            track,
+            inference,
+        } = probed;
         let status = duplicate_status(
             &path,
             &track,
@@ -1719,6 +2165,8 @@ pub fn prepare_import_plan(
             &existing_artists,
             &existing_credits,
             &existing_album_ids,
+            &inference,
+            &mut directory_files,
         ));
         set_progress_item(&progress, index, ImportItemState::Ready);
         update_progress(
@@ -2109,17 +2557,18 @@ fn resolve_import_artist_refs(
             if name.is_empty() {
                 return Err("Every credit needs a name or an existing artist.".to_owned());
             }
+            let normalized = normalized_entity_name(name);
             let matches = controller
                 .artists()
                 .into_iter()
-                .filter(|artist| artist.name() == name)
+                .filter(|artist| normalized_entity_name(artist.name()) == normalized)
                 .collect::<Vec<_>>();
             match matches.as_slice() {
                 [] => refs.push(CanonicalImportArtistRef::Proposed(name.to_owned())),
                 [artist] => refs.push(CanonicalImportArtistRef::Existing(artist.id())),
                 _ => {
                     return Err(format!(
-                        "Several artists are named {name:?}; select the intended identity explicitly."
+                        "Several artists normalize to {name:?}; select the intended identity explicitly."
                     ));
                 }
             }
@@ -2709,7 +3158,7 @@ mod tests {
     use super::{
         ArtistId, CandidateStatus, ImportAlbumTarget, ImportCredit, ImportDecision,
         ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
-        prepare_import_files, prepare_import_files_with_hook, prepare_import_plan,
+        MetadataSource, prepare_import_files, prepare_import_files_with_hook, prepare_import_plan,
     };
 
     struct TempDir(PathBuf);
@@ -3457,6 +3906,65 @@ mod tests {
         assert!(plan.candidates.is_empty());
         assert_eq!(controller.tracks().len(), 0);
         controller.shutdown();
+    }
+
+    #[test]
+    fn sidecar_lyrics_and_artwork_are_discovered_as_reviewable_suggestions() {
+        let dir = TempDir::new("sidecar-discovery");
+        let root = dir.path().join("FluxLibrary");
+        let source_dir = dir.path().join("Artist/Album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "01 - Song.wav", 4_410, 0.2);
+        fs::write(
+            source_dir.join("01 - Song.lrc"),
+            b"[00:01.00]sidecar lyrics\n",
+        )
+        .expect("lyrics");
+        fs::write(
+            source_dir.join("01 - Song.jpg"),
+            b"\xff\xd8\xfftrack artwork",
+        )
+        .expect("track art");
+        fs::write(source_dir.join("cover.png"), b"\x89PNG\r\n\x1a\nalbum").expect("album art");
+        let (controller, _control) = canonical_controller(&root);
+        let request = canonical_request(&controller, &root, vec![source], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let candidate = &plan.candidates[0];
+        assert_eq!(candidate.lyrics_text(), Some("[00:01.00]sidecar lyrics\n"));
+        assert!(
+            candidate
+                .lyrics_source_path()
+                .is_some_and(|path| path.ends_with("01 - Song.lrc"))
+        );
+        assert!(
+            candidate
+                .artwork_path()
+                .is_some_and(|path| path.ends_with("01 - Song.jpg"))
+        );
+        assert!(
+            candidate
+                .album_artwork_path()
+                .is_some_and(|path| path.ends_with("cover.png"))
+        );
+        assert_eq!(
+            candidate.provenance().lyrics,
+            Some(MetadataSource::SidecarLyrics)
+        );
+        assert_eq!(
+            candidate.provenance().artwork,
+            Some(MetadataSource::SidecarArtwork)
+        );
+        assert_eq!(
+            candidate.provenance().album_artwork,
+            Some(MetadataSource::SidecarArtwork)
+        );
+        let summary = candidate.provenance().summary();
+        assert!(summary.contains("lyrics lyrics sidecar"), "{summary}");
+        assert!(summary.contains("album art artwork sidecar"), "{summary}");
     }
 
     #[test]

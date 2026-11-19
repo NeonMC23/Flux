@@ -2103,7 +2103,10 @@ impl ImportManager {
             .album_artwork_path()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        self.edit_lyrics_path.clear();
+        self.edit_lyrics_path = candidate
+            .lyrics_source_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
         self.asset_error = None;
         self.number_error = None;
     }
@@ -8971,8 +8974,28 @@ impl FluxReady {
             ))
             .size(9)
             .color(MUTED),
+            text(format!("Provenance: {}", candidate.provenance().summary()))
+                .size(9)
+                .color(MUTED),
         ]
         .spacing(5);
+        if let Some(path) = candidate.lyrics_source_path() {
+            body = body.push(
+                text(format!("Lyrics sidecar: {}", path.display()))
+                    .size(8)
+                    .color(MUTED),
+            );
+        }
+        for note in candidate.sidecar_notes().iter().take(3) {
+            body = body.push(text(note.clone()).size(8).color(MUTED));
+        }
+        for conflict in candidate.conflicts().iter().take(4) {
+            body = body.push(
+                text(format!("Needs review: {conflict}"))
+                    .size(8)
+                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+            );
+        }
 
         if !flux_app::is_track_playable(candidate.source_track()) {
             body = body.push(
