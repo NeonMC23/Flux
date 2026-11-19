@@ -5596,7 +5596,8 @@ impl CanonicalLibrary {
             expected: None,
         }];
         self.commit_writes(None, writes)?;
-        self.reopen_after()?;
+        self.ratings.insert(id, TrackRating { rating, favorite });
+        self.reload_catalog_only()?;
         Ok(())
     }
 
@@ -5658,7 +5659,14 @@ impl CanonicalLibrary {
         }];
         let catalog = self.catalog.clone();
         self.commit_writes(Some(catalog), writes)?;
-        self.reopen_after()?;
+        self.ratings = ratings;
+        self.reload_catalog_only()?;
+        Ok(())
+    }
+
+    fn reload_catalog_only(&mut self) -> Result<(), CanonicalError> {
+        let catalog: CatalogDto = read_json(&self.root.join(CATALOG_FILE_NAME), CATALOG_FILE_NAME)?;
+        self.catalog = catalog;
         Ok(())
     }
 
