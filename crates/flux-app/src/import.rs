@@ -1077,6 +1077,36 @@ impl ImportPlan {
         }
     }
 
+    /// Applies one reviewed Track-artwork override to selected candidates.
+    pub fn apply_track_artwork_from_path(
+        &mut self,
+        indices: &[usize],
+        source: &Path,
+    ) -> Result<(), String> {
+        let fingerprint = flux_library::canonical::ContentFingerprint::of_file(source)
+            .map_err(|error| format!("Could not fingerprint Track artwork: {error}"))?;
+        for index in indices {
+            if let Some(candidate) = self.candidates.get_mut(*index) {
+                candidate.artwork = Some(flux_library::canonical::CanonicalImportAsset {
+                    source: source.to_path_buf(),
+                    fingerprint,
+                });
+                candidate.provenance.artwork = Some(MetadataSource::Manual);
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears Track-artwork overrides from selected candidates, restoring
+    /// Album fallback behavior.
+    pub fn clear_track_artwork_for(&mut self, indices: &[usize]) {
+        for index in indices {
+            if let Some(candidate) = self.candidates.get_mut(*index) {
+                candidate.clear_artwork();
+            }
+        }
+    }
+
     /// Number of candidates that will produce a new record.
     #[must_use]
     pub fn new_count(&self) -> usize {

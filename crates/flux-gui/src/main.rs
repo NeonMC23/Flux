@@ -1980,6 +1980,7 @@ struct ImportManager {
     bulk_new_artist_name: String,
     bulk_album_title: String,
     bulk_album_artwork_path: String,
+    bulk_track_artwork_path: String,
     asset_error: Option<String>,
     number_error: Option<String>,
 }
@@ -2020,6 +2021,7 @@ impl ImportManager {
             bulk_new_artist_name: String::new(),
             bulk_album_title: String::new(),
             bulk_album_artwork_path: String::new(),
+            bulk_track_artwork_path: String::new(),
             asset_error: None,
             number_error: None,
         }
@@ -2056,6 +2058,7 @@ impl ImportManager {
         self.bulk_new_artist_name.clear();
         self.bulk_album_title.clear();
         self.bulk_album_artwork_path.clear();
+        self.bulk_track_artwork_path.clear();
         self.asset_error = None;
         self.number_error = None;
     }
@@ -2349,6 +2352,11 @@ enum Message {
     ImportBulkAlbumArtworkChoose,
     ImportBulkApplyAlbumArtwork,
     ImportBulkClearAlbumArtwork,
+    ImportBulkTrackArtworkChanged(String),
+    ImportBulkTrackArtworkPicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    ImportBulkTrackArtworkChoose,
+    ImportBulkApplyTrackArtwork,
+    ImportBulkClearTrackArtwork,
     ImportDecisionChanged(usize, ImportDecision),
     ImportBulkSkip,
     ImportBulkImport,
@@ -2535,6 +2543,7 @@ impl Message {
             | Self::ImportArtworkPicked(session, _)
             | Self::ImportAlbumArtworkPicked(session, _)
             | Self::ImportBulkAlbumArtworkPicked(session, _)
+            | Self::ImportBulkTrackArtworkPicked(session, _)
             | Self::ArtworkLoaded(session, _, _)
             | Self::ImportNativeFilesPicked(session, _)
             | Self::ImportNativeFolderPicked(session, _)
@@ -2557,6 +2566,7 @@ impl Message {
             | Self::ImportArtworkPicked(current, _)
             | Self::ImportAlbumArtworkPicked(current, _)
             | Self::ImportBulkAlbumArtworkPicked(current, _)
+            | Self::ImportBulkTrackArtworkPicked(current, _)
             | Self::ArtworkLoaded(current, _, _)
             | Self::ImportNativeFilesPicked(current, _)
             | Self::ImportNativeFolderPicked(current, _)
@@ -5463,6 +5473,84 @@ impl FluxReady {
                     } else {
                         if let Some(plan) = manager.plan.as_mut() {
                             plan.clear_album_artwork_for(&indices);
+                        }
+                        manager.asset_error = None;
+                        if let Some(selected) = manager.selected {
+                            manager.select_candidate(selected);
+                        }
+                    }
+                }
+            }
+            Message::ImportBulkTrackArtworkChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.bulk_track_artwork_path = value;
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportBulkTrackArtworkChoose => {
+                let start = self.controller.canonical_root().map(Path::to_path_buf);
+                let session = self.controller.library_session();
+                return Task::perform(
+                    async move { flux_platform::pick_image_files_in(start.as_deref()) },
+                    move |result| Message::ImportBulkTrackArtworkPicked(session, result),
+                );
+            }
+            Message::ImportBulkTrackArtworkPicked(_, result) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    match result {
+                        Ok(Some(paths)) => {
+                            if let Some(path) = paths.first() {
+                                manager.bulk_track_artwork_path = path.display().to_string();
+                                manager.asset_error = None;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkApplyTrackArtwork => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let indices = manager.checked_indices();
+                if indices.is_empty() {
+                    manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                let path = PathBuf::from(manager.bulk_track_artwork_path.trim());
+                if path.as_os_str().is_empty() {
+                    manager.asset_error = Some("Choose a Track artwork file.".to_owned());
+                    return Task::none();
+                }
+                if let Err(error) = decode_artwork(&artwork_key(
+                    ArtworkOwner::Track(TrackId::new(0)),
+                    path.clone(),
+                )) {
+                    manager.asset_error = Some(format!("Track artwork rejected: {error}"));
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut() {
+                    match plan.apply_track_artwork_from_path(&indices, &path) {
+                        Ok(()) => {
+                            manager.asset_error = None;
+                            if let Some(selected) = manager.selected {
+                                manager.select_candidate(selected);
+                            }
+                        }
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkClearTrackArtwork => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    let indices = manager.checked_indices();
+                    if indices.is_empty() {
+                        manager.asset_error =
+                            Some("Select one or more candidates first.".to_owned());
+                    } else {
+                        if let Some(plan) = manager.plan.as_mut() {
+                            plan.clear_track_artwork_for(&indices);
                         }
                         manager.asset_error = None;
                         if let Some(selected) = manager.selected {
@@ -9236,7 +9324,7 @@ impl FluxReady {
             text(if fixed_target {
                 "Bulk Artist changes apply to checked candidates; Album membership stays locked. Per-candidate edits made afterward win."
             } else {
-                "Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; Track artwork overrides and lyrics remain individual."
+                "Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; shared Album and Track artwork controls apply only to checked candidates, while lyrics remain individual."
             })
             .size(8)
             .color(MUTED),
@@ -9291,6 +9379,28 @@ impl FluxReady {
                     .style(ghost_style)
                     .padding([5, 7])
                     .on_press(Message::ImportBulkClearAlbumArtwork),
+            ]
+            .spacing(6),
+            row![
+                text_input(
+                    "Track artwork override path for checked candidates…",
+                    &manager.bulk_track_artwork_path
+                )
+                .on_input(Message::ImportBulkTrackArtworkChanged)
+                .style(input_style)
+                .width(Length::Fill),
+                button(text("Choose…").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkTrackArtworkChoose),
+                button(text("Apply Track art").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkApplyTrackArtwork),
+                button(text("Clear Track art").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkClearTrackArtwork),
             ]
             .spacing(6),
         ]
@@ -17745,6 +17855,13 @@ mod tests {
             Message::ImportBulkAlbumArtworkPicked(0, Ok(Some(vec![album_art]))),
         );
         send(&mut gui, Message::ImportBulkApplyAlbumArtwork);
+        let track_art = dir.path().join("bulk-track-gui.png");
+        write_test_png(&track_art, 64, 64);
+        send(
+            &mut gui,
+            Message::ImportBulkTrackArtworkPicked(0, Ok(Some(vec![track_art]))),
+        );
+        send(&mut gui, Message::ImportBulkApplyTrackArtwork);
         let plan = gui
             .import_manager
             .as_ref()
@@ -17764,6 +17881,12 @@ mod tests {
             plan.candidates
                 .iter()
                 .all(|candidate| candidate.album_artwork_path().is_some())
+        );
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| candidate.artwork_path().is_some()),
+            "bulk Track artwork applies to every checked candidate"
         );
         let prepared = prepare_import_files(
             &plan,
