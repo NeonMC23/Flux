@@ -247,24 +247,29 @@ player remains visible:
   `osascript` on macOS, PowerShell WinForms on Windows), or use Flux Browser;
 - drop audio files or folders (Iced/winit X11/Windows/macOS; Wayland file-drop
   is not supported by the toolkit);
-- infer provisional artist, album, title, track number and disc number only
-  from filenames and directory names — no embedded tag is read; a missing Album
-  remains a standalone Track and never creates an “Unknown Album” placeholder;
+- infer provisional artist, album, title, track number and disc number from
+  filenames and directory names — no embedded tag is read; each reviewed field
+  records its filename/folder/existing-library/manual provenance, and a missing
+  Album remains a standalone Track and never creates an “Unknown Album”
+  placeholder;
 - edit ordered credits, add existing or named artists, remove/reorder credits,
   and choose the physical owner from the credits; the first credit is the
   default owner;
 - select an existing stable Artist and an existing Album owned by that Artist,
   create a new Album by title, or leave Album empty for a standalone Track;
-  ambiguous/fuzzy names are never merged;
+  case/whitespace-normalized unique matches are reused, while ambiguous or
+  merely similar names are never merged automatically;
 - check multiple candidates and apply one existing Artist or shared new Artist
-  name, one Album title (or standalone state), and one Album artwork asset to the
-  checked set; per-candidate Artist/Album edits override the bulk value
-  afterward;
-- attach a validated managed Album cover, a Track-specific artwork override, and
-  an LRC/TXT lyrics file to individual candidates before commit; Album artwork
-  never overwrites individual Track artwork overrides;
-- review and edit every candidate, with incomplete metadata visibly marked and
-  inherited Album artwork distinguished from Track overrides; in a fixed-target
+  name, one Album title (or standalone state), one Album artwork asset, or one
+  Track-artwork override to the checked set; per-candidate Artist/Album edits
+  override the bulk value afterward;
+- discover same-stem LRC/TXT lyrics and local Track/folder image sidecars as
+  reviewable suggestions; attach or replace a validated managed Album cover, a
+  Track-specific artwork override, and an LRC/TXT lyrics file before commit;
+  Album artwork never overwrites individual Track artwork overrides;
+- review and edit every candidate, with provenance, sidecar notes, conflicting
+  existing evidence, incomplete metadata and inherited Album artwork clearly
+  marked; in a fixed-target
   Album import, Album membership controls are hidden because the target Album is
   locked, while Artist and Album-artwork enrichment remain available;
 - validate each candidate by opening its decoder before review and again while
@@ -290,10 +295,11 @@ verifies. A changed artwork/lyrics source fingerprint or conflicting cover for
 one Album rejects the batch with complete-old state; no artist, Album, Track or
 managed asset is left partially published. Managed covers are decoded
 asynchronously for display; no tag artwork extraction occurs. The TUI uses the
-same filename inference and copy-only application path via its quick-import
-keys; rich review with artwork/lyrics attachment is GUI-only. Bulk Artist,
-Album/standalone assignment and shared Album artwork are explicit actions on
-checked candidates; lyrics and Track artwork remain per-candidate overrides.
+same filename inference and local sidecar discovery through its quick-import
+keys; rich review, provenance inspection and picker-driven attachment remain
+GUI-only. Bulk Artist, Album/standalone assignment, shared Album artwork and
+shared Track artwork are explicit actions on checked candidates; lyrics remain
+per-candidate overrides.
 
 Migration is explicit: *Library setup* accepts a legacy index file or portable
 schema-v3 folder, presents a read-only inventory and disk estimate, builds and
@@ -552,9 +558,9 @@ so compilation there is never evidence of audible playback.
 | macOS x86_64 | Compile-only cross-check | No | No standard GitHub runner; compile-only CI path |
 
 The local Linux rows in M7 and M8 were executed on Fedora 44, kernel 7.3.0 /
-x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. No Windows/macOS
-Rust target or SDK is installed on that host, so no cross-compilation or native
-runtime validation is claimed for M8.
+x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. M9 validation ran
+on the same Linux host; no Windows/macOS Rust target or SDK is installed there,
+so no cross-compilation or native runtime validation is claimed.
 
 The current Windows audit includes UTF-16/UNC path handling, PowerShell UTF-8
 dialog output, case-insensitive comparison fallback, reserved-name/long-path

@@ -257,7 +257,7 @@ with a compile-only macOS x86_64 cross-check. CPAL all-target compilation and
 CPAL GUI/TUI binary linking are checked on all matrix entries; no CI runner
 supplies a physical audio device.
 
-| Target | CI coverage defined | Locally executed in M7/M8 | Runtime status |
+| Target | CI coverage defined | Locally executed in M7–M9 | Runtime status |
 |---|---|---|---|
 | Linux x86_64 | Native tests/build, Clippy, CPAL check | Yes | GUI/TUI startup, TUI PTY, CPAL enumeration, explicit stream open and short WAV completion; no listening/hotplug |
 | Linux ARM64 | Native tests/build, CPAL check | No | Unverified locally |
@@ -872,6 +872,7 @@ from what remains structurally or physically unverified.
 | M6 consolidated UX polish: contextual back navigation, keyboard queue-follow consistency, centralized transient feedback, fixed-target import clarity and settings discoverability | Confirmed by deterministic GUI state/message tests plus GUI/TUI startup/PTY probes; no full manual mouse/keyboard walkthrough, screen-reader audit, or cross-platform UI validation |
 | M7 platform audit: path/reparse safety, TUI display width, CI matrix, target/architecture documentation | Linux native gates and runtime checks confirmed here; TUI width/combining/wide-character tests added; Windows/macOS targets were not installed and their CI jobs were not executed in this session, so those rows remain compile-contract/runtime-unverified |
 | M8 product hardening: settings retry safety, canonical creation lease, import-credit preservation, stale import/preload rejection, queue/history reconciliation, TUI editing/rating safety and row/artwork caching | Confirmed by deterministic settings, import, Controller, canonical, GUI and TUI regressions plus the six Linux gates; GUI/TUI runtime probes remain Linux-only and no new platform claim is made |
+| M9 product completion: metadata provenance, local lyrics/artwork sidecars, normalized entity matching, bulk Track artwork, atomic lyrics export, committed-cleanup warnings, bounded shutdown and cancellable fingerprint/copy work | Confirmed by new deterministic import, GUI, library, Controller and shutdown regressions plus Linux runtime probes; Windows/macOS remain source/CI-contract only |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
@@ -1578,15 +1579,16 @@ unrelated valid requests to fail with it. A transaction-level failure still
 leaves the previous catalogue authoritative through C1 recovery. Portable
 compatibility imports retain their existing prepare/commit path.
 
-Cancellation during discovery or preparation performs no catalogue write and
-removes copies created by that copy run. Cancellation after the final copy is
-also detected before catalogue application. Import does not extract embedded
-artwork or lyrics from audio tags; the GUI review may attach explicitly selected
-managed Album artwork, a Track artwork override and an LRC/TXT file. Attached
-image files are extension/size/signature-checked by the canonical path and
-decoded by the bounded GUI decoder before commit; lyrics must parse as supported
-LRC/TXT. Artwork/lyrics fingerprints are captured at review and rechecked at
-commit, so a changed source rejects the batch. Managed artwork/lyrics on
+Cancellation during discovery, hashing, or portable copy preparation performs
+no catalogue write and removes copies created by that copy run. Cancellation
+after the final copy is also detected before catalogue application. Import does
+not extract embedded artwork or lyrics from audio tags; it discovers local
+same-stem LRC/TXT sidecars and Track/folder PNG/JPEG/WebP artwork as reviewable
+suggestions. Automatically discovered images are header/dimension-checked
+(4096 px side / 16 MP bound) before review, and picker-selected images use the
+bounded GUI decoder. Lyrics must parse as supported LRC/TXT. Artwork/lyrics
+fingerprints are captured at review and rechecked at commit, so a changed source
+rejects the batch. Managed artwork/lyrics on
 unrelated existing tracks are untouched. Re-importing the same content is
 deduplicated by canonical fingerprint, while an explicit **Import separately**
 decision creates a new TrackId and a unique managed path.
@@ -1604,9 +1606,13 @@ artwork or lyrics file survives an uncommitted import. Conflicting artwork
 requests for one Album or a changed reviewed asset fail the whole batch before
 commit.
 
-Artist references distinguish existing stable IDs from proposed names. Exact
-unique existing names can resolve to an existing ID; ambiguous names require an
-explicit artist selection in review. The review also offers an existing Album
+Import review exposes field-level provenance (filename, folder, existing
+library, sidecar, fallback or manual edit) and deterministic conflict notes when
+filename/folder/existing evidence disagree. Artist references distinguish
+existing stable IDs from proposed names. Exact or case/whitespace-normalized
+unique existing names resolve to one stable ID; ambiguous normalized names
+require explicit review. The same unique-normalized rule applies to Album titles
+under the resolved owner before a new Album is created. The review also offers an existing Album
 picker filtered to the selected owner Artist; selecting one sets the exact owner
 title reference rather than fuzzy-matching. Typing a title creates a new Album
 only when no exact owner/title match exists; an empty Album field creates a
@@ -1621,7 +1627,8 @@ The GUI review supports checking multiple candidates and applying:
   other collaboration credits;
 - one Album title (exact existing owner/title reuse or one new Album per owner)
   or converting the checked candidates to standalone;
-- one validated Album artwork asset to all checked Album-member candidates.
+- one validated Album artwork asset to all checked Album-member candidates;
+- one validated Track-artwork override to every checked candidate.
 
 Bulk changes are explicit actions. The effective precedence is:
 
@@ -1632,7 +1639,8 @@ Bulk changes are explicit actions. The effective precedence is:
 5. filename/folder inference fallback captured at discovery.
 
 Album artwork and Track artwork are separate fields, so a shared cover cannot
-overwrite an individual Track override. If any checked candidate is an
+overwrite an individual Track override, and bulk Track artwork can be cleared
+back to inheritance. If any checked candidate is an
 existing-Track metadata update, bulk Artist/Album membership is refused and the
 user is directed to the Track editor, because metadata import preserves existing
 ownership/membership. The reviewed plan is inspected as a normal ImportPlan and
@@ -1936,6 +1944,30 @@ settings with a missing/version-0 schema remain readable with defaults. No
 persisted format, file name, schema version, migration rule, or canonical
 transaction behavior was changed by M1.
 
+### Committed cleanup and worker lifecycle
+
+A transaction that has published `catalog.flux` is committed even if deleting
+old audio/artwork/lyrics later fails. Flux now reopens the committed state,
+retains the cleaning journal for retry on the next open, and reports cleanup as
+a warning rather than claiming a rollback. Artist deletion returns a committed
+report with `cleanup_errors`; the Controller still removes deleted-track queue
+and history references. The journal cleanup loop attempts every unreferenced
+target before returning the first failure, so one blocked path cannot strand
+later safe deletions. Track deletion keeps its separate post-commit cleanup
+report because it does not use journal cleanup for those managed files.
+
+Import fingerprinting streams in 64 KiB chunks and observes cancellation. It
+returns no partial hash. Duplicate discovery skips existing files whose byte
+length cannot match before hashing and caches each existing fingerprint once per
+plan. Portable copy preparation checks cancellation per chunk and removes an
+unpublished destination. The final canonical import transaction remains
+synchronous.
+
+Shutdown waits for a scan only up to a bounded timeout and gives an in-flight
+audio-device open a short grace period. A dependency call that cannot be
+interrupted is isolated and documented; shutdown does not wait forever or claim
+that the worker completed.
+
 ### Persistence limitations
 
 - Queue/history are independently persisted from the catalogue; there is no
@@ -2129,15 +2161,17 @@ cleanup.
    switches for migration compatibility and existing tests. No GUI/TUI normal
    workflow uses them, but the API-level retirement is incomplete.
 2. Import review supports ordered credits, owner selection, add/remove/reorder,
-   existing-artist selection, optional Album/standalone choice and bulk Artist/
-   Album/Album-artwork actions. A separate featuring boolean and release-type
-   picker are not exposed; the canonical model stores order only. Track artwork
-   and lyrics remain individual rather than bulk-copy actions.
+   existing-artist selection, optional Album/standalone choice, field
+   provenance/conflict display, and bulk Artist/Album/Album-artwork/Track-artwork
+   actions. A separate featuring boolean and release-type picker are not exposed;
+   the canonical model stores order only. Lyrics remain individual rather than
+   bulk-copy actions.
 3. Import copy/publication runs synchronously at the canonical commit boundary;
-   cancellation is safe before commit. Import preflight opens the decoder and
-   validates the container/header plus the source fingerprint, but it does not
-   decode every frame; corruption later in a stream may surface only during
-   playback.
+   in-flight fingerprinting and portable copy preparation check cancellation,
+   but the final canonical transaction is not cancellable. Import preflight opens
+   the decoder and validates the container/header plus the source fingerprint,
+   but it does not decode every frame; corruption later in a stream may surface
+   only during playback.
 4. Single-track ownership transfer, whole-album transfer and multi-item artist
    deletion are implemented with copy-first publication, journal cleanup and
    no-op retry. Album transfer intentionally preserves AlbumId and does not merge
@@ -2162,8 +2196,9 @@ cleanup.
    verified in this stage.
 10. Fixed-target album import is exposed in the GUI only; the TUI retains general
     quick import and has no target-selection review flow.
-11. Atomic import deduplicates exact names only; approximate/fuzzy matching is
-    deliberately not performed. Ambiguous exact names require explicit review.
+11. Atomic import reuses exact and unique case/whitespace-normalized Artist and
+    Album names. Approximate/fuzzy matching is deliberately not performed;
+    ambiguous normalized names require explicit review.
 12. Artist deletion execution is exposed in the GUI only. The TUI deliberately
     refuses deletion/transfer and points to the GUI; this is a product limitation,
     not a separate transaction implementation.
@@ -2190,9 +2225,10 @@ cleanup.
     adding a new virtualization layer.
 19. Lyrics are line/event synchronized, not word-by-word. The editor is
     line-oriented rather than a rich multiline text area. Multi-timestamp LRC
-    lines are normalized on round-trip. Export uses a typed destination path,
-    not a native save dialog. No remote lyrics lookup, tag extraction or TUI
-    editing is implemented.
+    lines are normalized on round-trip. Export uses a typed file/directory path,
+    writes atomically and derives a sanitized Track filename for directory
+    destinations, but no native save dialog yet. No remote lyrics lookup, tag
+    extraction or TUI editing is implemented.
 20. Playback history and play counts are collected only after this feature is
     introduced; pre-existing listening activity is not inferred. History is
     derived state in `history.flux` and is separate from the canonical catalogue.

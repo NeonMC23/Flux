@@ -98,8 +98,8 @@ pub mod lyrics;
 pub use import::{
     AppliedImportItem, CandidateStatus, ImportAlbumTarget, ImportApplyReport, ImportCandidate,
     ImportCredit, ImportDecision, ImportItemState, ImportPlan, ImportProgress, ImportRequest,
-    ImportStage, ImportStorage, PreparedImport, PreparedImportItem, apply_import_plan,
-    prepare_import_files, prepare_import_plan,
+    ImportStage, ImportStorage, MetadataProvenance, MetadataSource, PreparedImport,
+    PreparedImportItem, apply_import_plan, prepare_import_files, prepare_import_plan,
 };
 
 pub use crate::lyrics::{LyricLine, LyricsDocument, LyricsError, LyricsKind, SyncLyricLine};

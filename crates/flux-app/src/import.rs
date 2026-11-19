@@ -1837,6 +1837,7 @@ pub(crate) fn path_valid_image_sidecar(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_candidate(
     source_path: PathBuf,
     source_track: Track,
@@ -4188,11 +4189,13 @@ mod tests {
         let source_dir = dir.path().join("Artist/Album");
         fs::create_dir_all(&source_dir).expect("source dirs");
         let source = wav(&source_dir, "01 - Song.wav", 4_410, 0.2);
+        let second = wav(&source_dir, "02 - Other.wav", 4_410, 0.3);
         fs::write(source_dir.join("01 - Song.lrc"), b"[00:01.00]quick lyric\n").expect("lyrics");
         image_file(&source_dir, "cover.png", image::ImageFormat::Png);
         controller
-            .import_files(std::slice::from_ref(&source), true)
+            .import_files(&[source, second], true)
             .expect("quick import");
+        assert_eq!(controller.tracks().len(), 2);
         let id = controller.tracks()[0].0;
         assert_eq!(
             controller.track_lyrics(id).as_deref(),
