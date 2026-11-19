@@ -188,6 +188,29 @@ enum AudioRecoveryPhase {
     Failed,
 }
 
+/// Maximum grace period for an in-flight device-open worker during shutdown.
+/// A blocked OS/driver call cannot be forcibly interrupted, so after this
+/// bounded wait the handle is detached and the process exiting owns final
+/// teardown.
+const RECOVERY_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+/// Maximum shutdown wait for a scan worker. Normal local scans finish far
+/// sooner; an unresponsive filesystem must not make window close hang.
+#[cfg(not(test))]
+const SCAN_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SCAN_SHUTDOWN_WAIT_TEST: Duration = Duration::from_millis(500);
+
+fn shutdown_scan_wait() -> Duration {
+    #[cfg(test)]
+    {
+        SCAN_SHUTDOWN_WAIT_TEST
+    }
+    #[cfg(not(test))]
+    {
+        SCAN_SHUTDOWN_WAIT
+    }
+}
+
 struct AudioRecovery {
     factory: AudioRecoveryFactory,
     phase: AudioRecoveryPhase,
@@ -249,7 +272,19 @@ impl Drop for AudioRecovery {
         // than leaked in the channel.
         self.result_rx.take();
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let deadline = Instant::now() + RECOVERY_SHUTDOWN_GRACE;
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            } else {
+                // The blocked OS call cannot be cancelled. Dropping the handle
+                // prevents an unbounded shutdown wait; the worker owns only
+                // this recovery's factory/result and exits when the driver
+                // returns.
+                drop(join);
+            }
         }
     }
 }
@@ -6525,7 +6560,7 @@ impl Controller {
             drop(recovery);
         }
         if let Some(rx) = self.scan_rx.take()
-            && let Ok(outcome) = rx.recv()
+            && let Ok(outcome) = rx.recv_timeout(shutdown_scan_wait())
         {
             let ScanOutcome {
                 library,
@@ -10090,6 +10125,39 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_is_bounded_when_audio_recovery_open_is_blocked() {
+        let dir = TempDir::new("audio-recovery-blocked-shutdown");
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, fixtures(&dir).root.clone());
+        let (factory, release, controls) = blocking_recovery_factory(44_100, 1);
+        controller.enable_test_audio_recovery(factory);
+        inject_fatal_output(&mut controller, "simulated blocked shutdown loss");
+        assert_eq!(
+            controller.audio_recovery.as_ref().map(|r| r.phase),
+            Some(super::AudioRecoveryPhase::Opening)
+        );
+
+        let started = Instant::now();
+        controller.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited unboundedly for a blocked device open"
+        );
+        release.send(()).expect("release recovery");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && controls.lock().expect("recovery controls").last().is_none()
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let controls = controls.lock().expect("recovery controls");
+        assert!(
+            controls.last().is_some_and(|control| !control.is_running()),
+            "the detached blocked worker must drop its late engine"
+        );
+    }
+
+    #[test]
     fn nonfatal_route_notice_does_not_stop_playback() {
         let dir = TempDir::new("audio-route-notice");
         let fx = fixtures(&dir);
@@ -11089,6 +11157,21 @@ mod tests {
             "shutdown reconciles and persists the auto-derived queue with the completed scan"
         );
         controller2.shutdown();
+    }
+
+    #[test]
+    fn shutdown_is_bounded_when_a_scan_worker_never_reports() {
+        let dir = TempDir::new("shutdown-lost-scan");
+        let (mut controller, _control) = boot(&dir);
+        let (keep_tx, rx) = std::sync::mpsc::channel::<super::ScanOutcome>();
+        controller.scan_rx = Some(rx);
+        let started = Instant::now();
+        controller.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited unboundedly for an unresponsive scan worker"
+        );
+        drop(keep_tx);
     }
 
     /// S1 regression: a scan whose work handoff fails (the receiving
