@@ -19,6 +19,10 @@ flux-core.workspace = true
 flux-library.workspace = true
 flux-audio.workspace = true
 flux-platform.workspace = true
+# Header-only image dimension validation for automatically discovered local
+# artwork sidecars. The same PNG/JPEG/WebP feature set is already used by the
+# GUI's bounded preview decoder.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 serde.workspace = true
 serde_json.workspace = true
 

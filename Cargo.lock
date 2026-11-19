@@ -935,6 +935,7 @@ dependencies = [
  "flux-library",
  "flux-platform",
  "hound",
+ "image",
  "serde",
  "serde_json",
 ]

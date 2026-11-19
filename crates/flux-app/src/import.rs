@@ -1814,11 +1814,27 @@ pub(crate) fn path_valid_image_sidecar(path: &Path) -> Result<(), String> {
     let valid = header.starts_with(b"\x89PNG\r\n\x1a\n")
         || header.starts_with(&[0xff, 0xd8, 0xff])
         || (header.starts_with(b"RIFF") && header.get(8..12) == Some(b"WEBP"));
-    if valid {
-        Ok(())
-    } else {
-        Err("image header is not PNG, JPEG, or WebP".to_owned())
+    if !valid {
+        return Err("image header is not PNG, JPEG, or WebP".to_owned());
     }
+    let reader = image::ImageReader::open(path)
+        .map_err(|error| error.to_string())?
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| error.to_string())?;
+    if width == 0
+        || height == 0
+        || width > 4096
+        || height > 4096
+        || u64::from(width) * u64::from(height) > 16_000_000
+    {
+        return Err(format!(
+            "image dimensions {width}x{height} exceed the 4096 px / 16 MP bound"
+        ));
+    }
+    Ok(())
 }
 
 fn make_candidate(
@@ -3311,6 +3327,15 @@ mod tests {
         path
     }
 
+    fn image_file(dir: &Path, name: &str, format: image::ImageFormat) -> PathBuf {
+        let path = dir.join(name);
+        fs::create_dir_all(path.parent().expect("parent")).expect("parents");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 102, 204, 255]))
+            .save_with_format(&path, format)
+            .expect("image");
+        path
+    }
+
     fn portable_controller(root: &Path) -> (Controller, NullControl) {
         fs::create_dir_all(root).expect("root");
         create_portable_library(root).expect("portable library");
@@ -4026,12 +4051,8 @@ mod tests {
             b"[00:01.00]sidecar lyrics\n",
         )
         .expect("lyrics");
-        fs::write(
-            source_dir.join("01 - Song.jpg"),
-            b"\xff\xd8\xfftrack artwork",
-        )
-        .expect("track art");
-        fs::write(source_dir.join("cover.png"), b"\x89PNG\r\n\x1a\nalbum").expect("album art");
+        image_file(&source_dir, "01 - Song.png", image::ImageFormat::Png);
+        image_file(&source_dir, "cover.png", image::ImageFormat::Png);
         let (controller, _control) = canonical_controller(&root);
         let request = canonical_request(&controller, &root, vec![source], None);
         let plan = prepare_import_plan(
@@ -4049,7 +4070,7 @@ mod tests {
         assert!(
             candidate
                 .artwork_path()
-                .is_some_and(|path| path.ends_with("01 - Song.jpg"))
+                .is_some_and(|path| path.ends_with("01 - Song.png"))
         );
         assert!(
             candidate
@@ -4103,6 +4124,16 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_image_validation_rejects_decompression_bomb_dimensions() {
+        let dir = TempDir::new("sidecar-image-bounds");
+        let path = dir.path().join("huge.png");
+        image::RgbaImage::new(5_000, 1)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .expect("image");
+        assert!(super::path_valid_image_sidecar(&path).is_err());
+    }
+
+    #[test]
     fn cancellable_copy_does_not_leave_a_destination_file() {
         let dir = TempDir::new("copy-cancel");
         let source = dir.path().join("source.wav");
@@ -4129,7 +4160,7 @@ mod tests {
         fs::create_dir_all(&source_dir).expect("source dirs");
         let source = wav(&source_dir, "01 - Song.wav", 4_410, 0.2);
         fs::write(source_dir.join("01 - Song.lrc"), b"[00:01.00]quick lyric\n").expect("lyrics");
-        fs::write(source_dir.join("cover.png"), b"\x89PNG\r\n\x1a\nalbum").expect("cover");
+        image_file(&source_dir, "cover.png", image::ImageFormat::Png);
         controller
             .import_files(std::slice::from_ref(&source), true)
             .expect("quick import");

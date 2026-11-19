@@ -3138,7 +3138,9 @@ impl CanonicalLibrary {
     }
 
     fn reopen_after(&mut self) -> Result<(), CanonicalError> {
-        let reopened = Self::open(&self.root)?;
+        let cleanup_warning = self.last_cleanup_warning.take();
+        let mut reopened = Self::open(&self.root)?;
+        reopened.last_cleanup_warning = cleanup_warning;
         *self = reopened;
         Ok(())
     }
