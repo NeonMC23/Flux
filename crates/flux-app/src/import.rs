@@ -19,7 +19,7 @@
 //! audio tags; user edits become sparse Flux overrides.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2291,7 +2291,11 @@ fn copy_reviewed_file(
     root: &Path,
     source: &Path,
     preferred: Option<&Path>,
+    cancel: &AtomicBool,
 ) -> Result<PathBuf, String> {
+    if is_cancelled(cancel) {
+        return Err("copy cancelled".to_owned());
+    }
     let mut reserved = HashSet::new();
     let destination = match preferred {
         Some(path) if path.starts_with(root) => {
@@ -2312,9 +2316,30 @@ fn copy_reviewed_file(
         .create_new(true)
         .open(&destination)
         .map_err(|err| format!("could not create {}: {err}", destination.display()))?;
-    if let Err(err) = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
+    let mut buffer = [0u8; 64 * 1024];
+    let result = (|| -> std::io::Result<()> {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "copy cancelled",
+                ));
+            }
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+        }
+        output.sync_all()
+    })();
+    if let Err(err) = result {
         let _ = std::fs::remove_file(&destination);
-        return Err(format!("copy failed: {err}"));
+        return Err(if err.kind() == std::io::ErrorKind::Interrupted {
+            "copy cancelled".to_owned()
+        } else {
+            format!("copy failed: {err}")
+        });
     }
     Ok(destination)
 }
@@ -2400,6 +2425,7 @@ where
                 &plan.library_root,
                 &candidate.source_path,
                 candidate.destination.as_deref(),
+                &cancel,
             )
         };
         let item = match result {
@@ -4074,6 +4100,24 @@ mod tests {
             Some(album)
         );
         controller.shutdown();
+    }
+
+    #[test]
+    fn cancellable_copy_does_not_leave_a_destination_file() {
+        let dir = TempDir::new("copy-cancel");
+        let source = dir.path().join("source.wav");
+        fs::write(&source, vec![1u8; 128 * 1024]).expect("source");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).expect("root");
+        let cancel = AtomicBool::new(true);
+        let error = super::copy_reviewed_file(&root, &source, None, &cancel)
+            .expect_err("pre-cancelled copy must stop");
+        assert_eq!(error, "copy cancelled");
+        assert_eq!(
+            fs::read_dir(&root).expect("root listing").count(),
+            0,
+            "no partial destination is published"
+        );
     }
 
     #[test]
