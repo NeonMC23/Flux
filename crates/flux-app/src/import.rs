@@ -1974,50 +1974,66 @@ fn duplicate_status(
     path_map: &HashMap<PathBuf, TrackId>,
     hash_cache: &mut HashMap<TrackId, Option<flux_library::canonical::ContentFingerprint>>,
     candidate_hashes: &mut HashMap<flux_library::canonical::ContentFingerprint, PathBuf>,
-) -> CandidateStatus {
+    cancel: &AtomicBool,
+) -> Option<CandidateStatus> {
     if let Some(id) = path_map.get(path) {
-        return CandidateStatus::ExistingPath(*id);
+        return Some(CandidateStatus::ExistingPath(*id));
     }
 
-    let Some(fingerprint) = flux_library::canonical::ContentFingerprint::of_file(path).ok() else {
-        return CandidateStatus::New;
-    };
+    let incoming_size = file_size(path).unwrap_or(0);
+    let fingerprint =
+        flux_library::canonical::ContentFingerprint::of_file_cancellable(path, cancel)
+            .ok()
+            .flatten()?;
     if let Some(other) = candidate_hashes.insert(fingerprint, path.to_path_buf()) {
-        return CandidateStatus::SameContent {
+        return Some(CandidateStatus::SameContent {
             track_id: None,
             other_source: Some(other),
-        };
+        });
     }
 
     let mut exact_matches = Vec::new();
     for (id, existing_track) in existing {
-        let existing_fingerprint = hash_cache.entry(*id).or_insert_with(|| {
-            flux_library::canonical::ContentFingerprint::of_file(existing_track.source().path())
-                .ok()
+        // Different byte lengths can never share a complete-file fingerprint.
+        // Avoid reading unrelated library audio just to prove that.
+        if incoming_size > 0
+            && file_size(existing_track.source().path()).is_some_and(|size| size != incoming_size)
+        {
+            continue;
+        }
+        let cached = hash_cache.entry(*id).or_insert_with(|| {
+            flux_library::canonical::ContentFingerprint::of_file_cancellable(
+                existing_track.source().path(),
+                cancel,
+            )
+            .ok()
+            .flatten()
         });
-        if *existing_fingerprint == Some(fingerprint) {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if *cached == Some(fingerprint) {
             exact_matches.push(*id);
         }
     }
     match exact_matches.as_slice() {
         [id] => {
-            return CandidateStatus::SameContent {
+            return Some(CandidateStatus::SameContent {
                 track_id: Some(*id),
                 other_source: None,
-            };
+            });
         }
         [] => {}
-        ids => return CandidateStatus::AmbiguousAudio(ids.to_vec()),
+        ids => return Some(CandidateStatus::AmbiguousAudio(ids.to_vec())),
     }
 
     if let Some((id, _)) = existing
         .iter()
         .find(|(_, existing_track)| same_metadata(track, existing_track))
     {
-        return CandidateStatus::SimilarMetadata(*id);
+        return Some(CandidateStatus::SimilarMetadata(*id));
     }
 
-    let incoming_size = file_size(path).unwrap_or(0);
     let incoming_duration = track.duration();
     let probable = existing
         .iter()
@@ -2034,17 +2050,17 @@ fn duplicate_status(
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
     match probable.as_slice() {
-        [id] => return CandidateStatus::ProbableAudio(*id),
+        [id] => return Some(CandidateStatus::ProbableAudio(*id)),
         [] => {}
-        ids => return CandidateStatus::AmbiguousAudio(ids.to_vec()),
+        ids => return Some(CandidateStatus::AmbiguousAudio(ids.to_vec())),
     }
 
     if let Some((id, _)) = existing.iter().find(|(_, existing_track)| {
         normalized(Some(track.title())) == normalized(Some(existing_track.title()))
     }) {
-        return CandidateStatus::SameTitleDifferentAudio(*id);
+        return Some(CandidateStatus::SameTitleDifferentAudio(*id));
     }
-    CandidateStatus::New
+    Some(CandidateStatus::New)
 }
 
 /// Discovers and prepares a review plan without modifying the library.
@@ -2149,14 +2165,18 @@ pub fn prepare_import_plan(
             track,
             inference,
         } = probed;
-        let status = duplicate_status(
+        let Some(status) = duplicate_status(
             &path,
             &track,
             &existing_tracks,
             &path_map,
             &mut hash_cache,
             &mut candidate_hashes,
-        );
+            &cancel,
+        ) else {
+            plan.cancelled = true;
+            break;
+        };
         plan.candidates.push(make_candidate(
             path,
             track,

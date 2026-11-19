@@ -179,25 +179,40 @@ pub struct ContentFingerprint {
 impl ContentFingerprint {
     /// Computes a fingerprint by streaming `path`; never reads audio tags.
     pub fn of_file(path: &Path) -> Result<Self, CanonicalError> {
+        Self::of_file_cancellable(path, &std::sync::atomic::AtomicBool::new(false))?
+            .ok_or_else(|| CanonicalError::Invalid("fingerprinting was cancelled".to_owned()))
+    }
+
+    /// Computes a fingerprint by streaming `path`, checking cancellation
+    /// between bounded chunks. Returns `None` when cancellation is observed;
+    /// no partial fingerprint is ever returned.
+    pub fn of_file_cancellable(
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<Self>, CanonicalError> {
+        use std::sync::atomic::Ordering;
         let mut file = fs::File::open(path)?;
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let mut size = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
-            size += read as u64;
+            size = size.saturating_add(read as u64);
             for byte in &buffer[..read] {
                 hash ^= u64::from(*byte);
                 hash = hash.wrapping_mul(0x100_0000_01b3);
             }
         }
-        Ok(Self {
+        Ok(Some(Self {
             size_bytes: size,
             fnv1a64: hash,
-        })
+        }))
     }
 }
 
@@ -9006,6 +9021,30 @@ fn push_cleanup_album(
         ))?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::ContentFingerprint;
+    use crate::test_support::TempDir;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn cancellable_fingerprinting_never_returns_a_partial_result() {
+        let dir = TempDir::new("fingerprint-cancel");
+        let file = dir.write("audio.bin", &vec![7u8; 256 * 1024]);
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            ContentFingerprint::of_file_cancellable(&file, &cancelled)
+                .expect("cancellable fingerprint")
+                .is_none()
+        );
+        let ready = AtomicBool::new(false);
+        let fingerprint = ContentFingerprint::of_file_cancellable(&file, &ready)
+            .expect("fingerprint")
+            .expect("complete fingerprint");
+        assert_eq!(fingerprint.size_bytes, 256 * 1024);
+    }
 }
 
 #[cfg(test)]
