@@ -2850,17 +2850,47 @@ fn apply_import_plan_canonical(
                 }
                 let album = if let Some(target) = &plan.target_album {
                     CanonicalImportAlbumRef::Existing(target.album_id)
+                } else if let Some(title) = candidate
+                    .album()
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                {
+                    let owner = match &refs[candidate.owner_index()] {
+                        CanonicalImportArtistRef::Existing(id) => Some(*id),
+                        CanonicalImportArtistRef::Proposed(_) => None,
+                    };
+                    let normalized = normalized_entity_name(title);
+                    let matches = owner.map_or_else(Vec::new, |owner| {
+                        controller
+                            .albums_owned_by(owner)
+                            .into_iter()
+                            .filter(|album_id| {
+                                controller.album(*album_id).is_some_and(|album| {
+                                    normalized_entity_name(&album.title) == normalized
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    match matches.as_slice() {
+                        [album_id] => CanonicalImportAlbumRef::Existing(*album_id),
+                        [] => CanonicalImportAlbumRef::ByName {
+                            title: title.to_owned(),
+                            release_type: ReleaseType::Album,
+                        },
+                        _ => {
+                            report.items.push(AppliedImportItem {
+                                index,
+                                track_id: None,
+                                state: ImportItemState::Failed,
+                                message: format!(
+                                    "Several Albums normalize to {title:?}; choose the intended Album explicitly."
+                                ),
+                            });
+                            continue;
+                        }
+                    }
                 } else {
-                    candidate
-                        .album()
-                        .map(str::trim)
-                        .filter(|title| !title.is_empty())
-                        .map_or(CanonicalImportAlbumRef::Standalone, |title| {
-                            CanonicalImportAlbumRef::ByName {
-                                title: title.to_owned(),
-                                release_type: ReleaseType::Album,
-                            }
-                        })
+                    CanonicalImportAlbumRef::Standalone
                 };
                 requests.push(CanonicalImportTrackRequest {
                     source: candidate.source_path().to_path_buf(),
@@ -3985,6 +4015,35 @@ mod tests {
         let summary = candidate.provenance().summary();
         assert!(summary.contains("lyrics lyrics sidecar"), "{summary}");
         assert!(summary.contains("album art artwork sidecar"), "{summary}");
+    }
+
+    #[test]
+    fn quick_import_reuses_unique_normalized_artist_and_album_names() {
+        let dir = TempDir::new("quick-normalized-entities");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let artist = controller.create_artist("The Artist").expect("artist");
+        let album = controller
+            .create_album(artist, "The Album", crate::ReleaseType::Album)
+            .expect("album");
+        let source_dir = dir.path().join("the artist/the album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(&[source], true)
+            .expect("quick import");
+        assert_eq!(controller.artists().len(), 1, "case-only duplicate artist");
+        assert_eq!(controller.albums().len(), 1, "case-only duplicate album");
+        assert_eq!(controller.tracks().len(), 1);
+        assert_eq!(
+            controller.track_artist_id(controller.tracks()[0].0),
+            Some(artist)
+        );
+        assert_eq!(
+            controller.track_album_id(controller.tracks()[0].0),
+            Some(album)
+        );
+        controller.shutdown();
     }
 
     #[test]

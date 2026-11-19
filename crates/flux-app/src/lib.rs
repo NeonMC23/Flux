@@ -5770,10 +5770,11 @@ impl Controller {
                 report.deduplicated += 1;
                 continue;
             }
+            let normalized_artist = normalize_import_name(&inferred.artist_name);
             let artist_ref = {
                 let matches = store
                     .artists()
-                    .filter(|artist| artist.name == inferred.artist_name)
+                    .filter(|artist| normalize_import_name(&artist.name) == normalized_artist)
                     .collect::<Vec<_>>();
                 match matches.as_slice() {
                     [artist] => CanonicalImportArtistRef::Existing(artist.id),
@@ -5782,7 +5783,7 @@ impl Controller {
                         report.issues.push(ImportIssue {
                             path: source.clone(),
                             reason: format!(
-                                "several artists are named {:?}; resolve the identity explicitly",
+                                "several artists normalize to {:?}; resolve the identity explicitly",
                                 inferred.artist_name
                             ),
                         });
@@ -5790,16 +5791,54 @@ impl Controller {
                     }
                 }
             };
-            let album =
-                inferred
-                    .album_title
-                    .clone()
-                    .map_or(CanonicalImportAlbumRef::Standalone, |title| {
-                        CanonicalImportAlbumRef::ByName {
-                            title,
-                            release_type: inferred.release_type,
-                        }
+            let album = inferred
+                .album_title
+                .as_ref()
+                .map_or(CanonicalImportAlbumRef::Standalone, |title| {
+                    let owner = match &artist_ref {
+                        CanonicalImportArtistRef::Existing(id) => Some(*id),
+                        CanonicalImportArtistRef::Proposed(_) => None,
+                    };
+                    let normalized = normalize_import_name(title);
+                    let matches = owner.map_or_else(Vec::new, |owner| {
+                        store
+                            .albums()
+                            .filter(|album| {
+                                album.owner_artist_id == owner
+                                    && normalize_import_name(&album.title) == normalized
+                            })
+                            .map(|album| album.id)
+                            .collect::<Vec<_>>()
                     });
+                    match matches.as_slice() {
+                        [album_id] => CanonicalImportAlbumRef::Existing(*album_id),
+                        [] => CanonicalImportAlbumRef::ByName {
+                            title: title.clone(),
+                            release_type: inferred.release_type,
+                        },
+                        _ => {
+                            report.issues.push(ImportIssue {
+                                path: source.clone(),
+                                reason: format!(
+                                    "several albums normalize to {title:?}; resolve the destination explicitly"
+                                ),
+                            });
+                            CanonicalImportAlbumRef::Standalone
+                        }
+                    }
+                });
+            if matches!(album, CanonicalImportAlbumRef::Standalone)
+                && inferred.album_title.is_some()
+                && store.albums().any(|album| {
+                    normalize_import_name(&album.title)
+                        == normalize_import_name(
+                            inferred.album_title.as_deref().unwrap_or_default(),
+                        )
+                })
+            {
+                // The ambiguous-album branch above already recorded the issue.
+                continue;
+            }
             requests.push(CanonicalImportTrackRequest {
                 source: source.clone(),
                 title: inferred.title,
