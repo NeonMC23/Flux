@@ -5685,6 +5685,7 @@ impl Controller {
         let mut requests = Vec::new();
         let mut request_sources = Vec::new();
         let mut fingerprints = std::collections::HashSet::new();
+        let mut sidecar_directories = std::collections::HashMap::new();
         for source in paths {
             if !is_supported_audio_path(source) {
                 report.issues.push(ImportIssue {
@@ -5707,6 +5708,52 @@ impl Controller {
                 });
                 continue;
             }
+            let sidecars = crate::import::discover_sidecars(source, &mut sidecar_directories);
+            let sidecar_asset = |path: &Path| {
+                flux_library::canonical::ContentFingerprint::of_file(path)
+                    .map(
+                        |fingerprint| flux_library::canonical::CanonicalImportAsset {
+                            source: path.to_path_buf(),
+                            fingerprint,
+                        },
+                    )
+                    .map_err(|error| format!("could not fingerprint {}: {error}", path.display()))
+            };
+            let artwork = match sidecars
+                .track_artwork
+                .as_deref()
+                .map(sidecar_asset)
+                .transpose()
+            {
+                Ok(asset) => asset,
+                Err(error) => {
+                    report.issues.push(ImportIssue {
+                        path: source.clone(),
+                        reason: format!("ignored Track-artwork sidecar: {error}"),
+                    });
+                    None
+                }
+            };
+            let album_artwork = if inferred.album_title.is_some() {
+                match sidecars
+                    .album_artwork
+                    .as_deref()
+                    .map(sidecar_asset)
+                    .transpose()
+                {
+                    Ok(asset) => asset,
+                    Err(error) => {
+                        report.issues.push(ImportIssue {
+                            path: source.clone(),
+                            reason: format!("ignored Album-artwork sidecar: {error}"),
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let lyrics = sidecars.lyrics.map(|(_, text)| text);
             let fingerprint = match flux_library::canonical::ContentFingerprint::of_file(source) {
                 Ok(fingerprint) => fingerprint,
                 Err(err) => {
@@ -5762,9 +5809,9 @@ impl Controller {
                 track_number: inferred.track_number,
                 disc_number: inferred.disc_number,
                 duration_ms: inferred.duration_ms,
-                artwork: None,
-                album_artwork: None,
-                lyrics: None,
+                artwork,
+                album_artwork,
+                lyrics,
                 allow_duplicate_content: false,
                 expected_source_fingerprint: None,
             });

@@ -1595,14 +1595,14 @@ fn base_for_existing(
     Some((track, artist))
 }
 
-struct SidecarDiscovery {
-    lyrics: Option<(PathBuf, String)>,
-    track_artwork: Option<PathBuf>,
-    album_artwork: Option<PathBuf>,
-    notes: Vec<String>,
+pub(crate) struct SidecarDiscovery {
+    pub(crate) lyrics: Option<(PathBuf, String)>,
+    pub(crate) track_artwork: Option<PathBuf>,
+    pub(crate) album_artwork: Option<PathBuf>,
+    pub(crate) notes: Vec<String>,
 }
 
-fn discover_sidecars(
+pub(crate) fn discover_sidecars(
     audio: &Path,
     directory_files: &mut HashMap<PathBuf, Vec<PathBuf>>,
 ) -> SidecarDiscovery {
@@ -1772,7 +1772,7 @@ fn read_lyrics_sidecar(path: &Path) -> Result<String, String> {
     Ok(text)
 }
 
-fn path_valid_image_sidecar(path: &Path) -> Result<(), String> {
+pub(crate) fn path_valid_image_sidecar(path: &Path) -> Result<(), String> {
     let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
     if metadata.len() == 0 || metadata.len() > 16 * 1024 * 1024 {
         return Err("image must be between 1 byte and 16 MiB".to_owned());
@@ -3985,6 +3985,38 @@ mod tests {
         let summary = candidate.provenance().summary();
         assert!(summary.contains("lyrics lyrics sidecar"), "{summary}");
         assert!(summary.contains("album art artwork sidecar"), "{summary}");
+    }
+
+    #[test]
+    fn quick_canonical_import_attaches_discovered_sidecars() {
+        let dir = TempDir::new("quick-sidecars");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source_dir = dir.path().join("Artist/Album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "01 - Song.wav", 4_410, 0.2);
+        fs::write(source_dir.join("01 - Song.lrc"), b"[00:01.00]quick lyric\n").expect("lyrics");
+        fs::write(source_dir.join("cover.png"), b"\x89PNG\r\n\x1a\nalbum").expect("cover");
+        controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("quick import");
+        let id = controller.tracks()[0].0;
+        assert_eq!(
+            controller.track_lyrics(id).as_deref(),
+            Some("[00:01.00]quick lyric\n")
+        );
+        assert!(
+            controller
+                .track_lyrics_path(id)
+                .is_some_and(|path| path.is_file())
+        );
+        assert!(
+            controller
+                .track_album_id(id)
+                .and_then(|album| controller.album_cover_path(album))
+                .is_some_and(|path| path.is_file())
+        );
+        controller.shutdown();
     }
 
     #[test]
