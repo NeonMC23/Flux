@@ -3082,6 +3082,7 @@ impl CanonicalLibrary {
             journal.state = JournalState::Cleaning;
             write_journal(&self.root, &journal)?;
             self.maybe_fail(TransactionFailPoint::BeforeCleanup)?;
+            let mut cleanup_error = None;
             for target in &cleanup {
                 self.maybe_fail(TransactionFailPoint::DuringCleanup)?;
                 if target
@@ -3091,9 +3092,16 @@ impl CanonicalLibrary {
                 {
                     self.maybe_fail(TransactionFailPoint::DuringLyricsCleanup)?;
                 }
-                cleanup_one_path(&self.root, &journal, target)?;
+                if let Err(error) = cleanup_one_path(&self.root, &journal, target)
+                    && cleanup_error.is_none()
+                {
+                    cleanup_error = Some(error);
+                }
             }
             self.maybe_fail(TransactionFailPoint::AfterCleanup)?;
+            if let Some(error) = cleanup_error {
+                return Err(error);
+            }
             journal.state = JournalState::Completed;
             write_journal(&self.root, &journal)?;
             self.maybe_fail(TransactionFailPoint::BeforeJournalFinalize)?;
@@ -5151,7 +5159,10 @@ impl CanonicalLibrary {
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+            Err(error) => Err(format!(
+                "could not remove {}: {error}. The catalogue deletion is committed; retry cleanup after resolving the obstacle.",
+                path.display()
+            )),
         }
     }
 
