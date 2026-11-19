@@ -4095,6 +4095,35 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_import_reuses_unique_normalized_artist_and_album_names() {
+        let dir = TempDir::new("review-normalized-entities");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let artist = controller.create_artist("The Artist").expect("artist");
+        let album = controller
+            .create_album(artist, "The Album", crate::ReleaseType::Album)
+            .expect("album");
+        let source_dir = dir.path().join("the artist/the album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "Song.wav", 4_410, 0.2);
+        let request = canonical_request(&controller, &root, vec![source], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        controller
+            .apply_import_plan(&plan, &prepared_for(&plan))
+            .expect("reviewed import");
+        assert_eq!(controller.artists().len(), 1);
+        assert_eq!(controller.albums().len(), 1);
+        let id = controller.tracks()[0].0;
+        assert_eq!(controller.track_artist_id(id), Some(artist));
+        assert_eq!(controller.track_album_id(id), Some(album));
+        controller.shutdown();
+    }
+
+    #[test]
     fn quick_import_reuses_unique_normalized_artist_and_album_names() {
         let dir = TempDir::new("quick-normalized-entities");
         let root = dir.path().join("FluxLibrary");
