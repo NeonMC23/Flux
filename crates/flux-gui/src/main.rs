@@ -8016,6 +8016,16 @@ impl FluxReady {
                 .size(10)
                 .color(SUCCESS),
             );
+            if !report.cleanup_errors.is_empty() {
+                panel = panel.push(
+                    text(format!(
+                        "Catalogue committed; managed-file cleanup is incomplete and will be retried on reopen: {}",
+                        report.cleanup_errors.join("; ")
+                    ))
+                    .size(9)
+                    .color(DANGER),
+                );
+            }
         }
         panel = panel.push(
             row![

@@ -249,6 +249,18 @@ pub enum CanonicalError {
     MissingResource(PathBuf),
     /// A transaction journal is malformed; no automatic repair is performed.
     Transaction { file: String, message: String },
+    /// The catalogue committed but journal-owned physical cleanup did not
+    /// finish. The committed state is authoritative and startup recovery will
+    /// retry cleanup; callers must not report this as a rollback.
+    CommittedCleanup { message: String },
+}
+
+impl CanonicalError {
+    /// Whether this error occurred after the catalogue commit point.
+    #[must_use]
+    pub fn is_committed_cleanup(&self) -> bool {
+        matches!(self, Self::CommittedCleanup { .. })
+    }
 }
 
 impl fmt::Display for CanonicalError {
@@ -289,6 +301,10 @@ impl fmt::Display for CanonicalError {
             Self::Transaction { file, message } => {
                 write!(f, "transaction {file} cannot be recovered: {message}")
             }
+            Self::CommittedCleanup { message } => write!(
+                f,
+                "the catalogue committed, but managed-resource cleanup is incomplete and will be retried on reopen: {message}"
+            ),
         }
     }
 }
@@ -475,6 +491,7 @@ pub struct CanonicalLibrary {
     album_paths: BTreeMap<AlbumId, RelPath>,
     playlist_paths: BTreeMap<PlaylistId, RelPath>,
     fail_scenario: Option<TransactionFailure>,
+    last_cleanup_warning: Option<String>,
 }
 
 impl CanonicalLibrary {
@@ -1706,6 +1723,7 @@ impl CanonicalLibrary {
             album_paths,
             playlist_paths,
             fail_scenario: None,
+            last_cleanup_warning: None,
         })
     }
 }
@@ -2851,6 +2869,14 @@ impl CanonicalLibrary {
         self.commit_writes_with_cleanup(new_catalog, writes, Vec::new())
     }
 
+    /// Takes any post-commit cleanup warning produced by the last mutation.
+    /// A non-empty value means the catalogue change committed successfully and
+    /// the journal will retry physical cleanup on the next open.
+    #[must_use]
+    pub fn take_cleanup_warning(&mut self) -> Option<String> {
+        self.last_cleanup_warning.take()
+    }
+
     fn ensure_plan_library(&self, library_id: &str) -> Result<(), CanonicalError> {
         if library_id != self.manifest.library_id {
             return Err(CanonicalError::Invalid(
@@ -2883,6 +2909,7 @@ impl CanonicalLibrary {
         writes: Vec<PendingWrite>,
         cleanup: Vec<RelPath>,
     ) -> Result<(), CanonicalError> {
+        self.last_cleanup_warning = None;
         self.maybe_fail(TransactionFailPoint::BeforeJournal)?;
         self.ensure_no_pending_transactions()?;
         let next_generation =
@@ -3088,8 +3115,21 @@ impl CanonicalLibrary {
                 if catalog_committed(&self.root, &transaction_id)? {
                     // The catalogue is authoritative. Preserve the journal so a
                     // later open can finish cleanup; never roll back committed
-                    // work.
-                    return Err(err);
+                    // work. Reopen when possible so the in-memory store matches
+                    // the published catalogue even though cleanup is pending.
+                    match self.reopen_after() {
+                        Ok(()) => {
+                            self.last_cleanup_warning = Some(err.to_string());
+                            return Ok(());
+                        }
+                        Err(reopen_error) => {
+                            return Err(CanonicalError::CommittedCleanup {
+                                message: format!(
+                                    "{err}; reopening the committed state also failed: {reopen_error}"
+                                ),
+                            });
+                        }
+                    }
                 }
                 let _ = recover_one_transaction(&self.root, &txn_dir, &journal, None);
                 Err(err)
@@ -8291,6 +8331,9 @@ pub struct ArtistDeletionReport {
     pub deleted_tracks: Vec<TrackId>,
     /// Albums removed with the artist.
     pub deleted_albums: Vec<AlbumId>,
+    /// Post-commit physical-cleanup issues. The catalogue changes and artist
+    /// deletion are already committed when this is non-empty.
+    pub cleanup_errors: Vec<String>,
 }
 
 impl CanonicalLibrary {
@@ -8964,14 +9007,30 @@ impl CanonicalLibrary {
             .retain(|artist| artist.id != plan.artist_id.get());
         catalog.next_album_id = next_album;
         catalog.tracks.sort_by_key(|track| track.id);
-        self.commit_writes_with_cleanup(Some(catalog), writes, cleanup)?;
-        self.reopen_after()?;
+        let cleanup_errors = match self.commit_writes_with_cleanup(Some(catalog), writes, cleanup) {
+            Ok(()) => {
+                if self.last_cleanup_warning.is_none() {
+                    self.reopen_after()?;
+                }
+                self.take_cleanup_warning()
+                    .map(|message| format!("catalogue committed; cleanup incomplete: {message}"))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            }
+            Err(CanonicalError::CommittedCleanup { message }) => {
+                vec![format!(
+                    "catalogue committed; cleanup incomplete: {message}"
+                )]
+            }
+            Err(err) => return Err(err),
+        };
         Ok(ArtistDeletionReport {
             artist_id: plan.artist_id,
             transferred: transferred as usize,
             credits_removed: credits_removed as usize,
             deleted_tracks: deleted_tracks.into_iter().collect(),
             deleted_albums: plan.owned_albums.clone(),
+            cleanup_errors,
         })
     }
 }
@@ -11760,6 +11819,44 @@ mod artist_deletion_tests {
                 .join("artists/artist_000001/albums/album_000001/cover.png")
                 .exists()
         );
+    }
+
+    #[test]
+    fn committed_artist_deletion_reports_cleanup_failure_without_rollback() {
+        let mut fx = fixture("delete-cleanup-report");
+        let image_source = fx._dir.write("artist.png", b"\x89PNG\r\n\x1a\nartist");
+        fx.library
+            .set_artist_image(fx.deleted, &image_source, "png")
+            .expect("artist image");
+        let image = fx
+            .library
+            .artist_image_path(fx.deleted)
+            .expect("managed image");
+        let plan = prepared_plan(&mut fx);
+        fs::remove_file(&image).expect("remove image fixture");
+        fs::create_dir(&image).expect("block image cleanup with a directory");
+
+        let report = fx
+            .library
+            .execute_artist_deletion(&plan)
+            .expect("catalogue commit is reported as committed");
+        assert!(
+            report
+                .cleanup_errors
+                .iter()
+                .any(|error| error.contains("catalogue committed")),
+            "{report:?}"
+        );
+        assert_eq!(report.artist_id, fx.deleted);
+
+        // Startup recovery retries the journal-owned cleanup once the obstacle
+        // is removed and preserves the already-committed catalogue state.
+        fs::remove_dir(&image).expect("remove cleanup obstacle");
+        drop(fx.library);
+        let reopened = CanonicalLibrary::open(&fx.root).expect("recover cleanup");
+        assert!(reopened.artist(fx.deleted).is_none());
+        assert!(reopened.track(fx.non_collaborative).is_none());
+        assert!(!image.exists());
     }
 
     #[test]

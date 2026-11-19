@@ -4983,13 +4983,21 @@ impl Controller {
         if current_deleted {
             self.outbox.push(ControllerEvent::PlaybackChanged);
         }
-        self.report_status(format!(
-            "Deleted artist {}: {} transferred, {} credit(s) removed, {} track(s) deleted.",
-            report.artist_id,
-            report.transferred,
-            report.credits_removed,
-            report.deleted_tracks.len()
-        ));
+        if report.cleanup_errors.is_empty() {
+            self.report_status(format!(
+                "Deleted artist {}: {} transferred, {} credit(s) removed, {} track(s) deleted.",
+                report.artist_id,
+                report.transferred,
+                report.credits_removed,
+                report.deleted_tracks.len()
+            ));
+        } else {
+            self.report_error(format!(
+                "Artist {} was deleted and the catalogue committed, but managed-resource cleanup is incomplete and will be retried on reopen: {}",
+                report.artist_id,
+                report.cleanup_errors.join("; ")
+            ));
+        }
         Ok(report)
     }
 
@@ -5762,13 +5770,19 @@ impl Controller {
     }
 
     fn refresh_from_canonical(&mut self) {
-        let Some(store) = self.canonical_store.as_ref() else {
+        let Some(store) = self.canonical_store.as_mut() else {
             return;
         };
         let library = store.runtime_library();
+        let cleanup_warning = store.take_cleanup_warning();
         self.tracks = snapshot(&library);
         self.library_revision = self.library_revision.wrapping_add(1);
         self.library = Some(library);
+        if let Some(message) = cleanup_warning {
+            self.report_error(format!(
+                "The catalogue change committed, but managed-resource cleanup is incomplete and will be retried on reopen: {message}"
+            ));
+        }
     }
 
     fn refresh_from_store(&mut self) {
