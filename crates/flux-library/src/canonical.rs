@@ -11421,11 +11421,17 @@ mod filesystem_edge_tests {
             fs::set_permissions(&locked, original).expect("restore");
             return;
         }
-        assert!(CanonicalLibrary::open(&root).is_err());
+        let mut loaded = CanonicalLibrary::open(&root).expect("committed state remains readable");
+        assert!(
+            loaded.take_cleanup_warning().is_some(),
+            "blocked cleanup is reported"
+        );
         assert!(obsolete.is_file());
         assert!(txn_dir.is_dir());
+        drop(loaded);
         fs::set_permissions(&locked, original).expect("restore");
-        let reopened = CanonicalLibrary::open(&root).expect("retry cleanup");
+        let mut reopened = CanonicalLibrary::open(&root).expect("retry cleanup");
+        assert!(reopened.take_cleanup_warning().is_none());
         assert!(!obsolete.exists());
         assert!(!txn_dir.exists());
         drop(reopened);
