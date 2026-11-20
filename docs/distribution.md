@@ -38,7 +38,7 @@ validated in M12/M13.
 ## CI execution
 
 The complete workflow was executed by `workflow_dispatch` at commit
-`8a1d525` (GitHub Actions run `44749832007`). All jobs passed:
+`f672237` (GitHub Actions run `44770380901`). All jobs passed:
 
 - format/Clippy, dependency licences, Linux x86_64 and ARM64 tests/builds,
   Windows x86_64 and ARM64 tests/builds, macOS ARM64 tests/build and macOS
@@ -52,8 +52,8 @@ does not sign with an unavailable identity, and uploads only private workflow
 artifacts with 14-day retention. Packaging jobs run only on
 `workflow_dispatch`; ordinary pushes run tests and build checks.
 
-Earlier M12/M13 dispatches exposed and fixed several native defects before this
-green run. The final artifacts below are from the green run.
+Earlier M12/M13/M14 dispatches exposed and fixed native defects before this
+green run. The final artifacts below are from the M14 green run.
 
 ## Artifact evidence
 
@@ -64,37 +64,37 @@ after downloading the private CI artifacts.
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-linux-x86_64.tar.gz` | 13,553,515 | `b8658af1c1c099c1752f63a3f6256f8057090c6065339076a0925b6f599b8549` |
-| `Flux-0.1.0-linux-x86_64.deb` | 10,310,662 | `d159670f7a5ecc77a79719d0e41706bfaf739e34c8ffdfac7213a879dcaff17e` |
-| `Flux-0.1.0-linux-x86_64.rpm` | 13,417,897 | `87673255554c5f5da3287c397d21b32771ef3142cf9a36e5ed0f8d583edd478d` |
+| `Flux-0.1.0-linux-x86_64.tar.gz` | 13,584,370 | `cb0879f1ac880c87b378522cd8b3d1538410aec6a46075635025c6205246a007` |
+| `Flux-0.1.0-linux-x86_64.deb` | 10,324,776 | `0e78f97c1b55637d6a8e840e58650b10da2750d8b63e379b5529855cf25dc81b` |
+| `Flux-0.1.0-linux-x86_64.rpm` | 13,445,395 | `0f97041ad60584cab596e001e67643c9398fd96247f377a69dc7476ac7e6ee91` |
 
 ### Linux ARM64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-linux-aarch64.tar.gz` | 13,625,693 | `cfeba176c2baa3e1d19cd72a63e4c8f261bb642d329fd950f7ff26729fa31a4a` |
-| `Flux-0.1.0-linux-aarch64.deb` | 10,072,002 | `b3efd84bb73568713250521f643059201ee98678aa36f7a103889e6bed62637a` |
-| `Flux-0.1.0-linux-aarch64.rpm` | 13,606,773 | `7cee1f97e8a3876eaab51968de586722667db6004a2d62002cf676f8d9064ab9` |
+| `Flux-0.1.0-linux-aarch64.tar.gz` | 13,646,886 | `d596d056fc355f5e0e40cfa951e47293a2e030b5441e98c7bb7f5a56df8bfa52` |
+| `Flux-0.1.0-linux-aarch64.deb` | 10,152,142 | `dc9e6d77fb45b074a4422a9484bf3574b4afd408a482567492906090a099217a` |
+| `Flux-0.1.0-linux-aarch64.rpm` | 13,629,427 | `eb8cf6079d6cbd8a208b3631cc126d8297b2ae636bea57a18508d283ff516afc` |
 
 ### Windows x86_64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-windows-x86_64.zip` | 10,272,051 | `1967859075256811f23f50a1251910827d36d412cb0511cd20d3e53d066f1491` |
-| `Flux-0.1.0-windows-x86_64-setup.exe` | 8,639,734 | `2f240aa50f4fad971d239bbdef6b6b25c013586a1c70f13cf8ccc67413596409` |
+| `Flux-0.1.0-windows-x86_64.zip` | 10,303,805 | `743ecbe38fd05ccc310de74d56c1a5f56cb5eae147570ddb472a1a4c50c96a2f` |
+| `Flux-0.1.0-windows-x86_64-setup.exe` | 8,658,750 | `ecdb48c3699894428d9d448ecc0b503f1ef1fc567d86f38b2e932b85e9664abc` |
 
 ### Windows ARM64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-windows-arm64.zip` | 9,728,225 | `2e1f2d0c217aaf24a3663054359be773a1f7ef66159adcf86b455eef980c8bdd` |
+| `Flux-0.1.0-windows-arm64.zip` | 9,753,233 | `17d140d16318eb20e80e64b3c3d0ce5a41994eb4a7172894639723a188de4a19` |
 
 ### macOS ARM64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-macos-arm64.app.zip` | 9,753,180 | `d4cfe6bdf2d780c02237f11e52763945ee13e2abcb6df74caec53f304c3faf0a` |
-| `Flux-0.1.0-macos-arm64.dmg` | 10,786,982 | `9e6febd5cbccf6f5d7f1139ddfbb3159a79ca8e082ade6b311bea21c1efed706` |
+| `Flux-0.1.0-macos-arm64.app.zip` | 9,777,444 | `de0407893b75de0cf3cfcf6aec598111363505da9974c843f199511cf942d8f9` |
+| `Flux-0.1.0-macos-arm64.dmg` | 10,819,223 | `51a0bcfc71ab3d47cf2d69f4c9147bba689ce4eb58e0658dd2e7c79003ee38ac` |
 
 Each platform's `SHA256SUMS-*.txt` file was verified with `sha256sum -c` against
 the downloaded bytes. No artifact contains a user library, queue, ratings,

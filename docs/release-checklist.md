@@ -102,10 +102,10 @@ diff -u /tmp/first /tmp/second
 Only claim bit-for-bit reproducibility for the formats actually compared. RPM
 build host/time must be normalized as in the provided script.
 
-## 7. M13 evidence snapshot
+## 7. M14 evidence snapshot
 
-The M13 green native run was GitHub Actions `44749832007` at commit `8a1d525`;
-M13 also adds local audio and package-manager evidence.
+The M14 green native run was GitHub Actions `44770380901` at commit `f672237`;
+M14 also keeps the M13 local audio and package-manager evidence available.
 Exact artifact sizes, SHA-256 values, compatibility floors, signing state and
 platform limitations are recorded in [`distribution.md`](distribution.md).
 
