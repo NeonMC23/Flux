@@ -1827,6 +1827,22 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CanonicalError> {
     Ok(())
 }
 
+/// Flushes a staged file to the device.
+///
+/// Windows `FlushFileBuffers` requires a handle with write access, so this
+/// deliberately opens the file for writing instead of reusing a read-only
+/// `File::open`. A read-only handle makes every transaction fail with
+/// `ERROR_ACCESS_DENIED` on Windows even though the file is writable.
+fn sync_file(path: &Path) -> Result<(), CanonicalError> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| io_context("could not open for sync", path, err))?;
+    file.sync_all()
+        .map_err(|err| io_context("could not sync file", path, err))?;
+    Ok(())
+}
+
 fn sync_directory(path: &Path) -> Result<(), CanonicalError> {
     #[cfg(unix)]
     {
@@ -3040,9 +3056,9 @@ impl CanonicalLibrary {
                     fs::copy(&target, &backup_path).map_err(|err| {
                         io_context("could not back up existing resource", &target, err)
                     })?;
-                    fs::File::open(&backup_path)
-                        .and_then(|file| file.sync_all())
-                        .map_err(|err| io_context("could not sync backup", &backup_path, err))?;
+                    sync_file(&backup_path).map_err(|err| {
+                        canonical_context("could not sync backup", &backup_path, err)
+                    })?;
                     Some(name)
                 } else {
                     None
@@ -3097,11 +3113,9 @@ impl CanonicalLibrary {
                     fs::copy(source, &staging).map_err(|err| {
                         io_context("could not stage copied resource", &staging, err)
                     })?;
-                    fs::File::open(&staging)
-                        .and_then(|file| file.sync_all())
-                        .map_err(|err| {
-                            io_context("could not sync staged resource", &staging, err)
-                        })?;
+                    sync_file(&staging).map_err(|err| {
+                        canonical_context("could not sync staged resource", &staging, err)
+                    })?;
                 } else {
                     return Err(CanonicalError::Invalid(
                         "transaction write has neither bytes nor a source".to_owned(),
@@ -5865,6 +5879,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_file_sync_uses_a_writable_handle() {
+        let dir = TempDir::new("sync-staged");
+        let path = dir.write("staged.bin", b"staged bytes");
+        // FlushFileBuffers rejects a read-only handle with Access denied.
+        super::sync_file(&path).expect("staged file sync");
     }
 
     fn import(dir: &TempDir, library: &mut CanonicalLibrary, name: &str) -> TrackId {
