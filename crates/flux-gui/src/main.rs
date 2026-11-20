@@ -3056,7 +3056,7 @@ impl FluxReady {
             .artist_description(id)
             .unwrap_or_default()
             .to_owned();
-        self.artist_aliases_input = self.controller.artist_aliases(id).join(", ");
+        self.artist_aliases_input = self.controller.artist_aliases(id).join("; ");
     }
 
     fn sync_album_editor(&mut self) {
@@ -4973,7 +4973,7 @@ impl FluxReady {
                 };
                 let aliases = self
                     .artist_aliases_input
-                    .split(',')
+                    .split(';')
                     .map(str::trim)
                     .filter(|alias| !alias.is_empty())
                     .map(ToOwned::to_owned)
@@ -14878,7 +14878,7 @@ impl FluxReady {
                         .style(input_style)
                         .width(Length::Fill),
                     text_input(
-                        "Aliases, comma separated (optional)…",
+                        "Aliases, separated by ; (optional)…",
                         &self.artist_aliases_input,
                     )
                     .on_input(Message::ArtistAliasesChanged)
@@ -19582,7 +19582,7 @@ mod tests {
         );
         send(
             &mut gui,
-            Message::ArtistAliasesChanged("Entity AKA, Former Name".to_owned()),
+            Message::ArtistAliasesChanged("Entity AKA; Former Name".to_owned()),
         );
         send(&mut gui, Message::SelectView(LibraryView::Tracks));
         assert_eq!(

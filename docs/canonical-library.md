@@ -374,7 +374,7 @@ when its last Track is removed or moved, so an empty Artist remains deliberate
 and visible.
 
 The GUI Artist list opens a detail page that edits name, description and
-comma-separated aliases; the TUI `Y` form edits name and `;`-separated aliases.
+`;`-separated aliases; the TUI `Y` form edits name and aliases the same way.
 The detail page assigns or removes a managed image, shows owned and
 credited-only Albums, lists all related Tracks by stable TrackId, and navigates
 to Album/Track views. Alias edits reject empty duplicates and aliases equal to
