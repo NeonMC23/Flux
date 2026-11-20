@@ -46,7 +46,7 @@ target_for_arch() {
 sign_bundle() {
   local app="$1"
   if [ -n "${CODESIGN_IDENTITY:-}" ]; then
-    echo "Signing with Developer ID identity from CODESIGN_IDENTITY"
+    echo "Signing with Developer ID identity from CODESIGN_IDENTITY" >&2
     codesign --force --deep --options runtime --timestamp \
       --sign "$CODESIGN_IDENTITY" "$app"
     codesign --verify --deep --strict --verbose=2 "$app"
@@ -59,7 +59,7 @@ sign_bundle() {
       rm -rf "$(dirname "$zip")"
     fi
   else
-    echo "No CODESIGN_IDENTITY supplied; applying an ad-hoc signature (not notarized)."
+    echo "No CODESIGN_IDENTITY supplied; applying an ad-hoc signature (not notarized)." >&2
     codesign --force --deep --sign - "$app"
     codesign --verify --deep --strict --verbose=2 "$app"
   fi

@@ -70,7 +70,10 @@ jobs:
           for size in (16, 32, 64, 256, 1024):
               image = Image.open(f"assets/icons/flux-{size}.png")
               assert image.size == (size, size), (size, image.size)
-          assert Image.open("assets/icons/flux.ico").size[0] >= 16
+          ico = Image.open("assets/icons/flux.ico")
+          assert ico.size[0] >= 16
+          icns = open("assets/icons/flux.icns", "rb").read()
+          assert icns[:4] == b"icns" and int.from_bytes(icns[4:8], "big") == len(icns)
           PY
 
   licenses:

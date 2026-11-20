@@ -29,6 +29,7 @@ if (-not $Version) { throw 'Could not determine the workspace version.' }
 $TargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root 'target' }
 $BinaryDir = Join-Path $TargetRoot (Join-Path $Target 'release')
 $Dist = if ($env:FLUX_DIST_DIR) { $env:FLUX_DIST_DIR } else { Join-Path $Root 'dist' }
+$NumericVersion = (($Version -split '\D+') + @('0','0','0'))[0..2] -join '.'
 $Name = "Flux-$Version-windows-$Architecture"
 $Stage = Join-Path $Dist $Name
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
@@ -107,6 +108,7 @@ if (-not $SkipInstaller) {
     } else {
         & $Iscc `
             "/DMyAppVersion=$Version" `
+            "/DMyVersionInfo=$NumericVersion.0" `
             "/DMyArch=$Architecture" `
             "/DMyStage=$Stage" `
             "/DMyOutput=$Dist" `
@@ -117,7 +119,7 @@ if (-not $SkipInstaller) {
     }
 }
 
-$Artifacts = @($Zip) + @($Installer) | Where-Object { $_ }
+$Artifacts = (@($Zip) + @($Installer)) | Where-Object { $_ }
 $Checksums = foreach ($artifact in $Artifacts) {
     $hash = (Get-FileHash -Algorithm SHA256 -Path $artifact).Hash.ToLowerInvariant()
     "$hash  $(Split-Path $artifact -Leaf)"

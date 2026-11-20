@@ -149,6 +149,17 @@ preservation of the generated user data after deleting the extracted application
 tree. The GUI started without stderr output; a native `.deb`/`.rpm` installation
 into a privileged host was not performed.
 
+## Linux compatibility boundary
+
+The locally built Linux binaries were produced on Fedora 44 with glibc 2.43, so
+those specific artifacts require a glibc 2.43-or-newer distribution. They are
+release-engineering validation artifacts, not the recommended compatibility
+baseline. The manual CI packaging job runs on Ubuntu 24.04 (glibc 2.39); those
+artifacts must be the ones reviewed for broader Linux distribution. No portable
+glibc baseline is claimed until that CI artifact is executed on target systems.
+The TUI and GUI both depend on the platform ALSA runtime and the usual X11 or
+Wayland desktop libraries.
+
 ## Budgets, signing and publication
 
 - No release, tag, GitHub release, installer upload or binary publication is

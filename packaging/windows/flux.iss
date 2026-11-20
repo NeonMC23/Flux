@@ -9,6 +9,9 @@
 #ifndef MyArch
   #define MyArch "x86_64"
 #endif
+#ifndef MyVersionInfo
+  #define MyVersionInfo "0.0.0.0"
+#endif
 #ifndef MyStage
   #define MyStage "..\..\dist\Flux"
 #endif
@@ -37,11 +40,11 @@ UninstallDisplayIcon={app}\flux.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyVersionInfo}
 VersionInfoCompany=NeonMC23
 VersionInfoDescription=Flux installer
 VersionInfoProductName=Flux
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyVersionInfo}
 
 #if MyArch == "arm64"
 ArchitecturesAllowed=arm64

@@ -73,8 +73,26 @@ set -e
 [ ! -s "$TMP/gui.err" ] || { echo "error: packaged GUI wrote stderr:" >&2; cat "$TMP/gui.err" >&2; exit 1; }
 [ -d "$XDG/data/flux/FluxLibrary" ] || { echo "error: first-run canonical library was not created" >&2; exit 1; }
 
+# Simulate a reinstall/upgrade from a fresh extraction over the same user data,
+# then confirm an application-owned sentinel and the library survive.
+mkdir -p "$XDG/config/flux"
+printf 'keep-config\n' > "$XDG/config/flux/upgrade-sentinel"
+printf 'keep-library\n' > "$XDG/data/flux/FluxLibrary/upgrade-sentinel"
+mkdir -p "$TMP/upgrade"
+tar -xzf "$TARBALL" -C "$TMP/upgrade"
+UPGRADE="$TMP/upgrade/$NAME"
+set +e
+timeout 6 env HOME="$XDG" XDG_CONFIG_HOME="$XDG/config" XDG_DATA_HOME="$XDG/data" \
+  "$UPGRADE/bin/flux" >"$TMP/upgrade.out" 2>"$TMP/upgrade.err"
+status=$?
+set -e
+[ "$status" -eq 124 ] || { echo "error: upgraded GUI exited $status" >&2; exit 1; }
+[ ! -s "$TMP/upgrade.err" ] || { echo "error: upgraded GUI wrote stderr:" >&2; cat "$TMP/upgrade.err" >&2; exit 1; }
+[ "$(cat "$XDG/config/flux/upgrade-sentinel")" = "keep-config" ]
+[ "$(cat "$XDG/data/flux/FluxLibrary/upgrade-sentinel")" = "keep-library" ]
+
 # Simulate uninstallation by deleting the application tree; user data must stay.
-rm -rf "$PORTABLE" "$TMP/deb" "$TMP/rpm"
+rm -rf "$PORTABLE" "$UPGRADE" "$TMP/deb" "$TMP/rpm"
 [ -d "$XDG/data/flux/FluxLibrary" ] || { echo "error: application removal deleted user data" >&2; exit 1; }
 [ -d "$XDG/config" ] || { echo "error: application removal deleted config" >&2; exit 1; }
 
