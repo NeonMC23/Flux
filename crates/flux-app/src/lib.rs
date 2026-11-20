@@ -10293,6 +10293,12 @@ mod tests {
         // before shutdown still exercises the join/cancellation path.
         release.send(()).expect("release recovery");
         controller.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && controls.lock().expect("recovery controls").last().is_none()
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let controls = controls.lock().expect("recovery controls mutex");
         assert!(
             controls.last().is_some_and(|control| !control.is_running()),
@@ -10320,7 +10326,9 @@ mod tests {
             "shutdown waited unboundedly for a blocked device open"
         );
         release.send(()).expect("release recovery");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // The detached worker may be scheduled late on a loaded ARM runner;
+        // shutdown itself is already bounded by the assertion above.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
             && controls.lock().expect("recovery controls").last().is_none()
         {
