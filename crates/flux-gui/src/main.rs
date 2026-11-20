@@ -17066,6 +17066,7 @@ mod tests {
             ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("temp dir");
+            let path = std::fs::canonicalize(&path).expect("canonical temp dir");
             Self(path)
         }
 
