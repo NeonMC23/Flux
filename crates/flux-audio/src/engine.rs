@@ -2376,6 +2376,8 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).expect("temp dir");
+            #[cfg(target_os = "macos")]
+            let path = fs::canonicalize(&path).expect("canonical temp dir");
             Self(path)
         }
     }
