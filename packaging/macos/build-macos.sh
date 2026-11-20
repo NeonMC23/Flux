@@ -136,7 +136,7 @@ if command -v hdiutil >/dev/null 2>&1; then
 fi
 
 (
-  cd "$DIST"
+  cd "$DEST"
   : > "SHA256SUMS-macos-$ARCH_LABEL.txt"
   for artifact in "Flux-$VERSION-macos-$ARCH_LABEL.app.zip" \
     "Flux-$VERSION-macos-$ARCH_LABEL.dmg"; do

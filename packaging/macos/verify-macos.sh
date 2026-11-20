@@ -49,7 +49,7 @@ if [ -f "$DMG" ]; then
 fi
 
 (
-  cd "$DIST"
+  cd "$DEST"
   shasum -a 256 -c "SHA256SUMS-macos-$ARCH.txt"
 )
 

@@ -21,6 +21,10 @@ done
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/flux-package-validate.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/asound.conf" <<'ALSA'
+pcm.!default { type null }
+ctl.!default { type null }
+ALSA
 
 assert_version() {
   local bin="$1"
@@ -73,7 +77,8 @@ assert_version "$TMP/rpm/usr/bin/flux-tui"
 XDG="$TMP/xdg"
 mkdir -p "$XDG/config" "$XDG/data"
 set +e
-timeout 8 env HOME="$XDG" XDG_CONFIG_HOME="$XDG/config" XDG_DATA_HOME="$XDG/data" \
+timeout 8 env ALSA_CONFIG_PATH="$TMP/asound.conf" HOME="$XDG" \
+  XDG_CONFIG_HOME="$XDG/config" XDG_DATA_HOME="$XDG/data" \
   "$PORTABLE/bin/flux" >"$TMP/gui.out" 2>"$TMP/gui.err"
 status=$?
 set -e
@@ -82,7 +87,14 @@ if [ "$status" -ne 124 ]; then
   sed -n '1,80p' "$TMP/gui.err" >&2
   exit 1
 fi
-[ ! -s "$TMP/gui.err" ] || { echo "error: packaged GUI wrote stderr:" >&2; cat "$TMP/gui.err" >&2; exit 1; }
+# ALSA's C library writes environment diagnostics when the CI host has no
+# sound card. Those are not Flux errors; any other stderr remains fatal.
+if grep -vE '^(ALSA lib |Cannot connect to server|jack server is not running)' \
+  "$TMP/gui.err" | grep -q .; then
+  echo "error: packaged GUI wrote stderr:" >&2
+  cat "$TMP/gui.err" >&2
+  exit 1
+fi
 [ -d "$XDG/data/flux/FluxLibrary" ] || { echo "error: first-run canonical library was not created" >&2; exit 1; }
 
 # Simulate a reinstall/upgrade from a fresh extraction over the same user data,
@@ -94,7 +106,8 @@ mkdir -p "$TMP/upgrade"
 tar -xzf "$TARBALL" -C "$TMP/upgrade"
 UPGRADE="$TMP/upgrade/$NAME"
 set +e
-timeout 6 env HOME="$XDG" XDG_CONFIG_HOME="$XDG/config" XDG_DATA_HOME="$XDG/data" \
+timeout 6 env ALSA_CONFIG_PATH="$TMP/asound.conf" HOME="$XDG" \
+  XDG_CONFIG_HOME="$XDG/config" XDG_DATA_HOME="$XDG/data" \
   "$UPGRADE/bin/flux" >"$TMP/upgrade.out" 2>"$TMP/upgrade.err"
 status=$?
 set -e
@@ -103,7 +116,12 @@ if [ "$status" -ne 124 ]; then
   sed -n '1,80p' "$TMP/upgrade.err" >&2
   exit 1
 fi
-[ ! -s "$TMP/upgrade.err" ] || { echo "error: upgraded GUI wrote stderr:" >&2; cat "$TMP/upgrade.err" >&2; exit 1; }
+if grep -vE '^(ALSA lib |Cannot connect to server|jack server is not running)' \
+  "$TMP/upgrade.err" | grep -q .; then
+  echo "error: upgraded GUI wrote stderr:" >&2
+  cat "$TMP/upgrade.err" >&2
+  exit 1
+fi
 [ "$(cat "$XDG/config/flux/upgrade-sentinel")" = "keep-config" ]
 [ "$(cat "$XDG/data/flux/FluxLibrary/upgrade-sentinel")" = "keep-library" ]
 
