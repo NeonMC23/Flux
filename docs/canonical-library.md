@@ -106,8 +106,8 @@ root may leave its documented temporary leftovers there after the switch.
 
 The GUI remains a presentation layer over the shared Controller. Its sidebar is
 grouped into primary library destinations (**Tracks**, **Artists**, **Albums**,
-**Playlists**), a small **Browse** group (**Folders**, **Smart Collections**,
-**Dashboard**) and **Settings** at the bottom. **Import music** is the single
+**Playlists**), a small **Browse** group (**Folders**, **Lyrics**, **Smart
+Collections**, **Dashboard**) and **Settings** at the bottom. **Import music** is the single
 primary action. The item list scrolls independently at the minimum window
 height, while Import, Settings and the transport remain reachable. The active
 library's identity lives in Library setup rather than in a permanent sidebar

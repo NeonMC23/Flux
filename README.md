@@ -127,8 +127,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   results are dropped, and the previous library's selection, queue, editor,
   caches and pending playback are cleared while global preferences remain. The
   sidebar keeps the primary **Tracks**, **Artists**, **Albums** and
-  **Playlists** destinations, a small **Browse** group for Folders, Smart
-  Collections and Dashboard, and **Settings** at the bottom. **Import music** is
+  **Playlists** destinations, a small **Browse** group for Folders, Lyrics,
+  Smart Collections and Dashboard, and **Settings** at the bottom. **Import music** is
   the single primary action. Use it for the review-first copy-only Import
   Manager: native file or folder picker, Flux Browser, drag-and-drop,
   name-inferred review, duplicate decisions, and real progress/cancel. Final

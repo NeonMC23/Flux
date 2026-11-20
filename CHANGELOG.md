@@ -14,7 +14,7 @@ authorized release.
   bulk actions, direct paths and detailed duplicate handling live under one
   collapsed **Advanced Options** section.
 - The sidebar was reduced to primary library destinations, a small Browse group
-  and Settings. Counters, shortcut reminders, technical library identity and
+  (including Folders, Lyrics, Smart Collections and Dashboard) and Settings. Counters, shortcut reminders, technical library identity and
   duplicate setup actions were removed.
 - Setup now centers on the active library and audio output, with first-run text
   and advanced Artist/Health/Migration tools collapsed. Library filters are

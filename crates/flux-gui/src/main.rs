@@ -10305,6 +10305,7 @@ impl FluxReady {
         nav_items = nav_items.push(container(text("BROWSE").size(8).color(MUTED)).padding([3, 8]));
         for view in [
             LibraryView::Folders,
+            LibraryView::Lyrics,
             LibraryView::Collections,
             LibraryView::Dashboard,
         ] {
