@@ -29,7 +29,8 @@
 //!   publish. The GUI retains the rich metadata/artwork editor.
 //!   Per-path issues open a scrollable result panel.
 //! - `e` edit the selected track,
-//!   `P` create an artist, `Y` rename an artist (`artist-id|new-name`),
+//!   `P` create an artist, `Y` edit an artist
+//!   (`artist-id|new-name|alias;alias`),
 //!   `V` list artist IDs, `X` reconcile, `L` relink a unique reported
 //!   move candidate
 //! - `/` search/filter, `Esc` clear search or cancel input, `?` opens
@@ -1304,8 +1305,8 @@ impl Tui {
                         lines.push(String::new());
                     }
                     lines.push(
-                        "TUI: Y renames an existing artist; P creates an artist. Description, \
-                         image, ownership transfer and deletion require the GUI."
+                        "TUI: Y edits name and aliases of an existing artist; P creates an artist. \
+                         Description, image, ownership transfer and deletion require the GUI."
                             .to_owned(),
                     );
                     self.open_info("Artists", lines);
@@ -1902,9 +1903,9 @@ impl Tui {
                         }
                     }
                     Mode::ArtistRenameInput => {
-                        let Some((id, name)) = text.split_once('|') else {
+                        let Some((id, rest)) = text.split_once('|') else {
                             self.lifecycle_msg = Some(
-                                "Use artist-id|new name for rename. The form remains open."
+                                "Use artist-id|new name|aliases for rename. The form remains open."
                                     .to_owned(),
                             );
                             self.input = text;
@@ -1912,15 +1913,39 @@ impl Tui {
                             self.mode = next;
                             return false;
                         };
+                        let (name, alias_part) = rest
+                            .split_once('|')
+                            .map_or((rest, None), |(name, aliases)| (name, Some(aliases)));
                         match id.trim().parse::<u64>() {
                             Ok(raw) => {
-                                if let Err(err) = self
+                                let artist = ArtistId::new(raw);
+                                let description = self
                                     .controller
-                                    .rename_artist(ArtistId::new(raw), name.trim())
-                                {
+                                    .artist_description(artist)
+                                    .map(str::to_owned);
+                                let aliases = alias_part.map_or_else(
+                                    || self.controller.artist_aliases(artist).to_vec(),
+                                    |aliases| {
+                                        aliases
+                                            .split(';')
+                                            .map(str::trim)
+                                            .filter(|alias| !alias.is_empty())
+                                            .map(ToOwned::to_owned)
+                                            .collect::<Vec<_>>()
+                                    },
+                                );
+                                if let Err(err) = self.controller.update_artist_metadata(
+                                    artist,
+                                    name.trim(),
+                                    description.as_deref(),
+                                    &aliases,
+                                ) {
                                     self.lifecycle_msg = Some(err);
                                 } else {
-                                    self.lifecycle_msg = Some(format!("Renamed artist {raw}."));
+                                    self.lifecycle_msg = Some(format!(
+                                        "Updated artist {raw} ({} alias(es)).",
+                                        aliases.len()
+                                    ));
                                 }
                             }
                             Err(_) => {
@@ -2480,7 +2505,7 @@ impl Tui {
             ),
             Mode::ArtistCreateInput => input_line("New artist name (Enter create, Esc cancel): "),
             Mode::ArtistRenameInput => {
-                input_line("Rename artist-id|new-name (Enter rename, Esc cancel): ")
+                input_line("Edit artist-id|new-name|aliases; aliases separated by ; (Enter save, Esc cancel): ")
             }
             Mode::OpenInput => {
                 input_line("Open canonical library folder (Enter switch, Esc cancel): ")
@@ -2928,7 +2953,7 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "e edit selected metadata · y read managed lyrics".to_owned(),
         "H local history · D selected Track membership · E Album/standalone relationships"
             .to_owned(),
-        "V artist/album relationships · P create artist · Y rename artist".to_owned(),
+        "V artist/album relationships · P create artist · Y edit name/aliases".to_owned(),
         "X refresh/reconcile · L relink a unique reported move candidate".to_owned(),
         String::new(),
         "LIBRARY LIFECYCLE".to_owned(),
@@ -3428,11 +3453,23 @@ mod tests {
 
         key(&mut tui, KeyCode::Char('Y'));
         assert_eq!(tui.mode, Mode::ArtistRenameInput);
-        tui.input = format!("{artist}|Renamed Tui Artist");
+        tui.input = format!("{artist}|Renamed Tui Artist|Tui AKA;Former Tui");
         key(&mut tui, KeyCode::Enter);
         assert_eq!(
             tui.controller.track(id).and_then(Track::artist),
             Some("Renamed Tui Artist")
+        );
+        assert_eq!(
+            tui.controller.artist_aliases(artist),
+            ["Tui AKA".to_owned(), "Former Tui".to_owned()]
+        );
+        key(&mut tui, KeyCode::Char('Y'));
+        tui.input = format!("{artist}|Tui Artist II");
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(
+            tui.controller.artist_aliases(artist),
+            ["Tui AKA".to_owned(), "Former Tui".to_owned()],
+            "omitting the alias field preserves existing aliases"
         );
 
         tui.controller

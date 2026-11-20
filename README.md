@@ -213,7 +213,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   metadata, artwork and lyrics editing remains GUI-only.
   `e` edits the selected track as
   `title|album|track|disc|artist-id|credit-ids`, `P` creates an artist, `Y`
-  renames an artist (`id|new-name`), `V` opens a scrollable Artist relationship
+  renames/edits an artist (`id|new-name|alias;alias`; omit the alias field to
+  preserve existing aliases), `V` opens a scrollable Artist relationship
   view, `E` opens the Album/order view, `D` shows the selected Track's Album,
   `X` refreshes/validates the canonical library, and `M` runs the canonical
   migration workflow. `y` opens read-only managed lyrics. Rows mark managed
