@@ -10922,6 +10922,7 @@ mod track_deletion_tests {
                 .track_audio_path(track)
                 .expect("standalone audio")
                 .to_string_lossy()
+                .replace('\\', "/")
                 .contains("/standalone/")
         );
         assert_eq!(
