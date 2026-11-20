@@ -40,7 +40,7 @@ fn main() {
             concat!(
                 "1 ICON \"{icon}\"\n",
                 "1 24 \"{manifest}\"\n",
-                "VS_VERSION_INFO VERSIONINFO\n",
+                "1 VERSIONINFO\n",
                 " FILEVERSION {numeric}\n",
                 " PRODUCTVERSION {numeric}\n",
                 " FILEFLAGSMASK 0x3fL\n",
