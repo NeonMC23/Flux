@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.neonmc23.flux</id>
+  <name>Flux</name>
+  <summary>A local-first, native music player for your own library</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Flux is a native desktop music player for local audio files. It manages a
+    self-contained canonical library with stable artist, album, track and queue
+    identities, managed artwork and lyrics, playlists, ratings and playback
+    history.</p>
+    <p>Import review is offline and local: metadata comes from filenames,
+    folders, existing library entities and local sidecar files. Flux does not
+    read or rewrite audio tags, require an account, or contact a network
+    service.</p>
+  </description>
+  <launchable type="desktop-id">io.github.neonmc23.flux.desktop</launchable>
+  <provides>
+    <binary>flux</binary>
+  </provides>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <keywords>
+    <keyword>music</keyword>
+    <keyword>audio</keyword>
+    <keyword>player</keyword>
+    <keyword>library</keyword>
+    <keyword>offline</keyword>
+  </keywords>
+  <url type="homepage">https://github.com/NeonMC23/Flux</url>
+  <developer id="io.github.neonmc23">
+    <name>NeonMC23</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-20">
+      <description>
+        <p>First release-engineering build with Linux packages, Windows and
+        macOS bundle automation, native build identity, icons and checksums.</p>
+      </description>
+    </release>
+  </releases>
+</component>

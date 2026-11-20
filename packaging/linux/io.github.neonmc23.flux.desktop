@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Flux
+GenericName=Music Player
+Comment=A local-first, native music player for your own library.
+Exec=flux
+Icon=io.github.neonmc23.flux
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;audio;player;library;offline;local;
+StartupNotify=true
+StartupWMClass=io.github.neonmc23.flux
