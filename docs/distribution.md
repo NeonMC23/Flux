@@ -33,7 +33,7 @@ actually built, packaged, inspected and executed.
 | macOS x86_64 | Compile-only cross-check | Not built | Not applicable | Compile only | No | No | No |
 
 macOS universal binaries remain a supported script option but were not built or
-validated in M12.
+validated in M12/M13.
 
 ## CI execution
 
@@ -52,7 +52,7 @@ does not sign with an unavailable identity, and uploads only private workflow
 artifacts with 14-day retention. Packaging jobs run only on
 `workflow_dispatch`; ordinary pushes run tests and build checks.
 
-Earlier M12 dispatches exposed and fixed several native defects before this
+Earlier M12/M13 dispatches exposed and fixed several native defects before this
 green run. The final artifacts below are from the green run.
 
 ## Artifact evidence

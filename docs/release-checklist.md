@@ -102,8 +102,8 @@ build host/time must be normalized as in the provided script.
 
 ## 7. M13 evidence snapshot
 
-The M12 green native run was GitHub Actions `44749832007` at commit `8a1d525`;
-M13 adds local audio/package-manager evidence and a refreshed native run.
+The M13 green native run was GitHub Actions `44749832007` at commit `8a1d525`;
+M13 also adds local audio and package-manager evidence.
 Exact artifact sizes, SHA-256 values, compatibility floors, signing state and
 platform limitations are recorded in [`distribution.md`](distribution.md).
 
