@@ -278,9 +278,9 @@ jobs:
         shell: pwsh
         run: |
           if ('${{ matrix.installer }}' -eq 'yes') {
-            ./packaging/windows/verify-windows.ps1 -Architecture '${{ matrix.arch }}' -TestInstaller
+            ./packaging/windows/verify-windows.ps1 -Architecture '${{ matrix.arch }}' -TestInstaller -TestGuiLaunch
           } else {
-            ./packaging/windows/verify-windows.ps1 -Architecture '${{ matrix.arch }}'
+            ./packaging/windows/verify-windows.ps1 -Architecture '${{ matrix.arch }}' -TestGuiLaunch
           }
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
