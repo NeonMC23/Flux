@@ -3907,7 +3907,17 @@ impl FluxReady {
         let Some(manager) = self.import_manager.as_mut() else {
             return;
         };
-        if prepared.cancelled {
+        let cancel_requested = manager.cancel.load(Ordering::Acquire);
+        if prepared.cancelled || cancel_requested {
+            // A cancel request can arrive after the copy worker has finished
+            // but before this result is processed. Nothing has been published
+            // yet, so honour it and remove this preparation's unpublished
+            // copies rather than starting an irreversible commit.
+            if cancel_requested && !prepared.cancelled {
+                for path in &prepared.created_files {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
             manager.stage = ImportUiStage::Cancelled;
             manager.progress_view.stage = ImportStage::Cancelled;
             manager.progress_view.message =
@@ -3921,7 +3931,8 @@ impl FluxReady {
             return;
         };
         manager.progress_view.stage = ImportStage::WritingCatalogue;
-        manager.progress_view.message = "Writing catalogue changes…".to_owned();
+        manager.progress_view.message =
+            "Publishing catalogue changes… this final commit cannot be cancelled.".to_owned();
         match self.controller.apply_import_plan(&plan, &prepared) {
             Ok(report) => {
                 let failed = report.failed > 0 && !import_has_committed_success(&report);
@@ -18686,6 +18697,28 @@ mod tests {
         assert_eq!(gui.controller.queue_len(), 1);
         assert_eq!(std::fs::read(&source).expect("source"), source_bytes);
         assert_ne!(track.source().path(), source);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn cancel_after_copy_preparation_never_starts_publication() {
+        let dir = TempDir::new("gui-import-cancel-before-commit");
+        let mut gui = gui(&dir);
+        let mut manager = ImportManager::new();
+        manager.stage = ImportUiStage::Importing;
+        manager.cancel = Arc::new(AtomicBool::new(true));
+        gui.import_manager = Some(manager);
+        let created = dir.path().join("prepared-but-unpublished.wav");
+        std::fs::write(&created, minimal_wav()).expect("prepared copy");
+        let prepared = PreparedImport {
+            created_files: vec![created.clone()],
+            ..PreparedImport::default()
+        };
+        gui.apply_import_review(prepared);
+        let manager = gui.import_manager.as_ref().expect("manager");
+        assert_eq!(manager.stage, ImportUiStage::Cancelled);
+        assert!(!created.exists(), "unpublished copy was left behind");
+        assert!(gui.controller.tracks().is_empty());
         gui.controller.shutdown();
     }
 
