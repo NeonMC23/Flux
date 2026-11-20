@@ -43,7 +43,7 @@ pub const APP_DESCRIPTION: &str = "A local-first, native music player for your o
 pub const APP_COPYRIGHT: &str = "Copyright (c) 2026 NeonMC23";
 
 /// Latest milestone whose implementation is complete and validated.
-pub const MILESTONE: &str = "M10";
+pub const MILESTONE: &str = "M11";
 
 /// Startup text shared by the GUI and TUI binaries.
 ///

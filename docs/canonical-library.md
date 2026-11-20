@@ -262,7 +262,7 @@ with a compile-only macOS x86_64 cross-check. CPAL all-target compilation and
 CPAL GUI/TUI binary linking are checked on all matrix entries; no CI runner
 supplies a physical audio device.
 
-| Target | CI coverage defined | Locally executed in M7–M10 | Runtime status |
+| Target | CI coverage defined | Locally executed in M7–M11 | Runtime status |
 |---|---|---|---|
 | Linux x86_64 | Native tests/build, Clippy, CPAL check | Yes | GUI/TUI startup, TUI PTY, CPAL enumeration, explicit stream open and short WAV completion; no listening/hotplug |
 | Linux ARM64 | Native tests/build, CPAL check | No | Unverified locally |
@@ -883,6 +883,7 @@ from what remains structurally or physically unverified.
 | M8 product hardening: settings retry safety, canonical creation lease, import-credit preservation, stale import/preload rejection, queue/history reconciliation, TUI editing/rating safety and row/artwork caching | Confirmed by deterministic settings, import, Controller, canonical, GUI and TUI regressions plus the six Linux gates; GUI/TUI runtime probes remain Linux-only and no new platform claim is made |
 | M9 product completion: metadata provenance, local lyrics/artwork sidecars, normalized entity matching, bulk Track artwork, atomic lyrics export, committed-cleanup warnings, bounded shutdown and cancellable fingerprint/copy work | Confirmed by new deterministic import, GUI, library, Controller and shutdown regressions plus Linux runtime probes; Windows/macOS remain source/CI-contract only |
 | M10 product closure: Artist alias editing/image repair states, artwork previews, native lyrics save dialogs, per-candidate release type, cancellable TUI import review, whole-context dirty-edit guards and startup cleanup warnings | Confirmed by deterministic GUI/TUI/Controller/library regressions, repeated full workspace runs, Linux GUI/TUI/CPAL probes and equivalent before/after performance probes; Windows/macOS remain source/CI-contract only |
+| M11 release engineering: canonical identity/icons, first-run notice, portable/Debian/RPM Linux packages, Windows resource/installer scripts, macOS app bundle scripts, third-party notices, manual-dispatch packaging CI and checksum/reproducibility checks | Linux x86_64 artifacts built, package-validated and runtime-probed; Windows/macOS packaging is source/CI prepared without native execution |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |

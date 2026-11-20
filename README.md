@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: canonical library runtime integrated.**
+**Status: release engineering prepared.**
 Both applications now open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -74,6 +74,37 @@ and queue store are separate files, and `Player` remains the only
 playback-decision authority — the controller keeps the engine in sync
 with it. Queue files are namespaced by active library and never by audio
 tags or absolute audio paths.
+
+## Installation and distribution
+
+Release-engineering artifacts are built locally or by manual CI dispatch; no
+release is published from this repository. See
+[`docs/distribution.md`](docs/distribution.md) for the full matrix and evidence.
+
+```sh
+# Linux x86_64 (or native architecture)
+packaging/linux/build-packages.sh
+packaging/linux/validate-packages.sh
+# → dist/Flux-0.1.0-linux-x86_64.tar.gz|.deb|.rpm plus SHA256SUMS
+
+# Windows (native PowerShell)
+packaging/windows/build-windows.ps1 -Architecture x86_64
+
+# macOS (native)
+packaging/macos/build-macos.sh
+```
+
+`flux --version` and `flux-tui --version` print
+`Flux 0.1.0 (io.github.neonmc23.flux)`. Packaged applications keep user data
+outside the install directory:
+
+- Linux: `~/.local/share/flux` and `~/.config/flux`;
+- macOS: `~/Library/Application Support/flux`;
+- Windows: `%LOCALAPPDATA%\flux` and `%APPDATA%\flux`.
+
+The default `FluxLibrary` is created on first launch and announced in Library
+setup. Uninstalling application files does not delete the library, queue,
+ratings, history, lyrics, artwork or settings.
 
 ## Using Flux
 
@@ -568,10 +599,10 @@ so compilation there is never evidence of audible playback.
 | macOS x86_64 | Compile-only cross-check | No | No standard GitHub runner; compile-only CI path |
 
 The local Linux rows in M7–M9 were executed on Fedora 44, kernel 7.3.x /
-x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. M10 validation ran
-on Fedora 44, kernel 7.3.4, Rust/Cargo 1.99.0. No Windows/macOS Rust target or
-SDK is installed there, so no cross-compilation or native runtime validation is
-claimed.
+x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. M10 and M11
+validation ran on Fedora 44, kernel 7.3.4, Rust/Cargo 1.99.0. No Windows/macOS
+Rust target or SDK is installed there, so no cross-compilation or native
+runtime validation is claimed.
 
 The current Windows audit includes UTF-16/UNC path handling, PowerShell UTF-8
 dialog output, case-insensitive comparison fallback, reserved-name/long-path

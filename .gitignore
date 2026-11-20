@@ -6,3 +6,6 @@
 .DS_Store
 *.swp
 .idea/
+
+# Release artifacts and local packaging output
+/dist/
