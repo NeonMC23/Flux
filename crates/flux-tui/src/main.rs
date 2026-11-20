@@ -3100,6 +3100,14 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// Encodes a filesystem path as JSON string contents. Windows paths contain
+    /// backslashes, which are escape characters in JSON.
+    fn json_path(path: &std::path::Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
     struct TempDir(std::path::PathBuf);
 
     impl TempDir {
@@ -3789,7 +3797,7 @@ mod tests {
             &index,
             format!(
                 r#"{{"version":1,"next_id":2,"tracks":[{{"id":1,"title":"Song","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
-                song.display()
+                json_path(&song)
             ),
         )
         .expect("index");
@@ -3957,8 +3965,8 @@ mod tests {
             dir.path().join("library-index.json"),
             format!(
                 r#"{{"version":1,"next_id":3,"tracks":[{{"id":1,"title":"One","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}},{{"id":2,"title":"Two","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
-                one.display(),
-                two.display()
+                json_path(&one),
+                json_path(&two)
             ),
         )
         .expect("index");
@@ -4144,8 +4152,8 @@ mod tests {
             dir.path().join("library-index.json"),
             format!(
                 r#"{{"version":1,"next_id":3,"tracks":[{{"id":1,"title":"One","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}},{{"id":2,"title":"Two","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
-                one.display(),
-                two.display()
+                json_path(&one),
+                json_path(&two)
             ),
         )
         .expect("index");
