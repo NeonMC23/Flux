@@ -95,9 +95,9 @@ if [ "${FLUX_UNIVERSAL:-0}" = "1" ]; then
   BUILD_ARGS=()
   [ -n "$JOBS" ] && BUILD_ARGS+=(--jobs "$JOBS")
   cargo build --release --locked -p flux-gui -p flux-tui --features cpal \
-    --target aarch64-apple-darwin "${BUILD_ARGS[@]}"
+    --target aarch64-apple-darwin "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
   cargo build --release --locked -p flux-gui -p flux-tui --features cpal \
-    --target x86_64-apple-darwin "${BUILD_ARGS[@]}"
+    --target x86_64-apple-darwin "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
   ARM_BIN="$TARGET_ROOT/aarch64-apple-darwin/release/flux"
   X86_BIN="$TARGET_ROOT/x86_64-apple-darwin/release/flux"
   ARM_TUI="$TARGET_ROOT/aarch64-apple-darwin/release/flux-tui"
@@ -115,7 +115,7 @@ else
   BUILD_ARGS=()
   [ -n "$JOBS" ] && BUILD_ARGS+=(--jobs "$JOBS")
   cargo build --release --locked -p flux-gui -p flux-tui --features cpal \
-    --target "$TARGET" "${BUILD_ARGS[@]}"
+    --target "$TARGET" "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
   STEP="$DIST/.Flux-$VERSION-macos-$ARCH_LABEL"
   rm -rf "$STEP"
   mkdir -p "$STEP"
