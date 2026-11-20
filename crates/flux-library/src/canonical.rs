@@ -8552,11 +8552,9 @@ impl CanonicalLibrary {
                 .unwrap_or_default();
             let audio_path = self.track_paths[&track.id].clone();
             let lyrics_path = self.track_lyrics_path(track.id).and_then(|path| {
-                path.strip_prefix(&self.root).ok().and_then(|relative| {
-                    relative
-                        .to_str()
-                        .and_then(|text| RelPath::from_utf8(text).ok())
-                })
+                path.strip_prefix(&self.root)
+                    .ok()
+                    .and_then(|relative| RelPath::from_os_path(relative).ok())
             });
             let playlist_ids = self
                 .playlists
@@ -9782,14 +9780,8 @@ mod failure_matrix_tests {
             })
             .expect("import");
         let audio = library.track_audio_path(track).expect("audio");
-        let rel = RelPath::from_utf8(
-            audio
-                .strip_prefix(library.root())
-                .expect("inside")
-                .to_str()
-                .expect("utf8"),
-        )
-        .expect("rel");
+        let rel = RelPath::from_os_path(audio.strip_prefix(library.root()).expect("inside"))
+            .expect("rel");
         let txn = "txn-unsafe";
         let txn_dir = root.join(TRANSACTIONS_DIR_NAME).join(txn);
         fs::create_dir_all(&txn_dir).expect("txn");
@@ -10864,6 +10856,7 @@ mod track_deletion_tests {
                 .track_audio_path(track)
                 .expect("standalone audio")
                 .to_string_lossy()
+                .replace('\\', "/")
                 .contains("/standalone/")
         );
         fx.library

@@ -933,7 +933,7 @@ mod tests {
             "stable artist relationship wins over the tag artist"
         );
         let copied = library.track_audio_path(TrackId::new(1)).expect("copied");
-        assert!(copied.starts_with(&destination));
+        assert!(copied.starts_with(library.root()));
         assert_eq!(fs::read(&copied).expect("copied audio"), audio_before);
         let _ = track;
 
