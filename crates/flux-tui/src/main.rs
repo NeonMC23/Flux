@@ -76,7 +76,7 @@ use flux_app::{
     ReconcileReport, StorageMode, TrackMetadataEdit, format_duration, is_track_playable,
     prepare_import_files, prepare_import_plan,
 };
-use flux_core::{APP_VERSION, ArtistId, MILESTONE, PlaybackState, Track, TrackId};
+use flux_core::{APP_VERSION, ArtistId, PlaybackState, Track, TrackId};
 use unicode_width::UnicodeWidthChar;
 
 fn handle_cli() -> bool {
@@ -901,12 +901,12 @@ impl Tui {
                         CandidateStatus::New => String::new(),
                         CandidateStatus::ExistingPath(_) => " · same path".to_owned(),
                         CandidateStatus::SameContent { .. } => " · same audio".to_owned(),
-                        CandidateStatus::SimilarMetadata(_) => " · similar metadata".to_owned(),
+                        CandidateStatus::SimilarMetadata(_) => " · check details".to_owned(),
                         CandidateStatus::SameTitleDifferentAudio(_) => {
                             " · different audio".to_owned()
                         }
-                        CandidateStatus::ProbableAudio(_) => " · probable audio".to_owned(),
-                        CandidateStatus::AmbiguousAudio(_) => " · ambiguous audio".to_owned(),
+                        CandidateStatus::ProbableAudio(_) => " · possible duplicate".to_owned(),
+                        CandidateStatus::AmbiguousAudio(_) => " · needs a decision".to_owned(),
                     };
                     (
                         index == ui.selected,
@@ -921,10 +921,13 @@ impl Tui {
                 .collect::<Vec<_>>();
             (count, issue_count, rows, ui.error.clone())
         };
-        let title = format!(
-            "IMPORT REVIEW · {count} candidate(s) · {} discovery issue(s) · Space include · u update · a all · s skip · y prepare · Esc cancel",
-            issue_count
-        );
+        let title = if issue_count > 0 {
+            format!(
+                "Import review · {count} track(s) · {issue_count} unreadable · Enter import · Esc cancel"
+            )
+        } else {
+            format!("Import review · {count} track(s) · Enter import · Esc cancel")
+        };
         self.line(out, top as u16, &title, width, true)?;
         for (row, (selected, text)) in rows.into_iter().enumerate() {
             let y = (top + 1 + row) as u16;
@@ -2485,26 +2488,26 @@ impl Tui {
             Mode::Normal => "tracks",
             _ => "input",
         };
-        let mut header = format!(
-            "Flux {MILESTONE} [{library_label}] [view {view_label}] [queue {}] [playback {}]",
-            self.controller.queue_len(),
-            self.controller.playback_mode().label()
-        );
+        let mut header = format!("Flux · {library_label} · {view_label}");
+        if self.controller.queue_len() > 0 {
+            header.push_str(&format!(" · queue {}", self.controller.queue_len()));
+        }
+        header.push_str(&format!(" · {}", self.controller.playback_mode().label()));
         if self.favorites_only {
-            header.push_str(" [favorites]");
+            header.push_str(" · favorites");
         }
         if !self.search.trim().is_empty() {
             let search = truncate_to_width(&self.search, 24);
-            header.push_str(&format!(" [search \"{search}\"]"));
+            header.push_str(&format!(" · search \"{search}\""));
         }
         if self.controller.portable_recovery().is_some() {
-            header.push_str("   [recovered — read-only, A acknowledges]");
+            header.push_str(" · recovered (read-only, A acknowledges)");
         }
         if self.controller.legacy_index_write_protected() {
-            header.push_str("   [index protected — U preserves & replaces]");
+            header.push_str(" · index protected (U preserves & replaces)");
         }
         if self.controller.is_scanning() {
-            header.push_str("   [scanning…]");
+            header.push_str(" · scanning…");
         }
         self.line(out, 0, &header, width, true)?;
 
@@ -2751,7 +2754,7 @@ impl Tui {
                 "Import worker running — Esc cancels · q quits after the worker stops.".to_owned()
             }
             Mode::ImportReview => {
-                "Review — ↑/↓ select · Space include · u update · a all · s skip · y/Enter prepare · Esc cancel"
+                "Review — ↑/↓ select · Space include/skip · a all · s skip all · Enter import · Esc cancel"
                     .to_owned()
             }
             Mode::ConfirmPreserveIndex => {
@@ -3123,7 +3126,7 @@ fn format_lyrics_timestamp(timestamp_ms: u64) -> String {
 }
 
 fn normal_help() -> &'static str {
-    "↑/↓ move · Enter play · / search · f favorite · 0–5 rate · Q queue · ? help · q quit"
+    "↑/↓ move · Enter play · e edit · / search · f favorite · Q queue · ? help · q quit"
 }
 
 fn resource_label(state: Option<flux_app::ResourceState>) -> Option<&'static str> {
