@@ -38,7 +38,7 @@ validated in M12.
 ## CI execution
 
 The complete workflow was executed by `workflow_dispatch` at commit
-`c456dca` (GitHub Actions run `44701347712`). All jobs passed:
+`0e32c40` (GitHub Actions run `44704197091`). All jobs passed:
 
 - format/Clippy, dependency licences, Linux x86_64 and ARM64 tests/builds,
   Windows x86_64 and ARM64 tests/builds, macOS ARM64 tests/build and macOS
@@ -64,37 +64,37 @@ after downloading the private CI artifacts.
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-linux-x86_64.tar.gz` | 13,538,591 | `2c496e1f289744a95d1f4df63834b02aa4a4e6e1016eb484bf8a2f9048c12e11` |
-| `Flux-0.1.0-linux-x86_64.deb` | 10,294,908 | `3c2ef6f43e0a3a050c48cea336a8776d3d86e3eb1cf255df3ae137ab0015472a` |
-| `Flux-0.1.0-linux-x86_64.rpm` | 13,401,486 | `5cd43ebffc7db228264cd3ede93297adb0608475d11c98380db5d384ec069b4b` |
+| `Flux-0.1.0-linux-x86_64.tar.gz` | 13,538,714 | `9e689c2fe6b22389b714c4ff229d4b2a386b3d8aa8076629ae4f9e0ac45e82ff` |
+| `Flux-0.1.0-linux-x86_64.deb` | 10,294,882 | `52cf144991189c9c98eb28284f23294a463270935d058044279c62fac5a725ae` |
+| `Flux-0.1.0-linux-x86_64.rpm` | 13,401,458 | `f7d16c7b79fa25050f8e6e30e800e6802b0c7f67f79b418075efc2759f5da1db` |
 
 ### Linux ARM64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-linux-aarch64.tar.gz` | 13,614,123 | `04ea419ced9e5294f04b6a719bf77ad558ed7c40348357685459feb448381ee6` |
-| `Flux-0.1.0-linux-aarch64.deb` | 10,098,620 | `893e8fce4194bfacec134b6f21a796c0bcc80082245df68549b31696ce88b6e0` |
-| `Flux-0.1.0-linux-aarch64.rpm` | 13,591,239 | `2adc0c1cc222ffe371ba31cec86fde904c66c596b6f6a0304ac2eff1d3cd1ba5` |
+| `Flux-0.1.0-linux-aarch64.tar.gz` | 13,614,087 | `b0ac2c9c75caeb8e717561072b9dd55d116c0a53f282e4611a0a7f8ee2059708` |
+| `Flux-0.1.0-linux-aarch64.deb` | 10,098,610 | `3693c039f3dbf4a3e765cfd82b1f8ee67ae6fa4aa3442ee66167409bfe1d518e` |
+| `Flux-0.1.0-linux-aarch64.rpm` | 13,591,220 | `51a96b282d3e1ebee34a0aada9a6b89a410dfecdd6710763bb71291973fc2652` |
 
 ### Windows x86_64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-windows-x86_64.zip` | 10,258,143 | `3745f26db28509fdcf47f0685f157e7405556fdcbc63f2c57ab6f4cd21b3c0b9` |
-| `Flux-0.1.0-windows-x86_64-setup.exe` | 8,630,996 | `9441dfdb6018e19b1273256506cdff78e0d69d6ab34fd943d39141c3fb1ef320` |
+| `Flux-0.1.0-windows-x86_64.zip` | 10,259,665 | `56e04a69237451e56bc4b18b5ccabfb02c2d4a876e921ef261fca89ef4ef928b` |
+| `Flux-0.1.0-windows-x86_64-setup.exe` | 8,629,819 | `9f7d56b8ffa4c3c0dec27ccb40c0b2f395fb01b6596d4c9cd4ad662e4411ebbb` |
 
 ### Windows ARM64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-windows-arm64.zip` | 9,712,741 | `d1a0af35bbcf4c8d0ef13c89b35961499d2baad30fd100b9036f77182ec0c501` |
+| `Flux-0.1.0-windows-arm64.zip` | 9,712,725 | `6aca18655d04893f0bea1711b173c79538ed944ca3b163e4c14847c868aa919b` |
 
 ### macOS ARM64
 
 | Artifact | Size | SHA-256 |
 |---|---:|---|
-| `Flux-0.1.0-macos-arm64.app.zip` | 9,739,206 | `6f3ea0a0f36fb3651f100e8b1490343630cdbe12d32706271d6f3d54496c7aa8` |
-| `Flux-0.1.0-macos-arm64.dmg` | 10,781,338 | `f7459894c27f9ad27e3dd2e24ada765f6c977a693656ddd4528cc9330ef8ba3a` |
+| `Flux-0.1.0-macos-arm64.app.zip` | 9,739,185 | `d8000f003951a01d1f990dffa107e011aefa387473f62bf07397eb7e4a21e0a0` |
+| `Flux-0.1.0-macos-arm64.dmg` | 10,781,326 | `194fe1f0a4fcd6a3ed9c12ce7285ece1a78d53b1809511fce7ad57ded0adb177` |
 
 Each platform's `SHA256SUMS-*.txt` file was verified with `sha256sum -c` against
 the downloaded bytes. No artifact contains a user library, queue, ratings,
