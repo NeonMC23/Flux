@@ -1145,6 +1145,39 @@ impl ImportPlan {
         }
     }
 
+    /// Reads, validates and applies one LRC/TXT file to selected candidates.
+    /// Per-candidate edits made afterward still win; the file is never copied
+    /// into the catalogue until the import commits.
+    pub fn apply_lyrics_from_path(
+        &mut self,
+        indices: &[usize],
+        source: &Path,
+    ) -> Result<(), String> {
+        let text = read_lyrics_sidecar(source)?;
+        let mut applied = 0usize;
+        for index in indices {
+            if let Some(candidate) = self.candidates.get_mut(*index) {
+                candidate.lyrics = Some(text.clone());
+                candidate.lyrics_source = Some(source.to_path_buf());
+                candidate.provenance.lyrics = Some(MetadataSource::Manual);
+                applied += 1;
+            }
+        }
+        if applied == 0 {
+            return Err("Select one or more candidates first.".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Clears managed lyrics proposals from selected candidates.
+    pub fn clear_lyrics_for(&mut self, indices: &[usize]) {
+        for index in indices {
+            if let Some(candidate) = self.candidates.get_mut(*index) {
+                candidate.set_lyrics_text(None);
+            }
+        }
+    }
+
     /// Number of candidates that will produce a new record.
     #[must_use]
     pub fn new_count(&self) -> usize {
@@ -4320,6 +4353,46 @@ mod tests {
             0,
             "no partial destination is published"
         );
+    }
+
+    #[test]
+    fn bulk_lyrics_apply_is_validated_and_clear_preserves_other_fields() {
+        let dir = TempDir::new("bulk-lyrics");
+        let root = dir.path().join("FluxLibrary");
+        let (controller, _control) = canonical_controller(&root);
+        let source_dir = dir.path().join("Artist/Album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "Song.wav", 4_410, 0.2);
+        let request = canonical_request(&controller, &root, vec![source], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let lyrics = dir.path().join("bulk.lrc");
+        fs::write(&lyrics, "[00:01.00]first\n").expect("lyrics");
+        plan.apply_lyrics_from_path(&[0], &lyrics)
+            .expect("valid bulk lyrics");
+        assert_eq!(plan.candidates[0].lyrics_text(), Some("[00:01.00]first\n"));
+        assert_eq!(
+            plan.candidates[0].provenance().lyrics,
+            Some(MetadataSource::Manual)
+        );
+        let invalid = dir.path().join("invalid.lrc");
+        fs::write(&invalid, [0xff, 0xfe, 0x00]).expect("invalid");
+        assert!(
+            plan.apply_lyrics_from_path(&[0], &invalid).is_err(),
+            "invalid UTF-8 is rejected"
+        );
+        assert_eq!(
+            plan.candidates[0].lyrics_text(),
+            Some("[00:01.00]first\n"),
+            "a failed bulk replace preserves the previous proposal"
+        );
+        plan.clear_lyrics_for(&[0]);
+        assert!(plan.candidates[0].lyrics_text().is_none());
+        assert_eq!(plan.candidates[0].album(), Some("Album"));
+        controller.shutdown();
     }
 
     #[test]

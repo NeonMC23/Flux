@@ -2199,9 +2199,9 @@ cleanup.
 2. Import review supports ordered credits, owner selection, add/remove/reorder,
    existing-artist selection, optional Album/standalone choice, per-candidate
    release type for newly created Albums, field provenance/conflict display, and
-   bulk Artist/Album/Album-artwork/Track-artwork actions. A separate featuring
-   boolean is not exposed; the canonical model stores credit order only. Lyrics
-   remain individual rather than bulk-copy actions.
+   bulk Artist/Album/Album-artwork/Track-artwork/lyrics actions. A separate
+   featuring boolean is not exposed; the canonical model stores credit order
+   only.
 3. Import copy/publication runs synchronously at the canonical commit boundary;
    in-flight fingerprinting and portable copy preparation check cancellation,
    but the final canonical transaction is not cancellable. Import preflight opens

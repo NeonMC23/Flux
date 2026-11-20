@@ -2008,6 +2008,7 @@ struct ImportManager {
     bulk_album_title: String,
     bulk_album_artwork_path: String,
     bulk_track_artwork_path: String,
+    bulk_lyrics_path: String,
     asset_error: Option<String>,
     number_error: Option<String>,
 }
@@ -2050,6 +2051,7 @@ impl ImportManager {
             bulk_album_title: String::new(),
             bulk_album_artwork_path: String::new(),
             bulk_track_artwork_path: String::new(),
+            bulk_lyrics_path: String::new(),
             asset_error: None,
             number_error: None,
         }
@@ -2087,6 +2089,7 @@ impl ImportManager {
         self.bulk_album_title.clear();
         self.bulk_album_artwork_path.clear();
         self.bulk_track_artwork_path.clear();
+        self.bulk_lyrics_path.clear();
         self.asset_error = None;
         self.number_error = None;
         self.edit_release_type = ReleaseType::Album;
@@ -2394,6 +2397,11 @@ enum Message {
     ImportBulkTrackArtworkChoose,
     ImportBulkApplyTrackArtwork,
     ImportBulkClearTrackArtwork,
+    ImportBulkLyricsChanged(String),
+    ImportBulkLyricsPicked(u64, Result<Option<Vec<PathBuf>>, String>),
+    ImportBulkLyricsChoose,
+    ImportBulkApplyLyrics,
+    ImportBulkClearLyrics,
     ImportDecisionChanged(usize, ImportDecision),
     ImportBulkSkip,
     ImportBulkImport,
@@ -2584,6 +2592,7 @@ impl Message {
             | Self::ImportAlbumArtworkPicked(session, _)
             | Self::ImportBulkAlbumArtworkPicked(session, _)
             | Self::ImportBulkTrackArtworkPicked(session, _)
+            | Self::ImportBulkLyricsPicked(session, _)
             | Self::ArtworkLoaded(session, _, _)
             | Self::ImportNativeFilesPicked(session, _)
             | Self::ImportNativeFolderPicked(session, _)
@@ -2608,6 +2617,7 @@ impl Message {
             | Self::ImportAlbumArtworkPicked(current, _)
             | Self::ImportBulkAlbumArtworkPicked(current, _)
             | Self::ImportBulkTrackArtworkPicked(current, _)
+            | Self::ImportBulkLyricsPicked(current, _)
             | Self::ArtworkLoaded(current, _, _)
             | Self::ImportNativeFilesPicked(current, _)
             | Self::ImportNativeFolderPicked(current, _)
@@ -5766,6 +5776,77 @@ impl FluxReady {
                             }
                         }
                         Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkLyricsChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.bulk_lyrics_path = value;
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportBulkLyricsChoose => {
+                let start = self.controller.canonical_root().map(Path::to_path_buf);
+                let session = self.controller.library_session();
+                return Task::perform(
+                    async move { flux_platform::pick_lyrics_files_in(start.as_deref()) },
+                    move |result| Message::ImportBulkLyricsPicked(session, result),
+                );
+            }
+            Message::ImportBulkLyricsPicked(_, result) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    match result {
+                        Ok(Some(paths)) => {
+                            if let Some(path) = paths.first() {
+                                manager.bulk_lyrics_path = path.display().to_string();
+                                manager.asset_error = None;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkApplyLyrics => {
+                let Some(manager) = self.import_manager.as_mut() else {
+                    return Task::none();
+                };
+                let indices = manager.checked_indices();
+                if indices.is_empty() {
+                    manager.asset_error = Some("Select one or more candidates first.".to_owned());
+                    return Task::none();
+                }
+                let path = PathBuf::from(manager.bulk_lyrics_path.trim());
+                if path.as_os_str().is_empty() {
+                    manager.asset_error = Some("Choose an LRC/TXT lyrics file.".to_owned());
+                    return Task::none();
+                }
+                if let Some(plan) = manager.plan.as_mut() {
+                    match plan.apply_lyrics_from_path(&indices, &path) {
+                        Ok(()) => {
+                            manager.asset_error = None;
+                            if let Some(selected) = manager.selected {
+                                manager.select_candidate(selected);
+                            }
+                        }
+                        Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkClearLyrics => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    let indices = manager.checked_indices();
+                    if indices.is_empty() {
+                        manager.asset_error =
+                            Some("Select one or more candidates first.".to_owned());
+                    } else {
+                        if let Some(plan) = manager.plan.as_mut() {
+                            plan.clear_lyrics_for(&indices);
+                        }
+                        manager.asset_error = None;
+                        if let Some(selected) = manager.selected {
+                            manager.select_candidate(selected);
+                        }
                     }
                 }
             }
@@ -9635,7 +9716,7 @@ impl FluxReady {
             text(if fixed_target {
                 "Bulk Artist changes apply to checked candidates; Album membership stays locked. Per-candidate edits made afterward win."
             } else {
-                "Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; shared Album and Track artwork controls apply only to checked candidates, while lyrics remain individual."
+                "Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; shared Album artwork, Track artwork and lyrics controls apply only to checked candidates."
             })
             .size(8)
             .color(MUTED),
@@ -9712,6 +9793,28 @@ impl FluxReady {
                     .style(ghost_style)
                     .padding([5, 7])
                     .on_press(Message::ImportBulkClearTrackArtwork),
+            ]
+            .spacing(6),
+            row![
+                text_input(
+                    "LRC/TXT lyrics path for checked candidates…",
+                    &manager.bulk_lyrics_path
+                )
+                .on_input(Message::ImportBulkLyricsChanged)
+                .style(input_style)
+                .width(Length::Fill),
+                button(text("Choose…").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkLyricsChoose),
+                button(text("Apply lyrics").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkApplyLyrics),
+                button(text("Clear lyrics").size(9))
+                    .style(ghost_style)
+                    .padding([5, 7])
+                    .on_press(Message::ImportBulkClearLyrics),
             ]
             .spacing(6),
         ]
@@ -18444,6 +18547,13 @@ mod tests {
             Message::ImportBulkTrackArtworkPicked(0, Ok(Some(vec![track_art]))),
         );
         send(&mut gui, Message::ImportBulkApplyTrackArtwork);
+        let lyrics = dir.path().join("bulk-gui.lrc");
+        std::fs::write(&lyrics, "[00:01.00]bulk lyric\n").expect("lyrics");
+        send(
+            &mut gui,
+            Message::ImportBulkLyricsPicked(0, Ok(Some(vec![lyrics]))),
+        );
+        send(&mut gui, Message::ImportBulkApplyLyrics);
         let plan = gui
             .import_manager
             .as_ref()
@@ -18470,6 +18580,15 @@ mod tests {
                 .all(|candidate| candidate.artwork_path().is_some()),
             "bulk Track artwork applies to every checked candidate"
         );
+        assert!(
+            plan.candidates.iter().all(|candidate| candidate
+                .lyrics_text()
+                .is_some_and(|text| text.contains("bulk lyric"))),
+            "bulk lyrics apply to every checked candidate"
+        );
+        assert!(plan.candidates.iter().all(|candidate| {
+            candidate.provenance().lyrics == Some(flux_app::MetadataSource::Manual)
+        }));
         let prepared = prepare_import_files(
             &plan,
             Arc::new(Mutex::new(ImportProgress::default())),
@@ -18485,6 +18604,11 @@ mod tests {
                 .iter()
                 .all(|(id, _)| { gui.controller.track_artist_id(*id) == Some(artist) })
         );
+        assert!(gui.controller.tracks().iter().all(|(id, _)| {
+            gui.controller
+                .track_lyrics(*id)
+                .is_some_and(|text| text.contains("bulk lyric"))
+        }));
         gui.controller.shutdown();
     }
 

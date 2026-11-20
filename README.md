@@ -304,8 +304,9 @@ asynchronously for display; no tag artwork extraction occurs. The TUI uses the
 same filename inference, local sidecar discovery and review/preparation worker
 for its import keys; rich metadata editing, provenance inspection and
 picker-driven attachment remain GUI-only. Bulk Artist, Album/standalone
-assignment, shared Album artwork and shared Track artwork are explicit actions
-on checked candidates in the GUI; lyrics remain per-candidate overrides.
+assignment, shared Album artwork, shared Track artwork and one validated
+LRC/TXT lyrics file are explicit actions on checked candidates in the GUI;
+per-candidate lyrics edits made afterward still win.
 
 Migration is explicit: *Library setup* accepts a legacy index file or portable
 schema-v3 folder, presents a read-only inventory and disk estimate, builds and
