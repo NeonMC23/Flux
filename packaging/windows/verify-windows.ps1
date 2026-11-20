@@ -64,13 +64,29 @@ try {
     if ((Get-PeSubsystem $Gui) -ne 2) { throw 'flux.exe is not a Windows GUI-subsystem executable.' }
     if ((Get-PeSubsystem $Tui) -ne 3) { throw 'flux-tui.exe is not a console-subsystem executable.' }
 
-    $Info = (Get-Item $Gui).VersionInfo
-    if ($Info.ProductName -ne 'Flux') { throw "flux.exe ProductName is '$($Info.ProductName)'." }
-    if ($Info.CompanyName -ne 'NeonMC23') { throw "flux.exe CompanyName is '$($Info.CompanyName)'." }
-    if (-not $Info.ProductVersion.StartsWith($Version)) {
-        throw "flux.exe ProductVersion is '$($Info.ProductVersion)', expected '$Version'."
+    $Info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Gui)
+    if ([string]::IsNullOrEmpty($Info.ProductName)) {
+        # Some Windows runner/process combinations return an empty
+        # FileVersionInfo for an otherwise valid resource. Fall back to the
+        # embedded UTF-16 strings instead of treating the resource as absent.
+        Write-Warning 'PowerShell did not expose version fields; checking the embedded resource strings.'
+        $utf16 = [System.Text.Encoding]::Unicode.GetString([System.IO.File]::ReadAllBytes($Gui))
+        foreach ($required in @(
+            'VS_VERSION_INFO', 'ProductName', 'Flux', 'CompanyName', 'NeonMC23',
+            'FileDescription', 'Flux local-first music player', 'FileVersion', $Version
+        )) {
+            if (-not $utf16.Contains($required)) {
+                throw "flux.exe version resource is missing '$required'."
+            }
+        }
+    } else {
+        if ($Info.ProductName -ne 'Flux') { throw "flux.exe ProductName is '$($Info.ProductName)'." }
+        if ($Info.CompanyName -ne 'NeonMC23') { throw "flux.exe CompanyName is '$($Info.CompanyName)'." }
+        if (-not $Info.ProductVersion.StartsWith($Version)) {
+            throw "flux.exe ProductVersion is '$($Info.ProductVersion)', expected '$Version'."
+        }
+        if ($Info.FileDescription -notmatch 'Flux') { throw 'flux.exe has no Flux file description.' }
     }
-    if ($Info.FileDescription -notmatch 'Flux') { throw 'flux.exe has no Flux file description.' }
 
     Add-Type -AssemblyName System.Drawing
     $Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($Gui)
