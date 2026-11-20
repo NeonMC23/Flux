@@ -140,28 +140,79 @@ fn find_resource_compiler() -> Option<PathBuf> {
         }
     }
 
-    let vswhere = env::var_os("ProgramFiles(x86)")
-        .map(PathBuf::from)?
-        .join("Microsoft Visual Studio/Installer/vswhere.exe");
-    if !vswhere.is_file() {
-        return None;
+    let program_files_x86 = env::var_os("ProgramFiles(x86)").map(PathBuf::from);
+    if let Some(vswhere) = program_files_x86
+        .as_ref()
+        .map(|root| root.join("Microsoft Visual Studio/Installer/vswhere.exe"))
+        .filter(|path| path.is_file())
+    {
+        if let Ok(output) = Command::new(&vswhere)
+            .args(["-latest", "-products", "*", "-property", "installationPath"])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let installation = PathBuf::from(line.trim());
+                if let Some(rc) = find_rc_under(&installation.join("VC/Tools/MSVC")) {
+                    return Some(rc);
+                }
+            }
+        }
+        if let Ok(output) = Command::new(&vswhere)
+            .args([
+                "-latest",
+                "-products",
+                "*",
+                "-find",
+                r"VC\Tools\MSVC\**\bin\Host*\*\rc.exe",
+            ])
+            .output()
+            && let Some(path) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        {
+            return Some(path);
+        }
     }
-    let output = Command::new(vswhere)
-        .args([
-            "-latest",
-            "-products",
-            "*",
-            "-requires",
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-find",
-            r"VC\Tools\MSVC\**\bin\Hostx64\x64\rc.exe",
-        ])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
+
+    // Last-resort known Visual Studio roots. This keeps release builds working
+    // without relying on a Developer Command Prompt being active.
+    let mut roots = Vec::new();
+    if let Some(root) = env::var_os("ProgramFiles").map(PathBuf::from) {
+        roots.push(root.join("Microsoft Visual Studio"));
+    }
+    if let Some(root) = program_files_x86 {
+        roots.push(root.join("Microsoft Visual Studio"));
+    }
+    roots.into_iter().find_map(|root| find_rc_under(&root))
+}
+
+fn find_rc_under(root: &Path) -> Option<PathBuf> {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 8 {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push((path, depth + 1));
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("rc.exe"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }

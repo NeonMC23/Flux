@@ -348,7 +348,9 @@ fn fallback_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     use flux_core::Track;
 

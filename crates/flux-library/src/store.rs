@@ -417,6 +417,7 @@ pub(crate) fn load_legacy_index_data(path: &Path) -> Result<LegacyIndexData, Sto
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::path::PathBuf;
     use std::time::Duration;
 

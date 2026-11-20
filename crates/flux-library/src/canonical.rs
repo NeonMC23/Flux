@@ -11301,6 +11301,7 @@ mod filesystem_edge_tests {
     use super::*;
     use crate::test_support::TempDir;
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct EdgeFixture {
         _dir: TempDir,
         root: std::path::PathBuf,
