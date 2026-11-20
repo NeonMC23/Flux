@@ -909,6 +909,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn linux_defaults_to_xdg_base_under_home() {
         let env = env_from(&[("HOME", "/home/ada")]);
@@ -920,6 +921,7 @@ mod tests {
         assert_eq!(dirs.config_dir(), &PathBuf::from("/home/ada/.config/flux"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn linux_honors_absolute_xdg_overrides_and_ignores_bad_ones() {
         let env = env_from(&[
@@ -936,6 +938,7 @@ mod tests {
         assert_eq!(resolve_dirs("flux", Platform::Linux, &env), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn macos_uses_application_support_for_both() {
         let env = env_from(&[("HOME", "/Users/ada")]);
