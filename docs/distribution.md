@@ -119,8 +119,29 @@ artifacts require glibc 2.43 and are not the broad-compatibility baseline.
 
 The CI package verifier ran the packaged GUI under Xvfb, checked `--version`,
 first-run canonical-library creation, desktop/AppStream metadata, package
-payloads and upgrade extraction. A privileged host installation with system
-package managers was **not** performed.
+payloads and upgrade extraction. M13 additionally ran real package-manager
+lifecycles in disposable containers; see below. The host's own package
+database is still not modified by any Flux script.
+
+### Linux package-manager lifecycle (M13)
+
+`packaging/linux/validate-package-managers.sh` uses rootless podman with
+Ubuntu 24.04 and Fedora 44 containers. It:
+
+- installs the `.deb` with `apt`/`dpkg` and the `.rpm` with `dnf`;
+- checks executables, desktop entry, AppStream metadata and icons;
+- creates sentinel library/config files under the container's `$HOME`;
+- upgrades a synthetic `0.0.9` `.deb` (same payload, older control version) to
+  `0.1.0`, then reinstalls the current package;
+- removes the package and verifies package-owned executables and desktop files
+  are gone while library/config sentinels remain;
+- checks that no user library was placed under `/usr/share`.
+
+The Debian and RPM lifecycle checks both passed locally. The script is opt-in
+because it requires `podman`; it fails clearly with `FLUX_REQUIRE_PODMAN=1` if
+the prerequisite is missing. ARM64 lifecycle installation was not attempted
+because an x86_64 host would emulate the package environment; ARM64 remains
+artifact-inspected and native-runtime-tested only under the CI Xvfb job.
 
 ## Windows formats and evidence
 
@@ -163,6 +184,50 @@ The bundle is **ad-hoc signed only** and not notarized; Gatekeeper assessment
 does not pass. No Developer ID or notary credential was available, and none was
 fabricated. CoreAudio output was not available on the runner.
 
+## Audio diagnostics and local hardware validation
+
+Both front-ends expose:
+
+```sh
+flux --audio-diagnostics
+flux-tui --audio-diagnostics
+```
+
+The report enumerates the backend devices with stable IDs, default/openable
+flags, then attempts to open and start the system-default output stream and
+reports its sample rate and channel count. It does not write settings, scan the
+library, or claim audible output. A build without the `cpal` feature reports
+that no backend exists.
+
+M13's local Fedora/Nobara validation reached these distinct levels:
+
+| Level | Evidence |
+|---|---|
+| Enumeration | 37 CPAL/ALSA devices reported, including the PipeWire default |
+| Stream initialization | Default sink opened at 48,000 Hz, 2 channels |
+| Decoded playback | Opt-in hardware test loaded a WAV, played for ≥1 second, and observed callbacks/delivered/played frames with no decoder/output errors |
+| Signal at the system sink | PulseAudio monitor capture measured a ~0.98 s tone at ~439 Hz; max sample amplitude was low because the test used 5% volume |
+| Audible confirmation | Not performed; no human listening or physical-route check is claimed |
+
+Windows and macOS CI runners exposed no output device, so their audio output
+remains unvalidated. The native tests still exercise decoding, queue/transition,
+recovery, and shutdown behavior through the deterministic null backend.
+
+## Native dialog coverage
+
+Linux dialog command boundaries are covered by a process-level integration test
+using fake `zenity`/`kdialog` executables: multi-select Unicode paths,
+cancellation, process failure, missing zenity fallback to kdialog, missing
+backends, and malformed single-selection output. A single-selection dialog that
+returns multiple lines is rejected rather than converted into a path containing
+a newline.
+
+The Windows PowerShell and macOS AppleScript dialog code is compiled and
+reviewed but was not interactively exercised; GUI-subsystem CLI probes,
+Unicode paths, bundle identity and application-data resolution were tested
+natively. Explorer/taskbar interaction and native dialog usability remain
+unverified.
+
 ## Installation and user data
 
 Packaged applications never store user data in the installation directory.
@@ -202,6 +267,12 @@ documented rather than hidden; no partial catalogue is ever published.
 # Linux x86_64 (or the native architecture)
 packaging/linux/build-packages.sh
 packaging/linux/validate-packages.sh
+FLUX_DIST_DIR=/path/to/artifacts packaging/linux/validate-package-managers.sh
+
+# Local audio diagnostics and opt-in hardware smoke tests
+cargo run --release -p flux-gui --features cpal -- --audio-diagnostics
+cargo run --release -p flux-tui --features cpal -- --audio-diagnostics
+cargo test -p flux-audio --features cpal --test cpal_hardware -- --ignored
 
 # Windows (PowerShell, native or appropriate runner)
 packaging/windows/build-windows.ps1 -Architecture x86_64
@@ -224,27 +295,63 @@ byte-identical `tar.gz`, `.deb` and `.rpm` artifacts. Normal builds use the
 current timestamp, so their checksums differ. No universal-reproducibility claim
 is made for platforms that were not built twice.
 
+## Signing readiness
+
+No credential is present in this environment; the prepared paths remain
+optional and fail closed when signing is explicitly required.
+
+**Windows Authenticode**
+
+- `FLUX_SIGN_CERT_SHA1` selects a certificate from the Windows certificate
+  store (preferred; no password on the command line).
+- `FLUX_SIGN_CERT_PATH` + optional `FLUX_SIGN_CERT_PASSWORD` select a PFX file.
+- `FLUX_SIGN_TIMESTAMP_URL` overrides the RFC 3161 timestamp service.
+- `FLUX_REQUIRE_SIGNING=1` makes missing or invalid signatures fatal.
+- Signing runs on the staged executables before ZIP/installer assembly and on
+  the installer before checksum generation. `signtool verify` and
+  `Get-AuthenticodeSignature` must both report success; the verifier rejects an
+  invalid signature.
+
+**macOS Developer ID / notarization**
+
+- `CODESIGN_IDENTITY` selects the signing identity; without it the bundle gets
+  an explicit ad-hoc signature.
+- `NOTARY_PROFILE` requires `CODESIGN_IDENTITY`; the script submits through
+  `notarytool`, staples the ticket, validates the staple and runs Gatekeeper
+  assessment. Signing happens before ZIP/DMG and checksum generation.
+- If an explicitly signed bundle fails Gatekeeper, the verifier fails rather
+  than silently downgrading the result.
+
+No secret is printed by either flow. Unsigned Windows and ad-hoc macOS
+artifacts remain clearly labelled; SmartScreen and Gatekeeper warnings are not
+suppressed.
+
 ## Budgets, signing and publication
 
 - No release, tag, GitHub release, installer upload or binary publication is
   performed by scripts or CI.
 - CI packaging runs only on `workflow_dispatch` and uploads private workflow
   artifacts with a 14-day retention period.
-- Signing credentials are never stored in the repository. Windows artifacts are
-  unsigned; macOS artifacts are ad-hoc signed and not notarized.
+- Signing credentials are never stored in the repository. M13 Windows artifacts
+  are unsigned; M13 macOS artifacts are ad-hoc signed and not notarized.
 - The six standard quality gates remain mandatory; packaging is additional
   validation, not a replacement.
 
 ## Known distribution limits
 
-- Native Windows and macOS audio output was not available on the CI runners.
+- Native Windows and macOS audio output was not available on the CI runners;
+  Linux hardware reached stream initialization and decoded playback, but not
+  human listening.
 - Windows artifacts are unsigned; macOS is ad-hoc signed and not notarized.
-- Native Windows file dialogs, Explorer integration, terminal behavior and
-  case-sensitive volumes remain unverified.
-- macOS x86_64 and universal builds are compile/script options, not M12 runtime
+- Native Windows/macOS dialogs, Explorer integration, terminal behavior and
+  case-sensitive volumes remain unverified; Linux dialog command boundaries are
+  covered by fake-backend integration tests.
+- macOS x86_64 and universal builds are compile/script options, not runtime
   evidence.
-- `.deb`/`.rpm` installation was validated by extraction, metadata and packaged
-  GUI startup, not by a privileged host installation.
+- `.deb`/`.rpm` lifecycle was validated in disposable containers, including a
+  synthetic older `.deb` upgrade; a privileged host install and an older RPM
+  upgrade were not performed.
+- ARM64 package-manager installation was not attempted under emulation.
 - Bit-for-bit reproducibility is claimed only for the previously compared Linux
   builds with a fixed epoch.
 - The final canonical import commit remains synchronous as documented above.

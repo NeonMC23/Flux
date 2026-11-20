@@ -31,6 +31,9 @@ authorized release.
 
 - WAV, FLAC, MP3, AAC/M4A, Ogg Vorbis and Opus playback, seek, gapless/crossfade,
   queue identity, history, ratings, favorites, playlists and oscilloscope.
+- `--audio-diagnostics` in the GUI and TUI reports enumerated devices, the
+  selected/default stream, sample rate/channels, and whether stream startup
+  actually succeeded.
 - Compact dark GUI (`#ff66cc` accent), terminal interface, native pickers,
   keyboard navigation and dirty-edit protection.
 
@@ -44,6 +47,10 @@ authorized release.
 - macOS `Flux.app`, ZIP/DMG, Info.plist, signing hooks and universal-binary
   support.
 - Manual-dispatch CI packaging jobs and platform artifact verifiers.
+- Disposable Ubuntu/Fedora package-manager lifecycle verification with real
+  `.deb`/`.rpm` install, synthetic older-version upgrade, reinstall and removal.
+- Optional Authenticode/Developer ID signing paths that fail closed when signing
+  is explicitly required; credentials remain external.
 - Reproducible Linux artifacts with `SOURCE_DATE_EPOCH`, including normalized
   RPM build time/host.
 

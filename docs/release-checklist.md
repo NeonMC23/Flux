@@ -34,6 +34,7 @@ Run the packaging script on each intended native platform and then its verifier:
 ```sh
 packaging/linux/build-packages.sh
 packaging/linux/validate-packages.sh
+FLUX_DIST_DIR=/path/to/artifacts packaging/linux/validate-package-managers.sh
 
 packaging/windows/build-windows.ps1 -Architecture x86_64
 packaging/windows/verify-windows.ps1 -Architecture x86_64 -TestInstaller -TestGuiLaunch
@@ -64,9 +65,27 @@ Use a disposable VM, container or CI runner, never the user's real library:
 - [ ] Uninstall removes only application files.
 - [ ] Reinstall after uninstall opens the previous library/settings.
 - [ ] Audio device discovery and playback (where a device exists).
+- [ ] `flux --audio-diagnostics` reports the intended device and stream state.
 - [ ] Shutdown, no orphaned processes, no writes into the install directory.
 
-## 5. Reproducibility
+## 5. Audio validation
+
+Use `--audio-diagnostics` on each installed build. Record separately:
+
+- device enumeration;
+- default/explicit stream initialization;
+- decoded playback;
+- signal at the system sink, if a monitor is available;
+- audible confirmation, if a human listened.
+
+Do not treat a null CI backend, a successful build, or stream initialization as
+audible playback. The opt-in CPAL hardware test is:
+
+```sh
+cargo test -p flux-audio --features cpal --test cpal_hardware -- --ignored
+```
+
+## 6. Reproducibility
 
 For Linux, compare two builds with a fixed epoch:
 
@@ -81,20 +100,31 @@ diff -u /tmp/first /tmp/second
 Only claim bit-for-bit reproducibility for the formats actually compared. RPM
 build host/time must be normalized as in the provided script.
 
-## 6. M12 evidence snapshot
+## 7. M13 evidence snapshot
 
-The green native run was GitHub Actions `44706634558` at commit `48419dc`.
-It covered Linux x86_64/ARM64 tests, Windows x86_64/ARM64 tests, macOS ARM64
-tests, macOS x86_64 compile-only, and all Linux/Windows/macOS packaging
-verifiers. Exact artifact sizes, SHA-256 values, compatibility floors, signing
-state and platform limitations are recorded in
-[`distribution.md`](distribution.md).
+The M12 green native run was GitHub Actions `44706634558` at commit `48419dc`;
+M13 adds local audio/package-manager evidence and a refreshed native run.
+Exact artifact sizes, SHA-256 values, compatibility floors, signing state and
+platform limitations are recorded in [`distribution.md`](distribution.md).
 
 Before reusing this checklist, re-run all six gates and every native verifier on
 the exact commit to be released; prior CI evidence does not transfer to a later
 tree.
 
-## 7. Publication boundary
+## 8. Signing (optional, credentials required)
+
+Windows: set `FLUX_SIGN_CERT_SHA1` or `FLUX_SIGN_CERT_PATH` (plus optional
+`FLUX_SIGN_CERT_PASSWORD`), and optionally `FLUX_SIGN_TIMESTAMP_URL` and
+`FLUX_REQUIRE_SIGNING=1`. Signing happens before ZIP/installer checksums; verify
+with `signtool verify /pa` or `Get-AuthenticodeSignature`.
+
+macOS: set `CODESIGN_IDENTITY` for Developer ID signing and `NOTARY_PROFILE` for
+notarization. Do not set `NOTARY_PROFILE` without an identity. The script
+staples and validates the ticket and requires Gatekeeper acceptance.
+
+Never commit credentials or include certificates/private keys in artifacts.
+
+## 9. Publication boundary
 
 - [ ] Do not create a release or tag.
 - [ ] Do not upload artifacts publicly.

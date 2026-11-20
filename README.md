@@ -601,10 +601,22 @@ workflow artifacts only.
 | macOS ARM64 | Native tests/build pass | `Flux.app`, ZIP and DMG; plist/icons/arch/signature, GUI first-run/reopen and Unicode home verified |
 | macOS x86_64 | Compile-only cross-check | Not packaged or executed |
 
-All M12 CI runners lack a usable audio endpoint, so native tests and packaging
-are **not** evidence of audible playback on Windows or macOS. The earlier local
-Linux validation covered CPAL enumeration/stream initialization and a short WAV
-completion on Fedora 44 / PipeWire; no listening or hotplug test is claimed.
+All CI runners lack a usable audio endpoint, so native tests and packaging are
+**not** evidence of audible playback on Windows or macOS. M13 added
+`flux --audio-diagnostics` / `flux-tui --audio-diagnostics`, which enumerate
+devices and actually attempt the default output stream. On the Fedora/Nobara
+host this reported 37 CPAL devices and opened the default PipeWire sink at
+48 kHz/2 channels. An opt-in CPAL hardware test decoded and played a WAV for
+more than one second, and a PulseAudio monitor capture measured a ~439 Hz tone
+at the sink. This proves decoded playback reached the system output; no human
+listening or physical-route check is claimed.
+
+M13 also installed and removed the packages through real package managers:
+Ubuntu 24.04 (`dpkg`/`apt`) and Fedora 44 (`rpm`/`dnf`) in disposable
+containers, including a synthetic older-version `.deb` upgrade. Library and
+configuration sentinels survived installation, upgrade, reinstall and removal.
+The container check is opt-in and requires `podman`; see
+[`docs/distribution.md`](docs/distribution.md).
 
 The Windows verification exercises native executables, Unicode extraction
 paths, first-run/reopen and installer ownership. Native Windows file dialogs,
