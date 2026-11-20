@@ -126,14 +126,14 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   finish before switching. Stale import, artwork, lyrics and file-picker
   results are dropped, and the previous library's selection, queue, editor,
   caches and pending playback are cleared while global preferences remain. The
-  sidebar groups **Library**, **Curated** and **Tools** destinations in a
-  scrollable list at small window heights, and shows the active library's
-  storage mode, folder name and full path on hover. Use **Import music** for the
-  review-first copy-only Import Manager: native file or folder picker, Flux
-  Browser, drag-and-drop, name-inferred editable review, duplicate decisions,
-  and real progress/cancel. Final result rows identify each reviewed source path
-  and retain per-item failure details; Flux Browser warns when entries vanish or
-  symbolic links are skipped instead of silently omitting them. Artist, Album
+  sidebar keeps the primary **Tracks**, **Artists**, **Albums** and
+  **Playlists** destinations, a small **Browse** group for Folders, Smart
+  Collections and Dashboard, and **Settings** at the bottom. **Import music** is
+  the single primary action. Use it for the review-first copy-only Import
+  Manager: native file or folder picker, Flux Browser, drag-and-drop,
+  name-inferred review, duplicate decisions, and real progress/cancel. Final
+  result rows retain per-item failure details; Flux Browser warns when entries
+  vanish or symbolic links are skipped instead of silently omitting them. Artist, Album
   and Track image editors preview a chosen replacement before assignment, and
   missing managed images are distinguished from inaccessible ones with repair
   guidance. Click a track to
@@ -143,10 +143,10 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   performs a grouped, case-insensitive global search over canonical artists,
   albums and tracks with direct navigation. Track rows expose favorite and
   rating controls and label missing versus inaccessible audio distinctly;
-  track views support favorites/lyrics/artwork/release/rating filters,
-  ascending/descending deterministic sorting by title/artist/album/track/rating/
-  date-added/duration/play-count/last-played, and multi-selection by stable
-  TrackIds. A Dashboard summarizes canonical counts plus locally recorded
+  track views keep sorting visible while favorites/lyrics/artwork/release/
+  rating filters live behind a **Filters** toggle; sorting is deterministic by
+  title/artist/album/track/rating/date-added/duration/play-count/last-played,
+  and multi-selection uses stable TrackIds. A Dashboard summarizes canonical counts plus locally recorded
   listening history; Smart Collections provide Favorites, Highly Rated,
   Recently Added, Recently Played, Most Played, Without Lyrics, Synchronized
   Lyrics and Without Artwork views. Play counts/history begin only after this
@@ -286,8 +286,13 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
 The GUI's **Import music** action opens a review-first workspace while the
 player remains visible:
 
-- choose files or a folder with the native OS dialog (zenity/kdialog on Linux,
-  `osascript` on macOS, PowerShell WinForms on Windows), or use Flux Browser;
+The default path follows **Source → Destination → Verify → Import**. Advanced
+controls are collapsed under **Advanced Options** at the bottom of the review
+and are not required for a normal import.
+
+- choose one source: a folder or one or more files, using the native OS dialog
+  (zenity/kdialog on Linux, `osascript` on macOS, PowerShell WinForms on
+  Windows), or Flux Browser;
 - drop audio files or folders (Iced/winit X11/Windows/macOS; Wayland file-drop
   is not supported by the toolkit);
 - infer provisional artist, album, title, track number and disc number from
@@ -295,24 +300,28 @@ player remains visible:
   records its filename/folder/existing-library/manual provenance, and a missing
   Album remains a standalone Track and never creates an “Unknown Album”
   placeholder;
-- edit ordered credits, add existing or named artists, remove/reorder credits,
-  and choose the physical owner from the credits; the first credit is the
-  default owner;
-- select an existing stable Artist and an existing Album owned by that Artist,
-  create a new Album by title, or leave Album empty for a standalone Track;
+- confirm the destination: the current library by default, with an explicit
+  route to Library setup when another destination is needed;
+- review the detected title, artist, album, artwork and lyrics for each track,
+  and correct anything that needs attention without filling optional fields;
+- **Advanced Options:** edit ordered credits, add existing or named artists,
+  remove/reorder credits, and choose the physical owner from the credits; the
+  first credit is the default owner;
+- choose an existing stable Artist in the primary review, or use
+  **Advanced Options** to select an existing Album owned by that Artist, create
+  a new Album by title, or leave Album empty for a standalone Track;
   case/whitespace-normalized unique matches are reused, while ambiguous or
   merely similar names are never merged automatically;
-- check multiple candidates and apply one existing Artist or shared new Artist
-  name, one Album title (or standalone state), one Album artwork asset, or one
-  Track-artwork override to the checked set; per-candidate Artist/Album edits
-  override the bulk value afterward;
+- **Advanced Options:** check multiple candidates and apply one existing Artist
+  or shared new Artist name, one Album title (or standalone state), one Album
+  artwork asset, or one Track-artwork override to the checked set; per-candidate
+  Artist/Album edits override the bulk value afterward;
 - discover same-stem LRC/TXT lyrics and local Track/folder image sidecars as
   reviewable suggestions; attach or replace a validated managed Album cover, a
   Track-specific artwork override, and an LRC/TXT lyrics file before commit;
   Album artwork never overwrites individual Track artwork overrides;
-- review and edit every candidate, with provenance, sidecar notes, conflicting
-  existing evidence, incomplete metadata and inherited Album artwork clearly
-  marked; in a fixed-target
+- review and edit every candidate, with human-readable duplicate status,
+  incomplete metadata and inherited Album artwork clearly marked; in a fixed-target
   Album import, Album membership controls are hidden because the target Album is
   locked, while Artist and Album-artwork enrichment remain available;
 - validate each candidate by opening its decoder before review and again while

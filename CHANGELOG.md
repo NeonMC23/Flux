@@ -4,7 +4,25 @@ All notable changes to Flux are documented here. Flux uses semantic versioning
 for release artifacts while the workspace remains at `0.1.0` until the first
 authorized release.
 
-## [0.1.0] — 2026-11-20
+## [0.1.0] — 2026-11-21
+
+### Usability
+
+- The ordinary import now follows Source → Destination → Verify → Import. The
+  review leads with title, artist, album, artwork, lyrics and a concise status;
+  track/disc numbers, credits, existing Album selection, release metadata,
+  bulk actions, direct paths and detailed duplicate handling live under one
+  collapsed **Advanced Options** section.
+- The sidebar was reduced to primary library destinations, a small Browse group
+  and Settings. Counters, shortcut reminders, technical library identity and
+  duplicate setup actions were removed.
+- Setup now centers on the active library and audio output, with first-run text
+  and advanced Artist/Health/Migration tools collapsed. Library filters are
+  collapsed behind **Filters**, and the Track editor leads with title, artist,
+  album, artwork and lyrics while ownership, credits, replacement, membership
+  and deletion controls are under **Advanced Options**.
+- TUI headers and import wording were simplified without changing shared
+  Controller behavior or persistence.
 
 ### Local library
 

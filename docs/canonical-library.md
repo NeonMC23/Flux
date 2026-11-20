@@ -105,17 +105,17 @@ root may leave its documented temporary leftovers there after the switch.
 ## GUI navigation and workflow feedback
 
 The GUI remains a presentation layer over the shared Controller. Its sidebar is
-grouped into **Library** (Tracks, Artists, Albums, Folders), **Curated**
-(Playlists, Smart Collections, Recently Added, Recently Played, Most Played) and
-**Tools** (Lyrics, Dashboard, Settings). The item list scrolls independently at
-the minimum window height, while Import, Library setup and the keyboard hints
-remain fixed. The footer shows the storage mode, the active library's final path
-component and the full path on hover, so multiple canonical libraries are
-distinguishable without opening setup.
+grouped into primary library destinations (**Tracks**, **Artists**, **Albums**,
+**Playlists**), a small **Browse** group (**Folders**, **Smart Collections**,
+**Dashboard**) and **Settings** at the bottom. **Import music** is the single
+primary action. The item list scrolls independently at the minimum window
+height, while Import, Settings and the transport remain reachable. The active
+library's identity lives in Library setup rather than in a permanent sidebar
+label, so the navigation does not repeat technical storage details.
 
 Keyboard navigation remains `1`–`0` for the primary views, `K` for Settings,
-`L` for Library setup, `Q` to toggle the queue and `/` to focus search. The
-sidebar hint reflects these keys rather than advertising a shorter subset.
+`L` for Library setup, `Q` to toggle the queue and `/` to focus search. Filters
+are collapsed behind the **Filters** toggle; sorting stays visible.
 Settings includes the full primary shortcut list and a direct link to the audio
 output controls in Library setup. `N`/`P` use the same Controller next/previous
 path as the transport buttons, including queue-follow behavior.
