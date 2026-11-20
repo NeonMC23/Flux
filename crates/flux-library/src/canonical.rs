@@ -6644,7 +6644,7 @@ mod tests {
         assert_eq!(track.title, "Title one.wav");
         assert_eq!(track.credited_artist_ids, vec![ArtistId::new(1)]);
         let audio = opened.track_audio_path(track_id).expect("audio path");
-        assert!(audio.starts_with(&root));
+        assert!(audio.starts_with(opened.root()));
         assert!(
             audio.ends_with("artists/artist_000001/albums/album_000001/tracks/track_000001.wav")
         );
@@ -9784,7 +9784,7 @@ mod failure_matrix_tests {
         let audio = library.track_audio_path(track).expect("audio");
         let rel = RelPath::from_utf8(
             audio
-                .strip_prefix(&root)
+                .strip_prefix(library.root())
                 .expect("inside")
                 .to_str()
                 .expect("utf8"),
