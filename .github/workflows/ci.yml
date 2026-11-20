@@ -62,6 +62,7 @@ jobs:
           bash -n packaging/linux/build-packages.sh
           bash -n packaging/linux/validate-packages.sh
           bash -n packaging/macos/build-macos.sh
+          bash -n packaging/macos/verify-macos.sh
           test -f assets/icons/flux.ico
           test -f assets/icons/flux.icns
           test -f assets/icons/flux-256.png
@@ -248,6 +249,14 @@ jobs:
           } else {
             ./packaging/windows/build-windows.ps1 -Architecture '${{ matrix.arch }}' -SkipInstaller
           }
+      - name: Verify Windows artifacts
+        shell: pwsh
+        run: |
+          if ('${{ matrix.installer }}' -eq 'yes') {
+            ./packaging/windows/verify-windows.ps1 -Architecture '${{ matrix.arch }}' -TestInstaller
+          } else {
+            ./packaging/windows/verify-windows.ps1 -Architecture '${{ matrix.arch }}'
+          }
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -275,6 +284,10 @@ jobs:
         env:
           FLUX_ARCH: arm64
         run: packaging/macos/build-macos.sh
+      - name: Verify macOS artifacts
+        env:
+          FLUX_ARCH: arm64
+        run: packaging/macos/verify-macos.sh
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:

@@ -40,6 +40,14 @@ if tar -tzf "$TARBALL" | grep -Eq '(^/)|(\.\./)'; then
   echo "error: portable archive contains an absolute or traversal path" >&2
   exit 1
 fi
+if tar -tvzf "$TARBALL" | awk '{print substr($1,1,1)}' | grep -qvE '^[-d]'; then
+  echo "error: portable archive contains a symlink or special file" >&2
+  exit 1
+fi
+if tar -tzf "$TARBALL" | grep -Eq 'FluxLibrary|\.flux/|queue\.json|ratings\.flux|history\.flux'; then
+  echo "error: portable archive contains user-library data" >&2
+  exit 1
+fi
 assert_version "$PORTABLE/bin/flux"
 assert_version "$PORTABLE/bin/flux-tui"
 desktop-file-validate "$PORTABLE/share/applications/io.github.neonmc23.flux.desktop"

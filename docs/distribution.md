@@ -90,6 +90,8 @@ publisher identity is fabricated.
 ## Installation and user data
 
 Packaged applications never store user data in the installation directory.
+Windows and macOS verification scripts validate bundle/installer structure,
+`--version`, icons and, where available, install/uninstall lifecycle sentinels.
 
 | Platform | Data | Config |
 |---|---|---|
@@ -120,10 +122,13 @@ SOURCE_DATE_EPOCH=0 packaging/linux/build-packages.sh
 
 # Windows (PowerShell, native or appropriate runner)
 packaging/windows/build-windows.ps1 -Architecture x86_64
+packaging/windows/verify-windows.ps1 -Architecture x86_64 -TestInstaller
 packaging/windows/build-windows.ps1 -Architecture arm64 -SkipInstaller
+packaging/windows/verify-windows.ps1 -Architecture arm64
 
 # macOS (native)
 packaging/macos/build-macos.sh
+packaging/macos/verify-macos.sh
 FLUX_UNIVERSAL=1 packaging/macos/build-macos.sh
 ```
 
