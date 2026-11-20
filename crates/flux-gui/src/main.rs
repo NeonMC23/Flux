@@ -15532,6 +15532,23 @@ impl FluxReady {
         let lib_ready = !scanning && !self.lib_input.trim().is_empty();
 
         let mut setup = column![].spacing(12);
+        if self.controller.default_library_created() {
+            setup = setup.push(
+                container(
+                    text(format!(
+                        "Flux created a new empty library at {}. Use Choose folder/files to import music, or open another existing library below. No music or existing settings were modified.",
+                        self.controller
+                            .canonical_root()
+                            .map(|root| root.display().to_string())
+                            .unwrap_or_else(|| "the per-user data directory".to_owned())
+                    ))
+                    .size(10)
+                    .color(ACCENT),
+                )
+                .padding(10)
+                .style(card_style),
+            );
+        }
 
         let (audio_title, audio_detail, audio_color) =
             audio_summary(self.controller.audio_status());
