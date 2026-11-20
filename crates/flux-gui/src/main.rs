@@ -2502,6 +2502,8 @@ enum Message {
     LyricsImportCancel,
     LyricsExportPathChanged(String),
     LyricsExport(String),
+    LyricsExportSave(String),
+    LyricsExportSaved(u64, String, Result<Option<PathBuf>, String>),
     LyricsOpenAlbum(AlbumId),
     LyricsOpenArtist(ArtistId),
     SelectView(LibraryView),
@@ -2569,6 +2571,7 @@ impl Message {
             | Self::ImportPlanReady(session, _, _)
             | Self::ImportPrepared(session, _, _)
             | Self::LyricsImportPicked(session, _)
+            | Self::LyricsExportSaved(session, _, _)
             | Self::AudioDevicesLoaded(session, _)
             | Self::AudioOutputOpened(session, _, _, _) => Some(*session),
             _ => None,
@@ -2592,6 +2595,7 @@ impl Message {
             | Self::ImportPlanReady(current, _, _)
             | Self::ImportPrepared(current, _, _)
             | Self::LyricsImportPicked(current, _)
+            | Self::LyricsExportSaved(current, _, _)
             | Self::AudioDevicesLoaded(current, _)
             | Self::AudioOutputOpened(current, _, _, _) => *current = session,
             _ => {}
@@ -6973,6 +6977,51 @@ impl FluxReady {
                 self.lyrics_export_pending = None;
             }
             Message::LyricsExport(format) => self.export_lyrics(&format),
+            Message::LyricsExportSave(format) => {
+                let Some(id) = self.selected_lyrics else {
+                    self.lyrics_error = Some("Select a track before exporting lyrics.".to_owned());
+                    return Task::none();
+                };
+                if self.controller.track_lyrics(id).is_none() {
+                    self.lyrics_error =
+                        Some("This track has no managed lyrics to export.".to_owned());
+                    return Task::none();
+                }
+                let extension = if format == "lrc" { "lrc" } else { "txt" };
+                let suggested = self.lyrics_export_suggested_name(id, extension);
+                let start = {
+                    let typed = self.lyrics_export_path.trim();
+                    if !typed.is_empty() {
+                        let path = PathBuf::from(typed);
+                        if path.is_dir() {
+                            Some(path)
+                        } else {
+                            path.parent().map(Path::to_path_buf)
+                        }
+                    } else {
+                        self.controller
+                            .track_lyrics_path(id)
+                            .and_then(|path| path.parent().map(Path::to_path_buf))
+                            .or_else(|| self.controller.canonical_root().map(Path::to_path_buf))
+                    }
+                };
+                let session = self.controller.library_session();
+                let requested = format.clone();
+                return Task::perform(
+                    async move { flux_platform::save_lyrics_file(&suggested, start.as_deref()) },
+                    move |result| Message::LyricsExportSaved(session, requested.clone(), result),
+                );
+            }
+            Message::LyricsExportSaved(_, format, result) => match result {
+                Ok(Some(path)) => {
+                    self.lyrics_export_path = path.display().to_string();
+                    self.lyrics_export_pending = None;
+                    self.lyrics_error = None;
+                    self.export_lyrics(&format);
+                }
+                Ok(None) => {}
+                Err(error) => self.lyrics_error = Some(error),
+            },
             Message::LyricsOpenAlbum(album_id) => {
                 if let Some(album) = self.controller.album(album_id) {
                     self.push_navigation_snapshot();
@@ -13132,6 +13181,27 @@ impl FluxReady {
         }
     }
 
+    fn lyrics_export_suggested_name(&self, id: TrackId, extension: &str) -> String {
+        let track = self.controller.track(id);
+        let mut name = track.map_or_else(
+            || format!("track-{id}"),
+            |track| format!("{} - {}", display_artist(track), track.title()),
+        );
+        name.retain(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+                )
+        });
+        let name = name.trim().trim_end_matches('.').trim();
+        if name.is_empty() {
+            format!("track-{id}.{extension}")
+        } else {
+            format!("{name}.{extension}")
+        }
+    }
+
     fn export_lyrics(&mut self, format: &str) {
         let Some(id) = self.selected_lyrics else {
             self.lyrics_error = Some("Select a track before exporting lyrics.".to_owned());
@@ -13155,24 +13225,7 @@ impl FluxReady {
             return;
         }
         if path.is_dir() {
-            let track = self.controller.track(id);
-            let mut name = track.map_or_else(
-                || format!("track-{id}"),
-                |track| format!("{} - {}", display_artist(track), track.title()),
-            );
-            name.retain(|character| {
-                !character.is_control()
-                    && !matches!(
-                        character,
-                        '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
-                    )
-            });
-            let name = name.trim().trim_end_matches('.').trim();
-            path.push(if name.is_empty() {
-                format!("track-{id}.{expected_extension}")
-            } else {
-                format!("{name}.{expected_extension}")
-            });
+            path.push(self.lyrics_export_suggested_name(id, expected_extension));
         } else {
             match path.extension().and_then(|extension| extension.to_str()) {
                 None => {
@@ -13658,6 +13711,21 @@ impl FluxReady {
                             .on_press_maybe(document.is_some().then_some(Message::LyricsExport("txt".to_owned()))),
                     ]
                     .spacing(6),
+                    row![
+                        button(text("Save .lrc…").size(10))
+                            .style(ghost_style)
+                            .padding([6, 8])
+                            .on_press_maybe(document.is_some().then_some(Message::LyricsExportSave("lrc".to_owned()))),
+                        button(text("Save .txt…").size(10))
+                            .style(ghost_style)
+                            .padding([6, 8])
+                            .on_press_maybe(document.is_some().then_some(Message::LyricsExportSave("txt".to_owned()))),
+                        text("Uses the native save dialog when available; the typed path above remains the fallback.")
+                            .size(9)
+                            .color(MUTED),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
                     text("Export is UTF-8 and never writes into audio files. Existing destination files require a second explicit confirmation.")
                         .size(9)
                         .color(MUTED),
@@ -21051,6 +21119,26 @@ mod tests {
             std::fs::read_to_string(&safe_export)
                 .expect("directory export")
                 .contains("Café")
+        );
+
+        let dialog_export = export_dir.join("dialog-export.lrc");
+        send(
+            &mut gui,
+            Message::LyricsExportSaved(0, "lrc".to_owned(), Ok(Some(dialog_export.clone()))),
+        );
+        assert!(
+            dialog_export.is_file(),
+            "a native-save result exports through the reviewed atomic path"
+        );
+        assert_eq!(gui.lyrics_export_path, dialog_export.display().to_string());
+        assert!(
+            std::fs::read_to_string(&dialog_export)
+                .expect("dialog export")
+                .contains("Café")
+        );
+        assert_eq!(
+            gui.lyrics_export_suggested_name(id, "lrc"),
+            "Lyrics Artist - IO Track.lrc"
         );
 
         // Existing lyrics require an explicit second import confirmation.

@@ -252,6 +252,35 @@ pub fn pick_lyrics_files_in(start: Option<&Path>) -> Result<Option<Vec<PathBuf>>
     }
 }
 
+/// Native save dialog for lyrics export.
+///
+/// `suggested_name` is only a prefilled file name; the dialog returns the
+/// user's chosen path and never writes the file itself. Cancellation is
+/// `Ok(None)`. Callers must still validate the destination, confirm any
+/// overwrite, and write atomically.
+pub fn save_lyrics_file(
+    suggested_name: &str,
+    start: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        pick_linux_save(suggested_name, start)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        pick_macos_save(suggested_name)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        pick_windows_save(suggested_name, start)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (suggested_name, start);
+        Err("native save dialogs are not implemented on this platform".to_owned())
+    }
+}
+
 /// Native folder picker with an optional starting directory.
 pub fn pick_folder_in(start: Option<&Path>) -> Result<Option<PathBuf>, String> {
     #[cfg(target_os = "linux")]
@@ -429,6 +458,63 @@ fn pick_linux_folder(start: Option<&Path>) -> Result<Option<PathBuf>, String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn linux_save_start(start: Option<&Path>, suggested_name: &str) -> PathBuf {
+    let base = start
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let base = if base.is_dir() {
+        base
+    } else {
+        base.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    let name = suggested_name.trim();
+    if name.is_empty() {
+        base
+    } else {
+        base.join(name)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pick_linux_save(suggested_name: &str, start: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    const FILTER: &str = "*.lrc *.txt";
+    let initial = linux_save_start(start, suggested_name);
+    let zenity = std::process::Command::new("zenity")
+        .arg("--file-selection")
+        .arg("--save")
+        .arg("--confirm-overwrite")
+        .arg("--title=Export lyrics")
+        .arg(prefixed_os_argument("--filename=", initial.as_os_str()))
+        .arg(format!("--file-filter=Lyrics files | {FILTER}"))
+        .arg("--file-filter=All files | *")
+        .output();
+    if let Ok(output) = zenity {
+        return parse_single_output(output);
+    }
+    let kdialog = std::process::Command::new("kdialog")
+        .arg("--getsavefilename")
+        .arg(&initial)
+        .arg(format!("Lyrics files ({FILTER})"))
+        .output();
+    match kdialog {
+        Ok(output) => parse_single_output(output),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(
+            "no native save dialog is available (install zenity or kdialog, or type a destination path)"
+                .to_owned(),
+        ),
+        Err(err) => Err(format!("could not start the native save dialog: {err}")),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn powershell_single_quoted(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 fn dialog_error(stderr: &[u8], status: Option<i32>) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     let detail = stderr
@@ -552,6 +638,89 @@ end try"#;
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
     Ok(parse_single_path_stdout(&output.stdout).map(|path| vec![path]))
+}
+
+#[cfg(target_os = "macos")]
+fn pick_macos_save(suggested_name: &str) -> Result<Option<PathBuf>, String> {
+    let name = suggested_name.trim();
+    let script = if name.is_empty() {
+        r#"try
+set chosen to choose file name with prompt "Export lyrics"
+return POSIX path of chosen
+on error number -128
+return ""
+end try"#
+            .to_owned()
+    } else {
+        format!(
+            r#"try
+set chosen to choose file name with prompt "Export lyrics" default name "{}"
+return POSIX path of chosen
+on error number -128
+return ""
+end try"#,
+            applescript_quoted(name)
+        )
+    };
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|err| format!("could not start the native save dialog: {err}"))?;
+    if !output.status.success() {
+        return Err(dialog_error(&output.stderr, output.status.code()));
+    }
+    Ok(parse_single_path_stdout(&output.stdout))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn applescript_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "windows")]
+fn pick_windows_save(
+    suggested_name: &str,
+    start: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let name = powershell_single_quoted(suggested_name.trim());
+    let initial = start
+        .map(|path| powershell_single_quoted(&path.display().to_string()))
+        .unwrap_or_default();
+    let script = format!(
+        r#"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.SaveFileDialog
+$d.Title = 'Export lyrics'
+$d.Filter = 'Lyrics files|*.lrc;*.txt|All files|*.*'
+$d.OverwritePrompt = $true
+$d.FileName = '{name}'
+$d.InitialDirectory = '{initial}'
+if ($d.ShowDialog() -eq 'OK') {{ $d.FileName }}"#
+    );
+    let output = match std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-STA")
+        .arg("-Command")
+        .arg(&script)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::process::Command::new("pwsh")
+                .arg("-NoProfile")
+                .arg("-STA")
+                .arg("-Command")
+                .arg(&script)
+                .output()
+                .map_err(|err| format!("could not start the native save dialog: {err}"))?
+        }
+        Err(err) => return Err(format!("could not start the native save dialog: {err}")),
+    };
+    if !output.status.success() {
+        return Err(dialog_error(&output.stderr, output.status.code()));
+    }
+    Ok(parse_single_path_stdout(&output.stdout))
 }
 
 #[cfg(target_os = "windows")]
@@ -681,8 +850,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Platform, app_dirs, parse_path_list_stdout, parse_single_path_stdout, prefixed_os_argument,
-        resolve_dirs,
+        Platform, app_dirs, applescript_quoted, linux_save_start, parse_path_list_stdout,
+        parse_single_path_stdout, powershell_single_quoted, prefixed_os_argument, resolve_dirs,
     };
 
     fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
@@ -691,6 +860,26 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), OsString::from(*v)))
             .collect();
         move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn save_dialog_helpers_preserve_names_and_escape_dialog_languages() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            linux_save_start(Some(&dir), "Artist - Song.lrc"),
+            dir.join("Artist - Song.lrc")
+        );
+        let file = dir.join("existing.lrc");
+        assert_eq!(
+            linux_save_start(Some(&file), "Song.lrc"),
+            dir.join("Song.lrc"),
+            "a file destination starts in its parent directory"
+        );
+        assert_eq!(powershell_single_quoted("O'Brien.lrc"), "O''Brien.lrc");
+        assert_eq!(
+            applescript_quoted(r#"A "B" \ C.lrc"#),
+            r#"A \"B\" \\ C.lrc"#
+        );
     }
 
     #[test]
