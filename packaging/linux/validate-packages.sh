@@ -77,7 +77,11 @@ timeout 8 env HOME="$XDG" XDG_CONFIG_HOME="$XDG/config" XDG_DATA_HOME="$XDG/data
   "$PORTABLE/bin/flux" >"$TMP/gui.out" 2>"$TMP/gui.err"
 status=$?
 set -e
-[ "$status" -eq 124 ] || { echo "error: packaged GUI exited $status" >&2; exit 1; }
+if [ "$status" -ne 124 ]; then
+  echo "error: packaged GUI exited $status" >&2
+  sed -n '1,80p' "$TMP/gui.err" >&2
+  exit 1
+fi
 [ ! -s "$TMP/gui.err" ] || { echo "error: packaged GUI wrote stderr:" >&2; cat "$TMP/gui.err" >&2; exit 1; }
 [ -d "$XDG/data/flux/FluxLibrary" ] || { echo "error: first-run canonical library was not created" >&2; exit 1; }
 
@@ -94,7 +98,11 @@ timeout 6 env HOME="$XDG" XDG_CONFIG_HOME="$XDG/config" XDG_DATA_HOME="$XDG/data
   "$UPGRADE/bin/flux" >"$TMP/upgrade.out" 2>"$TMP/upgrade.err"
 status=$?
 set -e
-[ "$status" -eq 124 ] || { echo "error: upgraded GUI exited $status" >&2; exit 1; }
+if [ "$status" -ne 124 ]; then
+  echo "error: upgraded GUI exited $status" >&2
+  sed -n '1,80p' "$TMP/upgrade.err" >&2
+  exit 1
+fi
 [ ! -s "$TMP/upgrade.err" ] || { echo "error: upgraded GUI wrote stderr:" >&2; cat "$TMP/upgrade.err" >&2; exit 1; }
 [ "$(cat "$XDG/config/flux/upgrade-sentinel")" = "keep-config" ]
 [ "$(cat "$XDG/data/flux/FluxLibrary/upgrade-sentinel")" = "keep-library" ]
