@@ -358,6 +358,7 @@ fn single_path(paths: Option<Vec<PathBuf>>) -> Option<PathBuf> {
     (paths.len() == 1).then(|| paths.remove(0))
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn parse_single_path_stdout(stdout: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -570,7 +571,13 @@ fn parse_single_output(output: std::process::Output) -> Result<Option<PathBuf>, 
     if !output.status.success() {
         return Err(dialog_error(&output.stderr, output.status.code()));
     }
-    Ok(parse_single_path_stdout(&output.stdout))
+    let mut paths = parse_path_list_stdout(&output.stdout);
+    if paths.len() > 1 {
+        return Err(
+            "the native dialog returned more than one path for a single selection".to_owned(),
+        );
+    }
+    Ok(paths.pop())
 }
 
 #[cfg(target_os = "macos")]
