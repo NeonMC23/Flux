@@ -84,11 +84,16 @@ fn handle_cli() -> bool {
             println!("{}", flux_core::release_info());
             return true;
         }
+        if arg == "--audio-diagnostics" {
+            println!("{}", flux_app::audio_diagnostics_report());
+            return true;
+        }
         if arg == "--help" || arg == "-h" {
             println!(
                 "Flux {}\nA local-first, native music player (terminal interface).\n\n\
                  Usage: flux-tui [MUSIC_DIR]\n\n\
                  MUSIC_DIR opens the cancellable import review for that folder.\n\
+                 --audio-diagnostics reports output devices and stream startup.\n\
                  Use --version to print the release identity and --help for this text.",
                 APP_VERSION
             );

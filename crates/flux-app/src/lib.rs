@@ -1027,6 +1027,65 @@ impl OpenedAudioOutput {
     pub fn device(&self) -> &AudioOutputDevice {
         &self.device
     }
+
+    /// The opened stream's sample rate and channel count, when the engine is
+    /// still alive. Used by the local audio diagnostic; playback code reads
+    /// the configuration through the installed engine.
+    #[must_use]
+    pub fn output_config(&self) -> Option<flux_audio::output::OutputConfig> {
+        self.engine
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(flux_audio::engine::EngineHandle::output_config)
+    }
+}
+
+/// Produces a local, read-only audio diagnostic report.
+///
+/// The report enumerates the backend devices, then attempts to open and start
+/// the system-default output stream long enough to learn its configuration.
+/// It never writes settings or user data and never claims that audio was
+/// audible. A failed enumeration or stream open is reported verbatim.
+#[must_use]
+pub fn audio_diagnostics_report() -> String {
+    let mut lines = vec!["Flux audio diagnostics".to_owned()];
+    match enumerate_audio_output_devices() {
+        Ok(devices) if devices.is_empty() => {
+            lines.push("Devices: none reported by the backend.".to_owned());
+        }
+        Ok(devices) => {
+            lines.push(format!("Devices: {}", devices.len()));
+            for device in devices {
+                let id = device.id.as_deref().unwrap_or("<no stable id>");
+                lines.push(format!(
+                    "- {} [{}] default={} can_open={}",
+                    device.name, id, device.is_default, device.can_open
+                ));
+            }
+        }
+        Err(error) => lines.push(format!("Device enumeration failed: {error}")),
+    }
+    match open_audio_output(None) {
+        Ok(opened) => {
+            let device = opened.device();
+            let id = device.id.as_deref().unwrap_or("<no stable id>");
+            lines.push(format!(
+                "Default output opened: {} [{}] default={}",
+                device.name, id, device.is_default
+            ));
+            match opened.output_config() {
+                Some(config) => lines.push(format!(
+                    "Output stream: {} Hz, {} channel(s)",
+                    config.sample_rate, config.channels
+                )),
+                None => lines
+                    .push("Output stream: opened but configuration was unavailable.".to_owned()),
+            }
+        }
+        Err(error) => lines.push(format!("Default output stream failed: {error}")),
+    }
+    lines.join("\n")
 }
 
 /// Enumerates output devices through the shared application boundary.
@@ -10550,6 +10609,23 @@ mod tests {
         assert!(error.contains("no audio-output backend"), "{error}");
         let error = super::open_audio_output(None).expect_err("no backend");
         assert!(error.contains("no audio-output backend"), "{error}");
+    }
+
+    #[cfg(not(feature = "cpal"))]
+    #[test]
+    fn audio_diagnostics_report_is_honest_without_a_backend() {
+        let report = super::audio_diagnostics_report();
+        assert!(report.contains("no audio-output backend"), "{report}");
+        assert!(report.contains("Default output stream failed"), "{report}");
+        assert!(!report.contains("Output stream: "), "{report}");
+    }
+
+    #[test]
+    fn opened_output_reports_the_stream_configuration() {
+        let (opened, _control) = opened_test_output(44_100, 2, "test:config");
+        let config = opened.output_config().expect("configuration");
+        assert_eq!(config.sample_rate, 44_100);
+        assert_eq!(config.channels, 2);
     }
 
     #[test]

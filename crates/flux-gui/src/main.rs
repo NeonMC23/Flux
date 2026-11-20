@@ -17061,11 +17061,15 @@ fn handle_cli() -> bool {
             cli_output(&format!("{}\n", flux_core::release_info()));
             return true;
         }
+        if arg == "--audio-diagnostics" {
+            cli_output(&format!("{}\n", flux_app::audio_diagnostics_report()));
+            return true;
+        }
         if arg == "--help" || arg == "-h" {
             cli_output(&format!(
                 "Flux {}\nA local-first, native music player.\n\nUsage: flux\n\n\
                  The GUI manages a canonical local library under the per-user data directory.\n\
-                 Use Flux\n  --version   print the release identity\n  --help      show this help\n",
+                 Use Flux\n  --version             print the release identity\n  --audio-diagnostics   report output devices and stream startup\n  --help                show this help\n",
                 APP_VERSION
             ));
             return true;
