@@ -17034,6 +17034,7 @@ fn window_icon() -> Option<window::Icon> {
 }
 
 fn window_settings() -> window::Settings {
+    #[allow(unused_mut)]
     let mut settings = window::Settings {
         min_size: Some(iced::Size::new(920.0, 620.0)),
         icon: window_icon(),
