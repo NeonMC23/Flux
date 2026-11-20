@@ -191,7 +191,8 @@ impl ContentFingerprint {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<Self>, CanonicalError> {
         use std::sync::atomic::Ordering;
-        let mut file = fs::File::open(path)?;
+        let mut file = fs::File::open(path)
+            .map_err(|err| io_context("could not open for fingerprinting", path, err))?;
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let mut size = 0u64;
         let mut buffer = [0u8; 64 * 1024];
@@ -199,7 +200,9 @@ impl ContentFingerprint {
             if cancel.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            let read = file.read(&mut buffer)?;
+            let read = file
+                .read(&mut buffer)
+                .map_err(|err| io_context("could not read for fingerprinting", path, err))?;
             if read == 0 {
                 break;
             }
@@ -887,6 +890,23 @@ fn safe_join(root: &Path, rel: &RelPath) -> Result<PathBuf, CanonicalError> {
     Ok(root.join(os))
 }
 
+/// Adds the operation and path to an I/O error while preserving its kind.
+/// Filesystem failures are otherwise reduced to an opaque OS message, which
+/// makes platform-specific diagnosis needlessly difficult.
+fn io_context(operation: &str, path: &Path, error: std::io::Error) -> CanonicalError {
+    CanonicalError::Io(std::io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    ))
+}
+
+fn canonical_context(operation: &str, path: &Path, error: CanonicalError) -> CanonicalError {
+    match error {
+        CanonicalError::Io(error) => io_context(operation, path, error),
+        other => CanonicalError::Invalid(format!("{operation} {}: {other}", path.display())),
+    }
+}
+
 fn validate_image_extension_size(
     source: &Path,
     extension: &str,
@@ -1100,7 +1120,8 @@ impl CanonicalLibrary {
             }
             Ok(_) => return Err(CanonicalError::AlreadyExists(root.to_path_buf())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(root)?;
+                fs::create_dir_all(root)
+                    .map_err(|err| io_context("could not create library root", root, err))?;
             }
             Err(err) => return Err(err.into()),
         }
@@ -1111,7 +1132,9 @@ impl CanonicalLibrary {
             TRANSACTIONS_DIR_NAME,
             BACKUPS_DIR_NAME,
         ] {
-            fs::create_dir_all(root.join(dir))?;
+            let path = root.join(dir);
+            fs::create_dir_all(&path)
+                .map_err(|err| io_context("could not create library directory", &path, err))?;
         }
         let manifest = LibraryManifestDto {
             schema_version: CANONICAL_SCHEMA_VERSION,
@@ -1141,27 +1164,33 @@ impl CanonicalLibrary {
             kind: RATINGS_KIND.to_owned(),
             entries: Vec::new(),
         };
+        let ratings_path = root.join(RATINGS_FILE_NAME);
         write_atomic(
-            &root.join(RATINGS_FILE_NAME),
+            &ratings_path,
             &serde_json::to_vec_pretty(&ratings).map_err(|err| CanonicalError::Malformed {
                 file: RATINGS_FILE_NAME.to_owned(),
                 message: err.to_string(),
             })?,
-        )?;
+        )
+        .map_err(|err| canonical_context("could not publish ratings", &ratings_path, err))?;
+        let catalog_path = root.join(CATALOG_FILE_NAME);
         write_atomic(
-            &root.join(CATALOG_FILE_NAME),
+            &catalog_path,
             &serde_json::to_vec_pretty(&catalog).map_err(|err| CanonicalError::Malformed {
                 file: CATALOG_FILE_NAME.to_owned(),
                 message: err.to_string(),
             })?,
-        )?;
+        )
+        .map_err(|err| canonical_context("could not publish catalogue", &catalog_path, err))?;
+        let manifest_path = root.join(LIBRARY_FILE_NAME);
         write_atomic(
-            &root.join(LIBRARY_FILE_NAME),
+            &manifest_path,
             &serde_json::to_vec_pretty(&manifest).map_err(|err| CanonicalError::Malformed {
                 file: LIBRARY_FILE_NAME.to_owned(),
                 message: err.to_string(),
             })?,
-        )?;
+        )
+        .map_err(|err| canonical_context("could not publish manifest", &manifest_path, err))?;
         Self::open(root)
     }
 
@@ -3008,8 +3037,12 @@ impl CanonicalLibrary {
                 let backup = if existed {
                     let name = format!("backup-{index}");
                     let backup_path = txn_dir.join(&name);
-                    fs::copy(&target, &backup_path)?;
-                    fs::File::open(&backup_path)?.sync_all()?;
+                    fs::copy(&target, &backup_path).map_err(|err| {
+                        io_context("could not back up existing resource", &target, err)
+                    })?;
+                    fs::File::open(&backup_path)
+                        .and_then(|file| file.sync_all())
+                        .map_err(|err| io_context("could not sync backup", &backup_path, err))?;
                     Some(name)
                 } else {
                     None
@@ -3057,10 +3090,18 @@ impl CanonicalLibrary {
                 self.maybe_fail(TransactionFailPoint::BeforeStaging)?;
                 let staging = txn_dir.join(format!("staging-{index}"));
                 if let Some(bytes) = &write.bytes {
-                    write_atomic(&staging, bytes)?;
+                    write_atomic(&staging, bytes).map_err(|err| {
+                        canonical_context("could not stage generated resource", &staging, err)
+                    })?;
                 } else if let Some(source) = &write.copy_from {
-                    fs::copy(source, &staging)?;
-                    fs::File::open(&staging)?.sync_all()?;
+                    fs::copy(source, &staging).map_err(|err| {
+                        io_context("could not stage copied resource", &staging, err)
+                    })?;
+                    fs::File::open(&staging)
+                        .and_then(|file| file.sync_all())
+                        .map_err(|err| {
+                            io_context("could not sync staged resource", &staging, err)
+                        })?;
                 } else {
                     return Err(CanonicalError::Invalid(
                         "transaction write has neither bytes nor a source".to_owned(),
@@ -3125,10 +3166,13 @@ impl CanonicalLibrary {
                 let staging = txn_dir.join(format!("staging-{index}"));
                 let target = safe_join(&self.root, &write.target)?;
                 if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
+                    fs::create_dir_all(parent).map_err(|err| {
+                        io_context("could not create resource directory", parent, err)
+                    })?;
                     reject_symlink_escape(&self.root, &write.target)?;
                 }
-                fs::rename(&staging, &target)?;
+                fs::rename(&staging, &target)
+                    .map_err(|err| io_context("could not publish resource", &target, err))?;
                 if let Some(parent) = target.parent() {
                     sync_directory(parent)?;
                 }
