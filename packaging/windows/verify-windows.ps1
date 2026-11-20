@@ -44,6 +44,17 @@ try {
     if ((Get-CliOutput $Gui '--help') -notmatch 'Usage: flux') { throw 'GUI --help mismatch.' }
     if ((Get-CliOutput $Tui '--help') -notmatch 'Usage: flux-tui') { throw 'TUI --help mismatch.' }
 
+    $RequireSigning = $env:FLUX_REQUIRE_SIGNING -eq '1'
+    foreach ($exe in @($Gui, $Tui)) {
+        $signature = Get-AuthenticodeSignature -FilePath $exe
+        if ($signature.Status -eq 'NotSigned') {
+            if ($RequireSigning) { throw "$exe is unsigned but signing is required." }
+        } elseif ($signature.Status -ne 'Valid') {
+            throw "$exe has an invalid Authenticode signature: $($signature.Status)."
+        }
+        Write-Host "$(Split-Path $exe -Leaf) signature: $($signature.Status)"
+    }
+
     # A release GUI is a Windows-subsystem executable (2); the TUI keeps the
     # console subsystem (3). Verify the PE header rather than inferring it
     # from packaging behavior.
@@ -157,6 +168,13 @@ try {
 
     if ($TestInstaller) {
         if (-not (Test-Path $Installer)) { throw "Missing installer: $Installer" }
+        $installerSignature = Get-AuthenticodeSignature -FilePath $Installer
+        if ($installerSignature.Status -eq 'NotSigned') {
+            if ($RequireSigning) { throw 'Installer is unsigned but signing is required.' }
+        } elseif ($installerSignature.Status -ne 'Valid') {
+            throw "Installer has an invalid Authenticode signature: $($installerSignature.Status)."
+        }
+        Write-Host "Installer signature: $($installerSignature.Status)"
         $oldLocal = $env:LOCALAPPDATA
         $oldRoaming = $env:APPDATA
         try {

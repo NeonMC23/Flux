@@ -42,7 +42,14 @@ else
 fi
 if spctl -a -vv "$APP" >/dev/null 2>&1; then
   echo "Gatekeeper assessment passed."
+  if [ -n "${CODESIGN_IDENTITY:-}" ] && [ -n "${NOTARY_PROFILE:-}" ]; then
+    xcrun stapler validate "$APP"
+  fi
 else
+  if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    echo "error: Gatekeeper rejected an explicitly signed bundle." >&2
+    exit 1
+  fi
   echo "Gatekeeper assessment does not pass (expected without Developer ID/notarization)."
 fi
 

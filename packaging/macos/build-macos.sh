@@ -21,6 +21,10 @@ if [ "$(uname -s)" != "Darwin" ]; then
   echo "error: macOS packaging must run on macOS (hdiutil/codesign/ditto/lipo)." >&2
   exit 2
 fi
+if [ -n "${NOTARY_PROFILE:-}" ] && [ -z "${CODESIGN_IDENTITY:-}" ]; then
+  echo "error: NOTARY_PROFILE requires CODESIGN_IDENTITY; nothing was signed or notarized." >&2
+  exit 2
+fi
 
 VERSION="$(awk '
   /^\[workspace.package\]/ { in_section=1; next }
@@ -56,7 +60,10 @@ sign_bundle() {
       ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
       xcrun notarytool submit "$zip" --keychain-profile "$NOTARY_PROFILE" --wait
       xcrun stapler staple "$app"
+      xcrun stapler validate "$app"
+      spctl -a -vv "$app"
       rm -rf "$(dirname "$zip")"
+      echo "Notarization, staple and Gatekeeper verification passed." >&2
     fi
   else
     echo "No CODESIGN_IDENTITY supplied; applying an ad-hoc signature (not notarized)." >&2

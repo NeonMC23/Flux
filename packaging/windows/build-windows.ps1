@@ -31,8 +31,62 @@ $BinaryDir = Join-Path $TargetRoot (Join-Path $Target 'release')
 $Dist = if ($env:FLUX_DIST_DIR) { $env:FLUX_DIST_DIR } else { Join-Path $Root 'dist' }
 $NumericVersion = (($Version -split '\D+') + @('0','0','0'))[0..2] -join '.'
 $Name = "Flux-$Version-windows-$Architecture"
+$SigningConfigured = [bool]($env:FLUX_SIGN_CERT_SHA1 -or $env:FLUX_SIGN_CERT_PATH)
+$RequireSigning = $env:FLUX_REQUIRE_SIGNING -eq '1'
+$TimestampUrl = if ($env:FLUX_SIGN_TIMESTAMP_URL) { $env:FLUX_SIGN_TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
+if ($RequireSigning -and -not $SigningConfigured) {
+    throw 'FLUX_REQUIRE_SIGNING=1 but no Authenticode certificate was supplied.'
+}
+if (-not $SigningConfigured -or $RequireSigning) {
+    # Deliberately no secrets in this message.
+    if (-not $SigningConfigured) {
+        Write-Host 'No Authenticode certificate supplied; artifacts will be unsigned.'
+    }
+}
 $Stage = Join-Path $Dist $Name
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
+
+function Find-SignTool {
+    $command = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+    if (Test-Path $kits) {
+        $candidate = Get-ChildItem $kits -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+        if ($candidate) { return $candidate.FullName }
+    }
+    return $null
+}
+
+function Invoke-AuthenticodeSign([string]$Path) {
+    if (-not $SigningConfigured) { return }
+    $signTool = Find-SignTool
+    if (-not $signTool) { throw 'signtool.exe was not found but signing was requested.' }
+    $signArgs = @('sign', '/fd', 'sha256', '/tr', $TimestampUrl, '/td', 'sha256')
+    if ($env:FLUX_SIGN_CERT_SHA1) {
+        $signArgs += @('/sha1', $env:FLUX_SIGN_CERT_SHA1)
+    } else {
+        if (-not (Test-Path $env:FLUX_SIGN_CERT_PATH)) {
+            throw 'FLUX_SIGN_CERT_PATH does not name a readable certificate file.'
+        }
+        $signArgs += @('/f', $env:FLUX_SIGN_CERT_PATH)
+        if ($env:FLUX_SIGN_CERT_PASSWORD) {
+            $signArgs += @('/p', $env:FLUX_SIGN_CERT_PASSWORD)
+        }
+    }
+    $signArgs += $Path
+    & $signTool @signArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed for $Path." }
+    & $signTool verify /pa /v $Path | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Authenticode verification failed for $Path." }
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($signature.Status -ne 'Valid') {
+        throw "Authenticode status for $Path is $($signature.Status), expected Valid."
+    }
+    Write-Host "Signed $Path"
+}
 
 if (-not $SkipBuild) {
     cargo build --release --locked --target $Target -p flux-gui -p flux-tui --features cpal
@@ -91,6 +145,9 @@ $Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($Gui)
 if (-not $Icon) { throw 'flux.exe has no embedded icon resource.' }
 $Icon.Dispose()
 
+Invoke-AuthenticodeSign (Join-Path $Stage 'flux.exe')
+Invoke-AuthenticodeSign (Join-Path $Stage 'flux-tui.exe')
+
 $Zip = Join-Path $Dist "$Name.zip"
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
 Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -CompressionLevel Optimal
@@ -119,6 +176,10 @@ if (-not $SkipInstaller) {
     }
 }
 
+if ($Installer) {
+    Invoke-AuthenticodeSign $Installer
+}
+
 $Artifacts = (@($Zip) + @($Installer)) | Where-Object { $_ }
 $Checksums = foreach ($artifact in $Artifacts) {
     $hash = (Get-FileHash -Algorithm SHA256 -Path $artifact).Hash.ToLowerInvariant()
@@ -128,4 +189,8 @@ $Checksums | Set-Content -Encoding ASCII (Join-Path $Dist 'SHA256SUMS-windows.tx
 
 Write-Host "Windows artifacts in $Dist"
 $Artifacts | ForEach-Object { Write-Host "  $_ ($([math]::Round((Get-Item $_).Length / 1MB, 1)) MiB)" }
-Write-Host 'Unsigned artifacts: SmartScreen warnings are expected until an authorized signing step.'
+if ($SigningConfigured) {
+    Write-Host 'Signed artifacts: verify the publisher identity and post-signature checksums before distribution.'
+} else {
+    Write-Host 'Unsigned artifacts: SmartScreen warnings are expected until an authorized signing step.'
+}
