@@ -26,6 +26,9 @@ authorized release.
   progress and stale-plan rejection.
 - Cancellable review-first TUI importer with explicit decisions, progress and
   honest final-transaction limits.
+- A cancel request that arrives between copy preparation and catalogue
+  publication now aborts before the irreversible commit and removes unpublished
+  copies; the commit phase is explicitly non-cancellable.
 
 ### Playback and experience
 
@@ -36,6 +39,9 @@ authorized release.
   actually succeeded.
 - Compact dark GUI (`#ff66cc` accent), terminal interface, native pickers,
   keyboard navigation and dirty-edit protection.
+- TUI path-based Artist name/aliases/description/image, Album title/release
+  type/cover, Track artwork override and managed-lyrics replacement workflows,
+  all through the shared Controller.
 
 ### Release engineering
 

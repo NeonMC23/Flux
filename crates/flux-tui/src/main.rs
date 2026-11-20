@@ -4566,6 +4566,37 @@ mod tests {
     }
 
     #[test]
+    fn large_track_list_reuses_cached_rows() {
+        let dir = TempDir::new("tui-large-track-list");
+        let tracks = (1..=5_000)
+            .map(|id| {
+                format!(
+                    r#"{{"id":{id},"title":"Track {id}","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}"#,
+                    json_path(&dir.path().join(format!("music/{id}.wav")))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            dir.path().join("library-index.json"),
+            format!(r#"{{"version":1,"next_id":5001,"tracks":[{tracks}]}}"#),
+        )
+        .expect("large index");
+        let mut tui = tui(&dir);
+        let started = std::time::Instant::now();
+        let first = tui.rows();
+        let first_elapsed = started.elapsed();
+        let second = tui.rows();
+        assert_eq!(first.len(), 5_000);
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &second),
+            "unchanged large list must reuse its cached rows"
+        );
+        println!("5,000-track TUI row build: {first_elapsed:?}");
+        tui.controller.shutdown();
+    }
+
+    #[test]
     fn queue_view_preserves_entry_identity_and_supports_play_move_and_remove() {
         let dir = TempDir::new("tui-queue-view");
         let root = dir.path().join("music");
