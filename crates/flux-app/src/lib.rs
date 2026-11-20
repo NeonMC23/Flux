@@ -1960,7 +1960,7 @@ impl Controller {
         } = seed;
         let mut player = Player::new();
         *player.queue_mut() = queue;
-        let controller = Self {
+        let mut controller = Self {
             tracks: snapshot(&library),
             library_revision: 1,
             library: Some(library),
@@ -2008,6 +2008,13 @@ impl Controller {
             last_status: None,
         };
         controller.engine.set_volume(controller.volume);
+        if let Some(store) = controller.canonical_store.as_mut()
+            && let Some(message) = store.take_cleanup_warning()
+        {
+            controller.report_error(format!(
+                "The committed catalogue loaded, but managed-resource cleanup is incomplete and will be retried on reopen: {message}"
+            ));
+        }
         controller
     }
 
@@ -14984,6 +14991,62 @@ mod tests {
     }
 
     #[test]
+    fn a_second_reviewed_plan_from_the_same_generation_is_rejected_after_the_first_commit() {
+        use crate::import::{
+            ImportDecision, ImportProgress, prepare_import_files, prepare_import_plan,
+        };
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let dir = TempDir::new("canonical-concurrent-import-plans");
+        let (root, first) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let second_dir = dir.path().join("Second/Album");
+        fs::create_dir_all(&second_dir).expect("second dirs");
+        let second = write_dc_wav(&second_dir, "02 - Second.wav", 4_410, 0.25);
+        let mut first_plan = prepare_import_plan(
+            import_request_for(&controller, &first),
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut second_plan = prepare_import_plan(
+            import_request_for(&controller, &second),
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(first_plan.generation, second_plan.generation);
+        first_plan.candidates[0].set_decision(ImportDecision::ImportNew);
+        second_plan.candidates[0].set_decision(ImportDecision::ImportNew);
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let first_prepared = prepare_import_files(
+            &first_plan,
+            Arc::clone(&progress),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let second_prepared = prepare_import_files(
+            &second_plan,
+            Arc::clone(&progress),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let first_report = controller
+            .apply_import_plan(&first_plan, &first_prepared)
+            .expect("first plan applies");
+        assert_eq!(first_report.imported, 1);
+        let second_report = controller
+            .apply_import_plan(&second_plan, &second_prepared)
+            .expect("second plan reports per-item staleness");
+        assert_eq!(second_report.imported, 0);
+        assert_eq!(second_report.failed, 1);
+        assert!(
+            second_report.items[0].message.contains("stale"),
+            "{:?}",
+            second_report.items[0]
+        );
+        assert_eq!(controller.tracks().len(), 1);
+        controller.shutdown();
+    }
+
+    #[test]
     fn metadata_mutation_invalidates_a_reviewed_canonical_import_plan() {
         use crate::import::{
             ImportDecision, ImportProgress, ImportRequest, ImportStorage, prepare_import_files,
@@ -15695,6 +15758,63 @@ mod tests {
                 .is_some_and(|error| error.contains("cleanup needs attention"))
         );
         controller.shutdown();
+    }
+
+    #[test]
+    fn boot_surfaces_committed_cleanup_warning_without_hiding_the_catalogue() {
+        let dir = TempDir::new("canonical-boot-cleanup");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        controller.shutdown();
+
+        let txn = "txn-boot-cleanup";
+        let txn_dir = root.join("transactions").join(txn);
+        fs::create_dir_all(&txn_dir).expect("txn");
+        fs::create_dir_all(root.join("blocked-cleanup")).expect("blocked directory");
+        let catalog_path = root.join("catalog.flux");
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("catalog")).expect("json");
+        catalog["transaction_id"] = serde_json::json!(txn);
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("catalog bytes"),
+        )
+        .expect("catalog");
+        fs::write(
+            txn_dir.join("journal.flux"),
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "kind": "flux-transaction",
+                    "transaction_id": "{txn}",
+                    "operation": "ownership-transfer",
+                    "state": "cleaning",
+                    "intended_generation": {},
+                    "actions": [],
+                    "cleanup": ["blocked-cleanup"]
+                }}"#,
+                catalog["generation"]
+            ),
+        )
+        .expect("journal");
+
+        let (restarted, _control) = boot_canonical_at(&root);
+        assert!(
+            restarted
+                .last_error()
+                .is_some_and(|error| error.contains("cleanup is incomplete")),
+            "{:?}",
+            restarted.last_error()
+        );
+        assert_eq!(restarted.tracks().len(), 1);
+        assert_eq!(restarted.tracks()[0].0, id);
+        assert!(
+            root.join("transactions").join(txn).is_dir(),
+            "journal is retained for retry"
+        );
+        restarted.shutdown();
     }
 
     #[test]
