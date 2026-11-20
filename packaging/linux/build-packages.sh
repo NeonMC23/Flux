@@ -53,6 +53,7 @@ if [ "${FLUX_SKIP_BUILD:-0}" != "1" ]; then
 fi
 GUI_BIN="$TARGET_ROOT/release/flux"
 TUI_BIN="$TARGET_ROOT/release/flux-tui"
+echo "Packaging release binaries from $TARGET_ROOT/release"
 for bin in "$GUI_BIN" "$TUI_BIN"; do
   [ -x "$bin" ] || { echo "error: missing release binary $bin" >&2; exit 1; }
 done
