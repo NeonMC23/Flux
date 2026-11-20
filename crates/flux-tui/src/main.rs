@@ -28,10 +28,11 @@
 //!   import/update/skip decisions, then prepare copies before the atomic
 //!   publish. The GUI retains the rich metadata/artwork editor.
 //!   Per-path issues open a scrollable result panel.
-//! - `e` edit the selected track,
-//!   `P` create an artist, `Y` edit an artist
-//!   (`artist-id|new-name|alias;alias`),
-//!   `V` list artist IDs, `X` reconcile, `L` relink a unique reported
+//! - `e` edit the selected track, `Z` edit its Album metadata/cover,
+//!   `W` set/remove a Track artwork override, `S` set/remove managed
+//!   lyrics from a UTF-8 path, `P` create an artist, and `Y` edit an
+//!   artist (`artist-id|name|aliases|description|image-path`);
+//!   `V` lists artist IDs, `X` reconciles, `L` relinks a unique reported
 //!   move candidate
 //! - `/` search/filter, `Esc` clear search or cancel input, `?` opens
 //!   the full scrollable help/limitations panel
@@ -70,10 +71,10 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use flux_app::{
-    AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller, ImportDecision, ImportPlan,
-    ImportProgress, ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport,
-    StorageMode, TrackMetadataEdit, format_duration, is_track_playable, prepare_import_files,
-    prepare_import_plan,
+    AlbumId, AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller, ImportDecision,
+    ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage, PreparedImport,
+    ReconcileReport, StorageMode, TrackMetadataEdit, format_duration, is_track_playable,
+    prepare_import_files, prepare_import_plan,
 };
 use flux_core::{APP_VERSION, ArtistId, MILESTONE, PlaybackState, Track, TrackId};
 use unicode_width::UnicodeWidthChar;
@@ -171,8 +172,14 @@ enum Mode {
     TrackEditInput,
     /// Creating a stable artist by name (`P`).
     ArtistCreateInput,
-    /// Renaming an artist as `artist-id|new-name` (`Y`).
+    /// Editing an artist as `artist-id|name|aliases|description|image` (`Y`).
     ArtistRenameInput,
+    /// Editing an album as `album-id|title|release-type|cover` (`Z`).
+    AlbumEditInput,
+    /// Setting/removing a Track artwork override from a path (`W`).
+    TrackArtworkInput,
+    /// Setting/removing managed Track lyrics from a UTF-8 file (`S`).
+    TrackLyricsInput,
     /// Typing the legacy index file to migrate (`M`, step 1).
     MigrateSourceInput,
     /// Typing the migration destination folder (`M`, step 2).
@@ -1293,7 +1300,41 @@ impl Tui {
             }
             KeyCode::Char('Y') => {
                 self.mode = Mode::ArtistRenameInput;
-                self.input.clear();
+                self.input = self
+                    .rows()
+                    .get(self.cursor)
+                    .copied()
+                    .and_then(|id| self.controller.track_artist_id(id))
+                    .map(|artist| artist_edit_form(&self.controller, artist))
+                    .unwrap_or_default();
+            }
+            KeyCode::Char('Z') => {
+                if let Some(id) = self.rows().get(self.cursor).copied()
+                    && let Some(album_id) = self.controller.track_album_id(id)
+                    && let Some(album) = self.controller.album(album_id)
+                {
+                    self.input = album_edit_form(album.id, &album.title, album.release_type);
+                    self.mode = Mode::AlbumEditInput;
+                } else {
+                    self.lifecycle_msg =
+                        Some("Select a track that belongs to an album first.".to_owned());
+                }
+            }
+            KeyCode::Char('W') => {
+                if let Some(id) = self.rows().get(self.cursor).copied() {
+                    self.input = track_asset_form(id);
+                    self.mode = Mode::TrackArtworkInput;
+                } else {
+                    self.lifecycle_msg = Some("Select a track first.".to_owned());
+                }
+            }
+            KeyCode::Char('S') => {
+                if let Some(id) = self.rows().get(self.cursor).copied() {
+                    self.input = track_asset_form(id);
+                    self.mode = Mode::TrackLyricsInput;
+                } else {
+                    self.lifecycle_msg = Some("Select a track first.".to_owned());
+                }
             }
             KeyCode::Char('V') => {
                 let artists = self.controller.artists();
@@ -1373,8 +1414,9 @@ impl Tui {
                         lines.push(String::new());
                     }
                     lines.push(
-                        "TUI: Y edits name and aliases of an existing artist; P creates an artist. \
-                         Description, image, ownership transfer and deletion require the GUI."
+                        "TUI: Y edits name, aliases, description and image of an existing \
+                         artist; P creates an artist. Ownership transfer and deletion require \
+                         the GUI."
                             .to_owned(),
                     );
                     self.open_info("Artists", lines);
@@ -1567,9 +1609,9 @@ impl Tui {
                         lines.push(String::new());
                     }
                     lines.push(
-                        "Empty albums are retained deliberately. TUI can inspect membership; \
-                         rename, artwork, reorder, add/move/remove Tracks and ownership transfer \
-                         require the GUI."
+                        "Empty albums are retained deliberately. TUI: Z edits title, release \
+                         type and cover. Track reorder, add/move/remove, ownership transfer and \
+                         deletion require the GUI."
                             .to_owned(),
                     );
                     self.open_info("Albums", lines);
@@ -1631,8 +1673,8 @@ impl Tui {
                         }
                         lines.push(String::new());
                         lines.push(
-                            "TUI is inspection-only here. Album metadata/artwork, order, \
-                         membership and Track movement use the GUI transactional workflows."
+                            "TUI: Z edits album metadata/cover. Track order, membership and \
+                         Track movement use the GUI transactional workflows."
                                 .to_owned(),
                         );
                         self.open_info("Selected album", lines);
@@ -1658,8 +1700,9 @@ impl Tui {
                             "This Track has no Album membership. Album artwork cannot be inherited; \
                              playback, queue, history, ratings and playlists remain available."
                                 .to_owned(),
-                            "TUI is inspection-only here. Adding it to an Album or moving it use \
-                             the GUI transactional membership workflow."
+                            "TUI: W sets/removes Track artwork and S sets/removes managed \
+                             lyrics. Adding it to an Album or moving it use the GUI membership \
+                             workflow."
                                 .to_owned(),
                         ];
                         lines.push(String::new());
@@ -1970,62 +2013,160 @@ impl Tui {
                             self.lifecycle_msg = Some(format!("Created artist {}.", text.trim()));
                         }
                     }
-                    Mode::ArtistRenameInput => {
-                        let Some((id, rest)) = text.split_once('|') else {
-                            self.lifecycle_msg = Some(
-                                "Use artist-id|new name|aliases for rename. The form remains open."
-                                    .to_owned(),
+                    Mode::ArtistRenameInput => match parse_artist_edit_form(&text) {
+                        Ok(edit) => {
+                            let current_description = self
+                                .controller
+                                .artist_description(edit.id)
+                                .map(str::to_owned);
+                            let description = edit
+                                .description
+                                .as_ref()
+                                .map(|value| value.as_deref())
+                                .unwrap_or(current_description.as_deref());
+                            let aliases = edit.aliases.unwrap_or_else(|| {
+                                self.controller.artist_aliases(edit.id).to_vec()
+                            });
+                            let metadata = self.controller.update_artist_metadata(
+                                edit.id,
+                                &edit.name,
+                                description,
+                                &aliases,
                             );
-                            self.input = text;
-                            next = Mode::ArtistRenameInput;
-                            self.mode = next;
-                            return false;
-                        };
-                        let (name, alias_part) = rest
-                            .split_once('|')
-                            .map_or((rest, None), |(name, aliases)| (name, Some(aliases)));
-                        match id.trim().parse::<u64>() {
-                            Ok(raw) => {
-                                let artist = ArtistId::new(raw);
-                                let description = self
-                                    .controller
-                                    .artist_description(artist)
-                                    .map(str::to_owned);
-                                let aliases = alias_part.map_or_else(
-                                    || self.controller.artist_aliases(artist).to_vec(),
-                                    |aliases| {
-                                        aliases
-                                            .split(';')
-                                            .map(str::trim)
-                                            .filter(|alias| !alias.is_empty())
-                                            .map(ToOwned::to_owned)
-                                            .collect::<Vec<_>>()
-                                    },
-                                );
-                                if let Err(err) = self.controller.update_artist_metadata(
-                                    artist,
-                                    name.trim(),
-                                    description.as_deref(),
-                                    &aliases,
-                                ) {
-                                    self.lifecycle_msg = Some(err);
-                                } else {
+                            let image = match edit.image {
+                                ImageEdit::Preserve => Ok(()),
+                                ImageEdit::Remove => self.controller.remove_artist_image(edit.id),
+                                ImageEdit::Set(path) => {
+                                    self.controller.set_artist_image(edit.id, &path)
+                                }
+                            };
+                            match (metadata, image) {
+                                (Ok(()), Ok(())) => {
                                     self.lifecycle_msg = Some(format!(
-                                        "Updated artist {raw} ({} alias(es)).",
+                                        "Updated artist {} ({} alias(es)).",
+                                        edit.id.get(),
                                         aliases.len()
                                     ));
                                 }
-                            }
-                            Err(_) => {
-                                self.lifecycle_msg = Some(
-                                    "Artist ID must be a whole number. The form remains open."
-                                        .to_owned(),
-                                );
-                                self.input = text;
-                                next = Mode::ArtistRenameInput;
+                                (Err(error), _) => {
+                                    self.lifecycle_msg = Some(error);
+                                }
+                                (_, Err(error)) => {
+                                    self.lifecycle_msg = Some(format!(
+                                        "Artist metadata saved; image failed: {error}"
+                                    ));
+                                }
                             }
                         }
-                    }
+                        Err(err) => {
+                            self.lifecycle_msg = Some(format!(
+                                "{err} The form remains open so you can correct it."
+                            ));
+                            self.input = text;
+                            next = Mode::ArtistRenameInput;
+                        }
+                    },
+                    Mode::AlbumEditInput => match parse_album_edit_form(&text) {
+                        Ok(edit) => {
+                            let metadata = self.controller.update_album_metadata(
+                                edit.id,
+                                &edit.title,
+                                edit.release_type,
+                            );
+                            let cover = match edit.cover {
+                                ImageEdit::Preserve => Ok(()),
+                                ImageEdit::Remove => self.controller.remove_album_cover(edit.id),
+                                ImageEdit::Set(path) => {
+                                    self.controller.set_album_cover(edit.id, &path)
+                                }
+                            };
+                            match (metadata, cover) {
+                                (Ok(()), Ok(())) => {
+                                    self.lifecycle_msg = Some(format!(
+                                        "Updated album {} ({}).",
+                                        edit.id.get(),
+                                        edit.release_type.as_str()
+                                    ));
+                                }
+                                (Err(error), _) => self.lifecycle_msg = Some(error),
+                                (_, Err(error)) => {
+                                    self.lifecycle_msg = Some(format!(
+                                        "Album metadata saved; cover failed: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.lifecycle_msg = Some(format!(
+                                "{err} The form remains open so you can correct it."
+                            ));
+                            self.input = text;
+                            next = Mode::AlbumEditInput;
+                        }
+                    },
+                    Mode::TrackArtworkInput => match parse_track_asset_form(&text, "artwork") {
+                        Ok((id, path)) => {
+                            let result = match path {
+                                Some(path) => self.controller.set_track_artwork(id, &path),
+                                None => self.controller.remove_track_artwork(id),
+                            };
+                            match result {
+                                Ok(()) => {
+                                    self.lifecycle_msg =
+                                        Some(format!("Updated artwork override for track {id}."));
+                                }
+                                Err(error) => self.lifecycle_msg = Some(error),
+                            }
+                        }
+                        Err(err) => {
+                            self.lifecycle_msg = Some(format!(
+                                "{err} The form remains open so you can correct it."
+                            ));
+                            self.input = text;
+                            next = Mode::TrackArtworkInput;
+                        }
+                    },
+                    Mode::TrackLyricsInput => match parse_track_asset_form(&text, "lyrics") {
+                        Ok((id, path)) => {
+                            let result = match path {
+                                Some(path) => match std::fs::read_to_string(&path) {
+                                    Ok(text) if text.len() <= 1024 * 1024 => self
+                                        .controller
+                                        .set_lyrics(id, Some(text.as_str()))
+                                        .map(|()| Some(text)),
+                                    Ok(_) => Err(
+                                        "Lyrics file is larger than 1 MiB; nothing was changed."
+                                            .to_owned(),
+                                    ),
+                                    Err(error) => Err(format!(
+                                        "Could not read lyrics file {}: {error}",
+                                        path.display()
+                                    )),
+                                },
+                                None => self.controller.set_lyrics(id, None).map(|()| None),
+                            };
+                            match result {
+                                Ok(Some(text)) => {
+                                    self.lifecycle_msg = Some(format!(
+                                        "Replaced managed lyrics for track {id} ({} line(s)).",
+                                        text.lines().count()
+                                    ));
+                                }
+                                Ok(None) => {
+                                    self.lifecycle_msg =
+                                        Some(format!("Removed managed lyrics for track {id}."));
+                                }
+                                Err(error) => self.lifecycle_msg = Some(error),
+                            }
+                        }
+                        Err(err) => {
+                            self.lifecycle_msg = Some(format!(
+                                "{err} The form remains open so you can correct it."
+                            ));
+                            self.input = text;
+                            next = Mode::TrackLyricsInput;
+                        }
+                    },
                     Mode::OpenInput => {
                         if text.trim().is_empty() {
                             self.lifecycle_msg = Some(
@@ -2573,8 +2714,17 @@ impl Tui {
             ),
             Mode::ArtistCreateInput => input_line("New artist name (Enter create, Esc cancel): "),
             Mode::ArtistRenameInput => {
-                input_line("Edit artist-id|new-name|aliases; aliases separated by ; (Enter save, Esc cancel): ")
+                input_line("Edit artist-id|name|aliases;aliases|description|image-path (empty image preserves, - removes; Enter save, Esc cancel): ")
             }
+            Mode::AlbumEditInput => input_line(
+                "Edit album-id|title|release-type|cover-path (empty cover preserves, - removes; Enter save, Esc cancel): ",
+            ),
+            Mode::TrackArtworkInput => input_line(
+                "Track artwork: track-id|image-path or track-id|- (Enter save, Esc cancel): ",
+            ),
+            Mode::TrackLyricsInput => input_line(
+                "Managed lyrics: track-id|UTF-8-file or track-id|- (Enter save, Esc cancel): ",
+            ),
             Mode::OpenInput => {
                 input_line("Open canonical library folder (Enter switch, Esc cancel): ")
             }
@@ -2748,6 +2898,144 @@ fn track_edit_form(controller: &Controller, id: TrackId, track: &Track) -> Strin
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImageEdit {
+    Preserve,
+    Remove,
+    Set(PathBuf),
+}
+
+impl ImageEdit {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") => Ok(Self::Preserve),
+            Some("-") => Ok(Self::Remove),
+            Some(path) => Ok(Self::Set(PathBuf::from(path))),
+        }
+    }
+}
+
+struct ArtistEditForm {
+    id: ArtistId,
+    name: String,
+    aliases: Option<Vec<String>>,
+    description: Option<Option<String>>,
+    image: ImageEdit,
+}
+
+fn artist_edit_form(controller: &Controller, id: ArtistId) -> String {
+    let name = controller
+        .artist(id)
+        .map(|artist| artist.name().to_owned())
+        .unwrap_or_default();
+    let aliases = controller.artist_aliases(id).join(";");
+    let description = controller.artist_description(id).unwrap_or_default();
+    format!("{id}|{name}|{aliases}|{description}|")
+}
+
+fn parse_artist_edit_form(input: &str) -> Result<ArtistEditForm, String> {
+    let fields: Vec<&str> = input.split('|').map(str::trim).collect();
+    if !(2..=5).contains(&fields.len()) {
+        return Err(
+            "Artist edit format: artist-id|name|aliases|description|image-path; aliases are separated by semicolons; empty image preserves and - removes."
+                .to_owned(),
+        );
+    }
+    let id = fields[0]
+        .parse::<u64>()
+        .map(ArtistId::new)
+        .map_err(|_| "Artist ID must be a whole number.".to_owned())?;
+    if fields[1].is_empty() {
+        return Err("Artist name must not be empty.".to_owned());
+    }
+    let aliases = fields.get(2).map(|value| {
+        value
+            .split(';')
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    });
+    let description = fields
+        .get(3)
+        .map(|value| (!value.is_empty()).then(|| (*value).to_owned()));
+    Ok(ArtistEditForm {
+        id,
+        name: fields[1].to_owned(),
+        aliases,
+        description,
+        image: ImageEdit::parse(fields.get(4).copied())?,
+    })
+}
+
+struct AlbumEditForm {
+    id: AlbumId,
+    title: String,
+    release_type: flux_app::ReleaseType,
+    cover: ImageEdit,
+}
+
+fn album_edit_form(id: AlbumId, title: &str, release_type: flux_app::ReleaseType) -> String {
+    format!("{id}|{title}|{}|", release_type.as_str())
+}
+
+fn parse_release_type(value: &str) -> Result<flux_app::ReleaseType, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "album" => Ok(flux_app::ReleaseType::Album),
+        "ep" => Ok(flux_app::ReleaseType::Ep),
+        "single" => Ok(flux_app::ReleaseType::Single),
+        "compilation" => Ok(flux_app::ReleaseType::Compilation),
+        "other" => Ok(flux_app::ReleaseType::Other),
+        _ => Err("Release type must be album, ep, single, compilation or other.".to_owned()),
+    }
+}
+
+fn parse_album_edit_form(input: &str) -> Result<AlbumEditForm, String> {
+    let fields: Vec<&str> = input.split('|').map(str::trim).collect();
+    if !(3..=4).contains(&fields.len()) {
+        return Err(
+            "Album edit format: album-id|title|release-type|cover-path; empty cover preserves and - removes."
+                .to_owned(),
+        );
+    }
+    let id = fields[0]
+        .parse::<u64>()
+        .map(AlbumId::new)
+        .map_err(|_| "Album ID must be a whole number.".to_owned())?;
+    if fields[1].is_empty() {
+        return Err("Album title must not be empty.".to_owned());
+    }
+    Ok(AlbumEditForm {
+        id,
+        title: fields[1].to_owned(),
+        release_type: parse_release_type(fields[2])?,
+        cover: ImageEdit::parse(fields.get(3).copied())?,
+    })
+}
+
+fn track_asset_form(id: TrackId) -> String {
+    format!("{id}|")
+}
+
+fn parse_track_asset_form(input: &str, label: &str) -> Result<(TrackId, Option<PathBuf>), String> {
+    let fields: Vec<&str> = input.split('|').map(str::trim).collect();
+    if fields.len() != 2 {
+        return Err(format!(
+            "Track {label} format: track-id|path or track-id|- to remove."
+        ));
+    }
+    let id = fields[0]
+        .parse::<u64>()
+        .map(TrackId::new)
+        .map_err(|_| "Track ID must be a whole number.".to_owned())?;
+    let path = match fields[1] {
+        "" => return Err(format!("Enter a {label} path or - to remove it.")),
+        "-" => None,
+        value => Some(PathBuf::from(value)),
+    };
+    Ok((id, path))
+}
+
 fn parse_track_edit_form(input: &str) -> Result<TrackMetadataEdit, String> {
     let fields: Vec<&str> = input.split('|').map(str::trim).collect();
     if !(5..=6).contains(&fields.len()) {
@@ -2915,7 +3203,10 @@ fn cancel_message(mode: Mode) -> Option<&'static str> {
         Mode::ImportReview => Some("Import review closed; nothing was copied or published."),
         Mode::TrackEditInput => Some("Track edit cancelled; no changes were made."),
         Mode::ArtistCreateInput => Some("Artist creation cancelled."),
-        Mode::ArtistRenameInput => Some("Artist rename cancelled; no changes were made."),
+        Mode::ArtistRenameInput => Some("Artist edit cancelled; no changes were made."),
+        Mode::AlbumEditInput => Some("Album edit cancelled; no changes were made."),
+        Mode::TrackArtworkInput => Some("Track artwork edit cancelled; no changes were made."),
+        Mode::TrackLyricsInput => Some("Lyrics edit cancelled; no changes were made."),
         Mode::OpenInput | Mode::CreateInput => {
             Some("Library switch cancelled; the active library is unchanged.")
         }
@@ -2992,7 +3283,11 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "e edit selected metadata · y read managed lyrics".to_owned(),
         "H local history · D selected Track membership · E Album/standalone relationships"
             .to_owned(),
-        "V artist/album relationships · P create artist · Y edit name/aliases".to_owned(),
+        "V artist/album relationships · P create artist".to_owned(),
+        "Y edit artist name/aliases/description/image · Z edit the selected album and cover"
+            .to_owned(),
+        "W set/remove Track artwork override · S set/remove managed lyrics from a UTF-8 file"
+            .to_owned(),
         "X refresh/reconcile · L relink a unique reported move candidate".to_owned(),
         String::new(),
         "LIBRARY LIFECYCLE".to_owned(),
@@ -3009,7 +3304,8 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
             .to_owned(),
         "Missing resources are retained; inaccessible paths are not treated as missing.".to_owned(),
         "The TUI never deletes external audio and never deletes library tracks.".to_owned(),
-        "Track deletion, audio/artwork/lyrics repair, ownership/album/artist transfer,".to_owned(),
+        "Track deletion, missing-resource repair, membership and ownership transfer,"
+            .to_owned(),
         "playlists, batch actions and global filters require the GUI review workflows."
             .to_owned(),
         "Audio-output enumeration and device selection are GUI-only; Play retries recovery here."
@@ -3096,13 +3392,17 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImportWorkerMessage, Mode, StorageMode, Track, Tui, clamp_terminal_size, detail_view_fits,
-        display_width, fit_input_line, help_lines, normal_help, pad_with_right, resource_label,
-        terminal_too_small, truncate_to_width,
+        ImageEdit, ImportWorkerMessage, Mode, StorageMode, Track, Tui, album_edit_form,
+        clamp_terminal_size, detail_view_fits, display_width, fit_input_line, help_lines,
+        normal_help, pad_with_right, parse_album_edit_form, parse_artist_edit_form,
+        parse_release_type, parse_track_asset_form, resource_label, terminal_too_small,
+        truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use flux_app::ImportDecision;
+    use flux_core::TrackId;
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Encodes a filesystem path as JSON string contents. Windows paths contain
@@ -4141,6 +4441,127 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             "Ctrl-C must quit from an info view"
         );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn metadata_edit_forms_parse_optional_artist_album_and_asset_fields() {
+        let artist = parse_artist_edit_form("7|New Name|Alias A;Alias B|Description|/tmp/a.png")
+            .expect("artist form");
+        assert_eq!(artist.id.get(), 7);
+        assert_eq!(artist.name, "New Name");
+        assert_eq!(
+            artist.aliases.as_deref(),
+            Some(["Alias A".to_owned(), "Alias B".to_owned()].as_slice())
+        );
+        assert_eq!(artist.description, Some(Some("Description".to_owned())));
+        assert_eq!(artist.image, ImageEdit::Set(PathBuf::from("/tmp/a.png")));
+
+        let minimal = parse_artist_edit_form("7|New Name").expect("minimal artist form");
+        assert!(minimal.aliases.is_none());
+        assert!(minimal.description.is_none());
+        assert_eq!(minimal.image, ImageEdit::Preserve);
+
+        let cleared = parse_artist_edit_form("7|New Name||| - ").expect("clear fields");
+        assert_eq!(cleared.aliases.as_deref(), Some([].as_slice()));
+        assert_eq!(cleared.description, Some(None));
+        assert_eq!(cleared.image, ImageEdit::Remove);
+
+        assert!(parse_artist_edit_form("7|").is_err());
+        assert!(parse_artist_edit_form("not-an-id|Name").is_err());
+
+        let album = parse_album_edit_form("3|Title|ep|-").expect("album form");
+        assert_eq!(album.id.get(), 3);
+        assert_eq!(album.title, "Title");
+        assert_eq!(album.release_type, flux_app::ReleaseType::Ep);
+        assert_eq!(album.cover, ImageEdit::Remove);
+        assert_eq!(
+            parse_release_type("single").expect("single"),
+            flux_app::ReleaseType::Single
+        );
+        assert!(parse_release_type("mixtape").is_err());
+        assert_eq!(
+            album_edit_form(album.id, &album.title, album.release_type),
+            "3|Title|ep|"
+        );
+
+        assert_eq!(
+            parse_track_asset_form("4|/tmp/art.png", "artwork").expect("asset"),
+            (TrackId::new(4), Some(PathBuf::from("/tmp/art.png")))
+        );
+        assert_eq!(
+            parse_track_asset_form("4|-", "lyrics").expect("remove"),
+            (TrackId::new(4), None)
+        );
+        assert!(parse_track_asset_form("4|", "artwork").is_err());
+        assert!(parse_track_asset_form("x|path", "artwork").is_err());
+    }
+
+    #[test]
+    fn tui_artist_artwork_and_lyrics_workflows_update_only_managed_resources() {
+        let dir = TempDir::new("tui-metadata-workflows");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical library");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        let artist = tui.controller.create_artist("Old Artist").expect("artist");
+        key(&mut tui, KeyCode::Char('Y'));
+        type_text(
+            &mut tui,
+            &format!(
+                "{}|New Artist|Alias;Second|Artist description|",
+                artist.get()
+            ),
+        );
+        assert_eq!(tui.mode, Mode::Normal);
+        let updated = tui.controller.artist(artist).expect("artist");
+        assert_eq!(updated.name(), "New Artist");
+        assert_eq!(
+            tui.controller.artist_aliases(artist),
+            ["Alias".to_owned(), "Second".to_owned()]
+        );
+        assert_eq!(
+            tui.controller.artist_description(artist),
+            Some("Artist description")
+        );
+
+        let source = dir.path().join("source/song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("source dir");
+        std::fs::write(&source, minimal_wav()).expect("song");
+        tui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("canonical import");
+        let track = tui.controller.tracks()[0].0;
+
+        let artwork = dir.path().join("cover.png");
+        std::fs::write(
+            &artwork,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .expect("artwork");
+        key(&mut tui, KeyCode::Char('W'));
+        // The form is prefilled with "track-id|"; append only the path.
+        type_text(&mut tui, &artwork.display().to_string());
+        let stored_art = tui
+            .controller
+            .track_artwork_path(track)
+            .expect("managed artwork path");
+        assert!(stored_art.is_file());
+        assert_ne!(stored_art, artwork);
+
+        let lyrics = dir.path().join("song.lrc");
+        std::fs::write(&lyrics, "[00:01.00]hello\n").expect("lyrics");
+        key(&mut tui, KeyCode::Char('S'));
+        type_text(&mut tui, &lyrics.display().to_string());
+        assert_eq!(
+            tui.controller.track_lyrics(track).as_deref(),
+            Some("[00:01.00]hello\n")
+        );
+        key(&mut tui, KeyCode::Char('S'));
+        type_text(&mut tui, "-");
+        assert!(tui.controller.track_lyrics(track).is_none());
         tui.controller.shutdown();
     }
 
