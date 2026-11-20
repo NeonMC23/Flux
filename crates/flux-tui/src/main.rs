@@ -3058,9 +3058,9 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImportWorkerMessage, Mode, StorageMode, Track, Tui, TuiImport, clamp_terminal_size,
-        detail_view_fits, display_width, fit_input_line, help_lines, normal_help, pad_with_right,
-        resource_label, terminal_too_small, truncate_to_width,
+        ImportWorkerMessage, Mode, StorageMode, Track, Tui, clamp_terminal_size, detail_view_fits,
+        display_width, fit_input_line, help_lines, normal_help, pad_with_right, resource_label,
+        terminal_too_small, truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use flux_app::ImportDecision;
