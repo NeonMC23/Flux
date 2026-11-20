@@ -28,8 +28,19 @@ try {
         if (-not (Test-Path $exe)) { throw "Missing executable in ZIP: $exe" }
     }
     $Expected = "Flux $Version (io.github.neonmc23.flux)"
-    if ((& $Gui --version).Trim() -ne $Expected) { throw 'GUI --version mismatch.' }
-    if ((& $Tui --version).Trim() -ne $Expected) { throw 'TUI --version mismatch.' }
+    function Get-CliOutput([string]$Executable, [string]$Argument) {
+        $stdout = Join-Path $Tmp ("stdout-" + [guid]::NewGuid() + ".txt")
+        $stderr = Join-Path $Tmp ("stderr-" + [guid]::NewGuid() + ".txt")
+        $process = Start-Process -FilePath $Executable -ArgumentList $Argument -Wait -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        if ($process.ExitCode -ne 0) {
+            throw "$Executable $Argument exited $($process.ExitCode): $(Get-Content $stderr -Raw)"
+        }
+        return (Get-Content $stdout -Raw).Trim()
+    }
+    if ((Get-CliOutput $Gui '--version') -ne $Expected) { throw 'GUI --version mismatch.' }
+    if ((Get-CliOutput $Tui '--version') -ne $Expected) { throw 'TUI --version mismatch.' }
+    if ((Get-CliOutput $Gui '--help') -notmatch 'Usage: flux') { throw 'GUI --help mismatch.' }
 
     Add-Type -AssemblyName System.Drawing
     $Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($Gui)
@@ -63,7 +74,7 @@ try {
             "/DIR=`"$InstallDir`""
         )
         if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)." }
-        if ((& (Join-Path $InstallDir 'flux.exe') --version).Trim() -ne $Expected) {
+        if ((Get-CliOutput (Join-Path $InstallDir 'flux.exe') '--version') -ne $Expected) {
             throw 'Installed GUI --version mismatch.'
         }
         $uninstaller = Join-Path $InstallDir 'unins000.exe'

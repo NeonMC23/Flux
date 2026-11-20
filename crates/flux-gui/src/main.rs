@@ -17008,19 +17008,66 @@ pub fn main() -> iced::Result {
         .run()
 }
 
+#[cfg(not(target_os = "windows"))]
+fn cli_output(text: &str) {
+    print!("{text}");
+}
+
+/// Windows GUI-subsystem executables do not reliably inherit a console from a
+/// shell pipeline. Write to the supplied handle when present, otherwise attach
+/// to the parent console before printing `--version`/`--help`.
+#[cfg(target_os = "windows")]
+fn cli_output(text: &str) {
+    use std::ffi::c_void;
+
+    const STD_OUTPUT_HANDLE: u32 = 0xffff_fff5;
+    const ATTACH_PARENT_PROCESS: u32 = 0xffff_ffff;
+
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn AttachConsole(process_id: u32) -> i32;
+        fn WriteFile(
+            handle: *mut c_void,
+            buffer: *const u8,
+            bytes: u32,
+            written: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+    }
+
+    unsafe {
+        let mut handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle as isize == -1 {
+            if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+                handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            }
+        }
+        if !handle.is_null() && handle as isize != -1 {
+            let mut written = 0u32;
+            let _ = WriteFile(
+                handle,
+                text.as_ptr(),
+                text.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+}
+
 fn handle_cli() -> bool {
     for arg in std::env::args_os().skip(1) {
         if arg == "--version" || arg == "-V" {
-            println!("{}", flux_core::release_info());
+            cli_output(&format!("{}\n", flux_core::release_info()));
             return true;
         }
         if arg == "--help" || arg == "-h" {
-            println!(
+            cli_output(&format!(
                 "Flux {}\nA local-first, native music player.\n\nUsage: flux\n\n\
                  The GUI manages a canonical local library under the per-user data directory.\n\
-                 Use Flux\n  --version   print the release identity\n  --help      show this help",
+                 Use Flux\n  --version   print the release identity\n  --help      show this help\n",
                 APP_VERSION
-            );
+            ));
             return true;
         }
     }
