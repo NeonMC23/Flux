@@ -3404,6 +3404,7 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).expect("temp dir");
+            let path = fs::canonicalize(&path).expect("canonical temp dir");
             Self(path)
         }
 
@@ -3504,7 +3505,11 @@ mod tests {
             sources,
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: root.to_path_buf(),
+            library_root: controller
+                .canonical_root()
+                .or_else(|| controller.portable_root())
+                .unwrap_or(root)
+                .to_path_buf(),
             existing_tracks: controller.tracks().to_vec(),
             existing_artists: controller
                 .tracks()

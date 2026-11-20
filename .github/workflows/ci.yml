@@ -138,6 +138,16 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v5
+      - name: Reduce Windows Defender contention during tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE -ErrorAction Stop
+            Add-MpPreference -ExclusionPath $env:RUNNER_TEMP -ErrorAction Stop
+          } catch {
+            Write-Warning "Could not add Defender exclusions: $_"
+          }
       - name: Install Linux system libraries
         if: runner.os == 'Linux'
         run: |
