@@ -80,6 +80,8 @@ tags or absolute audio paths.
 Release-engineering artifacts are built locally or by manual CI dispatch; no
 release is published from this repository. See
 [`docs/distribution.md`](docs/distribution.md) for the full matrix and evidence.
+The release operator checklist is
+[`docs/release-checklist.md`](docs/release-checklist.md).
 
 ```sh
 # Linux x86_64 (or native architecture)
