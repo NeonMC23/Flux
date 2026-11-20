@@ -75,6 +75,20 @@ jobs:
           assert ico.size[0] >= 16
           icns = open("assets/icons/flux.icns", "rb").read()
           assert icns[:4] == b"icns" and int.from_bytes(icns[4:8], "big") == len(icns)
+          import plistlib
+          template = open("packaging/macos/Info.plist.in", encoding="utf-8").read()
+          plist = plistlib.loads(
+              template.replace("__APP_ID__", "io.github.neonmc23.flux")
+              .replace("__VERSION__", "0.1.0")
+              .replace("__COPYRIGHT__", "Copyright (c) 2026 NeonMC23")
+              .encode()
+          )
+          assert plist["CFBundleIdentifier"] == "io.github.neonmc23.flux"
+          assert plist["CFBundleExecutable"] == "flux"
+          assert plist["CFBundleIconFile"] == "flux.icns"
+          import xml.etree.ElementTree as ET
+          ET.parse("packaging/windows/flux.manifest")
+          assert "96707750-32C7-4982-8664-11AE5B7B5C1B" in open("packaging/windows/flux.iss").read()
           PY
 
   licenses:
