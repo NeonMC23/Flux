@@ -563,10 +563,11 @@ so compilation there is never evidence of audible playback.
 | macOS ARM64 | Native tests/build + CPAL check | No | Source audited only; no macOS runtime |
 | macOS x86_64 | Compile-only cross-check | No | No standard GitHub runner; compile-only CI path |
 
-The local Linux rows in M7 and M8 were executed on Fedora 44, kernel 7.3.0 /
-x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. M9 validation ran
-on the same Linux host; no Windows/macOS Rust target or SDK is installed there,
-so no cross-compilation or native runtime validation is claimed.
+The local Linux rows in M7–M9 were executed on Fedora 44, kernel 7.3.x /
+x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. M10 validation ran
+on Fedora 44, kernel 7.3.4, Rust/Cargo 1.99.0. No Windows/macOS Rust target or
+SDK is installed there, so no cross-compilation or native runtime validation is
+claimed.
 
 The current Windows audit includes UTF-16/UNC path handling, PowerShell UTF-8
 dialog output, case-insensitive comparison fallback, reserved-name/long-path

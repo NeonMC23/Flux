@@ -260,7 +260,7 @@ with a compile-only macOS x86_64 cross-check. CPAL all-target compilation and
 CPAL GUI/TUI binary linking are checked on all matrix entries; no CI runner
 supplies a physical audio device.
 
-| Target | CI coverage defined | Locally executed in M7–M9 | Runtime status |
+| Target | CI coverage defined | Locally executed in M7–M10 | Runtime status |
 |---|---|---|---|
 | Linux x86_64 | Native tests/build, Clippy, CPAL check | Yes | GUI/TUI startup, TUI PTY, CPAL enumeration, explicit stream open and short WAV completion; no listening/hotplug |
 | Linux ARM64 | Native tests/build, CPAL check | No | Unverified locally |
@@ -371,13 +371,16 @@ rename and image assignment never perform fuzzy merging. An Artist is retained
 when its last Track is removed or moved, so an empty Artist remains deliberate
 and visible.
 
-The GUI Artist list opens a detail page that edits name/description, assigns or
-removes a managed image, shows owned and credited-only Albums, lists all related
-Tracks by stable TrackId, and navigates to Album/Track views. Renames are
-metadata-only, so paths and every queue/playlist/history/rating reference stay
-valid. Images use the same extension/size validation as Album covers plus the
-bounded GUI decoder; a failed replacement leaves the previous managed image
-intact.
+The GUI Artist list opens a detail page that edits name, description and
+comma-separated aliases, assigns or removes a managed image, shows owned and
+credited-only Albums, lists all related Tracks by stable TrackId, and navigates
+to Album/Track views. Alias edits reject empty duplicates and aliases equal to
+the display name. Renames are metadata-only, so paths and every
+queue/playlist/history/rating reference stay valid. Images use the same
+extension/size validation as Album covers plus the bounded GUI decoder; a chosen
+replacement can be previewed before assignment, and a failed replacement leaves
+the previous managed image intact. Missing or inaccessible managed Artist images
+are reported separately with repair guidance.
 
 The TUI `V` view lists ArtistId, optional description/image state, owned and
 credited Album relationships and related Track counts. `Y` renames an existing
@@ -876,6 +879,7 @@ from what remains structurally or physically unverified.
 | M7 platform audit: path/reparse safety, TUI display width, CI matrix, target/architecture documentation | Linux native gates and runtime checks confirmed here; TUI width/combining/wide-character tests added; Windows/macOS targets were not installed and their CI jobs were not executed in this session, so those rows remain compile-contract/runtime-unverified |
 | M8 product hardening: settings retry safety, canonical creation lease, import-credit preservation, stale import/preload rejection, queue/history reconciliation, TUI editing/rating safety and row/artwork caching | Confirmed by deterministic settings, import, Controller, canonical, GUI and TUI regressions plus the six Linux gates; GUI/TUI runtime probes remain Linux-only and no new platform claim is made |
 | M9 product completion: metadata provenance, local lyrics/artwork sidecars, normalized entity matching, bulk Track artwork, atomic lyrics export, committed-cleanup warnings, bounded shutdown and cancellable fingerprint/copy work | Confirmed by new deterministic import, GUI, library, Controller and shutdown regressions plus Linux runtime probes; Windows/macOS remain source/CI-contract only |
+| M10 product closure: Artist alias editing/image repair states, artwork previews, native lyrics save dialogs, per-candidate release type, cancellable TUI import review, whole-context dirty-edit guards and startup cleanup warnings | Confirmed by deterministic GUI/TUI/Controller/library regressions, repeated full workspace runs, Linux GUI/TUI/CPAL probes and equivalent before/after performance probes; Windows/macOS remain source/CI-contract only |
 | Missing-resource states/repair, single-track deletion, managed cleanup and session binding | Confirmed by deterministic canonical/Controller/GUI tests; no physical permission/hardware/cross-platform media validation |
 | GUI navigation grouping, responsive queue placement, active-library identity, resource badges, empty states and Import Manager result fidelity | Confirmed by deterministic GUI state/render helpers and existing message tests; no full interactive window-manager keyboard audit |
 | TUI help/info panels, stable QueueEntryId view, import issue panels, guarded destructive confirmations, session reset, long unicode input and small-terminal clamping | Confirmed by deterministic key/Controller tests and a pseudo-terminal startup/help/quit probe; no extensive manual terminal-multiplexer or cross-terminal emulator audit |
@@ -1474,8 +1478,10 @@ classification, rejects malformed input, preserves the source file and requires
 a second confirmation before replacing existing lyrics. Export writes UTF-8 LRC
 with timestamps or plain text without timestamps, requires `.lrc`/`.txt`
 extensions, does not touch audio, and requires a second action to overwrite an
-existing destination. Export path selection is a GUI path field, not a native
-save dialog. All operations are offline; no remote services are used.
+existing destination. Export path selection uses a typed file/directory field
+and a native save dialog (zenity/kdialog, macOS choose-file-name, Windows
+SaveFileDialog) with a sanitized Track filename suggestion. All operations are
+offline; no remote services are used.
 
 The TUI exposes read-only lyrics inspection with `y` (scrollable, Esc returns)
 but no editing/import/export/karaoke. Those remain GUI workflows.
@@ -1977,6 +1983,27 @@ audio-device open a short grace period. A dependency call that cannot be
 interrupted is isolated and documented; shutdown does not wait forever or claim
 that the worker completed.
 
+### Measured performance
+
+M10 uses the same temporary release-mode harness at `b774414` (M9) and the M10
+head, on the same Fedora 44 x86_64 host, `CARGO_TARGET_DIR`, warm filesystem and
+generated 44.1 kHz mono WAV fixtures. The probe seeds a canonical library with
+600 Tracks, then measures a 300-file import review against those existing Tracks,
+100 searches, and 240 single-Track rating updates.
+
+| Probe | M9 | M10 |
+|---|---|---|
+| Seed 600-file import | 93 ms | 90 ms |
+| Plan 300 new files over 600 existing | 203 ms | 188 ms |
+| Pre-cancelled plan | 0 ms | 0 ms |
+| 100 searches over 600 Tracks | 5 ms | 4 ms |
+| 240 rating updates | 144 ms | 143 ms |
+
+These differences are within run-to-run noise; M10 claims no material speed-up.
+The numbers are a regression check, not a benchmark of real-world disks or
+network filesystems. The final atomic import transaction and per-rating
+catalogue publication remain synchronous/fsync-bound.
+
 ### Persistence limitations
 
 - Queue/history are independently persisted from the catalogue; there is no
@@ -2237,9 +2264,9 @@ cleanup.
     adding a new virtualization layer.
 19. Lyrics are line/event synchronized, not word-by-word. The editor is
     line-oriented rather than a rich multiline text area. Multi-timestamp LRC
-    lines are normalized on round-trip. Export uses a typed file/directory path,
-    writes atomically and derives a sanitized Track filename for directory
-    destinations, but no native save dialog yet. No remote lyrics lookup, tag
+    lines are normalized on round-trip. Export supports a typed file/directory
+    path and a native save dialog, writes atomically and derives a sanitized
+    Track filename for directory destinations. No remote lyrics lookup, tag
     extraction or TUI editing is implemented.
 20. Playback history and play counts are collected only after this feature is
     introduced; pre-existing listening activity is not inferred. History is
