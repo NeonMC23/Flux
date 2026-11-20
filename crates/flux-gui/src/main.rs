@@ -2214,6 +2214,7 @@ struct FluxReady {
     artwork_loading: HashSet<ArtworkKey>,
     artist_detail_name_input: String,
     artist_description_input: String,
+    artist_aliases_input: String,
     artist_image_input: String,
     artist_image_picked: Option<PathBuf>,
     artist_image_remove_confirm: bool,
@@ -2313,6 +2314,7 @@ enum Message {
     AlbumCoverRemove,
     ArtistDetailNameChanged(String),
     ArtistDescriptionChanged(String),
+    ArtistAliasesChanged(String),
     ArtistMetadataSave,
     ArtistImageChanged(String),
     ArtistImageChoose,
@@ -2666,6 +2668,7 @@ impl FluxReady {
             artwork_loading: HashSet::new(),
             artist_detail_name_input: String::new(),
             artist_description_input: String::new(),
+            artist_aliases_input: String::new(),
             artist_image_input: String::new(),
             artist_image_picked: None,
             artist_image_remove_confirm: false,
@@ -2774,6 +2777,7 @@ impl FluxReady {
         self.artwork_loading.clear();
         self.artist_detail_name_input.clear();
         self.artist_description_input.clear();
+        self.artist_aliases_input.clear();
         self.artist_image_input.clear();
         self.artist_image_picked = None;
         self.artist_image_remove_confirm = false;
@@ -2993,6 +2997,7 @@ impl FluxReady {
     fn sync_artist_editor(&mut self) {
         self.artist_detail_name_input.clear();
         self.artist_description_input.clear();
+        self.artist_aliases_input.clear();
         self.artist_image_input.clear();
         self.artist_image_picked = None;
         self.artist_image_remove_confirm = false;
@@ -3008,6 +3013,7 @@ impl FluxReady {
             .artist_description(id)
             .unwrap_or_default()
             .to_owned();
+        self.artist_aliases_input = self.controller.artist_aliases(id).join(", ");
     }
 
     fn sync_album_editor(&mut self) {
@@ -4813,14 +4819,23 @@ impl FluxReady {
             }
             Message::ArtistDetailNameChanged(value) => self.artist_detail_name_input = value,
             Message::ArtistDescriptionChanged(value) => self.artist_description_input = value,
+            Message::ArtistAliasesChanged(value) => self.artist_aliases_input = value,
             Message::ArtistMetadataSave => {
                 let Some(artist) = self.selected_artist_id() else {
                     return Task::none();
                 };
+                let aliases = self
+                    .artist_aliases_input
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|alias| !alias.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
                 match self.controller.update_artist_metadata(
                     artist,
                     &self.artist_detail_name_input,
                     Some(self.artist_description_input.as_str()),
+                    &aliases,
                 ) {
                     Ok(()) => {
                         self.invalidate_search_cache();
@@ -14365,6 +14380,16 @@ impl FluxReady {
                     )
                     .size(10)
                     .color(MUTED),
+                    text(if self.controller.artist_aliases(artist_id).is_empty() {
+                        "No aliases.".to_owned()
+                    } else {
+                        format!(
+                            "Also known as: {}",
+                            self.controller.artist_aliases(artist_id).join(", ")
+                        )
+                    })
+                    .size(10)
+                    .color(MUTED),
                 ]
                 .spacing(3)
                 .width(Length::Fill),
@@ -14384,6 +14409,14 @@ impl FluxReady {
                         .on_submit(Message::ArtistMetadataSave)
                         .style(input_style)
                         .width(Length::Fill),
+                    text_input(
+                        "Aliases, comma separated (optional)…",
+                        &self.artist_aliases_input,
+                    )
+                    .on_input(Message::ArtistAliasesChanged)
+                    .on_submit(Message::ArtistMetadataSave)
+                    .style(input_style)
+                    .width(Length::Fill),
                     button(text("Save artist metadata").size(10))
                         .style(accent_button_style)
                         .padding([6, 9])
@@ -16512,6 +16545,7 @@ mod tests {
             artwork_loading: HashSet::new(),
             artist_detail_name_input: String::new(),
             artist_description_input: String::new(),
+            artist_aliases_input: String::new(),
             artist_image_input: String::new(),
             artist_image_picked: None,
             artist_image_remove_confirm: false,
@@ -18946,7 +18980,15 @@ mod tests {
             &mut gui,
             Message::ArtistDescriptionChanged("A user-authored description.".to_owned()),
         );
+        send(
+            &mut gui,
+            Message::ArtistAliasesChanged("Entity AKA, Former Name".to_owned()),
+        );
         send(&mut gui, Message::ArtistMetadataSave);
+        assert_eq!(
+            gui.controller.artist_aliases(artist),
+            ["Entity AKA".to_owned(), "Former Name".to_owned()]
+        );
         assert_eq!(
             gui.controller
                 .artist(artist)

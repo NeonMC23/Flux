@@ -4399,13 +4399,14 @@ impl Controller {
         Ok(())
     }
 
-    /// Updates an Artist display name and optional description. Canonical
-    /// relationships, aliases and image are preserved.
+    /// Updates an Artist display name, optional description and aliases.
+    /// Canonical relationships and the managed image are preserved.
     pub fn update_artist_metadata(
         &mut self,
         id: ArtistId,
         name: &str,
         description: Option<&str>,
+        aliases: &[String],
     ) -> Result<(), String> {
         if let Err(message) = self.portable_maintenance_guard() {
             self.report_error(message.clone());
@@ -4416,8 +4417,12 @@ impl Controller {
             self.report_error(message.clone());
             return Err(message);
         };
-        if let Err(err) = store.update_artist_metadata(id, name, description.map(ToOwned::to_owned))
-        {
+        if let Err(err) = store.update_artist_metadata(
+            id,
+            name,
+            description.map(ToOwned::to_owned),
+            aliases.to_vec(),
+        ) {
             let message = format!("Could not update artist: {err}");
             self.report_error(message.clone());
             return Err(message);
@@ -4435,6 +4440,16 @@ impl Controller {
             .as_ref()
             .and_then(|store| store.artist(id))
             .and_then(|artist| artist.description.as_deref())
+    }
+
+    /// Canonical Artist aliases in stored order.
+    #[must_use]
+    pub fn artist_aliases(&self, id: ArtistId) -> &[String] {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.artist(id))
+            .map(|artist| artist.aliases.as_slice())
+            .unwrap_or_default()
     }
 
     /// Absolute managed Artist image path, when assigned.

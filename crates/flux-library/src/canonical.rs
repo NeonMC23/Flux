@@ -2142,6 +2142,40 @@ fn normalized_import_name(value: &str) -> String {
         .to_lowercase()
 }
 
+/// Validates and normalizes editable Artist aliases.
+///
+/// Aliases are trimmed, empty entries dropped, and compared
+/// case/whitespace-insensitively. An alias may not duplicate another alias or
+/// the display name; callers receive an actionable error instead of a silent
+/// partial edit.
+fn normalize_artist_aliases(
+    name: &str,
+    aliases: Vec<String>,
+) -> Result<Vec<String>, CanonicalError> {
+    let name_key = normalized_import_name(name);
+    let mut seen = std::collections::HashSet::new();
+    let mut normalized = Vec::new();
+    for alias in aliases {
+        let alias = alias.trim().to_owned();
+        if alias.is_empty() {
+            continue;
+        }
+        let key = normalized_import_name(&alias);
+        if key == name_key {
+            return Err(CanonicalError::Invalid(format!(
+                "artist alias {alias:?} duplicates the display name"
+            )));
+        }
+        if !seen.insert(key) {
+            return Err(CanonicalError::Invalid(format!(
+                "artist alias {alias:?} is listed more than once"
+            )));
+        }
+        normalized.push(alias);
+    }
+    Ok(normalized)
+}
+
 fn resolve_import_artists(
     catalog: &mut CatalogDto,
     artists: &mut BTreeMap<ArtistId, CanonicalArtist>,
@@ -3279,6 +3313,7 @@ impl CanonicalLibrary {
         id: ArtistId,
         name: impl Into<String>,
         description: Option<String>,
+        aliases: Vec<String>,
     ) -> Result<(), CanonicalError> {
         self.ensure_writable()?;
         let artist =
@@ -3303,12 +3338,13 @@ impl CanonicalLibrary {
         let description = description
             .map(|description| description.trim().to_owned())
             .filter(|description| !description.is_empty());
+        let aliases = normalize_artist_aliases(&name, aliases)?;
         let dto = ArtistEntityDto {
             schema_version: CANONICAL_SCHEMA_VERSION,
             kind: ARTIST_KIND.to_owned(),
             id: id.get(),
             name,
-            aliases: artist.aliases,
+            aliases,
             description,
             image: artist.image,
         };
@@ -10397,8 +10433,32 @@ mod track_deletion_tests {
                 fx.a,
                 "Renamed A",
                 Some("Warm synthesizer artist".to_owned()),
+                vec!["Alias One".to_owned(), "  Alias Two  ".to_owned()],
             )
             .expect("artist metadata");
+        assert_eq!(
+            fx.library.artist(fx.a).expect("artist").aliases,
+            vec!["Alias One".to_owned(), "Alias Two".to_owned()]
+        );
+        assert_eq!(
+            fx.library
+                .update_artist_metadata(fx.a, "Renamed A", None, vec!["renamed   a".to_owned()],)
+                .expect_err("alias must not duplicate the display name")
+                .to_string(),
+            "invalid canonical library: artist alias \"renamed   a\" duplicates the display name"
+        );
+        assert_eq!(
+            fx.library
+                .update_artist_metadata(
+                    fx.a,
+                    "Renamed A",
+                    None,
+                    vec!["Same".to_owned(), " same ".to_owned()],
+                )
+                .expect_err("duplicate aliases are rejected")
+                .to_string(),
+            "invalid canonical library: artist alias \"same\" is listed more than once"
+        );
         fx.library
             .set_artist_image(fx.a, &artist_image, "png")
             .expect("artist image");
