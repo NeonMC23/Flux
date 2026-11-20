@@ -22,10 +22,13 @@
 //! - `Q` open the queue-entry view: `Enter` plays the selected stable
 //!   QueueEntryId, `Delete`/`d` removes it, `Ctrl+↑`/`Ctrl+↓` reorders it;
 //!   duplicate tracks remain distinct entries
-//! - `o` scan a folder (type a path), `r` refresh scanned folders
-//! - `i`/`I` quick copy-import paths into the canonical library;
-//!   per-path issues open a scrollable result panel (the GUI has the full
-//!   review-first Import Manager), `e` edit the selected track,
+//! - `o` imports a folder, `r` refreshes scanned folders
+//! - `i`/`I` import semicolon-separated paths into the canonical library.
+//!   Both routes open a cancellable discovery/review phase: select
+//!   import/update/skip decisions, then prepare copies before the atomic
+//!   publish. The GUI retains the rich metadata/artwork editor.
+//!   Per-path issues open a scrollable result panel.
+//! - `e` edit the selected track,
 //!   `P` create an artist, `Y` rename an artist (`artist-id|new-name`),
 //!   `V` list artist IDs, `X` reconcile, `L` relink a unique reported
 //!   move candidate
@@ -54,6 +57,10 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -62,8 +69,10 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use flux_app::{
-    AudioStatus, CanonicalMigrationPlan, Controller, ImportReport, ReconcileReport, StorageMode,
-    TrackMetadataEdit, format_duration, is_track_playable,
+    AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller, ImportDecision, ImportPlan,
+    ImportProgress, ImportReport, ImportRequest, ImportStage, ImportStorage, PreparedImport,
+    ReconcileReport, StorageMode, TrackMetadataEdit, format_duration, is_track_playable,
+    prepare_import_files, prepare_import_plan,
 };
 use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
 use unicode_width::UnicodeWidthChar;
@@ -123,6 +132,12 @@ enum Mode {
     CreateInput,
     /// Typing semicolon-separated audio file paths (`i`/`I` copy into the library).
     ImportInput,
+    /// A cancellable discovery/hashing phase is running in a worker.
+    ImportScanning,
+    /// Compact review of discovered candidates before any copy.
+    ImportReview,
+    /// A cancellable copy/preparation phase is running in a worker.
+    ImportPreparing,
     /// Editing the selected track as `title|album|track|disc|artist-id`.
     TrackEditInput,
     /// Creating a stable artist by name (`P`).
@@ -160,8 +175,26 @@ struct RowsCache {
     ids: Rc<Vec<TrackId>>,
 }
 
+struct TuiImport {
+    progress: Arc<Mutex<ImportProgress>>,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<ImportWorkerMessage>,
+    worker: Option<JoinHandle<()>>,
+    plan: Option<ImportPlan>,
+    selected: usize,
+    scroll: usize,
+    error: Option<String>,
+}
+
+enum ImportWorkerMessage {
+    Plan(Box<ImportPlan>),
+    Prepared(Box<PreparedImport>),
+}
+
 struct Tui {
     controller: Controller,
+    /// Compact import review/progress state shared with the GUI pipeline.
+    import_ui: Option<TuiImport>,
     /// Cursor position within the currently visible (filtered) rows.
     cursor: usize,
     /// First visible row index (scroll window).
@@ -183,8 +216,6 @@ struct Tui {
     migrated_dest: Option<PathBuf>,
     /// Latest library-lifecycle outcome (plan summary, errors, …).
     lifecycle_msg: Option<String>,
-    /// Kept true: canonical imports always copy; no external references exist.
-    import_copy: bool,
     /// Last reconciliation, used by the explicit `L` unique-relink action.
     last_reconcile: Option<ReconcileReport>,
     /// Read-only lyrics lines for the selected track.
@@ -323,8 +354,523 @@ impl Tui {
         self.mode = Mode::QueueView;
     }
 
+    /// Starts cancellable discovery/hashing in a worker using the same shared
+    /// import pipeline as the GUI. No catalogue write occurs in this phase.
+    fn start_import_review(
+        &mut self,
+        sources: Vec<PathBuf>,
+        recursive: bool,
+    ) -> Result<(), String> {
+        if sources.is_empty() {
+            return Err("Enter at least one file or folder path.".to_owned());
+        }
+        let Some(root) = self.controller.canonical_root().map(Path::to_path_buf) else {
+            return Err(
+                "The TUI import manager requires a canonical library; open or create one first."
+                    .to_owned(),
+            );
+        };
+        let existing_tracks = self.controller.tracks().to_vec();
+        let existing_artists = existing_tracks
+            .iter()
+            .filter_map(|(id, _)| Some((*id, self.controller.track_artist_id(*id)?)))
+            .collect::<Vec<_>>();
+        let existing_credits = existing_tracks
+            .iter()
+            .map(|(id, _)| (*id, self.controller.track_credits(*id)))
+            .collect::<Vec<_>>();
+        let existing_album_ids = existing_tracks
+            .iter()
+            .filter_map(|(id, _)| Some((*id, self.controller.track_album_id(*id)?)))
+            .collect::<Vec<_>>();
+        let request = ImportRequest {
+            sources,
+            recursive,
+            storage: ImportStorage::Copy,
+            library_root: root,
+            existing_tracks,
+            existing_artists,
+            existing_credits,
+            existing_album_ids,
+            target_album: None,
+            generation: self.controller.generation(),
+            library_session: self.controller.library_session(),
+        };
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_progress = Arc::clone(&progress);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            let plan = prepare_import_plan(request, worker_progress, worker_cancel);
+            let _ = tx.send(ImportWorkerMessage::Plan(Box::new(plan)));
+        });
+        self.import_ui = Some(TuiImport {
+            progress,
+            cancel,
+            rx,
+            worker: Some(worker),
+            plan: None,
+            selected: 0,
+            scroll: 0,
+            error: None,
+        });
+        self.mode = Mode::ImportScanning;
+        self.lifecycle_msg = Some("Discovering files and checking duplicates…".to_owned());
+        Ok(())
+    }
+
+    /// Polls the worker once per UI tick. Results are applied on the UI thread
+    /// only after the worker has joined, so no partial plan can leak.
+    fn poll_import_worker(&mut self) {
+        if !matches!(self.mode, Mode::ImportScanning | Mode::ImportPreparing) {
+            return;
+        }
+        let received = self.import_ui.as_ref().map(|ui| ui.rx.try_recv());
+        let message = match received {
+            Some(Ok(message)) => message,
+            Some(Err(TryRecvError::Empty)) | None => return,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.import_ui = None;
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some("The import worker stopped without a result.".to_owned());
+                return;
+            }
+        };
+        if let Some(ui) = self.import_ui.as_mut()
+            && let Some(worker) = ui.worker.take()
+        {
+            let _ = worker.join();
+        }
+        match message {
+            ImportWorkerMessage::Plan(plan) => {
+                let mut plan = *plan;
+                let cancelled = plan.cancelled
+                    || self
+                        .import_ui
+                        .as_ref()
+                        .is_some_and(|ui| ui.cancel.load(Ordering::Acquire));
+                if cancelled {
+                    self.import_ui = None;
+                    self.mode = Mode::Normal;
+                    self.lifecycle_msg =
+                        Some("Import cancelled; no catalogue changes were made.".to_owned());
+                    return;
+                }
+                if plan.candidates.is_empty() {
+                    let mut lines = plan
+                        .issues
+                        .iter()
+                        .map(|issue| format!("{} — {}", issue.path().display(), issue.reason()))
+                        .collect::<Vec<_>>();
+                    if lines.is_empty() {
+                        lines.push("No supported audio files were discovered.".to_owned());
+                    }
+                    self.import_ui = None;
+                    self.lifecycle_msg =
+                        Some("Import scan found no supported audio files.".to_owned());
+                    self.open_info("Import scan results", lines);
+                    return;
+                }
+                plan.candidates
+                    .iter_mut()
+                    .for_each(|candidate| candidate.set_decision(ImportDecision::ImportNew));
+                if let Some(ui) = self.import_ui.as_mut() {
+                    ui.selected = plan
+                        .candidates
+                        .iter()
+                        .position(|candidate| candidate.decision() != ImportDecision::Skip)
+                        .unwrap_or(0);
+                    ui.scroll = 0;
+                    ui.plan = Some(plan);
+                    ui.error = None;
+                }
+                self.mode = Mode::ImportReview;
+                self.lifecycle_msg = Some(
+                    "Review the discovered candidates; no files have been copied yet.".to_owned(),
+                );
+            }
+            ImportWorkerMessage::Prepared(prepared) => {
+                let prepared = *prepared;
+                let plan = self.import_ui.as_mut().and_then(|ui| ui.plan.take());
+                if prepared.cancelled {
+                    self.import_ui = None;
+                    self.mode = Mode::Normal;
+                    self.lifecycle_msg =
+                        Some("Import cancelled during preparation; no catalogue changes were made and unpublished copies were removed.".to_owned());
+                    return;
+                }
+                let Some(plan) = plan else {
+                    self.import_ui = None;
+                    self.mode = Mode::Normal;
+                    self.lifecycle_msg = Some("The reviewed import plan was lost.".to_owned());
+                    return;
+                };
+                self.import_ui = None;
+                match self.controller.apply_import_plan(&plan, &prepared) {
+                    Ok(report) => {
+                        let summary = format!(
+                            "Import complete: {} new, {} updated, {} skipped, {} failed, {} discovery issue(s).",
+                            report.imported,
+                            report.updated,
+                            report.skipped,
+                            report.failed,
+                            plan.issues.len()
+                        );
+                        let mut details = plan
+                            .issues
+                            .iter()
+                            .map(|issue| format!("{} — {}", issue.path().display(), issue.reason()))
+                            .collect::<Vec<_>>();
+                        details.extend(
+                            report
+                                .items
+                                .iter()
+                                .filter(|item| item.state == flux_app::ImportItemState::Failed)
+                                .map(|item| item.message.clone()),
+                        );
+                        if details.is_empty() {
+                            self.lifecycle_msg = Some(summary);
+                            self.mode = Mode::Normal;
+                        } else {
+                            self.lifecycle_msg = Some(summary.clone());
+                            details.insert(0, summary);
+                            self.open_info("Import results", details);
+                        }
+                    }
+                    Err(error) => {
+                        self.mode = Mode::Normal;
+                        self.lifecycle_msg = Some(error);
+                    }
+                }
+            }
+        }
+    }
+
+    fn import_progress_snapshot(&self) -> ImportProgress {
+        self.import_ui
+            .as_ref()
+            .and_then(|ui| ui.progress.lock().ok().map(|progress| progress.clone()))
+            .unwrap_or_default()
+    }
+
+    fn toggle_import_decision(&mut self) {
+        let Some(ui) = self.import_ui.as_mut() else {
+            return;
+        };
+        let Some(candidate) = ui
+            .plan
+            .as_mut()
+            .and_then(|plan| plan.candidates.get_mut(ui.selected))
+        else {
+            return;
+        };
+        match candidate.decision() {
+            ImportDecision::ImportNew | ImportDecision::UpdateExisting => {
+                candidate.set_decision(ImportDecision::Skip);
+            }
+            ImportDecision::Skip => candidate.set_decision(ImportDecision::ImportNew),
+        }
+    }
+
+    fn toggle_import_update(&mut self) {
+        let Some(ui) = self.import_ui.as_mut() else {
+            return;
+        };
+        let Some(candidate) = ui
+            .plan
+            .as_mut()
+            .and_then(|plan| plan.candidates.get_mut(ui.selected))
+        else {
+            return;
+        };
+        if candidate.status().can_update_metadata() && candidate.existing_match().is_some() {
+            candidate.set_decision(match candidate.decision() {
+                ImportDecision::UpdateExisting => ImportDecision::Skip,
+                _ => ImportDecision::UpdateExisting,
+            });
+        } else {
+            ui.error = Some(
+                "This candidate has no unique exact-audio match to update. Use Import or Skip."
+                    .to_owned(),
+            );
+        }
+    }
+
+    fn bulk_import_decision(&mut self, decision: ImportDecision) {
+        let Some(ui) = self.import_ui.as_mut() else {
+            return;
+        };
+        let Some(plan) = ui.plan.as_mut() else {
+            return;
+        };
+        for candidate in &mut plan.candidates {
+            let allowed = match decision {
+                ImportDecision::ImportNew => true,
+                ImportDecision::UpdateExisting => {
+                    candidate.status().can_update_metadata() && candidate.existing_match().is_some()
+                }
+                ImportDecision::Skip => true,
+            };
+            candidate.set_decision(if allowed {
+                decision
+            } else {
+                ImportDecision::Skip
+            });
+        }
+        ui.error = None;
+    }
+
+    fn prepare_reviewed_import(&mut self) {
+        let Some(ui) = self.import_ui.as_mut() else {
+            return;
+        };
+        let Some(plan) = ui.plan.clone() else {
+            return;
+        };
+        if !plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.decision() != ImportDecision::Skip)
+        {
+            ui.error = Some("Select at least one candidate to import or update.".to_owned());
+            return;
+        }
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_progress = Arc::clone(&progress);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            let prepared = prepare_import_files(&plan, worker_progress, worker_cancel);
+            let _ = tx.send(ImportWorkerMessage::Prepared(Box::new(prepared)));
+        });
+        ui.progress = progress;
+        ui.cancel = cancel;
+        ui.rx = rx;
+        ui.worker = Some(worker);
+        ui.error = None;
+        self.mode = Mode::ImportPreparing;
+        self.lifecycle_msg = Some("Preparing copies; catalogue has not changed yet.".to_owned());
+    }
+
+    /// Cancels and joins any in-flight import worker. Called on quit.
+    fn stop_import_worker(&mut self) {
+        if let Some(ui) = self.import_ui.as_mut() {
+            ui.cancel.store(true, Ordering::Release);
+            if let Some(worker) = ui.worker.take() {
+                let _ = worker.join();
+            }
+        }
+        self.import_ui = None;
+        if matches!(
+            self.mode,
+            Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing
+        ) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn close_import_review(&mut self) {
+        if matches!(self.mode, Mode::ImportScanning | Mode::ImportPreparing) {
+            if let Some(ui) = self.import_ui.as_mut() {
+                ui.cancel.store(true, Ordering::Release);
+            }
+            self.lifecycle_msg =
+                Some("Cancelling import; waiting for the worker to release files…".to_owned());
+            return;
+        }
+        self.import_ui = None;
+        self.mode = Mode::Normal;
+        self.lifecycle_msg = Some(
+            "Import review closed; no files were copied and no catalogue changes were made."
+                .to_owned(),
+        );
+    }
+
+    fn handle_import_progress_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if ctrl_c || key.code == KeyCode::Char('q') {
+            self.stop_import_worker();
+            return true;
+        }
+        if key.code == KeyCode::Esc {
+            self.close_import_review();
+        }
+        false
+    }
+
+    fn handle_import_review_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if ctrl_c || key.code == KeyCode::Char('q') {
+            self.import_ui = None;
+            self.mode = Mode::Normal;
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => self.close_import_review(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(ui) = self.import_ui.as_mut() {
+                    ui.selected = ui.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(ui) = self.import_ui.as_mut() {
+                    let max = ui
+                        .plan
+                        .as_ref()
+                        .map_or(0, |plan| plan.candidates.len().saturating_sub(1));
+                    ui.selected = (ui.selected + 1).min(max);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(ui) = self.import_ui.as_mut() {
+                    ui.selected = ui.selected.saturating_sub(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(ui) = self.import_ui.as_mut() {
+                    let max = ui
+                        .plan
+                        .as_ref()
+                        .map_or(0, |plan| plan.candidates.len().saturating_sub(1));
+                    ui.selected = (ui.selected + 10).min(max);
+                }
+            }
+            KeyCode::Char(' ') => self.toggle_import_decision(),
+            KeyCode::Char('u') => self.toggle_import_update(),
+            KeyCode::Char('a') => self.bulk_import_decision(ImportDecision::ImportNew),
+            KeyCode::Char('s') => self.bulk_import_decision(ImportDecision::Skip),
+            KeyCode::Enter | KeyCode::Char('y') => self.prepare_reviewed_import(),
+            _ => {}
+        }
+        false
+    }
+
+    fn draw_import_view(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let progress = self.import_progress_snapshot();
+        if matches!(self.mode, Mode::ImportScanning | Mode::ImportPreparing) {
+            let stage = match progress.stage {
+                ImportStage::Discovering => "Discovering files",
+                ImportStage::ReadingMetadata => "Reading local metadata",
+                ImportStage::DetectingDuplicates => "Checking duplicates",
+                ImportStage::Copying => "Copying selected files",
+                ImportStage::WritingCatalogue => "Publishing catalogue",
+                ImportStage::Completed => "Completed",
+                ImportStage::Cancelled => "Cancelled",
+                ImportStage::Failed => "Failed",
+                ImportStage::Idle => "Preparing",
+            };
+            let title = format!(
+                "{stage} · {}/{} · Esc cancel · q quit",
+                progress.done, progress.total
+            );
+            self.line(out, top as u16, &title, width, true)?;
+            let bar_width = width.saturating_sub(12).max(1);
+            let filled = (progress.done.min(progress.total) * bar_width)
+                .checked_div(progress.total)
+                .unwrap_or(0);
+            let bar = format!(
+                "[{}{}]",
+                "#".repeat(filled),
+                "-".repeat(bar_width.saturating_sub(filled))
+            );
+            self.line(out, (top + 1) as u16, &bar, width, false)?;
+            if height > 1 {
+                self.line(out, (top + 2) as u16, &progress.message, width, false)?;
+            }
+            if let Some(ui) = self.import_ui.as_ref()
+                && let Some(error) = &ui.error
+                && height > 2
+            {
+                self.line(out, (top + 3) as u16, error, width, false)?;
+            }
+            return Ok(());
+        }
+        let (count, rows, error) = {
+            let Some(ui) = self.import_ui.as_mut() else {
+                return Ok(());
+            };
+            let Some(plan) = ui.plan.as_ref() else {
+                return Ok(());
+            };
+            let count = plan.candidates.len();
+            ui.selected = ui.selected.min(count.saturating_sub(1));
+            if ui.selected < ui.scroll {
+                ui.scroll = ui.selected;
+            }
+            if ui.selected >= ui.scroll + height {
+                ui.scroll = ui.selected + 1 - height;
+            }
+            ui.scroll = ui.scroll.min(count.saturating_sub(height));
+            let rows_height = height.saturating_sub(1);
+            let rows = plan.candidates[ui.scroll.min(count)..count.min(ui.scroll + rows_height)]
+                .iter()
+                .enumerate()
+                .map(|(row, candidate)| {
+                    let index = ui.scroll + row;
+                    let marker = match candidate.decision() {
+                        ImportDecision::ImportNew => "[import]",
+                        ImportDecision::UpdateExisting => "[update]",
+                        ImportDecision::Skip => "[ skip ]",
+                    };
+                    let album = candidate
+                        .album()
+                        .map(|album| format!(" · {album}"))
+                        .unwrap_or_else(|| " · standalone".to_owned());
+                    let status = match candidate.status() {
+                        CandidateStatus::New => String::new(),
+                        CandidateStatus::ExistingPath(_) => " · same path".to_owned(),
+                        CandidateStatus::SameContent { .. } => " · same audio".to_owned(),
+                        CandidateStatus::SimilarMetadata(_) => " · similar metadata".to_owned(),
+                        CandidateStatus::SameTitleDifferentAudio(_) => {
+                            " · different audio".to_owned()
+                        }
+                        CandidateStatus::ProbableAudio(_) => " · probable audio".to_owned(),
+                        CandidateStatus::AmbiguousAudio(_) => " · ambiguous audio".to_owned(),
+                    };
+                    (
+                        index == ui.selected,
+                        format!(
+                            "{} {marker} {} — {}{album}{status}",
+                            if index == ui.selected { ">" } else { " " },
+                            candidate.title(),
+                            candidate.artist_name().unwrap_or("Unknown Artist")
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (count, rows, ui.error.clone())
+        };
+        let title = format!(
+            "IMPORT REVIEW · {count} candidate(s) · Space include · u update · a all · s skip · y prepare · Esc cancel"
+        );
+        self.line(out, top as u16, &title, width, true)?;
+        for (row, (selected, text)) in rows.into_iter().enumerate() {
+            let y = (top + 1 + row) as u16;
+            if selected {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        if let Some(error) = error
+            && height > 0
+        {
+            self.line(out, (top + height) as u16, &error, width, false)?;
+        }
+        Ok(())
+    }
+
     fn event_loop(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         loop {
+            self.poll_import_worker();
             self.controller.poll();
             self.draw(out)?;
             // Windows terminals report key releases too; act only on
@@ -504,6 +1050,10 @@ impl Tui {
         match self.mode {
             Mode::InfoView => return self.handle_info_key(key, ctrl_c),
             Mode::QueueView => return self.handle_queue_view_key(key, ctrl_c),
+            Mode::ImportScanning | Mode::ImportPreparing => {
+                return self.handle_import_progress_key(key, ctrl_c);
+            }
+            Mode::ImportReview => return self.handle_import_review_key(key, ctrl_c),
             _ => {}
         }
         if self.mode != Mode::Normal {
@@ -600,12 +1150,10 @@ impl Tui {
             }
             KeyCode::Char('i') => {
                 self.mode = Mode::ImportInput;
-                self.import_copy = true;
                 self.input.clear();
             }
             KeyCode::Char('I') => {
                 self.mode = Mode::ImportInput;
-                self.import_copy = true;
                 self.input.clear();
             }
             KeyCode::Char('e') => {
@@ -1291,18 +1839,8 @@ impl Tui {
                             self.lifecycle_msg =
                                 Some("No folder path entered; nothing was scanned.".to_owned());
                         } else {
-                            match self.controller.import_folder(Path::new(path), true) {
-                                Ok(report) => {
-                                    self.lifecycle_msg =
-                                        Some(import_summary("Folder import", &report));
-                                    if !report.issues.is_empty() {
-                                        self.open_info(
-                                            "Folder import results",
-                                            import_detail_lines("Folder import", &report),
-                                        );
-                                        next = Mode::InfoView;
-                                    }
-                                }
+                            match self.start_import_review(vec![PathBuf::from(path)], true) {
+                                Ok(()) => next = self.mode,
                                 Err(err) => {
                                     self.lifecycle_msg =
                                         Some(format!("Folder import failed: {err}"));
@@ -1325,18 +1863,8 @@ impl Tui {
                             self.lifecycle_msg =
                                 Some("Enter at least one audio file path.".to_owned());
                         } else {
-                            match self.controller.import_files(&paths, self.import_copy) {
-                                Ok(report) => {
-                                    self.lifecycle_msg =
-                                        Some(import_summary("File import", &report));
-                                    if !report.issues.is_empty() {
-                                        self.open_info(
-                                            "File import results",
-                                            import_detail_lines("File import", &report),
-                                        );
-                                        next = Mode::InfoView;
-                                    }
-                                }
+                            match self.start_import_review(paths, false) {
+                                Ok(()) => next = self.mode,
                                 Err(err) => {
                                     self.lifecycle_msg = Some(format!("File import failed: {err}"));
                                 }
@@ -1480,6 +2008,9 @@ impl Tui {
                     | Mode::LyricsView
                     | Mode::InfoView
                     | Mode::QueueView
+                    | Mode::ImportScanning
+                    | Mode::ImportReview
+                    | Mode::ImportPreparing
                     | Mode::ConfirmPreserveIndex
                     | Mode::ConfirmAcknowledgeRecovery => {}
                 }
@@ -1690,7 +2221,12 @@ impl Tui {
         if !detail_view_fits(height)
             && matches!(
                 self.mode,
-                Mode::InfoView | Mode::QueueView | Mode::LyricsView
+                Mode::InfoView
+                    | Mode::QueueView
+                    | Mode::LyricsView
+                    | Mode::ImportScanning
+                    | Mode::ImportReview
+                    | Mode::ImportPreparing
             )
         {
             self.line(
@@ -1711,6 +2247,7 @@ impl Tui {
             Mode::QueueView => "queue",
             Mode::InfoView => "help/info",
             Mode::LyricsView => "lyrics",
+            Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing => "import",
             Mode::Normal => "tracks",
             _ => "input",
         };
@@ -1854,6 +2391,11 @@ impl Tui {
             {
                 self.line(out, (list_top + 1 + row) as u16, line, width, false)?;
             }
+        } else if matches!(
+            self.mode,
+            Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing
+        ) {
+            self.draw_import_view(out, list_top, detail_height, width)?;
         } else {
             // Track list.
             if rows.is_empty() {
@@ -1961,6 +2503,13 @@ impl Tui {
             }
             Mode::LyricsView => {
                 "Lyrics read-only — ↑/↓ scroll · PgUp/PgDn · Esc back · q quits.".to_owned()
+            }
+            Mode::ImportScanning | Mode::ImportPreparing => {
+                "Import worker running — Esc cancels · q quits after the worker stops.".to_owned()
+            }
+            Mode::ImportReview => {
+                "Review — ↑/↓ select · Space include · u update · a all · s skip · y/Enter prepare · Esc cancel"
+                    .to_owned()
             }
             Mode::ConfirmPreserveIndex => {
                 "Preserve and replace protected index? y confirms; any other key cancels."
@@ -2296,6 +2845,10 @@ fn cancel_message(mode: Mode) -> Option<&'static str> {
         Mode::ScanInput => Some("Scan cancelled; no folder was scanned."),
         Mode::SearchInput => Some("Search input cancelled; the previous filter is unchanged."),
         Mode::ImportInput => Some("Import cancelled; no files were imported."),
+        Mode::ImportScanning | Mode::ImportPreparing => {
+            Some("Import cancelled; no catalogue changes were made.")
+        }
+        Mode::ImportReview => Some("Import review closed; nothing was copied or published."),
         Mode::TrackEditInput => Some("Track edit cancelled; no changes were made."),
         Mode::ArtistCreateInput => Some("Artist creation cancelled."),
         Mode::ArtistRenameInput => Some("Artist rename cancelled; no changes were made."),
@@ -2367,7 +2920,11 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "Ctrl+↑/↓ reorder selected entry; duplicate tracks remain distinct by #entry id".to_owned(),
         String::new(),
         "CATALOGUE".to_owned(),
-        "o scan folder · i/I copy-import files · r refresh".to_owned(),
+        "o import a folder · i/I import files · r refresh".to_owned(),
+        "Imports open a cancellable discovery/review phase before any copy.".to_owned(),
+        "Review: Space include · u update exact duplicate · a/s bulk · y prepare.".to_owned(),
+        "Esc cancels discovery or copy; nothing is published until preparation finishes."
+            .to_owned(),
         "e edit selected metadata · y read managed lyrics".to_owned(),
         "H local history · D selected Track membership · E Album/standalone relationships"
             .to_owned(),
@@ -2382,9 +2939,10 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "B legacy runtime switching is disabled; use M instead".to_owned(),
         String::new(),
         "SAFETY AND LIMITS".to_owned(),
-        "Imports are synchronous quick copy operations; there is no TUI cancel/review phase."
+        "TUI import review supports decisions only; rich metadata/artwork editing is GUI-only."
             .to_owned(),
-        "All per-path import issues are shown in a scrollable result panel.".to_owned(),
+        "Discovery, hashing and copy preparation are cancellable; the final atomic publish is not."
+            .to_owned(),
         "Missing resources are retained; inaccessible paths are not treated as missing.".to_owned(),
         "The TUI never deletes external audio and never deletes library tracks.".to_owned(),
         "Track deletion, audio/artwork/lyrics repair, ownership/album/artist transfer,".to_owned(),
@@ -2436,6 +2994,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 
     let mut tui = Tui {
         controller,
+        import_ui: None,
         cursor: 0,
         offset: 0,
         mode: if initial_info.is_some() {
@@ -2463,13 +3022,13 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         pending_plan: None,
         migrated_dest: None,
         lifecycle_msg: initial_import,
-        import_copy: true,
         last_reconcile: None,
     };
     let mut stdout = std::io::stdout();
     let result = tui.event_loop(&mut stdout);
 
     drop(guard);
+    tui.stop_import_worker();
     tui.controller.shutdown();
     result
 }
@@ -2482,6 +3041,7 @@ mod tests {
         terminal_too_small, truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use flux_app::ImportDecision;
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2523,6 +3083,7 @@ mod tests {
                 Some(dir.path().join("library-index.json")),
             )
             .expect("controller opens the test library"),
+            import_ui: None,
             cursor: 0,
             offset: 0,
             mode: Mode::Normal,
@@ -2542,7 +3103,6 @@ mod tests {
             pending_plan: None,
             migrated_dest: None,
             lifecycle_msg: None,
-            import_copy: true,
             last_reconcile: None,
         }
     }
@@ -2566,6 +3126,60 @@ mod tests {
             key(tui, KeyCode::Char(c));
         }
         key(tui, KeyCode::Enter);
+    }
+
+    fn wait_for_mode(tui: &mut Tui, mode: Mode) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            tui.poll_import_worker();
+            if tui.mode == mode {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "import worker did not reach {mode:?}: {:?}",
+            tui.lifecycle_msg
+        );
+    }
+
+    fn wait_for_tracks(tui: &mut Tui, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            tui.poll_import_worker();
+            if tui.controller.tracks().len() == count {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "import did not publish {count} track(s): {:?}",
+            tui.lifecycle_msg
+        );
+    }
+
+    fn wait_for_import_done(tui: &mut Tui) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            tui.poll_import_worker();
+            if !matches!(
+                tui.mode,
+                Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing
+            ) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "import did not finish: mode {:?}, message {:?}",
+            tui.mode, tui.lifecycle_msg
+        );
+    }
+
+    fn finish_import(tui: &mut Tui) {
+        wait_for_mode(tui, Mode::ImportReview);
+        key(tui, KeyCode::Char('y'));
+        wait_for_import_done(tui);
     }
 
     #[test]
@@ -2720,13 +3334,23 @@ mod tests {
 
         key(&mut tui, KeyCode::Char('i'));
         assert_eq!(tui.mode, Mode::ImportInput);
-        assert!(tui.import_copy);
         type_path(&mut tui, &source);
-        assert_eq!(tui.controller.tracks().len(), 1);
+        wait_for_mode(&mut tui, Mode::ImportReview);
+        assert_eq!(tui.mode, Mode::ImportReview);
+        assert_eq!(
+            tui.import_ui
+                .as_ref()
+                .and_then(|ui| ui.plan.as_ref())
+                .map(|plan| plan.candidates.len()),
+            Some(1)
+        );
+        key(&mut tui, KeyCode::Char('y'));
+        wait_for_tracks(&mut tui, 1);
+        assert_eq!(tui.mode, Mode::Normal);
         let id = tui.controller.tracks()[0].0;
         let artist = tui.controller.track_artist_id(id).expect("inferred artist");
         let source_message = tui.lifecycle_msg.clone().expect("import summary");
-        assert!(source_message.contains("1 added"), "{source_message}");
+        assert!(source_message.contains("1 new"), "{source_message}");
 
         key(&mut tui, KeyCode::Char('f'));
         assert!(
@@ -2840,8 +3464,125 @@ mod tests {
         std::fs::write(&outside, different).expect("outside");
         key(&mut tui, KeyCode::Char('I'));
         type_path(&mut tui, &outside);
+        finish_import(&mut tui);
         assert_eq!(tui.controller.tracks().len(), 2);
         assert!(outside.is_file(), "source is never moved or deleted");
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_import_review_skips_without_copying_and_cancels_discovery() {
+        let dir = TempDir::new("tui-import-review");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source_dir = dir.path().join("Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let before = std::fs::read(&source).expect("source bytes");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &source);
+        wait_for_mode(&mut tui, Mode::ImportReview);
+        key(&mut tui, KeyCode::Char('s'));
+        assert!(
+            tui.import_ui
+                .as_ref()
+                .and_then(|ui| ui.plan.as_ref())
+                .is_some_and(|plan| plan
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.decision() == ImportDecision::Skip))
+        );
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(
+            tui.mode,
+            Mode::ImportReview,
+            "preparing nothing is rejected in review"
+        );
+        assert_eq!(tui.controller.tracks().len(), 0);
+        assert_eq!(std::fs::read(&source).expect("source"), before);
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+        assert_eq!(tui.controller.tracks().len(), 0);
+
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &source);
+        key(&mut tui, KeyCode::Esc);
+        wait_for_import_done(&mut tui);
+        assert_eq!(tui.controller.tracks().len(), 0);
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("cancelled")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
+        tui.stop_import_worker();
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_import_review_updates_an_exact_duplicate_without_duplicating_it() {
+        let dir = TempDir::new("tui-import-update");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source_dir = dir.path().join("Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &source);
+        finish_import(&mut tui);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        let id = tui.controller.tracks()[0].0;
+        let managed = tui
+            .controller
+            .track(id)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &managed);
+        wait_for_mode(&mut tui, Mode::ImportReview);
+        assert!(
+            tui.import_ui
+                .as_ref()
+                .and_then(|ui| ui.plan.as_ref())
+                .and_then(|plan| plan.candidates.first())
+                .is_some_and(|candidate| candidate.status().can_update_metadata())
+        );
+        key(&mut tui, KeyCode::Char('u'));
+        assert!(
+            tui.import_ui
+                .as_ref()
+                .and_then(|ui| ui.plan.as_ref())
+                .and_then(|plan| plan.candidates.first())
+                .is_some_and(|candidate| candidate.decision() == ImportDecision::UpdateExisting)
+        );
+        key(&mut tui, KeyCode::Char('y'));
+        wait_for_import_done(&mut tui);
+        assert_eq!(tui.controller.tracks().len(), 1, "no duplicate TrackId");
+        assert_eq!(
+            tui.controller.tracks()[0].0,
+            id,
+            "the existing stable identity is preserved"
+        );
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("1 updated")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
         tui.controller.shutdown();
     }
 
@@ -2861,6 +3602,7 @@ mod tests {
         assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
         key(&mut tui, KeyCode::Char('I'));
         type_path(&mut tui, &source);
+        finish_import(&mut tui);
         assert_eq!(tui.controller.tracks().len(), 1);
         let id = tui.controller.tracks()[0].0;
         let audio = tui
@@ -3194,7 +3936,8 @@ mod tests {
         assert!(help.contains("SAFETY AND LIMITS"), "{help}");
         assert!(help.contains("device selection are GUI-only"), "{help}");
         assert!(help.contains("GUI review workflows"), "{help}");
-        assert!(help.contains("synchronous quick copy"), "{help}");
+        assert!(help.contains("cancellable discovery/review"), "{help}");
+        assert!(help.contains("final atomic publish is not"), "{help}");
         key(&mut tui, KeyCode::Down);
         assert_eq!(tui.info_scroll, 1);
         key(&mut tui, KeyCode::Esc);
@@ -3318,18 +4061,18 @@ mod tests {
             &format!("{};{}", source.display(), missing.display()),
         );
 
+        finish_import(&mut tui);
         assert_eq!(tui.controller.tracks().len(), 1);
         assert_eq!(tui.mode, Mode::InfoView);
         let summary = tui.lifecycle_msg.as_deref().expect("summary");
-        assert!(summary.contains("1 added"), "{summary}");
-        assert!(summary.contains("1 issue"), "{summary}");
+        assert!(summary.contains("1 new"), "{summary}");
+        assert!(summary.contains("1 discovery issue"), "{summary}");
         let details = tui.info_lines.join("\n");
-        assert!(details.contains("Per-path issues (1)"), "{details}");
         assert!(
             details.contains(&missing.display().to_string()),
             "{details}"
         );
-        assert_eq!(tui.info_title, "File import results");
+        assert_eq!(tui.info_title, "Import results");
         key(&mut tui, KeyCode::Esc);
         assert_eq!(tui.mode, Mode::Normal);
         tui.controller.shutdown();
@@ -3349,25 +4092,25 @@ mod tests {
         type_path(&mut tui, &root);
         key(&mut tui, KeyCode::Char('o'));
         type_path(&mut tui, &folder);
+        finish_import(&mut tui);
         assert_eq!(tui.controller.tracks().len(), 1);
         assert_eq!(tui.mode, Mode::InfoView);
         let details = tui.info_lines.join("\n");
         assert!(details.contains("notes.txt"), "{details}");
-        assert!(details.contains("Per-path issues"), "{details}");
         key(&mut tui, KeyCode::Esc);
 
         let missing = dir.path().join("does-not-exist");
         key(&mut tui, KeyCode::Char('o'));
         type_path(&mut tui, &missing);
-        assert_eq!(tui.mode, Mode::Normal);
-        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
+        wait_for_mode(&mut tui, Mode::InfoView);
         assert!(
             tui.lifecycle_msg
                 .as_deref()
-                .is_some_and(|message| message.contains("Folder import failed")),
+                .is_some_and(|message| message.contains("no supported audio files")),
             "{:?}",
             tui.lifecycle_msg
         );
+        assert_eq!(tui.controller.storage_mode(), StorageMode::Canonical);
         tui.controller.shutdown();
     }
 
@@ -3385,6 +4128,7 @@ mod tests {
         type_path(&mut tui, &root);
         key(&mut tui, KeyCode::Char('i'));
         type_path(&mut tui, &source);
+        finish_import(&mut tui);
         tui.search = "not present".to_owned();
         assert!(tui.empty_rows_message().contains("current search"));
         tui.favorites_only = true;

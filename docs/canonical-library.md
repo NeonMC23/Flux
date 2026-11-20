@@ -191,12 +191,15 @@ and Ctrl+Up/Down reorders that entry with its identity preserved. The track view
 still supports append/play-next/remove-current/reorder-current; deletion only
 removes queue entries, never catalogue tracks or audio files.
 
-Quick TUI imports remain synchronous copy-only operations with no review or
-cancel phase. Folder and file imports report added/updated/already-indexed/
-copied/issue counts. If any per-path issue exists, the TUI opens a scrollable
-result panel listing every issue path/reason; it never silently converts a
-partial or failed import into success. H1 decoder preflight, fingerprints,
-canonical transaction rules and Controller report semantics are unchanged.
+TUI imports open a cancellable discovery/review phase before any copy. The
+review lists every candidate with its import/update/skip decision and duplicate
+status; Space toggles one candidate, `u` selects a unique exact-audio update,
+`a`/`s` apply a bulk decision, and `y`/Enter starts cancellable copy preparation.
+Esc cancels discovery or preparation; the catalogue publishes only after the
+worker finishes. Per-path discovery failures are retained and shown in a
+scrollable result panel. Rich metadata, artwork and lyrics editing remains
+GUI-only. H1 decoder preflight, fingerprints, canonical transaction rules and
+Controller report semantics are unchanged.
 
 `U` (preserve/replace protected legacy index) and `A` (acknowledge portable
 recovery by restoring the catalogue backup) require explicit `y` confirmation;
@@ -2197,8 +2200,9 @@ cleanup.
    and cooperative cancellation.
 9. Cross-platform native behavior and real GUI migration were not runtime
    verified in this stage.
-10. Fixed-target album import is exposed in the GUI only; the TUI retains general
-    quick import and has no target-selection review flow.
+10. The TUI import review supports candidate import/update/skip decisions only;
+    fixed-target album selection and rich metadata/artwork/lyrics editing remain
+    GUI-only.
 11. Atomic import reuses exact and unique case/whitespace-normalized Artist and
     Album names. Approximate/fuzzy matching is deliberately not performed;
     ambiguous normalized names require explicit review.
@@ -2273,10 +2277,11 @@ cleanup.
     to follow, but a path that disappears before enumeration cannot be named;
     refresh and the authoritative H1 planning/preparation checks remain the
     safety boundary.
-29. The TUI remains a quick synchronous importer: it has no candidate review,
-    target-album selection, preparation progress, or in-flight cancellation.
-    Per-path failures are retained and shown, but users needing those controls
-    must use the GUI Import Manager.
+29. The TUI import review does not expose fixed-target Album selection, rich
+    metadata/artwork/lyrics editing, or per-candidate release type. Discovery,
+    hashing and copy preparation are cancellable; the final atomic catalogue
+    publish is synchronous. Users needing the full editor must use the GUI
+    Import Manager.
 30. TUI track deletion, audio/artwork/lyrics repair, ownership and album/artist
     transfer, playlists, batch actions and global filters remain GUI-only. The
     TUI does not expose a queue clear/bulk-removal operation.
