@@ -1165,6 +1165,14 @@ fn artwork_key(owner: ArtworkOwner, path: PathBuf) -> ArtworkKey {
     }
 }
 
+fn preview_handle(path: &Path) -> Result<ImageHandle, String> {
+    decode_artwork(&artwork_key(
+        ArtworkOwner::Album(AlbumId::new(0)),
+        path.to_path_buf(),
+    ))
+    .map(|data| data.handle)
+}
+
 fn decode_artwork(key: &ArtworkKey) -> Result<ArtworkData, String> {
     const MAX_BYTES: u64 = 32 * 1024 * 1024;
     const MAX_DIMENSION: u32 = 4096;
@@ -1908,6 +1916,7 @@ struct TrackEditor {
     replacement_plan: Option<TrackAudioReplacementPlan>,
     artwork_input: String,
     artwork_picked: Option<PathBuf>,
+    artwork_preview: Option<ImageHandle>,
     artwork_remove_confirm: bool,
     deletion_plan: Option<TrackDeletionPlan>,
     move_destination: Option<AlbumChoice>,
@@ -2210,6 +2219,7 @@ struct FluxReady {
     album_type: ReleaseType,
     album_cover_input: String,
     album_cover_picked: Option<PathBuf>,
+    album_cover_preview: Option<ImageHandle>,
     album_delete_confirm: bool,
     album_cover_remove_confirm: bool,
     artwork: BTreeMap<AlbumId, ArtworkEntry>,
@@ -2221,6 +2231,7 @@ struct FluxReady {
     artist_aliases_input: String,
     artist_image_input: String,
     artist_image_picked: Option<PathBuf>,
+    artist_image_preview: Option<ImageHandle>,
     artist_image_remove_confirm: bool,
     last_reconcile: Option<ReconcileReport>,
     migrate_source: String,
@@ -2315,6 +2326,7 @@ enum Message {
     AlbumCoverChoose,
     AlbumCoverPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     AlbumCoverApply,
+    AlbumCoverPreview,
     AlbumCoverRemove,
     ArtistDetailNameChanged(String),
     ArtistDescriptionChanged(String),
@@ -2324,11 +2336,13 @@ enum Message {
     ArtistImageChoose,
     ArtistImagePicked(u64, Result<Option<Vec<PathBuf>>, String>),
     ArtistImageApply,
+    ArtistImagePreview,
     ArtistImageRemove,
     TrackArtworkChanged(String),
     TrackArtworkChoose,
     TrackArtworkPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     TrackArtworkApply,
+    TrackArtworkPreview,
     TrackArtworkRemove,
     ArtworkLoaded(u64, ArtworkKey, Result<ArtworkData, String>),
     AlbumTrackMove(TrackId, isize),
@@ -2669,6 +2683,7 @@ impl FluxReady {
             album_type: ReleaseType::Album,
             album_cover_input: String::new(),
             album_cover_picked: None,
+            album_cover_preview: None,
             album_delete_confirm: false,
             album_cover_remove_confirm: false,
             artwork: BTreeMap::new(),
@@ -2680,6 +2695,7 @@ impl FluxReady {
             artist_aliases_input: String::new(),
             artist_image_input: String::new(),
             artist_image_picked: None,
+            artist_image_preview: None,
             artist_image_remove_confirm: false,
             last_reconcile: None,
             migrate_source: String::new(),
@@ -2762,6 +2778,7 @@ impl FluxReady {
         self.album_title_input.clear();
         self.album_cover_input.clear();
         self.album_cover_picked = None;
+        self.album_cover_preview = None;
         self.album_delete_confirm = false;
         self.album_cover_remove_confirm = false;
         self.playlist_create_open = false;
@@ -2789,6 +2806,7 @@ impl FluxReady {
         self.artist_aliases_input.clear();
         self.artist_image_input.clear();
         self.artist_image_picked = None;
+        self.artist_image_preview = None;
         self.artist_image_remove_confirm = false;
         *self.dashboard_cache.borrow_mut() = None;
         self.scope.reset();
@@ -3009,6 +3027,7 @@ impl FluxReady {
         self.artist_aliases_input.clear();
         self.artist_image_input.clear();
         self.artist_image_picked = None;
+        self.artist_image_preview = None;
         self.artist_image_remove_confirm = false;
         let Some(id) = self.selected_artist_id() else {
             return;
@@ -3032,6 +3051,7 @@ impl FluxReady {
             self.album_title_input.clear();
             self.album_cover_input.clear();
             self.album_cover_picked = None;
+            self.album_cover_preview = None;
             self.album_type = ReleaseType::Album;
             return;
         };
@@ -3042,6 +3062,7 @@ impl FluxReady {
         self.album_type = album.release_type;
         self.album_cover_input.clear();
         self.album_cover_picked = None;
+        self.album_cover_preview = None;
     }
 
     fn sync_deletion_defaults(&mut self) {
@@ -3149,6 +3170,7 @@ impl FluxReady {
             replacement_plan: None,
             artwork_input: String::new(),
             artwork_picked: None,
+            artwork_preview: None,
             artwork_remove_confirm: false,
             deletion_plan: None,
             move_destination: None,
@@ -4755,6 +4777,7 @@ impl FluxReady {
             Message::AlbumCoverChanged(value) => {
                 self.album_cover_input = value;
                 self.album_cover_picked = None;
+                self.album_cover_preview = None;
             }
             Message::AlbumCoverChoose => {
                 let start = self
@@ -4814,6 +4837,29 @@ impl FluxReady {
                     }
                 }
             }
+            Message::AlbumCoverPreview => {
+                let path = self
+                    .album_cover_picked
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(self.album_cover_input.trim()));
+                if path.as_os_str().is_empty() {
+                    self.lifecycle_msg = Some("Choose a cover image path first.".to_owned());
+                    self.album_cover_preview = None;
+                    return Task::none();
+                }
+                match preview_handle(&path) {
+                    Ok(handle) => {
+                        self.album_cover_preview = Some(handle);
+                        self.lifecycle_msg = Some(
+                            "Cover preview ready; it is not published until Apply.".to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        self.album_cover_preview = None;
+                        self.lifecycle_msg = Some(format!("Cover preview failed: {error}"));
+                    }
+                }
+            }
             Message::AlbumCoverApply => {
                 let Some(album) = self.selected_album_id() else {
                     return Task::none();
@@ -4839,6 +4885,7 @@ impl FluxReady {
                         *self.dashboard_cache.borrow_mut() = None;
                         self.album_cover_input.clear();
                         self.album_cover_picked = None;
+                        self.album_cover_preview = None;
                         self.artwork.remove(&album);
                         self.sync_album_editor();
                         self.lifecycle_msg = Some(format!("Updated cover for album {album}."));
@@ -4904,6 +4951,7 @@ impl FluxReady {
             Message::ArtistImageChanged(value) => {
                 self.artist_image_input = value;
                 self.artist_image_picked = None;
+                self.artist_image_preview = None;
                 self.artist_image_remove_confirm = false;
             }
             Message::ArtistImageChoose => {
@@ -4929,6 +4977,30 @@ impl FluxReady {
                 Ok(None) => {}
                 Err(error) => self.lifecycle_msg = Some(error),
             },
+            Message::ArtistImagePreview => {
+                let path = self
+                    .artist_image_picked
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(self.artist_image_input.trim()));
+                if path.as_os_str().is_empty() {
+                    self.lifecycle_msg = Some("Choose an artist image path first.".to_owned());
+                    self.artist_image_preview = None;
+                    return Task::none();
+                }
+                match preview_handle(&path) {
+                    Ok(handle) => {
+                        self.artist_image_preview = Some(handle);
+                        self.lifecycle_msg = Some(
+                            "Artist image preview ready; it is not published until Assign."
+                                .to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        self.artist_image_preview = None;
+                        self.lifecycle_msg = Some(format!("Artist image preview failed: {error}"));
+                    }
+                }
+            }
             Message::ArtistImageApply => {
                 let Some(artist) = self.selected_artist_id() else {
                     return Task::none();
@@ -4952,6 +5024,7 @@ impl FluxReady {
                         self.artist_artwork.remove(&artist);
                         self.artist_image_input.clear();
                         self.artist_image_picked = None;
+                        self.artist_image_preview = None;
                         self.sync_artist_editor();
                         self.lifecycle_msg = Some(format!("Updated image for artist {artist}."));
                     }
@@ -4983,6 +5056,7 @@ impl FluxReady {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.artwork_input = value;
                     editor.artwork_picked = None;
+                    editor.artwork_preview = None;
                     editor.artwork_remove_confirm = false;
                     editor.mark_dirty();
                 }
@@ -5015,6 +5089,30 @@ impl FluxReady {
                 Ok(None) => {}
                 Err(error) => self.lifecycle_msg = Some(error),
             },
+            Message::TrackArtworkPreview => {
+                let Some(editor) = self.track_editor.as_mut() else {
+                    return Task::none();
+                };
+                let path = editor
+                    .artwork_picked
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(editor.artwork_input.trim()));
+                if path.as_os_str().is_empty() {
+                    editor.error = Some("Choose a Track artwork path first.".to_owned());
+                    editor.artwork_preview = None;
+                    return Task::none();
+                }
+                match preview_handle(&path) {
+                    Ok(handle) => {
+                        editor.artwork_preview = Some(handle);
+                        editor.error = None;
+                    }
+                    Err(error) => {
+                        editor.artwork_preview = None;
+                        editor.error = Some(format!("Track artwork preview failed: {error}"));
+                    }
+                }
+            }
             Message::TrackArtworkApply => {
                 let Some(editor) = self.track_editor.as_ref() else {
                     return Task::none();
@@ -5040,6 +5138,7 @@ impl FluxReady {
                         if let Some(editor) = self.track_editor.as_mut() {
                             editor.artwork_input.clear();
                             editor.artwork_picked = None;
+                            editor.artwork_preview = None;
                         }
                         self.lifecycle_msg =
                             Some(format!("Updated artwork override for track {track}."));
@@ -11509,6 +11608,10 @@ impl FluxReady {
                     .style(accent_button_style)
                     .padding([6, 9])
                     .on_press(Message::TrackArtworkChoose),
+                button(text("Preview").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::TrackArtworkPreview),
                 button(text("Assign / replace").size(10))
                     .style(ghost_style)
                     .padding([6, 9])
@@ -11527,6 +11630,18 @@ impl FluxReady {
             ]
             .spacing(6),
         );
+        if let Some(handle) = &editor.artwork_preview {
+            body = body.push(
+                row![
+                    artwork_image(handle, 64.0, ContentFit::Cover),
+                    text("Selected Track-artwork preview — Assign publishes it; Album fallback is unchanged until then.")
+                        .size(9)
+                        .color(MUTED),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
         match self.controller.track_artwork_resource_state(editor.id) {
             Some(ResourceState::Missing) => body = body.push(
                 text("The catalogue references a Track-artwork override that is missing. Choose a replacement or remove the override to restore Album artwork.")
@@ -14603,6 +14718,10 @@ impl FluxReady {
                             .style(accent_button_style)
                             .padding([6, 9])
                             .on_press(Message::ArtistImageChoose),
+                        button(text("Preview").size(10))
+                            .style(ghost_style)
+                            .padding([6, 9])
+                            .on_press(Message::ArtistImagePreview),
                         button(text("Assign / replace").size(10))
                             .style(ghost_style)
                             .padding([6, 9])
@@ -14625,6 +14744,20 @@ impl FluxReady {
                         ),
                     ]
                     .spacing(6),
+                    if let Some(handle) = &self.artist_image_preview {
+                        Element::from(
+                            row![
+                                artwork_image(handle, 56.0, ContentFit::Cover),
+                                text("Selected Artist image preview — Assign publishes it; nothing changed yet.")
+                                    .size(9)
+                                    .color(MUTED),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        )
+                    } else {
+                        Element::from(iced::widget::Space::new().height(0))
+                    },
                     if let Some(reason) = self.artist_image_resource_state_label(artist_id) {
                         Element::from(text(reason).size(9).color(DANGER))
                     } else {
@@ -14866,6 +14999,10 @@ impl FluxReady {
                             .style(accent_button_style)
                             .padding([6, 9])
                             .on_press(Message::AlbumCoverChoose),
+                        button(text("Preview").size(10))
+                            .style(ghost_style)
+                            .padding([6, 9])
+                            .on_press(Message::AlbumCoverPreview),
                         button(text("Assign / replace").size(10))
                             .style(ghost_style)
                             .padding([6, 9])
@@ -14883,6 +15020,20 @@ impl FluxReady {
                         .on_press_maybe(album.cover.is_some().then_some(Message::AlbumCoverRemove)),
                     ]
                     .spacing(6),
+                    if let Some(handle) = &self.album_cover_preview {
+                        Element::from(
+                            row![
+                                artwork_image(handle, 56.0, ContentFit::Cover),
+                                text("Selected cover preview — Apply publishes it; nothing changed yet.")
+                                    .size(9)
+                                    .color(MUTED),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        )
+                    } else {
+                        Element::from(iced::widget::Space::new().height(0))
+                    },
                 ]
                 .spacing(6),
             )
@@ -16707,6 +16858,7 @@ mod tests {
             album_type: ReleaseType::Album,
             album_cover_input: String::new(),
             album_cover_picked: None,
+            album_cover_preview: None,
             album_delete_confirm: false,
             album_cover_remove_confirm: false,
             artwork: BTreeMap::new(),
@@ -16718,6 +16870,7 @@ mod tests {
             artist_aliases_input: String::new(),
             artist_image_input: String::new(),
             artist_image_picked: None,
+            artist_image_preview: None,
             artist_image_remove_confirm: false,
             last_reconcile: None,
             migrate_source: String::new(),
@@ -19218,7 +19371,13 @@ mod tests {
             &mut gui,
             Message::ArtistImagePicked(0, Ok(Some(vec![artist_image]))),
         );
+        send(&mut gui, Message::ArtistImagePreview);
+        assert!(
+            gui.artist_image_preview.is_some(),
+            "a selected Artist image is previewed before assignment"
+        );
         send(&mut gui, Message::ArtistImageApply);
+        assert!(gui.artist_image_preview.is_none());
         assert!(
             gui.controller
                 .artist_image_path(artist)
@@ -19260,6 +19419,13 @@ mod tests {
         send(
             &mut gui,
             Message::TrackArtworkPicked(0, Ok(Some(vec![track_image]))),
+        );
+        send(&mut gui, Message::TrackArtworkPreview);
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.artwork_preview.is_some()),
+            "a selected Track override is previewed before assignment"
         );
         send(&mut gui, Message::TrackArtworkApply);
         let managed_track_art = gui
@@ -19575,7 +19741,13 @@ mod tests {
             &mut gui,
             Message::AlbumCoverPicked(0, Ok(Some(vec![cover]))),
         );
+        send(&mut gui, Message::AlbumCoverPreview);
+        assert!(
+            gui.album_cover_preview.is_some(),
+            "a selected cover is previewed before publication"
+        );
         send(&mut gui, Message::AlbumCoverApply);
+        assert!(gui.album_cover_preview.is_none());
         assert!(
             gui.controller.album(album).expect("album").cover.is_some(),
             "the hidden non-UTF-8 cover path must survive publication"

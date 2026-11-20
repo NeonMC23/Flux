@@ -1510,7 +1510,10 @@ The GUI decodes managed PNG, JPEG and WebP artwork off the UI thread for display
 Decoding rejects files over 32 MiB, dimensions over 4096 px on either side or
 16 million pixels, zero-sized images and unsupported formats. A 512 px preview
 is generated with preserved aspect ratio, rendered with cover cropping in
-library/player thumbnails and contain fitting in detail pages. Missing, invalid
+library/player thumbnails and contain fitting in detail pages. Album, Artist and
+Track editors also expose an explicit Preview action for a typed or picked
+replacement, showing the decoded image without changing the managed resource;
+Apply/Assign publishes it. Missing, invalid
 or unsupported artwork falls back to the generated glyph; detail pages show the
 decode error without changing the managed file. Cache keys include owner,
 resource path, modification time and length, so replacement or removal

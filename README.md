@@ -99,7 +99,10 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   Browser, drag-and-drop, name-inferred editable review, duplicate decisions,
   and real progress/cancel. Final result rows identify each reviewed source path
   and retain per-item failure details; Flux Browser warns when entries vanish or
-  symbolic links are skipped instead of silently omitting them. Click a track to
+  symbolic links are skipped instead of silently omitting them. Artist, Album
+  and Track image editors preview a chosen replacement before assignment, and
+  missing managed images are distinguished from inaccessible ones with repair
+  guidance. Click a track to
   play it; use the transport row for pause/stop/skip/repeat/volume. The queue is
   inline on wide windows and opens as a closable overlay on narrower ones via
   **Queue** or `Q`, so it remains available at the minimum width. The search box
