@@ -83,7 +83,7 @@ build host/time must be normalized as in the provided script.
 
 ## 6. M12 evidence snapshot
 
-The green native run was GitHub Actions `44704197091` at commit `0e32c40`.
+The green native run was GitHub Actions `44706634558` at commit `48419dc`.
 It covered Linux x86_64/ARM64 tests, Windows x86_64/ARM64 tests, macOS ARM64
 tests, macOS x86_64 compile-only, and all Linux/Windows/macOS packaging
 verifiers. Exact artifact sizes, SHA-256 values, compatibility floors, signing
