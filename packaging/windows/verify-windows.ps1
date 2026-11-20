@@ -60,7 +60,7 @@ try {
         Set-Content -Encoding UTF8 (Join-Path $ConfigRoot 'verify-sentinel') 'keep'
         $process = Start-Process -FilePath $Installer -Wait -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
-            "/DIR=$InstallDir"
+            "/DIR=`"$InstallDir`""
         )
         if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)." }
         if ((& (Join-Path $InstallDir 'flux.exe') --version).Trim() -ne $Expected) {
