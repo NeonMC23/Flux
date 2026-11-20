@@ -677,9 +677,12 @@ impl ImportCandidate {
             || self.artist_id != self.base_artist_id
             || self.owner_index != 0
             || self.credits != self.base_credits
-            || self.artwork.is_some()
-            || self.album_artwork.is_some()
-            || self.lyrics.is_some()
+            || (self.artwork.is_some()
+                && self.provenance.artwork != Some(MetadataSource::SidecarArtwork))
+            || (self.album_artwork.is_some()
+                && self.provenance.album_artwork != Some(MetadataSource::SidecarArtwork))
+            || (self.lyrics.is_some()
+                && self.provenance.lyrics != Some(MetadataSource::SidecarLyrics))
     }
 
     /// Sets the reviewed title. An empty title means the display fallback.
@@ -706,9 +709,15 @@ impl ImportCandidate {
 
     /// Sets the reviewed album.
     pub fn set_album(&mut self, album: Option<String>) {
+        let previous = self.album.clone();
         self.album = album
             .map(|album| album.trim().to_owned())
             .filter(|album| !album.is_empty());
+        if self.album != previous
+            && self.provenance.album_artwork == Some(MetadataSource::SidecarArtwork)
+        {
+            self.clear_album_artwork();
+        }
         self.provenance.album = self.album.as_ref().map(|_| MetadataSource::Manual);
     }
 
@@ -1087,14 +1096,24 @@ impl ImportPlan {
     ) -> Result<(), String> {
         let fingerprint = flux_library::canonical::ContentFingerprint::of_file(source)
             .map_err(|error| format!("Could not fingerprint Track artwork: {error}"))?;
+        let mut applied = 0usize;
         for index in indices {
-            if let Some(candidate) = self.candidates.get_mut(*index) {
+            if let Some(candidate) = self.candidates.get_mut(*index)
+                && candidate.decision == ImportDecision::ImportNew
+            {
                 candidate.artwork = Some(flux_library::canonical::CanonicalImportAsset {
                     source: source.to_path_buf(),
                     fingerprint,
                 });
                 candidate.provenance.artwork = Some(MetadataSource::Manual);
+                applied += 1;
             }
+        }
+        if applied == 0 {
+            return Err(
+                "Bulk Track artwork applies only to candidates set to Import; existing metadata updates keep their artwork. Switch the intended candidates to Import first."
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -1964,7 +1983,6 @@ fn make_candidate(
         }
     }
     let sidecars = discover_sidecars(&source_path, directory_files);
-    conflicts.extend(sidecars.notes.iter().cloned());
     let mut candidate = ImportCandidate {
         source_path: source_path.clone(),
         source_track,
@@ -2001,16 +2019,34 @@ fn make_candidate(
         conflicts,
         sidecar_notes: sidecars.notes,
     };
-    if let Some((path, text)) = sidecars.lyrics {
-        candidate.set_sidecar_lyrics(path, text);
-    }
-    if let Some(path) = sidecars.track_artwork {
-        let _ = candidate.set_artwork_with_source(&path, MetadataSource::SidecarArtwork);
-    }
-    if candidate.album.is_some()
-        && let Some(path) = sidecars.album_artwork
+    let existing_duplicate = matches!(
+        candidate.status,
+        CandidateStatus::ExistingPath(_)
+            | CandidateStatus::SameContent {
+                track_id: Some(_),
+                ..
+            }
+    );
+    if !existing_duplicate {
+        if let Some((path, text)) = sidecars.lyrics {
+            candidate.set_sidecar_lyrics(path, text);
+        }
+        if let Some(path) = sidecars.track_artwork {
+            let _ = candidate.set_artwork_with_source(&path, MetadataSource::SidecarArtwork);
+        }
+        if candidate.album.is_some()
+            && let Some(path) = sidecars.album_artwork
+        {
+            let _ = candidate.set_album_artwork_with_source(&path, MetadataSource::SidecarArtwork);
+        }
+    } else if sidecars.lyrics.is_some()
+        || sidecars.track_artwork.is_some()
+        || sidecars.album_artwork.is_some()
     {
-        let _ = candidate.set_album_artwork_with_source(&path, MetadataSource::SidecarArtwork);
+        candidate.sidecar_notes.push(
+            "Discovered sidecars were not attached automatically to this existing duplicate; review them explicitly if replacement is intended."
+                .to_owned(),
+        );
     }
     candidate
 }
@@ -2030,9 +2066,11 @@ fn duplicate_status(
 
     let incoming_size = file_size(path).unwrap_or(0);
     let fingerprint =
-        flux_library::canonical::ContentFingerprint::of_file_cancellable(path, cancel)
-            .ok()
-            .flatten()?;
+        match flux_library::canonical::ContentFingerprint::of_file_cancellable(path, cancel) {
+            Ok(Some(fingerprint)) => fingerprint,
+            Ok(None) => return None,
+            Err(_) => return Some(CandidateStatus::New),
+        };
     if let Some(other) = candidate_hashes.insert(fingerprint, path.to_path_buf()) {
         return Some(CandidateStatus::SameContent {
             track_id: None,
@@ -2966,6 +3004,13 @@ fn apply_import_plan_canonical(
                 } else {
                     CanonicalImportAlbumRef::Standalone
                 };
+                let album_artwork = if matches!(album, CanonicalImportAlbumRef::Existing(_))
+                    && candidate.provenance().album_artwork == Some(MetadataSource::SidecarArtwork)
+                {
+                    None
+                } else {
+                    candidate.album_artwork.clone()
+                };
                 requests.push(CanonicalImportTrackRequest {
                     source: candidate.source_path().to_path_buf(),
                     title: candidate.title().to_owned(),
@@ -2976,7 +3021,7 @@ fn apply_import_plan_canonical(
                     disc_number: candidate.disc_number(),
                     duration_ms: None,
                     artwork: candidate.artwork.clone(),
-                    album_artwork: candidate.album_artwork.clone(),
+                    album_artwork,
                     lyrics: candidate.lyrics.clone(),
                     allow_duplicate_content: matches!(
                         candidate.status(),
@@ -4094,6 +4139,22 @@ mod tests {
         let summary = candidate.provenance().summary();
         assert!(summary.contains("lyrics lyrics sidecar"), "{summary}");
         assert!(summary.contains("album art artwork sidecar"), "{summary}");
+        assert!(
+            !candidate.is_edited(),
+            "automatic sidecar suggestions are not user edits"
+        );
+        let mut changed = candidate.clone();
+        changed.set_title("Edited by hand");
+        assert!(changed.is_edited());
+        changed.set_album(Some("Another Album".to_owned()));
+        assert!(
+            changed.album_artwork_path().is_none(),
+            "a folder cover suggestion does not follow a changed Album destination"
+        );
+        assert!(
+            changed.artwork_path().is_some(),
+            "the same-stem Track image remains valid after an Album change"
+        );
     }
 
     #[test]
@@ -4122,6 +4183,37 @@ mod tests {
         let id = controller.tracks()[0].0;
         assert_eq!(controller.track_artist_id(id), Some(artist));
         assert_eq!(controller.track_album_id(id), Some(album));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn quick_import_resolves_conflicting_folder_covers_in_one_batch() {
+        let dir = TempDir::new("quick-conflicting-covers");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let first_dir = dir.path().join("IncomingA/Artist/Album");
+        let second_dir = dir.path().join("IncomingB/Artist/Album");
+        fs::create_dir_all(&first_dir).expect("first dirs");
+        fs::create_dir_all(&second_dir).expect("second dirs");
+        let first = wav(&first_dir, "one.wav", 4_410, 0.2);
+        let second = wav(&second_dir, "two.wav", 4_410, 0.3);
+        image_file(&first_dir, "cover.png", image::ImageFormat::Png);
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(second_dir.join("cover.png"), image::ImageFormat::Png)
+            .expect("second cover");
+        let first_cover_bytes = fs::read(first_dir.join("cover.png")).expect("cover");
+        controller
+            .import_files(&[first, second], true)
+            .expect("quick import");
+        assert_eq!(controller.tracks().len(), 2);
+        let album = controller
+            .track_album_id(controller.tracks()[0].0)
+            .expect("album");
+        assert_eq!(
+            fs::read(controller.album_cover_path(album).expect("cover")).expect("managed cover"),
+            first_cover_bytes,
+            "the first batch cover wins without rejecting the whole import"
+        );
         controller.shutdown();
     }
 
@@ -4183,6 +4275,98 @@ mod tests {
     }
 
     #[test]
+    fn bulk_track_artwork_does_not_touch_existing_metadata_updates() {
+        let dir = TempDir::new("bulk-track-art-existing");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source_dir = dir.path().join("Artist/Album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("base import");
+        let managed = controller
+            .track(controller.tracks()[0].0)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let request = canonical_request(&controller, &root, vec![managed], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        plan.candidates[0].set_decision(ImportDecision::UpdateExisting);
+        let artwork = image_file(&dir.path().join("art"), "art.png", image::ImageFormat::Png);
+        let error = plan
+            .apply_track_artwork_from_path(&[0], &artwork)
+            .expect_err("existing metadata updates keep their artwork");
+        assert!(
+            error.contains("only to candidates set to Import"),
+            "{error}"
+        );
+        assert!(plan.candidates[0].artwork_path().is_none());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn existing_duplicate_review_does_not_auto_replace_assets_with_sidecars() {
+        let dir = TempDir::new("sidecar-existing-duplicate");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source_dir = dir.path().join("Artist/Album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "Song.wav", 4_410, 0.2);
+        controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("base import");
+        let managed = controller
+            .track(controller.tracks()[0].0)
+            .expect("track")
+            .source()
+            .path()
+            .to_path_buf();
+        let managed_dir = managed.parent().expect("managed parent");
+        let managed_stem = managed
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("managed stem");
+        fs::write(
+            managed_dir.join(format!("{managed_stem}.lrc")),
+            b"[00:01.00]late sidecar\n",
+        )
+        .expect("lyrics");
+        image_file(
+            managed_dir,
+            &format!("{managed_stem}.png"),
+            image::ImageFormat::Png,
+        );
+        image_file(managed_dir, "cover.png", image::ImageFormat::Png);
+        let request = canonical_request(&controller, &root, vec![managed], None);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let candidate = &plan.candidates[0];
+        assert!(matches!(
+            candidate.status(),
+            CandidateStatus::ExistingPath(_)
+        ));
+        assert!(candidate.lyrics_text().is_none());
+        assert!(candidate.artwork_path().is_none());
+        assert!(candidate.album_artwork_path().is_none());
+        assert!(
+            candidate
+                .sidecar_notes()
+                .iter()
+                .any(|note| note.contains("not attached automatically"))
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn quick_canonical_import_attaches_discovered_sidecars() {
         let dir = TempDir::new("quick-sidecars");
         let root = dir.path().join("FluxLibrary");
@@ -4207,11 +4391,21 @@ mod tests {
                 .track_lyrics_path(id)
                 .is_some_and(|path| path.is_file())
         );
-        assert!(
-            controller
-                .track_album_id(id)
-                .and_then(|album| controller.album_cover_path(album))
-                .is_some_and(|path| path.is_file())
+        let album = controller.track_album_id(id).expect("album");
+        let cover = controller.album_cover_path(album).expect("album cover");
+        let original_cover = fs::read(&cover).expect("cover bytes");
+        let third = wav(&source_dir, "03 - Third.wav", 4_410, 0.4);
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([10, 20, 30, 255]))
+            .save_with_format(source_dir.join("cover.png"), image::ImageFormat::Png)
+            .expect("replacement cover sidecar");
+        controller
+            .import_files(&[third], true)
+            .expect("existing album import");
+        assert_eq!(
+            fs::read(controller.album_cover_path(album).expect("same cover"))
+                .expect("preserved cover bytes"),
+            original_cover,
+            "quick import must not replace an existing Album cover from a sidecar"
         );
         controller.shutdown();
     }

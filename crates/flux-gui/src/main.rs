@@ -4017,6 +4017,21 @@ impl FluxReady {
         }
     }
 
+    fn block_if_track_editor_is_dirty(&mut self, action: &str) -> bool {
+        let Some(editor) = self.track_editor.as_mut() else {
+            return false;
+        };
+        if !editor.dirty {
+            return false;
+        }
+        editor.discard_confirm = false;
+        editor.error = Some(format!(
+            "Save or cancel the Track metadata edits before {action}. The library was not changed."
+        ));
+        self.lifecycle_msg = editor.error.clone();
+        true
+    }
+
     fn block_if_lyrics_editor_is_dirty(&mut self, action: &str) -> bool {
         let Some(editor) = self.lyrics_editor.as_mut() else {
             return false;
@@ -4024,7 +4039,7 @@ impl FluxReady {
         if !editor.dirty {
             return false;
         }
-        editor.discard_confirm = true;
+        editor.discard_confirm = false;
         editor.error = Some(format!(
             "Save or cancel the lyrics edits before {action}. Unsaved text would otherwise be hidden and discarded."
         ));
@@ -6104,12 +6119,22 @@ impl FluxReady {
                 }
             }
             Message::OpenLibraryPressed => {
+                if self.block_if_track_editor_is_dirty("switching libraries")
+                    || self.block_if_lyrics_editor_is_dirty("switching libraries")
+                {
+                    return Task::none();
+                }
                 let path = PathBuf::from(self.lib_input.trim());
                 if self.controller.switch_to_canonical(&path).is_ok() {
                     self.after_switch();
                 }
             }
             Message::CreateLibraryPressed => {
+                if self.block_if_track_editor_is_dirty("creating a new library")
+                    || self.block_if_lyrics_editor_is_dirty("creating a new library")
+                {
+                    return Task::none();
+                }
                 let path = PathBuf::from(self.lib_input.trim());
                 if self
                     .controller
@@ -6171,6 +6196,11 @@ impl FluxReady {
                 self.lifecycle_msg = Some("Migration cancelled — nothing was written.".to_owned());
             }
             Message::OpenMigratedPressed => {
+                if self.block_if_track_editor_is_dirty("opening the migrated library")
+                    || self.block_if_lyrics_editor_is_dirty("opening the migrated library")
+                {
+                    return Task::none();
+                }
                 if let Some(destination) = self.migrated_dest.clone()
                     && self.controller.switch_to_canonical(&destination).is_ok()
                 {
@@ -7436,7 +7466,6 @@ impl FluxReady {
                     && !self.close_confirm
                 {
                     self.close_confirm = true;
-                    editor.discard_confirm = true;
                     editor.error = Some(
                         "Unsaved lyrics changes will be lost. Close the window again to discard them, or save/cancel the editor first."
                             .to_owned(),
@@ -7448,7 +7477,6 @@ impl FluxReady {
                     && !self.close_confirm
                 {
                     self.close_confirm = true;
-                    editor.discard_confirm = true;
                     editor.error = Some(
                         "Unsaved metadata edits will be lost. Close the window again to discard them, or save/cancel the editor first."
                             .to_owned(),
@@ -16676,6 +16704,17 @@ mod tests {
             &mut gui,
             Message::EditorTitleChanged("Unsaved title".to_owned()),
         );
+        let other_root = dir.path().join("other-library");
+        flux_app::create_canonical_library(&other_root).expect("other canonical");
+        gui.lib_input = other_root.display().to_string();
+        send(&mut gui, Message::OpenLibraryPressed);
+        assert_eq!(gui.controller.canonical_root(), Some(root.as_path()));
+        assert!(
+            gui.track_editor.is_some(),
+            "switching libraries must not discard a dirty Track editor"
+        );
+        gui.lib_input = root.display().to_string();
+
         send(
             &mut gui,
             Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
@@ -16702,6 +16741,19 @@ mod tests {
         assert!(!gui.closed);
         assert!(gui.close_confirm);
         assert!(gui.track_editor.is_some());
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(
+            gui.track_editor.is_some(),
+            "acking the close warning with Escape must not bypass the editor"
+        );
+        assert!(
+            gui.track_editor
+                .as_ref()
+                .is_some_and(|editor| editor.discard_confirm)
+        );
         gui.controller.shutdown();
     }
 

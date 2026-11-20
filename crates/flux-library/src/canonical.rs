@@ -1216,13 +1216,15 @@ impl CanonicalLibrary {
                 "catalogue library_id does not match library.flux".to_owned(),
             ));
         }
-        recover_transactions(
+        let cleanup_warnings = recover_transactions(
             &root,
             &manifest.library_id,
             catalog.generation,
             catalog.transaction_id.as_deref(),
         )?;
-        Self::load(root, manifest, catalog)
+        let mut library = Self::load(root, manifest, catalog)?;
+        library.last_cleanup_warning = cleanup_warnings.into_iter().next();
+        Ok(library)
     }
 
     fn load(
@@ -1920,10 +1922,11 @@ fn recover_transactions(
     library_id: &str,
     generation: u64,
     catalog_transaction: Option<&str>,
-) -> Result<(), CanonicalError> {
+) -> Result<Vec<String>, CanonicalError> {
+    let mut cleanup_warnings = Vec::new();
     let dir = root.join(TRANSACTIONS_DIR_NAME);
     if !dir.exists() {
-        return Ok(());
+        return Ok(cleanup_warnings);
     }
     let mut entries = fs::read_dir(&dir)?.flatten().collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.file_name());
@@ -1956,9 +1959,15 @@ fn recover_transactions(
         }
         if catalog_transaction == Some(journal.transaction_id.as_str()) {
             // The catalogue is the authoritative commit record. Finish only
-            // this transaction's journal-owned cleanup.
-            cleanup_committed_paths(root, &journal)?;
-            let _ = fs::remove_dir_all(entry.path());
+            // this transaction's journal-owned cleanup. If cleanup is still
+            // blocked, load the committed state read-only and preserve the
+            // journal so writes stay blocked until a later retry succeeds.
+            match cleanup_committed_paths(root, &journal) {
+                Ok(()) => {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+                Err(error) => cleanup_warnings.push(error.to_string()),
+            }
             continue;
         }
         if matches!(
@@ -1971,9 +1980,13 @@ fn recover_transactions(
             // Its committed/cleaning/completed state means all metadata files
             // were already published, so finish only its journal-owned cleanup.
             if journal.operation == "metadata-write" && journal.intended_generation == generation {
-                cleanup_committed_paths(root, &journal)?;
-                let _ = fs::remove_dir_all(entry.path());
-                let _ = sync_directory(&dir);
+                match cleanup_committed_paths(root, &journal) {
+                    Ok(()) => {
+                        let _ = fs::remove_dir_all(entry.path());
+                        let _ = sync_directory(&dir);
+                    }
+                    Err(error) => cleanup_warnings.push(error.to_string()),
+                }
                 continue;
             }
             return Err(CanonicalError::Transaction {
@@ -2015,7 +2028,7 @@ fn recover_transactions(
     }
     // The caller will re-read the catalogue after recovery.
     let _ = (library_id, generation);
-    Ok(())
+    Ok(cleanup_warnings)
 }
 
 /// Artist reference in an atomic import batch.
@@ -2121,6 +2134,14 @@ pub struct CanonicalTrackMetadataUpdate {
     pub lyrics: Option<String>,
 }
 
+fn normalized_import_name(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 fn resolve_import_artists(
     catalog: &mut CatalogDto,
     artists: &mut BTreeMap<ArtistId, CanonicalArtist>,
@@ -2146,38 +2167,58 @@ fn resolve_import_artists(
                         "proposed artist name must not be empty".to_owned(),
                     ));
                 }
-                if let Some(id) = new_artist_ids.get(&name) {
+                let normalized = normalized_import_name(&name);
+                if let Some(id) = new_artist_ids.get(&normalized) {
                     *id
                 } else {
-                    let id = ArtistId::new(catalog.next_artist_id);
-                    catalog.next_artist_id = advance_counter(catalog.next_artist_id, "artist")?;
-                    let rel = artist_rel(id);
-                    catalog.artists.push(CatalogArtistDto {
-                        id: id.get(),
-                        path: rel.display_lossy(),
-                    });
-                    let dto = ArtistEntityDto {
-                        schema_version: CANONICAL_SCHEMA_VERSION,
-                        kind: ARTIST_KIND.to_owned(),
-                        id: id.get(),
-                        name: name.clone(),
-                        aliases: Vec::new(),
-                        description: None,
-                        image: None,
-                    };
-                    push_entity_write(writes, &rel, "artist.flux", &dto)?;
-                    artists.insert(
-                        id,
-                        CanonicalArtist {
-                            id,
-                            name: name.clone(),
-                            aliases: Vec::new(),
-                            description: None,
-                            image: None,
-                        },
-                    );
-                    new_artist_ids.insert(name, id);
-                    id
+                    let existing = artists
+                        .values()
+                        .filter(|artist| normalized_import_name(&artist.name) == normalized)
+                        .map(|artist| artist.id)
+                        .collect::<Vec<_>>();
+                    match existing.as_slice() {
+                        [id] => {
+                            new_artist_ids.insert(normalized, *id);
+                            *id
+                        }
+                        [] => {
+                            let id = ArtistId::new(catalog.next_artist_id);
+                            catalog.next_artist_id =
+                                advance_counter(catalog.next_artist_id, "artist")?;
+                            let rel = artist_rel(id);
+                            catalog.artists.push(CatalogArtistDto {
+                                id: id.get(),
+                                path: rel.display_lossy(),
+                            });
+                            let dto = ArtistEntityDto {
+                                schema_version: CANONICAL_SCHEMA_VERSION,
+                                kind: ARTIST_KIND.to_owned(),
+                                id: id.get(),
+                                name: name.clone(),
+                                aliases: Vec::new(),
+                                description: None,
+                                image: None,
+                            };
+                            push_entity_write(writes, &rel, "artist.flux", &dto)?;
+                            artists.insert(
+                                id,
+                                CanonicalArtist {
+                                    id,
+                                    name: name.clone(),
+                                    aliases: Vec::new(),
+                                    description: None,
+                                    image: None,
+                                },
+                            );
+                            new_artist_ids.insert(normalized, id);
+                            id
+                        }
+                        _ => {
+                            return Err(CanonicalError::Invalid(format!(
+                                "import artist name {name:?} normalizes to several existing artists"
+                            )));
+                        }
+                    }
                 }
             }
         };
@@ -3125,19 +3166,14 @@ impl CanonicalLibrary {
                     // later open can finish cleanup; never roll back committed
                     // work. Reopen when possible so the in-memory store matches
                     // the published catalogue even though cleanup is pending.
-                    match self.reopen_after() {
-                        Ok(()) => {
-                            self.last_cleanup_warning = Some(err.to_string());
-                            return Ok(());
-                        }
-                        Err(reopen_error) => {
-                            return Err(CanonicalError::CommittedCleanup {
-                                message: format!(
-                                    "{err}; reopening the committed state also failed: {reopen_error}"
-                                ),
-                            });
-                        }
-                    }
+                    return match self.reopen_after() {
+                        Ok(()) => Ok(()),
+                        Err(reopen_error) => Err(CanonicalError::CommittedCleanup {
+                            message: format!(
+                                "{err}; reopening the committed state also failed: {reopen_error}"
+                            ),
+                        }),
+                    };
                 }
                 let _ = recover_one_transaction(&self.root, &txn_dir, &journal, None);
                 Err(err)
@@ -3146,9 +3182,11 @@ impl CanonicalLibrary {
     }
 
     fn reopen_after(&mut self) -> Result<(), CanonicalError> {
-        let cleanup_warning = self.last_cleanup_warning.take();
+        let previous_warning = self.last_cleanup_warning.take();
         let mut reopened = Self::open(&self.root)?;
-        reopened.last_cleanup_warning = cleanup_warning;
+        if previous_warning.is_some() {
+            reopened.last_cleanup_warning = previous_warning;
+        }
         *self = reopened;
         Ok(())
     }
@@ -3554,36 +3592,53 @@ impl CanonicalLibrary {
                             "album title must not be empty".to_owned(),
                         ));
                     }
-                    let key = (owner, title.clone());
+                    let key = (owner, normalized_import_name(&title));
                     if let Some(id) = new_album_ids.get(&key) {
                         Some(*id)
-                    } else if let Some(existing) = albums
-                        .values()
-                        .find(|album| album.owner_artist_id == owner && album.title == title)
-                    {
-                        Some(existing.id)
                     } else {
-                        let id = AlbumId::new(catalog.next_album_id);
-                        catalog.next_album_id = advance_counter(catalog.next_album_id, "album")?;
-                        let rel = album_rel(owner, id);
-                        catalog.albums.push(CatalogAlbumDto {
-                            id: id.get(),
-                            artist_id: owner.get(),
-                            path: rel.display_lossy(),
-                        });
-                        albums.insert(
-                            id,
-                            CanonicalAlbum {
-                                id,
-                                owner_artist_id: owner,
-                                title: title.clone(),
-                                release_type,
-                                cover: None,
-                                track_order: Vec::new(),
-                            },
-                        );
-                        new_album_ids.insert(key, id);
-                        Some(id)
+                        let existing = albums
+                            .values()
+                            .filter(|album| {
+                                album.owner_artist_id == owner
+                                    && normalized_import_name(&album.title) == key.1
+                            })
+                            .map(|album| album.id)
+                            .collect::<Vec<_>>();
+                        match existing.as_slice() {
+                            [id] => {
+                                new_album_ids.insert(key, *id);
+                                Some(*id)
+                            }
+                            [] => {
+                                let id = AlbumId::new(catalog.next_album_id);
+                                catalog.next_album_id =
+                                    advance_counter(catalog.next_album_id, "album")?;
+                                let rel = album_rel(owner, id);
+                                catalog.albums.push(CatalogAlbumDto {
+                                    id: id.get(),
+                                    artist_id: owner.get(),
+                                    path: rel.display_lossy(),
+                                });
+                                albums.insert(
+                                    id,
+                                    CanonicalAlbum {
+                                        id,
+                                        owner_artist_id: owner,
+                                        title: title.clone(),
+                                        release_type,
+                                        cover: None,
+                                        track_order: Vec::new(),
+                                    },
+                                );
+                                new_album_ids.insert(key, id);
+                                Some(id)
+                            }
+                            _ => {
+                                return Err(CanonicalError::Invalid(format!(
+                                    "import album title {title:?} normalizes to several existing albums"
+                                )));
+                            }
+                        }
                     }
                 }
             };
@@ -5102,11 +5157,7 @@ impl CanonicalLibrary {
             expected: None,
         });
         catalog.tracks.retain(|entry| entry.id != track.id.get());
-        self.commit_writes_with_cleanup(Some(catalog), writes, Vec::new())?;
-        self.reopen_after()?;
-
-        let mut cleanup_errors = Vec::new();
-        for path in [
+        let cleanup = [
             Some(plan.audio_path.clone()),
             Some(plan.record_path.clone()),
             plan.lyrics_path.clone(),
@@ -5114,56 +5165,30 @@ impl CanonicalLibrary {
         ]
         .into_iter()
         .flatten()
-        {
-            if let Err(error) = self.cleanup_unreferenced_track_resource(&path) {
-                cleanup_errors.push(error);
+        .collect::<Vec<_>>();
+        let cleanup_errors = match self.commit_writes_with_cleanup(Some(catalog), writes, cleanup) {
+            Ok(()) => {
+                if self.last_cleanup_warning.is_none() {
+                    self.reopen_after()?;
+                }
+                self.take_cleanup_warning()
+                    .map(|message| format!("catalogue committed; cleanup incomplete: {message}"))
+                    .into_iter()
+                    .collect::<Vec<_>>()
             }
-        }
+            Err(CanonicalError::CommittedCleanup { message }) => {
+                vec![format!(
+                    "catalogue committed; cleanup incomplete: {message}"
+                )]
+            }
+            Err(err) => return Err(err),
+        };
         Ok(TrackDeletionReport {
             track_id: track.id,
             album_id: track.album_id,
             audio_was_present: plan.audio_present,
             cleanup_errors,
         })
-    }
-
-    fn cleanup_unreferenced_track_resource(&self, target: &RelPath) -> Result<(), String> {
-        let text = target.display_lossy();
-        if self
-            .catalog
-            .tracks
-            .iter()
-            .any(|track| track.audio_path == text || track.record_path == text)
-        {
-            return Err(format!(
-                "kept managed resource still referenced by the catalogue: {text}"
-            ));
-        }
-        if self.tracks.values().any(|track| {
-            self.track_records
-                .get(&track.id)
-                .and_then(|record| plan_track_lyrics_rel(record, track.lyrics.as_deref()))
-                .is_some_and(|lyrics| lyrics == *target)
-        }) {
-            return Err(format!(
-                "kept managed lyrics still referenced by another track: {text}"
-            ));
-        }
-        reject_symlink_escape(&self.root, target).map_err(|error| error.to_string())?;
-        let path = safe_join(&self.root, target).map_err(|error| error.to_string())?;
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                if let Some(parent) = path.parent() {
-                    sync_directory(parent).map_err(|error| error.to_string())?;
-                }
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!(
-                "could not remove {}: {error}. The catalogue deletion is committed; retry cleanup after resolving the obstacle.",
-                path.display()
-            )),
-        }
     }
 
     /// Updates track metadata. Owner/album are intentionally not changed by
@@ -9608,14 +9633,17 @@ mod failure_matrix_tests {
             }"#,
         )
         .expect("journal");
+        let mut loaded = CanonicalLibrary::open(&root).expect("committed state remains readable");
         assert!(
-            CanonicalLibrary::open(&root).is_err(),
-            "cleanup failure must require recovery attention"
+            loaded.take_cleanup_warning().is_some(),
+            "blocked cleanup is reported on the readable committed state"
         );
         assert!(blocked.is_dir());
         assert!(txn_dir.is_dir(), "journal survives failed recovery");
+        drop(loaded);
         fs::remove_dir(&blocked).expect("unblock");
-        let reopened = CanonicalLibrary::open(&root).expect("retry recovery");
+        let mut reopened = CanonicalLibrary::open(&root).expect("retry recovery");
+        assert!(reopened.take_cleanup_warning().is_none());
         assert!(
             !txn_dir.exists(),
             "journal finalized after successful retry"
@@ -11193,7 +11221,7 @@ mod track_deletion_tests {
             report
                 .cleanup_errors
                 .iter()
-                .any(|error| error.contains("could not remove")),
+                .any(|error| error.contains("cleanup incomplete")),
             "{report:?}"
         );
         assert!(fx.library.track(fx.track).is_none());
@@ -11869,6 +11897,11 @@ mod artist_deletion_tests {
             "{report:?}"
         );
         assert_eq!(report.artist_id, fx.deleted);
+        assert!(
+            fx.library.artist(fx.deleted).is_none(),
+            "the readable committed state must not remain stale"
+        );
+        assert!(fx.library.track(fx.non_collaborative).is_none());
 
         // Startup recovery retries the journal-owned cleanup once the obstacle
         // is removed and preserves the already-committed catalogue state.
@@ -13636,6 +13669,46 @@ mod atomic_import_tests {
         for source in sources {
             assert!(source.is_file(), "source is never deleted");
         }
+    }
+
+    #[test]
+    fn import_batch_normalizes_proposed_artist_and_album_names() {
+        let dir = TempDir::new("atomic-import-normalized");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let first = request(
+            &dir,
+            "one.wav",
+            "One",
+            CanonicalImportArtistRef::Proposed("The Artist".to_owned()),
+            CanonicalImportAlbumRef::ByName {
+                title: "The Album".to_owned(),
+                release_type: ReleaseType::Album,
+            },
+        );
+        let second = request(
+            &dir,
+            "two.wav",
+            "Two",
+            CanonicalImportArtistRef::Proposed("  the   artist ".to_owned()),
+            CanonicalImportAlbumRef::ByName {
+                title: "the album ".to_owned(),
+                release_type: ReleaseType::Album,
+            },
+        );
+        let ids = library
+            .import_tracks_batch(library.generation(), vec![first, second])
+            .expect("normalized batch import");
+        assert_eq!(ids.len(), 2);
+        assert_eq!(library.artists().count(), 1);
+        assert_eq!(library.albums().count(), 1);
+        let artist = library.artists().next().expect("artist");
+        let album = library.albums().next().expect("album");
+        assert_eq!(artist.name, "The Artist");
+        assert_eq!(album.title, "The Album");
+        assert!(library
+            .tracks()
+            .all(|track| track.owner_artist_id == artist.id && track.album_id == Some(album.id)));
     }
 
     #[test]

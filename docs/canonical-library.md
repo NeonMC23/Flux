@@ -1608,11 +1608,14 @@ commit.
 
 Import review exposes field-level provenance (filename, folder, existing
 library, sidecar, fallback or manual edit) and deterministic conflict notes when
-filename/folder/existing evidence disagree. Artist references distinguish
+filename/folder/existing evidence disagree. Folder cover suggestions are
+dropped for an existing Album destination unless the user explicitly selects
+them, and a changed Album destination clears the old folder-cover suggestion. Artist references distinguish
 existing stable IDs from proposed names. Exact or case/whitespace-normalized
 unique existing names resolve to one stable ID; ambiguous normalized names
 require explicit review. The same unique-normalized rule applies to Album titles
-under the resolved owner before a new Album is created. The review also offers an existing Album
+under the resolved owner before a new Album is created, including proposed names
+created earlier in the same import batch. The review also offers an existing Album
 picker filtered to the selected owner Artist; selecting one sets the exact owner
 title reference rather than fuzzy-matching. Typing a title creates a new Album
 only when no exact owner/title match exists; an empty Album field creates a
@@ -1947,14 +1950,14 @@ transaction behavior was changed by M1.
 ### Committed cleanup and worker lifecycle
 
 A transaction that has published `catalog.flux` is committed even if deleting
-old audio/artwork/lyrics later fails. Flux now reopens the committed state,
-retains the cleaning journal for retry on the next open, and reports cleanup as
-a warning rather than claiming a rollback. Artist deletion returns a committed
-report with `cleanup_errors`; the Controller still removes deleted-track queue
-and history references. The journal cleanup loop attempts every unreferenced
-target before returning the first failure, so one blocked path cannot strand
-later safe deletions. Track deletion keeps its separate post-commit cleanup
-report because it does not use journal cleanup for those managed files.
+old audio/artwork/lyrics later fails. Flux loads the committed catalogue even
+when journal cleanup is still blocked, exposes a cleanup warning, blocks further
+writes through the retained journal, and retries cleanup on the next open. The
+cleanup loop attempts every unreferenced target before returning the first
+failure, so one blocked path cannot strand later safe deletions. Artist and
+single-Track deletion return committed reports with `cleanup_errors`; the
+Controller still removes deleted-track queue and history references. No
+post-commit cleanup obstacle is presented as a catalog rollback.
 
 Import fingerprinting streams in 64 KiB chunks and observes cancellation. It
 returns no partial hash. Duplicate discovery skips existing files whose byte
@@ -2209,10 +2212,10 @@ cleanup.
     safety and fingerprints only; it does not decode the audio or read tags.
 15. On platforms that block deleting an open file, replacing or moving the
     currently playing track may leave old-file cleanup pending until playback
-    releases the handle. Catalogue changes remain authoritative; journal-owned
-    cleanup retries on reopen. Single-track deletion uses its own reported
-    best-effort cleanup rather than the journal, so an unresolvable obstacle is
-    surfaced without automatic retry.
+    releases the handle. Catalogue changes remain authoritative; reads load the
+    committed state with a cleanup warning, writes stay blocked, and journal
+    cleanup retries on reopen. Single-track deletion uses the same journal
+    cleanup path and reports persistent obstacles.
 16. ENOSPC and a true second mounted filesystem were not available for testing.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
@@ -2296,7 +2299,11 @@ cleanup.
     not inspect embedded tags, search remote services, infer Artist images
     automatically, or merge conflicting candidates; review edits override every
     suggestion.
-37. Native pickers preserve spaces and non-UTF-8 Unix bytes. Multi-selection
+37. Fingerprint cancellation is observed between 64 KiB reads. A read blocked
+    indefinitely by an unresponsive filesystem or device cannot be interrupted
+    by the cooperative flag; shutdown/cancellation limits for such OS calls are
+    documented rather than claimed.
+38. Native pickers preserve spaces and non-UTF-8 Unix bytes. Multi-selection
     dialogs use newline as the record separator, so a selected filename containing
     a literal newline cannot be represented safely there; the single-folder path
     retains embedded newlines by treating the whole output (minus one trailing

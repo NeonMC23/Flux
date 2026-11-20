@@ -5687,6 +5687,10 @@ impl Controller {
         let mut request_sources = Vec::new();
         let mut fingerprints = std::collections::HashSet::new();
         let mut sidecar_directories = std::collections::HashMap::new();
+        let mut batch_album_covers: std::collections::HashMap<
+            (String, String),
+            flux_library::canonical::ContentFingerprint,
+        > = std::collections::HashMap::new();
         for source in paths {
             if !is_supported_audio_path(source) {
                 report.issues.push(ImportIssue {
@@ -5839,6 +5843,33 @@ impl Controller {
             {
                 // The ambiguous-album branch above already recorded the issue.
                 continue;
+            }
+            let mut album_artwork = if matches!(album, CanonicalImportAlbumRef::Existing(_)) {
+                // Quick import has no review confirmation; never let a folder
+                // sidecar silently replace an existing Album's chosen cover.
+                None
+            } else {
+                album_artwork
+            };
+            if let (Some(asset), Some(title)) =
+                (album_artwork.as_ref(), inferred.album_title.as_ref())
+            {
+                let key = (normalized_artist.clone(), normalize_import_name(title));
+                match batch_album_covers.get(&key) {
+                    None => {
+                        batch_album_covers.insert(key, asset.fingerprint);
+                    }
+                    Some(existing) if *existing == asset.fingerprint => {}
+                    Some(_) => {
+                        report.issues.push(ImportIssue {
+                            path: source.clone(),
+                            reason: format!(
+                                "conflicting Album-cover sidecars target {title:?}; the first cover is used and this candidate's cover is ignored"
+                            ),
+                        });
+                        album_artwork = None;
+                    }
+                }
             }
             requests.push(CanonicalImportTrackRequest {
                 source: source.clone(),
