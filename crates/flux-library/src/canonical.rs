@@ -9638,6 +9638,10 @@ mod failure_matrix_tests {
             loaded.take_cleanup_warning().is_some(),
             "blocked cleanup is reported on the readable committed state"
         );
+        assert!(
+            loaded.create_artist("Blocked write", Vec::new()).is_err(),
+            "pending cleanup blocks new mutations"
+        );
         assert!(blocked.is_dir());
         assert!(txn_dir.is_dir(), "journal survives failed recovery");
         drop(loaded);
