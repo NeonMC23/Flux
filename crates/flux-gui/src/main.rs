@@ -2232,6 +2232,7 @@ struct FluxReady {
     artist_detail_name_input: String,
     artist_description_input: String,
     artist_aliases_input: String,
+    artist_form_dirty: bool,
     artist_image_input: String,
     artist_image_picked: Option<PathBuf>,
     artist_image_preview: Option<ImageHandle>,
@@ -2334,6 +2335,7 @@ enum Message {
     ArtistDetailNameChanged(String),
     ArtistDescriptionChanged(String),
     ArtistAliasesChanged(String),
+    ArtistMetadataRevert,
     ArtistMetadataSave,
     ArtistImageChanged(String),
     ArtistImageChoose,
@@ -2531,7 +2533,7 @@ enum Message {
     LyricsExportPathChanged(String),
     LyricsExport(String),
     LyricsExportSave(String),
-    LyricsExportSaved(u64, String, Result<Option<PathBuf>, String>),
+    LyricsExportSaved(u64, TrackId, String, Result<Option<PathBuf>, String>),
     LyricsOpenAlbum(AlbumId),
     LyricsOpenArtist(ArtistId),
     SelectView(LibraryView),
@@ -2600,7 +2602,7 @@ impl Message {
             | Self::ImportPlanReady(session, _, _)
             | Self::ImportPrepared(session, _, _)
             | Self::LyricsImportPicked(session, _)
-            | Self::LyricsExportSaved(session, _, _)
+            | Self::LyricsExportSaved(session, _, _, _)
             | Self::AudioDevicesLoaded(session, _)
             | Self::AudioOutputOpened(session, _, _, _) => Some(*session),
             _ => None,
@@ -2625,7 +2627,7 @@ impl Message {
             | Self::ImportPlanReady(current, _, _)
             | Self::ImportPrepared(current, _, _)
             | Self::LyricsImportPicked(current, _)
-            | Self::LyricsExportSaved(current, _, _)
+            | Self::LyricsExportSaved(current, _, _, _)
             | Self::AudioDevicesLoaded(current, _)
             | Self::AudioOutputOpened(current, _, _, _) => *current = session,
             _ => {}
@@ -2704,6 +2706,7 @@ impl FluxReady {
             artist_detail_name_input: String::new(),
             artist_description_input: String::new(),
             artist_aliases_input: String::new(),
+            artist_form_dirty: false,
             artist_image_input: String::new(),
             artist_image_picked: None,
             artist_image_preview: None,
@@ -3033,6 +3036,7 @@ impl FluxReady {
     }
 
     fn sync_artist_editor(&mut self) {
+        self.artist_form_dirty = false;
         self.artist_detail_name_input.clear();
         self.artist_description_input.clear();
         self.artist_aliases_input.clear();
@@ -3154,6 +3158,11 @@ impl FluxReady {
     }
 
     fn start_track_editor(&mut self, id: TrackId) {
+        if self.block_if_track_editor_is_dirty("opening another Track editor")
+            || self.block_if_lyrics_editor_is_dirty("opening a Track editor")
+        {
+            return;
+        }
         let Some(track) = self.controller.track(id) else {
             return;
         };
@@ -4080,6 +4089,16 @@ impl FluxReady {
         true
     }
 
+    fn block_if_artist_form_is_dirty(&mut self, action: &str) -> bool {
+        if !self.artist_form_dirty {
+            return false;
+        }
+        self.lifecycle_msg = Some(format!(
+            "Save or revert the Artist metadata edits before {action}. The library was not changed."
+        ));
+        true
+    }
+
     fn block_if_lyrics_editor_is_dirty(&mut self, action: &str) -> bool {
         let Some(editor) = self.lyrics_editor.as_mut() else {
             return false;
@@ -4123,12 +4142,14 @@ impl FluxReady {
                 | Message::ToggleSetup
                 | Message::ImportOpen
                 | Message::ImportOpenSetup
+                | Message::ImportDropPath(_)
         )
     }
 
     fn select_view(&mut self, view: LibraryView) {
         if self.block_if_track_editor_is_dirty("switching views")
             || self.block_if_lyrics_editor_is_dirty("switching views")
+            || self.block_if_artist_form_is_dirty("switching views")
         {
             return;
         }
@@ -4318,7 +4339,8 @@ impl FluxReady {
         }
         if Self::message_changes_context(&message)
             && (self.block_if_track_editor_is_dirty("navigating away")
-                || self.block_if_lyrics_editor_is_dirty("navigating away"))
+                || self.block_if_lyrics_editor_is_dirty("navigating away")
+                || self.block_if_artist_form_is_dirty("navigating away"))
         {
             return Task::none();
         }
@@ -4807,6 +4829,7 @@ impl FluxReady {
                     if let Some(path) = paths.first() {
                         self.album_cover_input = path.display().to_string();
                         self.album_cover_picked = Some(path.clone());
+                        self.album_cover_preview = None;
                     }
                 }
                 Ok(None) => {}
@@ -4926,9 +4949,24 @@ impl FluxReady {
                     Err(error) => self.lifecycle_msg = Some(error),
                 }
             }
-            Message::ArtistDetailNameChanged(value) => self.artist_detail_name_input = value,
-            Message::ArtistDescriptionChanged(value) => self.artist_description_input = value,
-            Message::ArtistAliasesChanged(value) => self.artist_aliases_input = value,
+            Message::ArtistDetailNameChanged(value) => {
+                self.artist_detail_name_input = value;
+                self.artist_form_dirty = true;
+            }
+            Message::ArtistDescriptionChanged(value) => {
+                self.artist_description_input = value;
+                self.artist_form_dirty = true;
+            }
+            Message::ArtistAliasesChanged(value) => {
+                self.artist_aliases_input = value;
+                self.artist_form_dirty = true;
+            }
+            Message::ArtistMetadataRevert => {
+                if self.selected_artist_id().is_some() {
+                    self.sync_artist_editor();
+                    self.lifecycle_msg = Some("Reverted unsaved Artist metadata edits.".to_owned());
+                }
+            }
             Message::ArtistMetadataSave => {
                 let Some(artist) = self.selected_artist_id() else {
                     return Task::none();
@@ -4982,6 +5020,7 @@ impl FluxReady {
                     if let Some(path) = paths.first() {
                         self.artist_image_input = path.display().to_string();
                         self.artist_image_picked = Some(path.clone());
+                        self.artist_image_preview = None;
                         self.artist_image_remove_confirm = false;
                     }
                 }
@@ -5094,6 +5133,7 @@ impl FluxReady {
                     {
                         editor.artwork_input = path.display().to_string();
                         editor.artwork_picked = Some(path.clone());
+                        editor.artwork_preview = None;
                         editor.artwork_remove_confirm = false;
                     }
                 }
@@ -7084,6 +7124,8 @@ impl FluxReady {
                     self.lyrics_editor = None;
                     self.lyrics_import = None;
                     self.lyrics_error = None;
+                    self.sync_album_editor();
+                    self.sync_artist_editor();
                 } else {
                     self.lifecycle_msg = Some("Nothing is playing.".to_owned());
                 }
@@ -7234,7 +7276,13 @@ impl FluxReady {
                 self.lyrics_export_path = value;
                 self.lyrics_export_pending = None;
             }
-            Message::LyricsExport(format) => self.export_lyrics(&format),
+            Message::LyricsExport(format) => {
+                let Some(id) = self.selected_lyrics else {
+                    self.lyrics_error = Some("Select a track before exporting lyrics.".to_owned());
+                    return Task::none();
+                };
+                self.export_lyrics_for(id, &format);
+            }
             Message::LyricsExportSave(format) => {
                 let Some(id) = self.selected_lyrics else {
                     self.lyrics_error = Some("Select a track before exporting lyrics.".to_owned());
@@ -7267,15 +7315,20 @@ impl FluxReady {
                 let requested = format.clone();
                 return Task::perform(
                     async move { flux_platform::save_lyrics_file(&suggested, start.as_deref()) },
-                    move |result| Message::LyricsExportSaved(session, requested.clone(), result),
+                    move |result| {
+                        Message::LyricsExportSaved(session, id, requested.clone(), result)
+                    },
                 );
             }
-            Message::LyricsExportSaved(_, format, result) => match result {
+            Message::LyricsExportSaved(_, id, format, result) => match result {
                 Ok(Some(path)) => {
+                    // Choosing an exact path in the native save dialog (with its
+                    // own overwrite prompt where supported) is the user's
+                    // explicit overwrite intent for this Track/format pair.
                     self.lyrics_export_path = path.display().to_string();
-                    self.lyrics_export_pending = None;
+                    self.lyrics_export_pending = Some((path, format.clone()));
                     self.lyrics_error = None;
-                    self.export_lyrics(&format);
+                    self.export_lyrics_for(id, &format);
                 }
                 Ok(None) => {}
                 Err(error) => self.lyrics_error = Some(error),
@@ -7290,6 +7343,7 @@ impl FluxReady {
                     self.selected_group = Some(album_key_for_title(album_id, &album.title));
                     self.search.clear();
                     self.sync_album_editor();
+                    self.sync_artist_editor();
                 }
             }
             Message::LyricsOpenArtist(artist_id) => {
@@ -7304,6 +7358,8 @@ impl FluxReady {
                         artist.name()
                     ));
                     self.search.clear();
+                    self.sync_artist_editor();
+                    self.sync_album_editor();
                 }
             }
             Message::SortDirectionToggled => {
@@ -10033,11 +10089,14 @@ impl FluxReady {
                         .color(MUTED),
                 );
             }
-            if let (Some(owner), Some(title)) = (candidate.artist_id(), candidate.album()) {
-                if let Some(existing) = self.controller.albums().into_iter().find(|album| {
-                    album.owner_artist_id == owner
-                        && entity_name_key(&album.title) == entity_name_key(title)
-                }) {
+            if let Some(title) = candidate.album() {
+                let existing = candidate.artist_id().and_then(|owner| {
+                    self.controller.albums().into_iter().find(|album| {
+                        album.owner_artist_id == owner
+                            && entity_name_key(&album.title) == entity_name_key(title)
+                    })
+                });
+                if let Some(existing) = existing {
                     body = body.push(
                         text(format!(
                             "Reuses existing AlbumId {} · owner {}",
@@ -10063,6 +10122,13 @@ impl FluxReady {
                     text("Standalone Track · no Album will be created or referenced.")
                         .size(8)
                         .color(ACCENT),
+                );
+            }
+            if candidate.album().is_some() && candidate.artist_id().is_none() {
+                body = body.push(
+                    text("The typed Artist will be created only when this batch commits.")
+                        .size(8)
+                        .color(MUTED),
                 );
             }
             if candidate.decision() == ImportDecision::UpdateExisting {
@@ -13512,11 +13578,7 @@ impl FluxReady {
         }
     }
 
-    fn export_lyrics(&mut self, format: &str) {
-        let Some(id) = self.selected_lyrics else {
-            self.lyrics_error = Some("Select a track before exporting lyrics.".to_owned());
-            return;
-        };
+    fn export_lyrics_for(&mut self, id: TrackId, format: &str) {
         let Some(raw) = self.controller.track_lyrics(id) else {
             self.lyrics_error = Some("This track has no managed lyrics to export.".to_owned());
             return;
@@ -14827,6 +14889,13 @@ impl FluxReady {
                         .style(accent_button_style)
                         .padding([6, 9])
                         .on_press(Message::ArtistMetadataSave),
+                    button(text("Revert unsaved edits").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            self.artist_form_dirty
+                                .then_some(Message::ArtistMetadataRevert),
+                        ),
                 ]
                 .spacing(6),
             )
@@ -16998,6 +17067,7 @@ mod tests {
             artist_detail_name_input: String::new(),
             artist_description_input: String::new(),
             artist_aliases_input: String::new(),
+            artist_form_dirty: false,
             artist_image_input: String::new(),
             artist_image_picked: None,
             artist_image_preview: None,
@@ -17190,6 +17260,22 @@ mod tests {
         send(
             &mut gui,
             Message::EditorTitleChanged("Unsaved title".to_owned()),
+        );
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("e".into()), Modifiers::default()),
+        );
+        assert!(
+            gui.track_editor.is_some(),
+            "keyboard edit must not replace a dirty editor"
+        );
+        send(
+            &mut gui,
+            Message::ImportDropPath(dir.path().join("dropped.wav")),
+        );
+        assert!(
+            gui.track_editor.is_some(),
+            "a file drop must not discard a dirty editor"
         );
         let original_view = gui.view;
         send(&mut gui, Message::SelectView(LibraryView::Artists));
@@ -19498,6 +19584,12 @@ mod tests {
             &mut gui,
             Message::ArtistAliasesChanged("Entity AKA, Former Name".to_owned()),
         );
+        send(&mut gui, Message::SelectView(LibraryView::Tracks));
+        assert_eq!(
+            gui.view,
+            LibraryView::Artists,
+            "unsaved Artist metadata blocks view switching"
+        );
         send(&mut gui, Message::ArtistMetadataSave);
         assert_eq!(
             gui.controller.artist_aliases(artist),
@@ -21550,9 +21642,10 @@ mod tests {
         );
 
         let dialog_export = export_dir.join("dialog-export.lrc");
+        std::fs::write(&dialog_export, "old content").expect("existing destination");
         send(
             &mut gui,
-            Message::LyricsExportSaved(0, "lrc".to_owned(), Ok(Some(dialog_export.clone()))),
+            Message::LyricsExportSaved(0, id, "lrc".to_owned(), Ok(Some(dialog_export.clone()))),
         );
         assert!(
             dialog_export.is_file(),
