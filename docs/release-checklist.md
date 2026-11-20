@@ -67,6 +67,8 @@ Use a disposable VM, container or CI runner, never the user's real library:
 - [ ] Audio device discovery and playback (where a device exists).
 - [ ] `flux --audio-diagnostics` reports the intended device and stream state.
 - [ ] Shutdown, no orphaned processes, no writes into the install directory.
+- [ ] A cancel requested during preparation is not reported after commit starts;
+      the committing state is explicitly non-cancellable.
 
 ## 5. Audio validation
 

@@ -259,7 +259,11 @@ this behavior deliberately: moving publication to a detached worker would have
 to preserve controller/library-session rebinding, journal ownership, shutdown
 ordering and cancellation truthfulness, which is a broader transaction redesign
 than this milestone's platform-validation scope. The limitation is therefore
-documented rather than hidden; no partial catalogue is ever published.
+documented rather than hidden; no partial catalogue is ever published. M14 adds
+a concrete worker/job design and acceptance-test contract in
+[`import-publication-design.md`](import-publication-design.md), and fixes the
+race where a cancel request arriving after preparation but before publication
+was ignored.
 
 ## Build commands
 

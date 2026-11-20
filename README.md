@@ -61,7 +61,7 @@ selects or writes those backends.
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). Dialog output preserves spaces and Unix non-UTF-8 path bytes; Windows PowerShell output is forced to UTF-8. |
 | `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, enriched artwork/lyrics attachment, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, dedicated Artist and Album detail pages, metadata/relationship/artwork editing, reviewed track move/audio replacement, decoded managed Album/Artist/Track artwork with override semantics, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart collections/rating controls, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
-| `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, cancellable review-first import with discovery progress and per-candidate import/update/skip decisions, folder import, track/artist edit keys, Artist/Album relationship inspection, inline artwork/lyrics markers, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. Rich artwork/lyrics editing remains GUI-only and is documented below. |
+| `flux-tui` | binary `flux-tui` | Interactive terminal application (crossterm): track list with search, canonical create/open, cancellable review-first import with discovery progress and per-candidate import/update/skip decisions, folder import, track/artist/album metadata edit keys, path-based managed artwork and lyrics replacement, Artist/Album relationship inspection, inline artwork/lyrics markers, missing-file marker, canonical migration workflow, queue add/play-next/remove/reorder, and the same controller semantics as the GUI. GUI-only operations are documented below. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
 `flux-tui → flux-app + flux-core + crossterm`,
@@ -245,24 +245,25 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   copies and hashing inside the final synchronous transaction are not
   cancellable. Discovery issues open a scrollable result panel containing every
   issue rather than only the first, and are counted in the review header. Rich
-  metadata, artwork and lyrics editing remains GUI-only.
+  rich import-review artwork/lyrics attachment remains GUI-only.
   `e` edits the selected track as
-  `title|album|track|disc|artist-id|credit-ids`, `P` creates an artist, `Y`
-  renames/edits an artist (`id|new-name|alias;alias`; omit the alias field to
-  preserve existing aliases), `V` opens a scrollable Artist relationship
-  view, `E` opens the Album/order view, `D` shows the selected Track's Album,
-  `X` refreshes/validates the canonical library, and `M` runs the canonical
-  migration workflow. `y` opens read-only managed lyrics. Rows mark managed
-  Track artwork and lyrics; Album detail labels inherited versus Track-specific
-  artwork.
-  The TUI is inspection/limited-edit by design. Album metadata, cover,
-  reorder/membership/move and Track artwork pickers, rich import review with
-  artwork/lyrics attachment, description/image editing and ownership transfer
-  require the GUI. The TUI never fabricates a destructive shortcut for them.
-  Global artist/album/track search, filters, multi-selection, playlist
-  management, lyrics editing/import/export/karaoke and batch playlist/favorite
-  actions also require the GUI; the TUI edits one selected Track's favorite and
-  rating at a time.
+  `title|album|track|disc|artist-id|credit-ids`, `Z` edits the selected track's
+  Album (`album-id|title|release-type|cover-path`), `W` sets/removes a Track
+  artwork override from a path, `S` imports/replaces/removes managed lyrics from
+  a UTF-8 path, `P` creates an artist, `Y` edits an artist
+  (`id|name|aliases|description|image-path`), `V` opens a scrollable Artist
+  relationship view, `E` opens the Album/order view, `D` shows the selected
+  Track's Album, `X` refreshes/validates the canonical library, and `M` runs the
+  canonical migration workflow. `y` opens read-only managed lyrics. Rows mark
+  managed Track artwork and lyrics; Album detail labels inherited versus
+  Track-specific artwork.
+  The TUI uses explicit filesystem paths rather than native pickers. Rich import
+  review with per-candidate artwork/lyrics attachment, Album reorder/membership/
+  move, ownership transfer/deletion, playlists, global filters, multi-selection,
+  batch actions and karaoke remain GUI workflows. The TUI never fabricates a
+  destructive shortcut for them.
+  Track moves, managed-audio repair/replacement, artwork repair and
+  single-track deletion require the GUI review workflow.
 
   `Q` opens a queue-entry view: `Enter` plays the selected stable
   `QueueEntryId`, `Delete`/`d` removes it, and `Ctrl+↑`/`Ctrl+↓` reorders it.
@@ -551,10 +552,11 @@ changes therefore need an Album first. Cross-owner Track moves use the reviewed
 ownership-transfer workflow. The import manager applies shared Artist/Album and
 Album artwork to checked candidates, while Track artwork, lyrics and the release
 type of a newly created Album remain per-candidate; a featuring boolean and
-one-action metadata templates beyond that scope remain future work. The TUI exposes
-inspection and safe rename/create operations, not Album/Track artwork pickers,
-rich import review, membership changes or ownership transfer. Lyrics must be
-valid UTF-8 LRC/TXT; embedded audio tags are neither read nor written.
+one-action metadata templates beyond that scope remain future work. The TUI
+exposes path-based Artist/Album/Track metadata, artwork and lyrics edits, but not
+native pickers, rich import review, membership changes or ownership transfer.
+Lyrics must be valid UTF-8 LRC/TXT; embedded audio tags are neither read nor
+written.
 Native dialogs and file-drop are implemented; cross-platform runtime
 verification remains limited to Linux/X11. Native picker parsing preserves
 leading/trailing spaces, Unicode, and non-UTF-8 Unix names; Windows PowerShell

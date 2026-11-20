@@ -2215,7 +2215,9 @@ cleanup.
    on a large import, and moving it to a detached worker would have to preserve
    library-session rebinding, journal ownership, shutdown ordering and
    cancellation truthfulness. It is retained and documented in
-   [`distribution.md`](distribution.md#import-publication-responsiveness).
+   [`distribution.md`](distribution.md#import-publication-responsiveness) and the
+   worker design contract in
+   [`import-publication-design.md`](import-publication-design.md).
 4. Single-track ownership transfer, whole-album transfer and multi-item artist
    deletion are implemented with copy-first publication, journal cleanup and
    no-op retry. Album transfer intentionally preserves AlbumId and does not merge
@@ -2227,8 +2229,8 @@ cleanup.
 6. Ratings/favorites are editable per Track in both the GUI and TUI, and the
    GUI exposes rating filters, deterministic sorts, batch favorite/rating
    actions and Highly Rated/Favorites collections. A dedicated full-screen
-   rating editor does not exist. Lyrics have dedicated GUI and read-only TUI
-   views.
+   rating editor does not exist. Lyrics have a dedicated GUI editor plus a TUI
+   read-only view and path-based managed replacement/removal.
 7. Automatic catalogue-backup rollback is not generation-consistent and is
    disabled; transaction-journal recovery is implemented and test-injected at
    every listed boundary. A recovery-required malformed journal requires manual
@@ -2242,8 +2244,10 @@ cleanup.
    case-sensitive volumes, Linux privileged package installation, and audio
    output on Windows/macOS remain unverified.
 10. The TUI import review supports candidate import/update/skip decisions only;
-    fixed-target album selection and rich metadata/artwork/lyrics editing remain
-    GUI-only.
+    fixed-target album selection and per-candidate artwork/lyrics attachment
+    remain GUI-only. After import, the TUI can edit Artist name/aliases/
+    description/image, Album title/release type/cover, and Track artwork/lyrics
+    through explicit paths using the shared Controller.
 11. Atomic import reuses exact and unique case/whitespace-normalized Artist and
     Album names. Approximate/fuzzy matching is deliberately not performed;
     ambiguous normalized names require explicit review.
@@ -2251,8 +2255,9 @@ cleanup.
     refuses deletion/transfer and points to the GUI; this is a product limitation,
     not a separate transaction implementation.
 13. Move and managed-audio replacement review are GUI-only; the TUI supports
-    safe metadata/credit editing and its help directs these two operations to
-    the GUI review workflow.
+    safe Track metadata/credit editing, Album metadata/cover, Artist metadata/
+    image, Track artwork and managed lyrics through shared Controller operations,
+    and directs membership/move/repair workflows to the GUI.
 14. Audio replacement validates file existence, non-empty content, extension
     safety and fingerprints only; it does not decode the audio or read tags.
 15. On platforms that block deleting an open file, replacing or moving the
