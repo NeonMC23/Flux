@@ -268,6 +268,7 @@ pub fn save_lyrics_file(
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = start;
         pick_macos_save(suggested_name)
     }
     #[cfg(target_os = "windows")]
@@ -290,12 +291,12 @@ pub fn pick_folder_in(start: Option<&Path>) -> Result<Option<PathBuf>, String> {
     #[cfg(target_os = "macos")]
     {
         let _ = start;
-        pick_macos(true)
+        Ok(single_path(pick_macos(true)?))
     }
     #[cfg(target_os = "windows")]
     {
         let _ = start;
-        pick_windows(true)
+        Ok(single_path(pick_windows(true)?))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -346,6 +347,15 @@ fn parse_path_list_stdout(stdout: &[u8]) -> Vec<PathBuf> {
             })
             .collect()
     }
+}
+
+/// Converts a picker result that should contain one path into a single path.
+/// Multiple paths are treated as an unusable selection rather than silently
+/// choosing an arbitrary entry.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn single_path(paths: Option<Vec<PathBuf>>) -> Option<PathBuf> {
+    let mut paths = paths?;
+    (paths.len() == 1).then(|| paths.remove(0))
 }
 
 fn parse_single_path_stdout(stdout: &[u8]) -> Option<PathBuf> {
@@ -852,6 +862,7 @@ mod tests {
     use super::{
         Platform, app_dirs, applescript_quoted, linux_save_start, parse_path_list_stdout,
         parse_single_path_stdout, powershell_single_quoted, prefixed_os_argument, resolve_dirs,
+        single_path,
     };
 
     fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
@@ -879,6 +890,20 @@ mod tests {
         assert_eq!(
             applescript_quoted(r#"A "B" \ C.lrc"#),
             r#"A \"B\" \\ C.lrc"#
+        );
+    }
+
+    #[test]
+    fn folder_picker_results_require_exactly_one_path() {
+        assert_eq!(single_path(None), None);
+        assert_eq!(single_path(Some(Vec::new())), None);
+        assert_eq!(
+            single_path(Some(vec![PathBuf::from("/music")])),
+            Some(PathBuf::from("/music"))
+        );
+        assert_eq!(
+            single_path(Some(vec![PathBuf::from("/one"), PathBuf::from("/two")])),
+            None
         );
     }
 
