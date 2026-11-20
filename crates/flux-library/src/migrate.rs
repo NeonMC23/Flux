@@ -1697,7 +1697,10 @@ mod tests {
         assert_eq!(fs::read(&real_outside).expect("target"), b"target");
     }
 
-    #[cfg(unix)]
+    // macOS volumes reject names that are not valid UTF-8 (APFS returns
+    // EILSEQ), so the raw-byte path contract can only be exercised on a
+    // filesystem that stores arbitrary bytes.
+    #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_unix_bytes_are_preserved_and_migrated_on_unix() {
         use std::ffi::OsString;
