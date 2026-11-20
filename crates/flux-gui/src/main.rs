@@ -11,6 +11,8 @@
 //! [`flux_app`]. Real audio output requires a build with `--features cpal`;
 //! otherwise the player bar says so and playback attempts report why.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
