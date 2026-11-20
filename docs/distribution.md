@@ -163,7 +163,8 @@ baseline. The manual CI packaging job runs on Ubuntu 24.04 (glibc 2.39); those
 artifacts must be the ones reviewed for broader Linux distribution. No portable
 glibc baseline is claimed until that CI artifact is executed on target systems.
 The TUI and GUI both depend on the platform ALSA runtime and the usual X11 or
-Wayland desktop libraries.
+Wayland desktop libraries. The `.deb` metadata derives its `libc6` lower bound
+from the linked GUI binary instead of claiming a false broad compatibility floor.
 
 ## Budgets, signing and publication
 
