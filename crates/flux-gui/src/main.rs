@@ -4058,19 +4058,45 @@ impl FluxReady {
         editor.error = Some(format!(
             "Save or cancel the lyrics edits before {action}. Unsaved text would otherwise be hidden and discarded."
         ));
+        self.lifecycle_msg = editor.error.clone();
         true
     }
 
+    /// Messages that replace the visible editing context or open another
+    /// editor. A dirty Track/lyrics editor must be saved or explicitly
+    /// cancelled first so navigation can never hide unsaved work.
+    fn message_changes_context(message: &Message) -> bool {
+        matches!(
+            message,
+            Message::SelectView(_)
+                | Message::SelectGroup(_)
+                | Message::OpenAlbum(_)
+                | Message::OpenArtist(_)
+                | Message::NavigateBack
+                | Message::SearchNavigateArtist(_)
+                | Message::SearchNavigateAlbum(_)
+                | Message::SearchNavigateTrack(_)
+                | Message::CollectionSelect(_)
+                | Message::CollectionBack
+                | Message::PlaylistSelect(_)
+                | Message::PlaylistBack
+                | Message::LyricsSelect(_)
+                | Message::LyricsBack
+                | Message::LyricsOpenCurrent
+                | Message::LyricsOpenAlbum(_)
+                | Message::LyricsOpenArtist(_)
+                | Message::EditTrack(_)
+                | Message::LyricsEditOpen
+                | Message::ToggleSetup
+                | Message::ImportOpen
+                | Message::ImportOpenSetup
+        )
+    }
+
     fn select_view(&mut self, view: LibraryView) {
-        if let Some(editor) = self.lyrics_editor.as_mut()
-            && editor.dirty
-            && !editor.discard_confirm
+        if self.block_if_track_editor_is_dirty("switching views")
+            || self.block_if_lyrics_editor_is_dirty("switching views")
         {
-            editor.discard_confirm = true;
-            editor.error = Some(
-                "Unsaved lyrics changes will be discarded. Choose the destination again to leave the editor."
-                    .to_owned(),
-            );
             return;
         }
         self.navigation_stack.clear();
@@ -4139,6 +4165,11 @@ impl FluxReady {
     }
 
     fn toggle_setup(&mut self) {
+        if self.block_if_track_editor_is_dirty("opening setup")
+            || self.block_if_lyrics_editor_is_dirty("opening setup")
+        {
+            return;
+        }
         self.show_setup = !self.show_setup;
         self.page = 0;
     }
@@ -4173,6 +4204,11 @@ impl FluxReady {
     }
 
     fn navigate_back(&mut self) {
+        if self.block_if_track_editor_is_dirty("going back")
+            || self.block_if_lyrics_editor_is_dirty("going back")
+        {
+            return;
+        }
         let Some(snapshot) = self.navigation_stack.pop() else {
             return;
         };
@@ -4244,6 +4280,12 @@ impl FluxReady {
         if message
             .library_session()
             .is_some_and(|session| session != self.controller.library_session())
+        {
+            return Task::none();
+        }
+        if Self::message_changes_context(&message)
+            && (self.block_if_track_editor_is_dirty("navigating away")
+                || self.block_if_lyrics_editor_is_dirty("navigating away"))
         {
             return Task::none();
         }
@@ -16866,6 +16908,15 @@ mod tests {
             &mut gui,
             Message::EditorTitleChanged("Unsaved title".to_owned()),
         );
+        let original_view = gui.view;
+        send(&mut gui, Message::SelectView(LibraryView::Artists));
+        assert_eq!(
+            gui.view, original_view,
+            "view switching must not hide a dirty Track editor"
+        );
+        let artist_id = gui.controller.track_artist_id(id).expect("artist");
+        send(&mut gui, Message::OpenArtist(artist_id));
+        assert_eq!(gui.view, original_view);
         let other_root = dir.path().join("other-library");
         flux_app::create_canonical_library(&other_root).expect("other canonical");
         gui.lib_input = other_root.display().to_string();
@@ -16948,6 +16999,18 @@ mod tests {
         assert!(!gui.closed);
         assert!(!gui.controller.is_shutdown());
         assert!(gui.close_confirm);
+
+        let view = gui.view;
+        send(&mut gui, Message::SelectView(LibraryView::Artists));
+        assert_eq!(gui.view, view, "dirty lyrics block view switching");
+        assert!(
+            gui.lyrics_editor
+                .as_ref()
+                .is_some_and(|editor| editor.dirty)
+        );
+        send(&mut gui, Message::OpenAlbum(AlbumId::new(1)));
+        assert_eq!(gui.view, view, "dirty lyrics block entity navigation");
+        assert!(gui.lyrics_editor.is_some());
         gui.controller.shutdown();
     }
 
