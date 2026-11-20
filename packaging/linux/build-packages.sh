@@ -139,6 +139,8 @@ install -m755 "$GUI_BIN" "$DEBROOT/usr/bin/flux"
 install -m755 "$TUI_BIN" "$DEBROOT/usr/bin/flux-tui"
 cp -a "$STAGE/share/." "$DEBROOT/usr/share/"
 INSTALLED_SIZE="$(du -sk "$DEBROOT" | awk '{print $1}')"
+GLIBC_MIN="$(objdump -T "$GUI_BIN" | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+[ -n "$GLIBC_MIN" ] || GLIBC_MIN="2.39"
 cat > "$DEBROOT/DEBIAN/control" <<EOF
 Package: flux
 Version: $VERSION
@@ -148,7 +150,7 @@ Architecture: $DEB_ARCH
 Installed-Size: $INSTALLED_SIZE
 Maintainer: NeonMC23 <piotr.souchon23@gmail.com>
 Homepage: https://github.com/NeonMC23/Flux
-Depends: libasound2t64 | libasound2, libc6, libgcc-s1, libfontconfig1, libx11-6, libxkbcommon0, libwayland-client0
+Depends: libasound2t64 | libasound2, libc6 (>= $GLIBC_MIN), libgcc-s1, libfontconfig1, libx11-6, libxkbcommon0, libwayland-client0
 Description: Local-first native music player
  Flux is a native desktop music player for local audio files. It manages a
  self-contained canonical library with stable artist, album, track and queue
