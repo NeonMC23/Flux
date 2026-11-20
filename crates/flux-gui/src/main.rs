@@ -10898,6 +10898,19 @@ impl FluxReady {
         }
     }
 
+    fn artist_image_resource_state_label(&self, artist_id: ArtistId) -> Option<String> {
+        match self.controller.artist_image_resource_state(artist_id) {
+            Some(ResourceState::Missing) => Some(
+                "The catalogue references a managed Artist image that is missing. Choose a new image to repair it, or remove the reference."
+                    .to_owned(),
+            ),
+            Some(ResourceState::Unavailable(reason)) => Some(format!(
+                "The Artist image path exists but cannot be inspected ({reason}). Flux will not overwrite or remove an inaccessible resource; repair permissions or choose a replacement explicitly."
+            )),
+            _ => None,
+        }
+    }
+
     fn artist_artwork<'a>(&'a self, artist_id: ArtistId, size: f32) -> Element<'a, Message> {
         let seed = self
             .controller
@@ -11400,6 +11413,21 @@ impl FluxReady {
             ]
             .spacing(6),
         );
+        match self.controller.track_artwork_resource_state(editor.id) {
+            Some(ResourceState::Missing) => body = body.push(
+                text("The catalogue references a Track-artwork override that is missing. Choose a replacement or remove the override to restore Album artwork.")
+                    .size(9)
+                    .color(DANGER),
+            ),
+            Some(ResourceState::Unavailable(reason)) => body = body.push(
+                text(format!(
+                    "The Track-artwork override cannot be inspected ({reason}). Flux will not overwrite or remove an inaccessible resource; repair permissions first."
+                ))
+                .size(9)
+                .color(DANGER),
+            ),
+            _ => {}
+        }
         body = body.push(text("DELETE THIS TRACK").size(9).color(DANGER));
         body = body.push(
             text("Removes this TrackId, its managed audio, metadata record, lyrics, Track artwork override, rating and queue entries. The album, artist and inherited album artwork are retained even when empty. Other tracks and playlist order are preserved. This is not a bulk delete.")
@@ -14464,13 +14492,22 @@ impl FluxReady {
                         ),
                     ]
                     .spacing(6),
+                    if let Some(reason) = self.artist_image_resource_state_label(artist_id) {
+                        Element::from(text(reason).size(9).color(DANGER))
+                    } else {
+                        Element::from(
+                            text("No managed image yet. Choosing an image replaces the generated fallback.")
+                                .size(9)
+                                .color(MUTED),
+                        )
+                    },
                 ]
                 .spacing(6),
             )
             .padding(10)
             .style(card_style),
-            text("ALBUMS").size(9).color(ACCENT),
         ];
+        body = body.push(text("ALBUMS").size(9).color(ACCENT));
         if album_ids.is_empty() {
             body = body.push(
                 text("No albums associated with this artist yet.")
@@ -19021,6 +19058,13 @@ mod tests {
             gui.controller
                 .artist_image_path(artist)
                 .is_some_and(|path| path.is_file())
+        );
+        let managed_artist_image = gui.controller.artist_image_path(artist).expect("image");
+        std::fs::remove_file(&managed_artist_image).expect("remove managed image");
+        assert!(
+            gui.artist_image_resource_state_label(artist)
+                .is_some_and(|label| label.contains("missing")),
+            "missing Artist images are surfaced with repair guidance"
         );
         send(&mut gui, Message::ArtistImageRemove);
         assert!(gui.controller.artist_image_path(artist).is_some());

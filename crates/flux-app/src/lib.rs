@@ -2806,6 +2806,21 @@ impl Controller {
         Some(resource_state(&self.track_lyrics_path(id)?))
     }
 
+    /// Distinguishes present, definitely missing, and inaccessible/invalid
+    /// managed Track-artwork overrides. `None` means no override is assigned
+    /// and Album artwork is the fallback.
+    #[must_use]
+    pub fn track_artwork_resource_state(&self, id: TrackId) -> Option<ResourceState> {
+        Some(resource_state(&self.track_artwork_path(id)?))
+    }
+
+    /// Distinguishes present, definitely missing, and inaccessible/invalid
+    /// managed Artist images. `None` means no image is assigned.
+    #[must_use]
+    pub fn artist_image_resource_state(&self, id: ArtistId) -> Option<ResourceState> {
+        Some(resource_state(&self.artist_image_path(id)?))
+    }
+
     /// The playback model's state.
     #[must_use]
     pub fn player_state(&self) -> PlaybackState {
@@ -15951,6 +15966,50 @@ mod tests {
         fs::remove_file(&lyrics).expect("remove lyrics");
         assert_eq!(
             controller.track_lyrics_resource_state(id),
+            Some(ResourceState::Missing)
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn artist_and_track_artwork_resource_states_are_inspectable() {
+        let dir = TempDir::new("artwork-resource-state");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let artist = controller.track_artist_id(id).expect("artist");
+        let image = dir.path().join("artist.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nartist").expect("image");
+        controller
+            .set_artist_image(artist, &image)
+            .expect("artist image");
+        assert_eq!(
+            controller.artist_image_resource_state(artist),
+            Some(ResourceState::Present)
+        );
+        let managed = controller.artist_image_path(artist).expect("managed image");
+        fs::remove_file(&managed).expect("remove image");
+        assert_eq!(
+            controller.artist_image_resource_state(artist),
+            Some(ResourceState::Missing)
+        );
+
+        let artwork = dir.path().join("track.png");
+        fs::write(&artwork, b"\x89PNG\r\n\x1a\ntrack").expect("artwork");
+        controller
+            .set_track_artwork(id, &artwork)
+            .expect("track artwork");
+        assert_eq!(
+            controller.track_artwork_resource_state(id),
+            Some(ResourceState::Present)
+        );
+        let managed = controller
+            .track_artwork_path(id)
+            .expect("managed track artwork");
+        fs::remove_file(&managed).expect("remove track artwork");
+        assert_eq!(
+            controller.track_artwork_resource_state(id),
             Some(ResourceState::Missing)
         );
         controller.shutdown();
