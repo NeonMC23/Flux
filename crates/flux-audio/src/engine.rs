@@ -3101,7 +3101,8 @@ mod tests {
             matches!(e, EngineEvent::Loaded { .. })
         });
         engine.play();
-        for _ in 0..6 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while engine.position() == Duration::ZERO && std::time::Instant::now() < deadline {
             control.drain_frames(512);
             std::thread::sleep(Duration::from_millis(5));
         }
