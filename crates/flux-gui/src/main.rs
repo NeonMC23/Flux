@@ -17861,7 +17861,13 @@ mod tests {
             Message::SelectAudioDevice(Some("test:one".to_owned())),
         );
         let stale_token = gui.audio_switch_token;
-        send(&mut gui, Message::SelectAudioDevice(None));
+        // Selecting the same explicit target again mints a newer token even
+        // while the first open is pending. Choosing the default here would be
+        // a no-op in a CPAL build that already follows the default.
+        send(
+            &mut gui,
+            Message::SelectAudioDevice(Some("test:one".to_owned())),
+        );
         gui.audio_switch_error = None;
         send(
             &mut gui,
