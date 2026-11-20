@@ -546,6 +546,7 @@ fn dialog_error(stderr: &[u8], status: Option<i32>) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_zenity_output(output: std::process::Output) -> Result<Option<Vec<PathBuf>>, String> {
     if output.status.code() == Some(1) {
         return Ok(None);
@@ -561,6 +562,7 @@ fn parse_zenity_output(output: std::process::Output) -> Result<Option<Vec<PathBu
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_single_output(output: std::process::Output) -> Result<Option<PathBuf>, String> {
     if output.status.code() == Some(1) {
         return Ok(None);
