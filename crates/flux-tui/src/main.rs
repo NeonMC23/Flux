@@ -75,10 +75,33 @@ use flux_app::{
     StorageMode, TrackMetadataEdit, format_duration, is_track_playable, prepare_import_files,
     prepare_import_plan,
 };
-use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
+use flux_core::{APP_VERSION, ArtistId, MILESTONE, PlaybackState, Track, TrackId};
 use unicode_width::UnicodeWidthChar;
 
+fn handle_cli() -> bool {
+    for arg in std::env::args_os().skip(1) {
+        if arg == "--version" || arg == "-V" {
+            println!("{}", flux_core::release_info());
+            return true;
+        }
+        if arg == "--help" || arg == "-h" {
+            println!(
+                "Flux {}\nA local-first, native music player (terminal interface).\n\n\
+                 Usage: flux-tui [MUSIC_DIR]\n\n\
+                 MUSIC_DIR opens the cancellable import review for that folder.\n\
+                 Use --version to print the release identity and --help for this text.",
+                APP_VERSION
+            );
+            return true;
+        }
+    }
+    false
+}
+
 fn main() -> ExitCode {
+    if handle_cli() {
+        return ExitCode::SUCCESS;
+    }
     let initial_dir = std::env::args_os().nth(1).map(PathBuf::from);
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         println!("{}", flux_core::startup_message());
@@ -3008,6 +3031,10 @@ fn pad_with_right(left: &str, right: &str, width: usize) -> String {
 fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
     let controller =
         Controller::open_default().map_err(|err| std::io::Error::other(err.to_string()))?;
+    let created_default = controller.default_library_created();
+    let default_root = controller
+        .canonical_root()
+        .map(|root| root.display().to_string());
 
     let guard = TerminalGuard::enter()?;
     // Restore the terminal even if a panic unwinds through the loop.
@@ -3041,6 +3068,12 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         lifecycle_msg: None,
         last_reconcile: None,
     };
+    if created_default {
+        tui.lifecycle_msg = Some(format!(
+            "Created a new empty library at {}. Use i/o to import music; ? lists commands.",
+            default_root.unwrap_or_else(|| "the per-user data directory".to_owned())
+        ));
+    }
     if let Some(dir) = initial_dir
         && let Err(error) = tui.start_import_review(vec![dir], true)
     {

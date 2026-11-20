@@ -1615,6 +1615,9 @@ pub struct Controller {
     outbox: Vec<ControllerEvent>,
     last_error: Option<String>,
     last_status: Option<String>,
+    /// True when `open_default` created the per-user canonical library during
+    /// this launch. UI entry points use it to explain first-run state.
+    default_library_created: bool,
 }
 
 /// Initial state for a controller, assembled by the fallible
@@ -1926,6 +1929,7 @@ impl Controller {
         let startup_warning = startup.warning.clone();
         let mut controller = Self::new_canonical(startup.engine, startup.status, &root)
             .map_err(|err| ControllerOpenError::Canonical(err.to_string()))?;
+        controller.default_library_created = needs_initialization;
         controller.active_audio_device = startup.active;
         controller.selected_audio_device = startup.selected;
         controller.enable_default_audio_recovery();
@@ -2006,6 +2010,7 @@ impl Controller {
             outbox: Vec::new(),
             last_error: None,
             last_status: None,
+            default_library_created: false,
         };
         controller.engine.set_volume(controller.volume);
         if let Some(store) = controller.canonical_store.as_mut()
@@ -2770,6 +2775,13 @@ impl Controller {
     pub fn track_lyrics(&self, id: TrackId) -> Option<String> {
         let path = self.canonical_store.as_ref()?.track_lyrics_path(id)?;
         std::fs::read_to_string(path).ok()
+    }
+
+    /// Whether this launch created the default per-user library. UI entry
+    /// points use this to explain first-run state without hiding the path.
+    #[must_use]
+    pub fn default_library_created(&self) -> bool {
+        self.default_library_created
     }
 
     /// Last-known availability of a catalogue track. `None` in legacy mode

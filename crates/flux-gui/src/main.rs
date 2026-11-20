@@ -28,7 +28,10 @@ use flux_app::{
     TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration, is_track_playable,
     prepare_import_files, prepare_import_plan,
 };
-use flux_core::{APP_NAME, ArtistId, PlaybackState, QueueEntry, QueueEntryId, Track, TrackId};
+use flux_core::{
+    APP_ID, APP_NAME, APP_VERSION, ArtistId, PlaybackState, QueueEntry, QueueEntryId, Track,
+    TrackId,
+};
 use iced::ContentFit;
 use iced::advanced::Widget;
 use iced::advanced::layout::{self, Layout};
@@ -11184,6 +11187,11 @@ impl FluxReady {
             audio_card,
             text("KEYBOARD").size(9).color(MUTED),
             shortcut_card,
+            text(format!(
+                "{APP_NAME} {APP_VERSION} · {APP_ID} · local-first; no network services"
+            ))
+            .size(9)
+            .color(MUTED),
         ]
         .spacing(10)
         .width(Length::Fill)
@@ -16438,9 +16446,23 @@ enum FluxState {
 impl Flux {
     fn boot() -> Self {
         match Controller::open_default() {
-            Ok(controller) => Self {
-                state: FluxState::Ready(Box::new(FluxReady::new(controller))),
-            },
+            Ok(controller) => {
+                let created = controller.default_library_created();
+                let root = controller
+                    .canonical_root()
+                    .map(|root| root.display().to_string());
+                let mut ready = FluxReady::new(controller);
+                if created {
+                    ready.show_setup = true;
+                    ready.lifecycle_msg = Some(format!(
+                        "Created a new empty library at {}. Use Import music to add files, or choose another existing library below.",
+                        root.unwrap_or_else(|| "the per-user data directory".to_owned())
+                    ));
+                }
+                Self {
+                    state: FluxState::Ready(Box::new(ready)),
+                }
+            }
             Err(error) => Self {
                 state: FluxState::Blocked(error.to_string()),
             },
@@ -16954,17 +16976,57 @@ fn reconcile_summary(report: &ReconcileReport) -> String {
 }
 
 pub fn main() -> iced::Result {
+    if handle_cli() {
+        return Ok(());
+    }
     iced::application(Flux::boot, Flux::update, Flux::view)
         .title(APP_NAME)
         .theme(Flux::theme)
         .subscription(Flux::subscription)
-        .window(window::Settings {
-            min_size: Some(iced::Size::new(920.0, 620.0)),
-            ..window::Settings::default()
-        })
+        .window(window_settings())
         .window_size((1_180.0, 760.0))
         .exit_on_close_request(false)
         .run()
+}
+
+fn handle_cli() -> bool {
+    for arg in std::env::args_os().skip(1) {
+        if arg == "--version" || arg == "-V" {
+            println!("{}", flux_core::release_info());
+            return true;
+        }
+        if arg == "--help" || arg == "-h" {
+            println!(
+                "Flux {}\nA local-first, native music player.\n\nUsage: flux\n\n\
+                 The GUI manages a canonical local library under the per-user data directory.\n\
+                 Use Flux\n  --version   print the release identity\n  --help      show this help",
+                APP_VERSION
+            );
+            return true;
+        }
+    }
+    false
+}
+
+fn window_icon() -> Option<window::Icon> {
+    let image =
+        image::load_from_memory(include_bytes!("../../../assets/icons/flux-256.png")).ok()?;
+    let image = image.to_rgba8();
+    let (width, height) = image.dimensions();
+    window::icon::from_rgba(image.into_raw(), width, height).ok()
+}
+
+fn window_settings() -> window::Settings {
+    let mut settings = window::Settings {
+        min_size: Some(iced::Size::new(920.0, 620.0)),
+        icon: window_icon(),
+        ..window::Settings::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        settings.platform_specific.application_id = APP_ID.to_owned();
+    }
+    settings
 }
 
 #[cfg(test)]
@@ -20483,6 +20545,15 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn release_icon_is_embedded_in_window_settings() {
+        assert!(
+            window_icon().is_some(),
+            "the committed 256 px icon must decode for the window"
+        );
+        assert!(window_settings().icon.is_some());
     }
 
     #[test]
