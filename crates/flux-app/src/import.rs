@@ -393,12 +393,14 @@ pub struct ImportCandidate {
     title: String,
     artist_name: Option<String>,
     album: Option<String>,
+    release_type: ReleaseType,
     track_number: Option<u32>,
     disc_number: Option<u32>,
     artist_id: Option<ArtistId>,
     credits: Vec<ImportCredit>,
     owner_index: usize,
     base_credits: Vec<ImportCredit>,
+    base_release_type: ReleaseType,
     metadata_incomplete: bool,
     existing_match: Option<ExistingTrackMatch>,
     metadata_matches_existing: bool,
@@ -491,6 +493,18 @@ impl ImportCandidate {
     #[must_use]
     pub fn album(&self) -> Option<&str> {
         self.album.as_deref()
+    }
+
+    /// Release type proposed for a newly created Album. Existing Album
+    /// membership keeps its stored type.
+    #[must_use]
+    pub fn release_type(&self) -> ReleaseType {
+        self.release_type
+    }
+
+    /// Sets the release type for a newly created Album.
+    pub fn set_release_type(&mut self, kind: ReleaseType) {
+        self.release_type = kind;
     }
 
     /// Current reviewed track number.
@@ -672,6 +686,7 @@ impl ImportCandidate {
         self.title != self.base_title
             || self.artist_name != self.base_artist_name
             || self.album != self.base_album
+            || self.release_type != self.base_release_type
             || self.track_number != self.base_track_number
             || self.disc_number != self.base_disc_number
             || self.artist_id != self.base_artist_id
@@ -847,6 +862,8 @@ impl ImportCandidate {
         self.base_artist_name = Some(target.owner_name.clone());
         self.base_artist_id = Some(target.owner_artist_id);
         self.base_credits = self.credits.clone();
+        self.release_type = target.release_type;
+        self.base_release_type = target.release_type;
         self.provenance.album = Some(MetadataSource::Manual);
         self.provenance.artist = MetadataSource::Manual;
     }
@@ -1995,12 +2012,14 @@ fn make_candidate(
         title: base_title.clone(),
         artist_name: base_artist_name.clone(),
         album: base_album.clone(),
+        release_type: inference.track.release_type,
         track_number: base_track_number,
         disc_number: base_disc_number,
         artist_id: base_artist_id,
         credits: base_credits.clone(),
         owner_index: 0,
         base_credits,
+        base_release_type: inference.track.release_type,
         base_title,
         base_artist_name,
         base_album,
@@ -2987,7 +3006,7 @@ fn apply_import_plan_canonical(
                         [album_id] => CanonicalImportAlbumRef::Existing(*album_id),
                         [] => CanonicalImportAlbumRef::ByName {
                             title: title.to_owned(),
-                            release_type: ReleaseType::Album,
+                            release_type: candidate.release_type,
                         },
                         _ => {
                             report.items.push(AppliedImportItem {
@@ -4183,6 +4202,35 @@ mod tests {
         let id = controller.tracks()[0].0;
         assert_eq!(controller.track_artist_id(id), Some(artist));
         assert_eq!(controller.track_album_id(id), Some(album));
+        controller.shutdown();
+    }
+
+    #[test]
+    fn reviewed_import_publishes_the_selected_release_type() {
+        let dir = TempDir::new("review-release-type");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let source_dir = dir.path().join("Artist/Album");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = wav(&source_dir, "Song.wav", 4_410, 0.2);
+        let request = canonical_request(&controller, &root, vec![source], None);
+        let mut plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(plan.candidates[0].release_type(), crate::ReleaseType::Album);
+        plan.candidates[0].set_release_type(crate::ReleaseType::Ep);
+        assert!(plan.candidates[0].is_edited());
+        controller
+            .apply_import_plan(&plan, &prepared_for(&plan))
+            .expect("release type import");
+        let id = controller.tracks()[0].0;
+        let album = controller.track_album_id(id).expect("album");
+        assert_eq!(
+            controller.album(album).map(|album| album.release_type),
+            Some(crate::ReleaseType::Ep)
+        );
         controller.shutdown();
     }
 

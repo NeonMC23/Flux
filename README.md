@@ -505,9 +505,9 @@ Optional Album membership is canonical, but Album owner transfer and Track
 ownership transfer still require an Album destination; standalone ownership
 changes therefore need an Album first. Cross-owner Track moves use the reviewed
 ownership-transfer workflow. The import manager applies shared Artist/Album and
-Album artwork to checked candidates, while Track artwork and lyrics remain
-per-candidate; release-type selection, a featuring boolean and one-action
-metadata templates beyond that scope remain future work. The TUI exposes
+Album artwork to checked candidates, while Track artwork, lyrics and the release
+type of a newly created Album remain per-candidate; a featuring boolean and
+one-action metadata templates beyond that scope remain future work. The TUI exposes
 inspection and safe rename/create operations, not Album/Track artwork pickers,
 rich import review, membership changes or ownership transfer. Lyrics must be
 valid UTF-8 LRC/TXT; embedded audio tags are neither read nor written.

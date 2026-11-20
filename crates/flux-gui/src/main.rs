@@ -1987,6 +1987,7 @@ struct ImportManager {
     edit_artist: String,
     edit_credit: String,
     edit_album: String,
+    edit_release_type: ReleaseType,
     edit_track_number: String,
     edit_disc_number: String,
     edit_artwork: String,
@@ -2028,6 +2029,7 @@ impl ImportManager {
             edit_artist: String::new(),
             edit_credit: String::new(),
             edit_album: String::new(),
+            edit_release_type: ReleaseType::Album,
             edit_track_number: String::new(),
             edit_disc_number: String::new(),
             edit_artwork: String::new(),
@@ -2078,6 +2080,7 @@ impl ImportManager {
         self.bulk_track_artwork_path.clear();
         self.asset_error = None;
         self.number_error = None;
+        self.edit_release_type = ReleaseType::Album;
     }
 
     fn checked_indices(&self) -> Vec<usize> {
@@ -2107,6 +2110,7 @@ impl ImportManager {
         self.edit_artist = candidate.artist_name().unwrap_or_default().to_owned();
         self.edit_credit.clear();
         self.edit_album = candidate.album().unwrap_or_default().to_owned();
+        self.edit_release_type = candidate.release_type();
         self.edit_track_number = candidate
             .track_number()
             .map(|number| number.to_string())
@@ -2383,6 +2387,7 @@ enum Message {
     ImportTitleChanged(String),
     ImportArtistChanged(String),
     ImportAlbumChanged(String),
+    ImportReleaseTypeChanged(ReleaseType),
     ImportAlbumPicked(Option<AlbumChoice>),
     ImportTrackNumberChanged(String),
     ImportDiscNumberChanged(String),
@@ -5714,6 +5719,19 @@ impl FluxReady {
                             candidate.clear_album_artwork();
                             manager.edit_album_artwork.clear();
                         }
+                    }
+                }
+            }
+            Message::ImportReleaseTypeChanged(kind) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                {
+                    manager.edit_release_type = kind;
+                    if let Some(plan) = manager.plan.as_mut()
+                        && let Some(index) = manager.selected
+                        && let Some(candidate) = plan.candidates.get_mut(index)
+                    {
+                        candidate.set_release_type(kind);
                     }
                 }
             }
@@ -9763,6 +9781,11 @@ impl FluxReady {
                             .size(8)
                             .color(ACCENT),
                     );
+                    body = body.push(text("RELEASE TYPE FOR NEW ALBUM").size(8).color(MUTED));
+                    body = body.push(release_type_buttons(
+                        candidate.release_type(),
+                        Message::ImportReleaseTypeChanged,
+                    ));
                 }
             } else if candidate.album().is_none() {
                 body = body.push(
@@ -17978,6 +18001,10 @@ mod tests {
         );
         send(
             &mut gui,
+            Message::ImportReleaseTypeChanged(ReleaseType::Single),
+        );
+        send(
+            &mut gui,
             Message::ImportCreditNameChanged("Featured Artist".to_owned()),
         );
         send(&mut gui, Message::ImportCreditAddNamed);
@@ -18040,6 +18067,13 @@ mod tests {
             .expect("imported track artwork");
         assert!(imported_art.is_file());
         let imported_album = gui.controller.track_album_id(id).expect("album");
+        assert_eq!(
+            gui.controller
+                .album(imported_album)
+                .map(|album| album.release_type),
+            Some(ReleaseType::Single),
+            "the per-candidate release type is published"
+        );
         assert!(
             gui.controller
                 .album_cover_path(imported_album)
