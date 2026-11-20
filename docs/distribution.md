@@ -1,7 +1,7 @@
 # Flux distribution guide
 
-This document describes the M11 release-engineering outputs. Flux is prepared
-for distribution but **no release, tag, or public upload is created by this
+This document records the M12 release-candidate evidence. Flux is prepared for
+distribution, but **no release, tag, or public upload is created by this
 repository**.
 
 ## Identity
@@ -17,81 +17,155 @@ The stable values are:
 `flux --version` and `flux-tui --version` print the same release identity, so
 packaged artifacts can be checked without starting a GUI or terminal session.
 
-## Supported build targets
+## Supported targets
 
-| Platform | Architecture | Build status | Validation status |
-|---|---|---|---|
-| Linux | x86_64 | Built locally | Packaged, extracted, runtime-tested |
-| Linux | ARM64 | CI job defined | Not built locally (x86_64 host) |
-| Windows | x86_64 | CI job defined | Not built or run locally |
-| Windows | ARM64 | CI job defined | Not built or run locally |
-| macOS | ARM64 | CI job defined | Not built or run locally |
-| macOS | x86_64 | Script supported | Not built or run locally |
-| macOS | universal | Script option | Not built or run locally |
+M12 executed the native CI matrix and the manual packaging jobs. A green
+cross-compile is not runtime validation; the columns below distinguish what was
+actually built, packaged, inspected and executed.
 
-A target is only called validated when the artifact was executed on that native
-platform. A green cross-compile or YAML entry is not runtime validation.
+| Platform | Built natively | Packaged | Artifact verified | CI tests/build | Installed | GUI runtime | Audio tested |
+|---|---|---|---|---|---|---|---|
+| Linux x86_64 | Yes (Ubuntu 24.04) | `.tar.gz`, `.deb`, `.rpm` | Yes | Yes | Extracted/upgrade simulated, not privileged install | Yes, under Xvfb | No device on runner |
+| Linux ARM64 | Yes (native ARM64 runner) | `.tar.gz`, `.deb`, `.rpm` | Yes | Yes | Extracted/upgrade simulated, not privileged install | Yes, under Xvfb | No device on runner |
+| Windows x86_64 | Yes (windows-2025) | Portable ZIP, Inno Setup | Yes | Yes | Yes, temp-dir install/reinstall/uninstall | Yes, first-run and reopen | No device on runner |
+| Windows ARM64 | Yes (windows-11-arm) | Portable ZIP | Yes | Yes | Portable extraction only (no installer) | Yes, first-run and reopen | No device on runner |
+| macOS ARM64 | Yes (macos-15) | `.app`, ZIP, DMG | Yes | Yes | Bundle extracted from ZIP and DMG | Yes, first-run and reopen | No device on runner |
+| macOS x86_64 | Compile-only cross-check | Not built | Not applicable | Compile only | No | No | No |
 
-## Linux formats
+macOS universal binaries remain a supported script option but were not built or
+validated in M12.
 
-Implemented and locally validated:
+## CI execution
+
+The complete workflow was executed by `workflow_dispatch` at commit
+`c456dca` (GitHub Actions run `44701347712`). All jobs passed:
+
+- format/Clippy, dependency licences, Linux x86_64 and ARM64 tests/builds,
+  Windows x86_64 and ARM64 tests/builds, macOS ARM64 tests/build and macOS
+  x86_64 compile-only cross-check;
+- Linux x86_64/ARM64 packaging and package validation;
+- Windows x86_64/ARM64 packaging and artifact verification;
+- macOS ARM64 packaging and artifact verification.
+
+The workflow has `contents: read` permission, does not create tags or releases,
+does not sign with an unavailable identity, and uploads only private workflow
+artifacts with 14-day retention. Packaging jobs run only on
+`workflow_dispatch`; ordinary pushes run tests and build checks.
+
+Earlier M12 dispatches exposed and fixed several native defects before this
+green run. The final artifacts below are from the green run.
+
+## Artifact evidence
+
+All sizes are bytes. All SHA-256 values were independently verified locally
+after downloading the private CI artifacts.
+
+### Linux x86_64
+
+| Artifact | Size | SHA-256 |
+|---|---:|---|
+| `Flux-0.1.0-linux-x86_64.tar.gz` | 13,538,591 | `2c496e1f289744a95d1f4df63834b02aa4a4e6e1016eb484bf8a2f9048c12e11` |
+| `Flux-0.1.0-linux-x86_64.deb` | 10,294,908 | `3c2ef6f43e0a3a050c48cea336a8776d3d86e3eb1cf255df3ae137ab0015472a` |
+| `Flux-0.1.0-linux-x86_64.rpm` | 13,401,486 | `5cd43ebffc7db228264cd3ede93297adb0608475d11c98380db5d384ec069b4b` |
+
+### Linux ARM64
+
+| Artifact | Size | SHA-256 |
+|---|---:|---|
+| `Flux-0.1.0-linux-aarch64.tar.gz` | 13,614,123 | `04ea419ced9e5294f04b6a719bf77ad558ed7c40348357685459feb448381ee6` |
+| `Flux-0.1.0-linux-aarch64.deb` | 10,098,620 | `893e8fce4194bfacec134b6f21a796c0bcc80082245df68549b31696ce88b6e0` |
+| `Flux-0.1.0-linux-aarch64.rpm` | 13,591,239 | `2adc0c1cc222ffe371ba31cec86fde904c66c596b6f6a0304ac2eff1d3cd1ba5` |
+
+### Windows x86_64
+
+| Artifact | Size | SHA-256 |
+|---|---:|---|
+| `Flux-0.1.0-windows-x86_64.zip` | 10,258,143 | `3745f26db28509fdcf47f0685f157e7405556fdcbc63f2c57ab6f4cd21b3c0b9` |
+| `Flux-0.1.0-windows-x86_64-setup.exe` | 8,630,996 | `9441dfdb6018e19b1273256506cdff78e0d69d6ab34fd943d39141c3fb1ef320` |
+
+### Windows ARM64
+
+| Artifact | Size | SHA-256 |
+|---|---:|---|
+| `Flux-0.1.0-windows-arm64.zip` | 9,712,741 | `d1a0af35bbcf4c8d0ef13c89b35961499d2baad30fd100b9036f77182ec0c501` |
+
+### macOS ARM64
+
+| Artifact | Size | SHA-256 |
+|---|---:|---|
+| `Flux-0.1.0-macos-arm64.app.zip` | 9,739,206 | `6f3ea0a0f36fb3651f100e8b1490343630cdbe12d32706271d6f3d54496c7aa8` |
+| `Flux-0.1.0-macos-arm64.dmg` | 10,781,338 | `f7459894c27f9ad27e3dd2e24ada765f6c977a693656ddd4528cc9330ef8ba3a` |
+
+Each platform's `SHA256SUMS-*.txt` file was verified with `sha256sum -c` against
+the downloaded bytes. No artifact contains a user library, queue, ratings,
+history, settings or other user data.
+
+## Linux formats and compatibility
+
+Implemented and validated:
 
 - **Portable `.tar.gz`** — `bin/flux`, `bin/flux-tui`, desktop entry,
   AppStream metadata, hicolor icons, README, MIT licence, third-party notices
-  and license texts. No user data is embedded.
+  and license texts.
 - **`.deb`** — installs to `/usr/bin` and `/usr/share`, with package metadata,
-  desktop entry, icons, AppStream metadata and documentation. Uninstall removes
-  only package-owned files.
-- **`.rpm`** — same payload and ownership rules, with `alsa-lib`, fontconfig,
-  X11, xkbcommon and Wayland client dependencies declared.
+  desktop entry, icons, AppStream metadata and documentation.
+- **`.rpm`** — same payload and ownership rules.
 
-AppImage and Flatpak were evaluated and deliberately not implemented in M11:
-AppImage tooling is not present in this environment and would add a separate
-FUSE/runtime maintenance path; Flatpak requires a portal/sandbox permission
-design that has not been validated for Flux's local-library and audio workflow.
-The portable archive, `.deb` and `.rpm` cover the supported Linux paths without
-claiming an unvalidated sandbox integration.
+The Ubuntu-built binary's highest referenced glibc symbol is `GLIBC_2.39`;
+the `.deb` declares `libc6 (>= 2.39)` plus ALSA, fontconfig, X11, xkbcommon and
+Wayland client libraries. The ARM64 artifact is a native AArch64 ELF with the
+same floor and declares `Architecture: arm64` / RPM `aarch64`. Local Fedora
+artifacts require glibc 2.43 and are not the broad-compatibility baseline.
 
-## Windows formats
+The CI package verifier ran the packaged GUI under Xvfb, checked `--version`,
+first-run canonical-library creation, desktop/AppStream metadata, package
+payloads and upgrade extraction. A privileged host installation with system
+package managers was **not** performed.
 
-Prepared for native Windows packaging:
+## Windows formats and evidence
 
 - portable ZIP containing `flux.exe`, `flux-tui.exe`, docs and license texts;
 - an Inno Setup 6 per-user installer with Start Menu entry, optional desktop
   shortcut and stable AppId `{96707750-32C7-4982-8664-11AE5B7B5C1B}`.
 
-`crates/flux-gui/build.rs` embeds the `.ico`, version resource and an as-invoker
-DPI-aware/long-path-aware manifest into the MSVC executable when `rc.exe` is
-available. The installer does not add user-data deletion entries.
+Native verification confirmed:
 
-No Windows SDK/runner is available locally. The scripts are source-audited and
-the CI packaging jobs are defined but were not executed in this environment.
-Artifacts are unsigned unless an authorized signing identity is supplied; expect
-SmartScreen warnings and verify SHA-256 checksums.
+- `flux.exe` is an `IMAGE_SUBSYSTEM_WINDOWS_GUI` executable and
+  `flux-tui.exe` is `IMAGE_SUBSYSTEM_WINDOWS_CUI`;
+- the GUI carries embedded icon, version resource and manifest; release
+  identity is `Flux 0.1.0 (io.github.neonmc23.flux)`;
+- `--version` and `--help` work for both executables, including from a
+  Unicode extraction path;
+- the release GUI creates a first-run canonical library under a redirected
+  `%LOCALAPPDATA%`, stays running, and reopens the same library;
+- the installer installs, reinstalls over the same location, preserves
+  sentinel data/config files, and uninstall leaves user data/config intact
+  while removing the application executable.
 
-## macOS formats
+The Windows artifacts are unsigned. SmartScreen warnings are expected until an
+authorized signing identity is supplied. Native file dialogs, Explorer
+integration, audio output and case-sensitive volumes were not exercised.
 
-Prepared for native macOS packaging:
+## macOS formats and evidence
 
 - `Flux.app` with `Contents/MacOS/flux`, `Contents/MacOS/flux-tui`,
   `Info.plist`, `flux.icns`, docs, notices and license texts;
 - ZIP created with `ditto`;
-- DMG created with `hdiutil` when available;
-- optional universal binary via `FLUX_UNIVERSAL=1` and `lipo`;
-- ad-hoc signing by default, or Developer ID signing through
-  `CODESIGN_IDENTITY`; notarization only through an explicitly supplied
-  `NOTARY_PROFILE`.
+- DMG created with `hdiutil`;
+- optional universal binary via `FLUX_UNIVERSAL=1` and `lipo`.
 
-No macOS runner or SDK is available locally. The bundle script, plist and icon
-are source-audited; the CI job is defined but not executed here. Ad-hoc builds
-are not notarized and Gatekeeper will warn. No certificate, credential or
-publisher identity is fabricated.
+Native verification confirmed the bundle identifier, version, icon, ARM64
+Mach-O slices, code-signature integrity, ZIP expansion and DMG mount. The
+packaged GUI was launched against a disposable Unicode home directory; it
+created the first-run canonical library and reopened it successfully.
+
+The bundle is **ad-hoc signed only** and not notarized; Gatekeeper assessment
+does not pass. No Developer ID or notary credential was available, and none was
+fabricated. CoreAudio output was not available on the runner.
 
 ## Installation and user data
 
 Packaged applications never store user data in the installation directory.
-Windows and macOS verification scripts validate bundle/installer structure,
-`--version`, icons and, where available, install/uninstall lifecycle sentinels.
 
 | Platform | Data | Config |
 |---|---|---|
@@ -100,15 +174,27 @@ Windows and macOS verification scripts validate bundle/installer structure,
 | Windows | `%LOCALAPPDATA%\flux` | `%APPDATA%\flux` |
 
 The default canonical library is `<data>/FluxLibrary`. On a fresh launch Flux
-creates that empty library, announces the path, and opens Library setup so the
-user can import music or choose another library. Import itself remains an
-explicit action.
+creates that empty library and opens Library setup so the user can import music
+or choose another library.
 
 Uninstalling the application must not remove `FluxLibrary`, the legacy index,
 queue, ratings, history, lyrics, artwork or settings. The Linux package scripts
 contain no user-data deletion entries; the Windows installer has no
 `[UninstallDelete]` entries; the macOS application bundle has no user-data
 payload.
+
+## Import publication responsiveness
+
+Import planning, fingerprinting and portable copy preparation are cancellable
+and run off the UI thread in the GUI. The final canonical publication is still a
+synchronous, journal-backed transaction on the applying thread: it copies and
+verifies staged resources, publishes them and commits the catalogue atomically.
+A large import can therefore pause the GUI during that final commit. M12 kept
+this behavior deliberately: moving publication to a detached worker would have
+to preserve controller/library-session rebinding, journal ownership, shutdown
+ordering and cancellation truthfulness, which is a broader transaction redesign
+than this milestone's platform-validation scope. The limitation is therefore
+documented rather than hidden; no partial catalogue is ever published.
 
 ## Build commands
 
@@ -117,14 +203,11 @@ payload.
 packaging/linux/build-packages.sh
 packaging/linux/validate-packages.sh
 
-# Reproducible-timestamp attempt for the portable archive
-SOURCE_DATE_EPOCH=0 packaging/linux/build-packages.sh
-
 # Windows (PowerShell, native or appropriate runner)
 packaging/windows/build-windows.ps1 -Architecture x86_64
-packaging/windows/verify-windows.ps1 -Architecture x86_64 -TestInstaller
+packaging/windows/verify-windows.ps1 -Architecture x86_64 -TestInstaller -TestGuiLaunch
 packaging/windows/build-windows.ps1 -Architecture arm64 -SkipInstaller
-packaging/windows/verify-windows.ps1 -Architecture arm64
+packaging/windows/verify-windows.ps1 -Architecture arm64 -TestGuiLaunch
 
 # macOS (native)
 packaging/macos/build-macos.sh
@@ -136,35 +219,10 @@ Artifacts are written to `dist/` and are intentionally ignored by Git. Each
 platform writes a `SHA256SUMS-*.txt` file. Release artifacts must be reviewed and
 checksum-verified before any authorized publication.
 
-### Local reproducibility check
-
-Two consecutive Linux builds with `SOURCE_DATE_EPOCH=0` produced byte-identical
-`tar.gz`, `.deb` and `.rpm` artifacts. Normal builds use the current timestamp,
-so their checksums differ. RPM build time/host are normalized to the supplied
-epoch and `reproducible`; no universal-reproducibility claim is made for
-platforms that were not built twice here.
-
-## Linux local validation evidence
-
-The M11 Linux x86_64 run produced and inspected all three formats. Validation
-covered package metadata, payload listing, archive traversal rejection, desktop
-and AppStream validation, `--version` from each extracted payload, packaged GUI
-startup with isolated XDG directories, first-run canonical-library creation, and
-preservation of the generated user data after deleting the extracted application
-tree. The GUI started without stderr output; a native `.deb`/`.rpm` installation
-into a privileged host was not performed.
-
-## Linux compatibility boundary
-
-The locally built Linux binaries were produced on Fedora 44 with glibc 2.43, so
-those specific artifacts require a glibc 2.43-or-newer distribution. They are
-release-engineering validation artifacts, not the recommended compatibility
-baseline. The manual CI packaging job runs on Ubuntu 24.04 (glibc 2.39); those
-artifacts must be the ones reviewed for broader Linux distribution. No portable
-glibc baseline is claimed until that CI artifact is executed on target systems.
-The TUI and GUI both depend on the platform ALSA runtime and the usual X11 or
-Wayland desktop libraries. The `.deb` metadata derives its `libc6` lower bound
-from the linked GUI binary instead of claiming a false broad compatibility floor.
+Two consecutive Linux builds with `SOURCE_DATE_EPOCH=0` previously produced
+byte-identical `tar.gz`, `.deb` and `.rpm` artifacts. Normal builds use the
+current timestamp, so their checksums differ. No universal-reproducibility claim
+is made for platforms that were not built twice.
 
 ## Budgets, signing and publication
 
@@ -172,21 +230,22 @@ from the linked GUI binary instead of claiming a false broad compatibility floor
   performed by scripts or CI.
 - CI packaging runs only on `workflow_dispatch` and uploads private workflow
   artifacts with a 14-day retention period.
-- Signing credentials are never stored in the repository. Unsigned Windows and
-  ad-hoc macOS artifacts are labelled as such.
+- Signing credentials are never stored in the repository. Windows artifacts are
+  unsigned; macOS artifacts are ad-hoc signed and not notarized.
 - The six standard quality gates remain mandatory; packaging is additional
   validation, not a replacement.
 
 ## Known distribution limits
 
-- Native Windows and macOS runtime validation is unavailable in this
-  environment.
-- Linux ARM64, Windows ARM64 and macOS x86_64/universal are prepared but not
-  locally built.
-- `.deb`/`.rpm` installation was validated by extraction and metadata inspection,
-  not by a privileged host installation. Uninstall behavior is enforced by
-  package ownership rules and absence of user-data entries.
-- Bit-for-bit reproducibility is claimed only where two local builds were
-  compared. RPM embeds host/build metadata by default; do not claim universal
-  reproducibility from a single build.
+- Native Windows and macOS audio output was not available on the CI runners.
+- Windows artifacts are unsigned; macOS is ad-hoc signed and not notarized.
+- Native Windows file dialogs, Explorer integration, terminal behavior and
+  case-sensitive volumes remain unverified.
+- macOS x86_64 and universal builds are compile/script options, not M12 runtime
+  evidence.
+- `.deb`/`.rpm` installation was validated by extraction, metadata and packaged
+  GUI startup, not by a privileged host installation.
+- Bit-for-bit reproducibility is claimed only for the previously compared Linux
+  builds with a fixed epoch.
+- The final canonical import commit remains synchronous as documented above.
 - No automatic update mechanism, telemetry or network service exists.

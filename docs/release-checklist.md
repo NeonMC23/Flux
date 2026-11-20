@@ -36,7 +36,7 @@ packaging/linux/build-packages.sh
 packaging/linux/validate-packages.sh
 
 packaging/windows/build-windows.ps1 -Architecture x86_64
-packaging/windows/verify-windows.ps1 -Architecture x86_64 -TestInstaller
+packaging/windows/verify-windows.ps1 -Architecture x86_64 -TestInstaller -TestGuiLaunch
 
 packaging/macos/build-macos.sh
 packaging/macos/verify-macos.sh
@@ -59,6 +59,7 @@ Use a disposable VM, container or CI runner, never the user's real library:
 
 - [ ] Fresh install, first launch and default-library creation.
 - [ ] Existing library selection and import.
+- [ ] GUI starts, creates the first-run library, and reopens an existing library.
 - [ ] Reinstall/upgrade over the same user data (sentinel preserved).
 - [ ] Uninstall removes only application files.
 - [ ] Reinstall after uninstall opens the previous library/settings.
@@ -80,7 +81,20 @@ diff -u /tmp/first /tmp/second
 Only claim bit-for-bit reproducibility for the formats actually compared. RPM
 build host/time must be normalized as in the provided script.
 
-## 6. Publication boundary
+## 6. M12 evidence snapshot
+
+The green native run was GitHub Actions `44701347712` at commit `c456dca`.
+It covered Linux x86_64/ARM64 tests, Windows x86_64/ARM64 tests, macOS ARM64
+tests, macOS x86_64 compile-only, and all Linux/Windows/macOS packaging
+verifiers. Exact artifact sizes, SHA-256 values, compatibility floors, signing
+state and platform limitations are recorded in
+[`distribution.md`](distribution.md).
+
+Before reusing this checklist, re-run all six gates and every native verifier on
+the exact commit to be released; prior CI evidence does not transfer to a later
+tree.
+
+## 7. Publication boundary
 
 - [ ] Do not create a release or tag.
 - [ ] Do not upload artifacts publicly.

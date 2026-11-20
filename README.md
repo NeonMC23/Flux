@@ -586,40 +586,38 @@ cargo run -p flux-tui --features cpal -- ~/Music
 ## Supported targets and CI
 
 Flux targets Linux, Windows 10/11, and macOS on x86_64 and ARM64. CI
-(`.github/workflows/ci.yml`) is configured to run formatting, Clippy, license
-checks, native tests/builds, CPAL all-target compilation and CPAL binary
-linking on Linux x86_64/ARM64, Windows x86_64/ARM64 and macOS ARM64; macOS
-x86_64 has a compile-only cross-check. CI runners have no usable audio device,
-so compilation there is never evidence of audible playback.
+(`.github/workflows/ci.yml`) runs formatting, Clippy, license checks, native
+tests/builds, CPAL all-target compilation and CPAL binary linking on Linux
+x86_64/ARM64, Windows x86_64/ARM64 and macOS ARM64; macOS x86_64 has a
+compile-only cross-check. Manual-dispatch packaging jobs produce private
+workflow artifacts only.
 
-| Platform | Configured CI | Executed in this session | Runtime/hardware evidence |
-|---|---|---|---|
-| Linux x86_64 | Native tests/build + CPAL check | Yes, all six gates | GUI start, TUI PTY, CPAL device enumeration/stream initialization and short WAV completion on this host; no listening/hotplug test |
-| Linux ARM64 | Native tests/build + CPAL check | No | Not locally available |
-| Windows x86_64 | Native tests/build + CPAL check | No | Source audited only; no Windows target installed or Windows runtime |
-| Windows ARM64 | Native tests/build + CPAL check | No | Source audited only; no Windows target installed or Windows runtime |
-| macOS ARM64 | Native tests/build + CPAL check | No | Source audited only; no macOS runtime |
-| macOS x86_64 | Compile-only cross-check | No | No standard GitHub runner; compile-only CI path |
+| Platform | Native CI result | Packaging/runtime evidence |
+|---|---|---|
+| Linux x86_64 | Tests/build pass on Ubuntu 24.04 | `.tar.gz`, `.deb`, `.rpm`; verified, packaged GUI started under Xvfb with first-run library creation |
+| Linux ARM64 | Native ARM64 tests/build pass | `.tar.gz`, `.deb`, `.rpm`; verified, packaged GUI started under Xvfb on the native ARM64 runner |
+| Windows x86_64 | Native tests/build pass | Portable ZIP and Inno Setup installer; PE identity/resources, Unicode path, GUI first-run/reopen, install, reinstall and uninstall sentinel lifecycle verified |
+| Windows ARM64 | Native ARM64 tests/build pass | Portable ZIP; PE identity/resources, Unicode path and GUI first-run/reopen verified; no installer |
+| macOS ARM64 | Native tests/build pass | `Flux.app`, ZIP and DMG; plist/icons/arch/signature, GUI first-run/reopen and Unicode home verified |
+| macOS x86_64 | Compile-only cross-check | Not packaged or executed |
 
-The local Linux rows in M7–M9 were executed on Fedora 44, kernel 7.3.x /
-x86_64, Rust/Cargo 1.99.0, with PulseAudio on PipeWire 1.6.9. M10 and M11
-validation ran on Fedora 44, kernel 7.3.4, Rust/Cargo 1.99.0. No Windows/macOS
-Rust target or SDK is installed there, so no cross-compilation or native
-runtime validation is claimed.
+All M12 CI runners lack a usable audio endpoint, so native tests and packaging
+are **not** evidence of audible playback on Windows or macOS. The earlier local
+Linux validation covered CPAL enumeration/stream initialization and a short WAV
+completion on Fedora 44 / PipeWire; no listening or hotplug test is claimed.
 
-The current Windows audit includes UTF-16/UNC path handling, PowerShell UTF-8
-dialog output, case-insensitive comparison fallback, reserved-name/long-path
-limitations, and reparse-point rejection for managed paths. macOS source uses
-CoreAudio through CPAL, standard Application Support directories, case-insensitive
-path fallback until per-volume probing exists, and compile-checked native
-dialogs. Native pickers honor a caller-provided starting directory on Linux;
-the macOS and Windows dialog scripts currently ignore that hint. These are
-source/CI-contract checks unless the table above says runtime executed.
+The Windows verification exercises native executables, Unicode extraction
+paths, first-run/reopen and installer ownership. Native Windows file dialogs,
+Explorer integration and case-sensitive volumes remain unverified. macOS
+verification exercises the native app executable and ad-hoc-signed bundle, but
+not notarization or CoreAudio output. Native pickers honor a caller-provided
+starting directory on Linux; the macOS and Windows dialog scripts currently
+ignore that hint.
 
 Local interactive/runtime verification remains limited to Linux/X11 (plus the
-TUI PTY). Windows/macOS native dialogs, window managers, terminals, filesystems,
-locking behavior and hardware audio remain unverified here. Windows/macOS
-case-sensitive-volume behavior is a known limitation.
+TUI PTY). Windows/macOS native dialogs, window managers, terminals and hardware
+audio remain unverified here. Windows/macOS case-sensitive-volume behavior is a
+known limitation.
 
 ## License
 

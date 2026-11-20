@@ -2211,7 +2211,11 @@ cleanup.
    but the final canonical transaction is not cancellable. Import preflight opens
    the decoder and validates the container/header plus the source fingerprint,
    but it does not decode every frame; corruption later in a stream may surface
-   only during playback.
+   only during playback. M12 re-audited this: the final commit can pause the GUI
+   on a large import, and moving it to a detached worker would have to preserve
+   library-session rebinding, journal ownership, shutdown ordering and
+   cancellation truthfulness. It is retained and documented in
+   [`distribution.md`](distribution.md#import-publication-responsiveness).
 4. Single-track ownership transfer, whole-album transfer and multi-item artist
    deletion are implemented with copy-first publication, journal cleanup and
    no-op retry. Album transfer intentionally preserves AlbumId and does not merge
@@ -2232,8 +2236,11 @@ cleanup.
 8. Migration is application-level and bidirectional in the normal UI, but the
    execute phase is synchronous; very large migrations need background progress
    and cooperative cancellation.
-9. Cross-platform native behavior and real GUI migration were not runtime
-   verified in this stage.
+9. M12 executed native Linux x86_64/ARM64, Windows x86_64/ARM64 and macOS ARM64
+   tests and packaging verifiers; Windows and macOS GUI first-run/reopen were
+   exercised on native runners. Windows file dialogs, Explorer integration,
+   case-sensitive volumes, Linux privileged package installation, and audio
+   output on Windows/macOS remain unverified.
 10. The TUI import review supports candidate import/update/skip decisions only;
     fixed-target album selection and rich metadata/artwork/lyrics editing remain
     GUI-only.
