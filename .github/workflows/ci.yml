@@ -63,6 +63,7 @@ jobs:
           bash -n packaging/linux/validate-packages.sh
           bash -n packaging/macos/build-macos.sh
           bash -n packaging/macos/verify-macos.sh
+          python3 packaging/check-metadata.py
           test -f assets/icons/flux.ico
           test -f assets/icons/flux.icns
           test -f assets/icons/flux-256.png
