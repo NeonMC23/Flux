@@ -1940,7 +1940,7 @@ impl Controller {
             controller.report_error(error);
         }
         controller.restore_queue_playback(restored_playback);
-        controller.report_status(format!("Opened canonical library at {}.", root.display()));
+        controller.report_status("Library ready.".to_owned());
         Ok(controller)
     }
 

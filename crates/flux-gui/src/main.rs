@@ -755,22 +755,20 @@ fn audio_summary(status: &AudioStatus) -> (&'static str, String, Color) {
     match status {
         AudioStatus::Ready => (
             "Ready",
-            "An output device was initialized successfully for this session.".to_owned(),
+            "Audio will play through this device.".to_owned(),
             SUCCESS,
         ),
         AudioStatus::BuildWithoutBackend => (
-            "Not available in this build",
-            "This binary was compiled without an audio-output backend. Browsing and \
-             library management still work; build with `--features cpal` for playback."
-                .to_owned(),
+            "Audio unavailable",
+            "This build cannot play audio. Use a build with playback enabled.".to_owned(),
             MUTED,
         ),
         AudioStatus::DeviceUnavailable(reason) => {
             ("Output device unavailable", reason.clone(), DANGER)
         }
         AudioStatus::Recovering(reason) => (
-            "Recovering audio output",
-            format!("{reason} Flux is attempting to reopen the current default device."),
+            "Reconnecting audio",
+            format!("{reason} Trying the selected output again."),
             ACCENT,
         ),
     }
@@ -1023,14 +1021,6 @@ fn deletion_decision_label(decision: &flux_app::ArtistDeletionDecision) -> Strin
             "Delete needs confirmation".to_owned()
         }
     }
-}
-
-fn entity_name_key(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
 }
 
 fn display_artist(track: &Track) -> String {
@@ -1980,6 +1970,7 @@ struct FileBrowser {
 struct ImportManager {
     stage: ImportUiStage,
     request_id: u64,
+    advanced_open: bool,
     target_album: Option<ImportAlbumTarget>,
     sources: Vec<PathBuf>,
     recursive: bool,
@@ -2023,6 +2014,7 @@ impl ImportManager {
         Self {
             stage: ImportUiStage::Choose,
             request_id: 0,
+            advanced_open: false,
             target_album: None,
             sources: Vec::new(),
             recursive: true,
@@ -2165,6 +2157,7 @@ struct NavigationSnapshot {
     lyrics_mode: LyricsMode,
     lyrics_follow_current: bool,
     filter_favorites: bool,
+    filters_open: bool,
     filter_lyrics: TriFilter,
     filter_artwork: TriFilter,
     filter_release: ReleaseFilter,
@@ -2182,6 +2175,7 @@ struct FluxReady {
     selected_tracks: Vec<TrackId>,
     focused_track: Option<TrackId>,
     filter_favorites: bool,
+    filters_open: bool,
     filter_lyrics: TriFilter,
     filter_artwork: TriFilter,
     filter_release: ReleaseFilter,
@@ -2213,6 +2207,7 @@ struct FluxReady {
     lyrics_cache: RefCell<BTreeMap<TrackId, LyricsCacheEntry>>,
     lib_input: String,
     track_editor: Option<TrackEditor>,
+    track_editor_advanced_open: bool,
     import_manager: Option<ImportManager>,
     import_request_seq: u64,
     deletion_manager: Option<DeletionManager>,
@@ -2268,6 +2263,7 @@ struct FluxReady {
     queue_overlay_open: bool,
     window_width: f32,
     close_confirm: bool,
+    setup_advanced_open: bool,
     closed: bool,
 }
 
@@ -2448,6 +2444,7 @@ enum Message {
     ImportFileHoverLeft,
     ImportApply,
     ImportCancel,
+    ImportAdvancedToggled,
     OpenLibraryPressed,
     CreateLibraryPressed,
     AcknowledgeRecoveryPressed,
@@ -2458,7 +2455,6 @@ enum Message {
     CancelMigrationPressed,
     OpenMigratedPressed,
     ReconcilePressed,
-    RefreshPressed,
     SearchChanged(String),
     ClearSearch,
     SearchNavigateArtist(ArtistId),
@@ -2471,6 +2467,7 @@ enum Message {
     TrackSelectionSelectAll,
     TrackSelectionClear,
     FilterFavoritesToggled,
+    ToggleFilters,
     FilterLyricsCycle,
     FilterArtworkCycle,
     FilterReleaseChanged(ReleaseFilter),
@@ -2520,6 +2517,8 @@ enum Message {
     LyricsFilterChanged(String),
     LyricsModeChanged(LyricsMode),
     LyricsEditOpen,
+    TrackEditorOpenLyrics,
+    TrackEditorAdvancedToggled,
     LyricsEditorTextChanged(usize, String),
     LyricsEditorTimestampChanged(usize, String),
     LyricsEditorAddLine,
@@ -2544,6 +2543,7 @@ enum Message {
     SelectView(LibraryView),
     SelectGroup(Option<String>),
     ToggleSetup,
+    ToggleSetupAdvanced,
     ToggleQueue,
     PagePrev,
     PageNext,
@@ -2656,6 +2656,7 @@ impl FluxReady {
             selected_tracks: Vec::new(),
             focused_track: None,
             filter_favorites: false,
+            filters_open: false,
             filter_lyrics: TriFilter::Any,
             filter_artwork: TriFilter::Any,
             filter_release: ReleaseFilter::Any,
@@ -2687,6 +2688,7 @@ impl FluxReady {
             lyrics_cache: RefCell::new(BTreeMap::new()),
             lib_input: String::new(),
             track_editor: None,
+            track_editor_advanced_open: false,
             import_manager: None,
             import_request_seq: 0,
             deletion_manager: None,
@@ -2742,6 +2744,7 @@ impl FluxReady {
             queue_overlay_open: false,
             window_width: 1_180.0,
             close_confirm: false,
+            setup_advanced_open: false,
             closed: false,
         }
     }
@@ -3172,6 +3175,7 @@ impl FluxReady {
             return;
         };
         let metadata_plan = self.controller.plan_track_metadata_update(id).ok();
+        self.track_editor_advanced_open = false;
         self.track_editor = Some(TrackEditor {
             id,
             title: track.title().to_owned(),
@@ -4155,6 +4159,7 @@ impl FluxReady {
                 | Message::LyricsOpenArtist(_)
                 | Message::EditTrack(_)
                 | Message::LyricsEditOpen
+                | Message::TrackEditorOpenLyrics
                 | Message::ToggleSetup
                 | Message::ImportOpen
                 | Message::ImportOpenSetup
@@ -4222,6 +4227,7 @@ impl FluxReady {
             .or_else(|| self.controller.legacy_index_path())
     }
 
+    #[cfg(test)]
     fn active_library_label(&self) -> String {
         let Some(path) = self.active_library_path() else {
             return "Session-only library".to_owned();
@@ -4256,6 +4262,7 @@ impl FluxReady {
             lyrics_mode: self.lyrics_mode,
             lyrics_follow_current: self.lyrics_follow_current,
             filter_favorites: self.filter_favorites,
+            filters_open: self.filters_open,
             filter_lyrics: self.filter_lyrics,
             filter_artwork: self.filter_artwork,
             filter_release: self.filter_release,
@@ -4292,6 +4299,7 @@ impl FluxReady {
         self.lyrics_mode = snapshot.lyrics_mode;
         self.lyrics_follow_current = snapshot.lyrics_follow_current;
         self.filter_favorites = snapshot.filter_favorites;
+        self.filters_open = snapshot.filters_open;
         self.filter_lyrics = snapshot.filter_lyrics;
         self.filter_artwork = snapshot.filter_artwork;
         self.filter_release = snapshot.filter_release;
@@ -6437,6 +6445,11 @@ impl FluxReady {
                 }
             }
             Message::ImportApply => return self.start_import_copy(),
+            Message::ImportAdvancedToggled => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.advanced_open = !manager.advanced_open;
+                }
+            }
             Message::ImportCancel => {
                 if let Some(manager) = self.import_manager.as_mut() {
                     if matches!(
@@ -6553,7 +6566,6 @@ impl FluxReady {
                     self.last_reconcile = Some(report);
                 }
             }
-            Message::RefreshPressed => self.controller.refresh(),
             Message::SearchChanged(value) => {
                 if self.block_if_lyrics_editor_is_dirty("searching") {
                     return Task::none();
@@ -6658,6 +6670,9 @@ impl FluxReady {
                 self.selected_tracks = visible;
             }
             Message::TrackSelectionClear => self.selected_tracks.clear(),
+            Message::ToggleFilters => {
+                self.filters_open = !self.filters_open;
+            }
             Message::FilterFavoritesToggled => {
                 self.filter_favorites = !self.filter_favorites;
                 self.page = 0;
@@ -7162,6 +7177,26 @@ impl FluxReady {
                 }
             }
             Message::LyricsEditOpen => self.open_lyrics_editor(),
+            Message::TrackEditorAdvancedToggled => {
+                self.track_editor_advanced_open = !self.track_editor_advanced_open;
+            }
+            Message::TrackEditorOpenLyrics => {
+                if self.block_if_track_editor_is_dirty("opening lyrics") {
+                    return Task::none();
+                }
+                let Some(id) = self.track_editor.as_ref().map(|editor| editor.id) else {
+                    return Task::none();
+                };
+                self.track_editor = None;
+                self.selected_lyrics = Some(id);
+                self.lyrics_mode = LyricsMode::Edit;
+                self.view = LibraryView::Lyrics;
+                self.navigation_stack.clear();
+                self.selected_group = None;
+                self.selected_playlist = None;
+                self.collection = None;
+                self.open_lyrics_editor();
+            }
             Message::LyricsEditorTextChanged(index, value) => {
                 if let Some(editor) = self.lyrics_editor.as_mut()
                     && let Some(line) = editor.lines.get_mut(index)
@@ -7464,6 +7499,9 @@ impl FluxReady {
                 if self.show_setup {
                     return self.refresh_audio_devices();
                 }
+            }
+            Message::ToggleSetupAdvanced => {
+                self.setup_advanced_open = !self.setup_advanced_open;
             }
             Message::ToggleQueue => self.toggle_queue(),
             Message::PagePrev => {
@@ -8797,44 +8835,45 @@ impl FluxReady {
     fn import_header(&self, manager: &ImportManager) -> Element<'_, Message> {
         let (title, subtitle) = if manager.browser.is_some() {
             (
-                "Flux Browser".to_owned(),
-                "Choose files or a folder using Flux's built-in browser.".to_owned(),
+                "Browse for music".to_owned(),
+                "Choose a folder or files from this computer.".to_owned(),
             )
         } else {
             match manager.stage {
                 ImportUiStage::Choose => (
                     "Import music".to_owned(),
-                    "Choose files or folders, drop them here, then review before anything is written."
+                    "Choose a folder or files. You can review everything before importing."
                         .to_owned(),
                 ),
                 ImportUiStage::Scanning => (
-                    "Reading import…".to_owned(),
-                    "Discovering files and reading metadata without changing the library."
-                        .to_owned(),
+                    "Checking files…".to_owned(),
+                    "Nothing in your library is changed yet.".to_owned(),
                 ),
                 ImportUiStage::Review => (
-                    "Review import".to_owned(),
+                    "Review music".to_owned(),
                     format!(
-                        "{} candidate(s) · edit metadata, resolve conflicts, and choose storage.",
-                        manager.plan.as_ref().map_or(0, |plan| plan.candidates.len())
+                        "{} track(s). Edit anything that needs attention.",
+                        manager
+                            .plan
+                            .as_ref()
+                            .map_or(0, |plan| plan.candidates.len())
                     ),
                 ),
                 ImportUiStage::Importing => (
                     "Importing…".to_owned(),
-                    "Copying files and publishing catalogue changes. Playback stays responsive."
-                        .to_owned(),
+                    "The final commit cannot be cancelled.".to_owned(),
                 ),
                 ImportUiStage::Completed => (
                     "Import complete".to_owned(),
-                    "Only the categories you approved were written to the catalogue.".to_owned(),
+                    "Your music is now in the library.".to_owned(),
                 ),
                 ImportUiStage::Cancelled => (
                     "Import cancelled".to_owned(),
-                    "No catalogue changes were published for the cancelled stage.".to_owned(),
+                    "Your library was not changed.".to_owned(),
                 ),
                 ImportUiStage::Failed => (
                     "Import needs attention".to_owned(),
-                    "The issue below prevented all or part of the import.".to_owned(),
+                    "Your library was not changed.".to_owned(),
                 ),
             }
         };
@@ -8865,186 +8904,178 @@ impl FluxReady {
     }
 
     fn import_choose_body<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
-        if manager.stage == ImportUiStage::Scanning {
-            return self.import_progress_view(manager);
-        }
         let portable = matches!(
             self.controller.storage_mode(),
             StorageMode::Portable | StorageMode::Canonical
         );
-        let library_label = self
-            .controller
-            .canonical_root()
-            .or_else(|| self.controller.portable_root())
-            .map(|root| root.display().to_string())
-            .unwrap_or_else(|| "No portable library is active".to_owned());
-        let mut body = column![].spacing(10);
+        let mut body = column![].spacing(12);
         if let Some(target) = &manager.target_album {
             body = body.push(
-                text(format!(
-                    "FIXED TARGET · \"{}\" · AlbumId {} · owner {}",
-                    target.title, target.album_id, target.owner_name
-                ))
-                .size(10)
-                .color(ACCENT),
+                text(format!("Importing into the album “{}”", target.title))
+                    .size(11)
+                    .color(ACCENT),
             );
         }
         if !portable {
             body = body.push(
                 container(
                     column![
-                        text("A canonical library is required").size(13).color(TEXT),
-                        text(
-                            "Imports, Flux metadata edits, stable artists, albums and resources \
-                             live inside the canonical library. The legacy app index is a \
-                             migration source only."
-                        )
-                        .size(10)
-                        .color(MUTED),
-                        button(text("Open Library setup").size(11))
+                        text("Open a library first").size(15).color(TEXT),
+                        text("Flux needs an active library before it can import music.")
+                            .size(10)
+                            .color(MUTED),
+                        button(text("Open library setup").size(11))
                             .style(accent_button_style)
                             .padding([7, 12])
                             .on_press(Message::ImportOpenSetup),
                     ]
-                    .spacing(6),
+                    .spacing(8),
                 )
-                .padding(12)
+                .padding(14)
                 .width(Length::Fill)
                 .style(card_style),
             );
+            return body.into();
         }
 
-        let native_row = row![
-            button(text("Choose files…").size(12))
-                .style(accent_button_style)
-                .padding([8, 14])
-                .on_press_maybe(portable.then_some(Message::ImportNativeFiles)),
-            button(text("Choose folder…").size(12))
-                .style(ghost_style)
-                .padding([8, 14])
-                .on_press_maybe(portable.then_some(Message::ImportNativeFolder)),
-            button(text("Flux Browser: files").size(11))
-                .style(ghost_style)
-                .padding([8, 12])
-                .on_press_maybe(portable.then_some(Message::ImportBrowserOpenFiles)),
-            button(text("Flux Browser: folder").size(11))
-                .style(ghost_style)
-                .padding([8, 12])
-                .on_press_maybe(portable.then_some(Message::ImportBrowserOpenFolder)),
-        ]
-        .spacing(8)
-        .wrap();
-        body = body.push(native_row);
-
-        let drop_zone =
-            container(
-                column![
-                text("Drop audio files or folders here").size(16).color(TEXT),
-                text(
-                    "The native picker is the default path. Flux Browser is a working fallback; \
-                     path entry is available for troubleshooting."
-                )
-                .size(10)
-                .color(MUTED),
+        body = body.push(
+            text("Choose where the music comes from")
+                .size(12)
+                .color(TEXT),
+        );
+        body = body.push(
+            row![
+                button(text("Choose folder…").size(12))
+                    .style(accent_button_style)
+                    .padding([8, 14])
+                    .on_press(Message::ImportNativeFolder),
+                button(text("Choose files…").size(12))
+                    .style(ghost_style)
+                    .padding([8, 14])
+                    .on_press(Message::ImportNativeFiles),
             ]
-                .spacing(5)
-                .align_x(Alignment::Center),
-            )
-            .padding(18)
-            .width(Length::Fill)
-            .height(Length::Fixed(108.0))
-            .center(Length::Fill)
-            .style(|_| {
-                container::Style::default()
-                    .background(if manager.drop_hover {
-                        ACCENT_SOFT
-                    } else {
-                        SURFACE
-                    })
-                    .border(Border {
-                        color: if manager.drop_hover { ACCENT } else { BORDER },
-                        width: 1.0,
-                        radius: 12.0.into(),
-                    })
-            });
+            .spacing(8),
+        );
+        body = body.push(
+            row![
+                text("Or browse inside Flux:").size(10).color(MUTED),
+                button(text("Files").size(10))
+                    .style(ghost_style)
+                    .padding([4, 8])
+                    .on_press(Message::ImportBrowserOpenFiles),
+                button(text("Folder").size(10))
+                    .style(ghost_style)
+                    .padding([4, 8])
+                    .on_press(Message::ImportBrowserOpenFolder),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+
+        let drop_zone = container(
+            column![
+                text("Drop music here").size(15).color(TEXT),
+                text("You can review every track before anything is imported.")
+                    .size(10)
+                    .color(MUTED),
+            ]
+            .spacing(5)
+            .align_x(Alignment::Center),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .height(Length::Fixed(96.0))
+        .center(Length::Fill)
+        .style(|_| {
+            container::Style::default()
+                .background(if manager.drop_hover {
+                    ACCENT_SOFT
+                } else {
+                    SURFACE
+                })
+                .border(Border {
+                    color: if manager.drop_hover { ACCENT } else { BORDER },
+                    width: 1.0,
+                    radius: 12.0.into(),
+                })
+        });
         body = body.push(drop_zone);
 
         body = body.push(
-            row![
-                button(text(if manager.recursive {
+            container(
+                row![
+                    text("Destination:").size(10).color(MUTED),
+                    text("Current library")
+                        .size(11)
+                        .color(TEXT)
+                        .width(Length::Fill),
+                    button(text("Change").size(10))
+                        .style(ghost_style)
+                        .padding([4, 8])
+                        .on_press(Message::ImportOpenSetup),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(card_style),
+        );
+
+        body = body.push(
+            button(
+                text(if manager.recursive {
                     "✓ Include subfolders"
                 } else {
                     "Include subfolders"
                 })
-                .size(11))
-                .style(nav_style(manager.recursive))
-                .padding([6, 10])
-                .on_press(Message::ImportRecursiveToggled),
-                text("Folders are walked without following symbolic links; repeated paths are deduplicated.")
-                    .size(10)
-                    .color(MUTED),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+                .size(10),
+            )
+            .style(nav_style(manager.recursive))
+            .padding([5, 9])
+            .on_press(Message::ImportRecursiveToggled),
         );
 
         body = body.push(
-            column![
-                text("STORAGE").size(9).color(ACCENT),
-                text("Every import is copied into the canonical library. External references are not supported; original sources are never moved or deleted.")
-                    .size(10)
-                    .color(MUTED),
-                text(format!("Library: {library_label}")).size(10).color(MUTED),
-            ]
-            .spacing(5),
+            button(
+                text(if manager.advanced_open {
+                    "▾ Advanced Options"
+                } else {
+                    "▸ Advanced Options"
+                })
+                .size(10),
+            )
+            .style(ghost_style)
+            .padding([5, 8])
+            .on_press(Message::ImportAdvancedToggled),
         );
-
-        body = body.push(
-            row![
-                text_input(
-                    "Troubleshooting fallback: audio file paths separated by ;",
-                    &manager.manual_input,
-                )
-                .on_input(Message::ImportManualChanged)
-                .on_submit(Message::ImportManualAdd)
-                .style(input_style)
-                .width(Length::Fill),
-                button(text("Add paths").size(11))
-                    .style(ghost_style)
-                    .padding([7, 10])
-                    .on_press_maybe(
-                        (!manager.manual_input.trim().is_empty())
-                            .then_some(Message::ImportManualAdd)
-                    ),
-            ]
-            .spacing(8),
-        );
+        if manager.advanced_open {
+            body = body.push(
+                column![
+                    text("Add file paths manually").size(9).color(MUTED),
+                    row![
+                        text_input("Audio file paths separated by ;", &manager.manual_input)
+                            .on_input(Message::ImportManualChanged)
+                            .on_submit(Message::ImportManualAdd)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text("Add").size(10))
+                            .style(ghost_style)
+                            .padding([6, 9])
+                            .on_press_maybe(
+                                (!manager.manual_input.trim().is_empty())
+                                    .then_some(Message::ImportManualAdd)
+                            ),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(5),
+            );
+        }
 
         if manager.stage == ImportUiStage::Scanning {
             body = body.push(self.import_progress_view(manager));
         }
-        body = body.push(
-            container(
-                column![
-                    text("REVIEW FIRST").size(9).color(ACCENT),
-                    text("Nothing is written to the catalogue until you approve the reviewed list.")
-                        .size(10)
-                        .color(MUTED),
-                    text("NON-DESTRUCTIVE").size(9).color(ACCENT),
-                    text("Audio files are copied into the library; originals and embedded tags are never modified.")
-                        .size(10)
-                        .color(MUTED),
-                    text("DUPLICATE-AWARE").size(9).color(ACCENT),
-                    text("Exact paths, possible identical content, and similar metadata remain distinct decisions.")
-                        .size(10)
-                        .color(MUTED),
-                ]
-                .spacing(4),
-            )
-            .padding(12)
-            .width(Length::Fill)
-            .style(card_style),
-        );
         if let Some(error) = &manager.error {
             body = body.push(text(error).size(11).color(DANGER));
         }
@@ -9265,105 +9296,63 @@ impl FluxReady {
         let Some(plan) = manager.plan.as_ref() else {
             return self.import_choose_body(manager);
         };
-        let mut body = column![].spacing(8);
+        let ready = plan.new_count() + plan.update_count();
+        let attention = plan
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.status().has_conflict()
+                    || candidate.metadata_incomplete()
+                    || !flux_app::is_track_playable(candidate.source_track())
+            })
+            .count();
+        let mut body = column![].spacing(10);
         if let Some(target) = &plan.target_album {
             body = body.push(
-                text(format!(
-                    "FIXED TARGET · \"{}\" · AlbumId {} · owner {}",
-                    target.title, target.album_id, target.owner_name
-                ))
-                .size(10)
-                .color(ACCENT),
+                text(format!("Importing into “{}”", target.title))
+                    .size(11)
+                    .color(ACCENT),
             );
         }
         body = body.push(
             row![
-                text(format!(
-                    "{} new · {} update · {} skip · {} issue(s)",
-                    plan.new_count(),
-                    plan.update_count(),
-                    plan.skip_count(),
-                    plan.issues.len()
-                ))
-                .size(10)
-                .color(MUTED)
-                .width(Length::Fill),
-                button(text("Skip all").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportBulkSkip),
-                button(text("Import new").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportBulkImport),
-                button(text("Update exact").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportBulkUpdate),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        );
-        body = body.push(
-            text("Keys: ↑/↓ select · s skip · i import · u update · Ctrl+Enter import · Esc close")
-                .size(9)
-                .color(MUTED),
-        );
-        body = body.push(
-            row![
-                text(format!(
-                    "{} candidate(s) checked for bulk actions",
-                    manager.checked.len()
-                ))
-                .size(9)
-                .color(if manager.checked.is_empty() {
-                    MUTED
+                text(format!("{ready} track(s) ready")).size(12).color(TEXT),
+                if attention > 0 {
+                    Element::from(
+                        text(format!("· {attention} need attention"))
+                            .size(10)
+                            .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+                    )
                 } else {
-                    ACCENT
-                }),
-                button(text("Check all").size(9))
-                    .style(ghost_style)
-                    .padding([4, 7])
-                    .on_press(Message::ImportCheckAll),
-                button(text("Clear checks").size(9))
-                    .style(ghost_style)
-                    .padding([4, 7])
-                    .on_press(Message::ImportClearChecked),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        );
-        body = body.push(
-            row![
-                text("COPY-ONLY · managed canonical library")
-                    .size(9)
-                    .color(ACCENT),
-                text(format!("Library: {}", plan.library_root.display()))
-                    .size(9)
-                    .color(MUTED),
+                    Element::from(text("").size(10))
+                },
+                iced::widget::Space::new().width(Length::Fill),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
-
         if !plan.issues.is_empty() {
-            let mut issue_text = format!("{} skipped/unreadable path(s): ", plan.issues.len());
-            for issue in plan.issues.iter().take(3) {
-                issue_text.push_str(&format!(
-                    "{} ({}); ",
-                    issue.path().display(),
-                    issue.reason()
-                ));
+            let mut summary = format!("{} file(s) could not be read: ", plan.issues.len());
+            for issue in plan.issues.iter().take(2) {
+                let name = issue
+                    .path()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| issue.path().display().to_string());
+                summary.push_str(&format!("{name} ({}); ", issue.reason()));
             }
-            body = body.push(text(issue_text).size(9).color(MUTED));
+            if plan.issues.len() > 2 {
+                summary.push_str("and more.");
+            }
+            body = body.push(text(summary).size(9).color(MUTED));
         }
+
         let mut rows = column![].spacing(3);
         for (index, candidate) in plan.candidates.iter().enumerate() {
             rows = rows.push(self.import_candidate_row(manager, index, candidate));
         }
         let list = scrollable(rows).height(Length::Fill);
         let details = self.import_candidate_details(manager);
-
         body = body.push(
             row![
                 container(list)
@@ -9389,6 +9378,27 @@ impl FluxReady {
         body.height(Length::Fill).into()
     }
 
+    fn import_status_label(candidate: &flux_app::ImportCandidate) -> (&'static str, Color) {
+        match candidate.status() {
+            CandidateStatus::New => ("Ready", SUCCESS),
+            CandidateStatus::ExistingPath(_) => {
+                ("Already in library", Color::from_rgb8(0xff, 0xc2, 0x66))
+            }
+            CandidateStatus::SameContent {
+                track_id: Some(_), ..
+            } => ("Already in library", Color::from_rgb8(0xff, 0xc2, 0x66)),
+            CandidateStatus::SameContent { track_id: None, .. } => {
+                ("Duplicate file", Color::from_rgb8(0xff, 0xc2, 0x66))
+            }
+            CandidateStatus::SimilarMetadata(_)
+            | CandidateStatus::SameTitleDifferentAudio(_)
+            | CandidateStatus::ProbableAudio(_)
+            | CandidateStatus::AmbiguousAudio(_) => {
+                ("Check details", Color::from_rgb8(0xff, 0xc2, 0x66))
+            }
+        }
+    }
+
     fn import_candidate_row<'a>(
         &self,
         manager: &ImportManager,
@@ -9396,112 +9406,68 @@ impl FluxReady {
         candidate: &'a flux_app::ImportCandidate,
     ) -> Element<'a, Message> {
         let selected = manager.selected == Some(index);
-        let (status, color) = match candidate.status() {
-            CandidateStatus::New => ("New", SUCCESS),
-            CandidateStatus::ExistingPath(_) => (
-                "Exact audio · same path",
-                Color::from_rgb8(0xff, 0xc2, 0x66),
+        let (status, status_color) = Self::import_status_label(candidate);
+        let meta = match candidate.album() {
+            Some(album) => format!(
+                "{} · {}",
+                candidate.artist_name().unwrap_or("Unknown artist"),
+                album
             ),
-            CandidateStatus::SameContent {
-                track_id: Some(_), ..
-            } if candidate.metadata_matches_existing() => {
-                ("Exact audio duplicate", Color::from_rgb8(0xff, 0xc2, 0x66))
-            }
-            CandidateStatus::SameContent {
-                track_id: Some(_), ..
-            } => (
-                "Same audio · metadata differs",
-                Color::from_rgb8(0xff, 0xc2, 0x66),
+            None => format!(
+                "{} · Standalone",
+                candidate.artist_name().unwrap_or("Unknown artist")
             ),
-            CandidateStatus::SameContent { track_id: None, .. } => (
-                "Duplicate incoming audio",
-                Color::from_rgb8(0xff, 0xc2, 0x66),
-            ),
-            CandidateStatus::SimilarMetadata(_) => ("Metadata collision", MUTED),
-            CandidateStatus::SameTitleDifferentAudio(_) => ("Same title · different audio", MUTED),
-            CandidateStatus::ProbableAudio(_) => ("Probable duplicate · uncertain", MUTED),
-            CandidateStatus::AmbiguousAudio(_) => ("Ambiguous audio match", MUTED),
         };
         let decision = match candidate.decision() {
-            ImportDecision::ImportNew => "import",
-            ImportDecision::UpdateExisting => "update",
-            ImportDecision::Skip => "skip",
+            ImportDecision::ImportNew => "Will import",
+            ImportDecision::UpdateExisting => "Will update",
+            ImportDecision::Skip => "Skipped",
         };
-        let progress_state = manager
-            .progress_view
-            .items
-            .get(index)
-            .copied()
-            .unwrap_or(ImportItemState::Pending);
-        let state = match progress_state {
-            ImportItemState::Scanning => "scanning",
-            ImportItemState::Importing => "importing",
-            ImportItemState::Imported => "imported",
-            ImportItemState::Failed => "failed",
-            _ => decision,
-        };
-        let mut title = row![
-            text(format!("{}", index + 1))
-                .size(9)
-                .color(MUTED)
-                .width(Length::Fixed(22.0)),
-            column![
-                text(candidate.title())
-                    .size(12)
-                    .color(if selected { ACCENT } else { TEXT }),
-                text(candidate.artist_name().unwrap_or("Unknown artist"))
-                    .size(9)
-                    .color(MUTED),
-            ]
-            .spacing(1)
-            .width(Length::Fill),
-            column![
-                text(status).size(9).color(color),
-                text(format!(
-                    "{} · {} · {}",
-                    candidate
-                        .source_track()
-                        .duration()
-                        .map(format_duration)
-                        .unwrap_or_else(|| "--:--".to_owned()),
-                    candidate.format(),
-                    human_size(candidate.file_size())
-                ))
-                .size(8)
-                .color(MUTED),
-            ]
-            .spacing(1),
-            text(state).size(8).color(MUTED).width(Length::Fixed(58.0)),
+        let mut row = row![].spacing(7).align_y(Alignment::Center);
+        if manager.advanced_open {
+            row = row.push(
+                button(
+                    text(if manager.checked.contains(&index) {
+                        "☑"
+                    } else {
+                        "☐"
+                    })
+                    .size(12),
+                )
+                .style(ghost_style)
+                .padding([4, 5])
+                .on_press(Message::ImportToggleChecked(index)),
+            );
+        }
+        let mut labels = column![
+            text(candidate.title())
+                .size(12)
+                .color(if selected { ACCENT } else { TEXT }),
+            text(meta).size(9).color(MUTED),
         ]
-        .spacing(7)
-        .align_y(Alignment::Center);
+        .spacing(1)
+        .width(Length::Fill);
         if candidate.metadata_incomplete() {
-            title = title.push(text("incomplete").size(8).color(MUTED));
+            labels = labels.push(text("Missing details").size(8).color(MUTED));
         }
         if !flux_app::is_track_playable(candidate.source_track()) {
-            title = title.push(text("indexed, not playable").size(8).color(MUTED));
+            labels = labels.push(text("This format cannot be played").size(8).color(MUTED));
         }
-        row![
-            button(
-                text(if manager.checked.contains(&index) {
-                    "☑"
-                } else {
-                    "☐"
-                })
-                .size(13)
-            )
-            .style(ghost_style)
-            .padding([5, 6])
-            .on_press(Message::ImportToggleChecked(index)),
-            button(title)
-                .width(Length::Fill)
-                .padding([7, 8])
-                .style(track_row_style(selected))
-                .on_press(Message::ImportSelect(index)),
-        ]
-        .spacing(3)
-        .align_y(Alignment::Center)
-        .into()
+        row = row.push(labels);
+        row = row.push(
+            column![
+                text(status).size(9).color(status_color),
+                text(decision).size(8).color(MUTED),
+            ]
+            .spacing(1)
+            .width(Length::Fixed(112.0)),
+        );
+        button(row)
+            .width(Length::Fill)
+            .padding([7, 8])
+            .style(track_row_style(selected))
+            .on_press(Message::ImportSelect(index))
+            .into()
     }
 
     fn import_candidate_details<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
@@ -9509,17 +9475,20 @@ impl FluxReady {
             return text("No candidate selected.").size(11).color(MUTED).into();
         };
         let Some(index) = manager.selected else {
-            return text("Select a candidate to edit.")
-                .size(11)
-                .color(MUTED)
-                .into();
+            return text("Select a track to edit.").size(11).color(MUTED).into();
         };
         let Some(candidate) = plan.candidates.get(index) else {
-            return text("Select a candidate to edit.")
-                .size(11)
-                .color(MUTED)
-                .into();
+            return text("Select a track to edit.").size(11).color(MUTED).into();
         };
+        let targeted = plan.target_album.is_some();
+        let editable = manager.stage == ImportUiStage::Review;
+        let (status, status_color) = Self::import_status_label(candidate);
+
+        let source_name = candidate
+            .source_path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| candidate.source_path().display().to_string());
         let mut body = column![
             row![
                 text(candidate.title()).size(16).color(TEXT),
@@ -9531,398 +9500,94 @@ impl FluxReady {
             ]
             .spacing(8)
             .align_y(Alignment::Center),
-            text(candidate.source_path().display().to_string())
-                .size(9)
-                .color(MUTED),
-            text(format!(
-                "Inferred from names: {} · {} · {}",
-                candidate.source_track().title(),
-                candidate.source_track().artist().unwrap_or("—"),
-                candidate.source_track().album().unwrap_or("—")
-            ))
-            .size(9)
-            .color(MUTED),
-            text(format!(
-                "{} · {} · {}",
-                candidate
-                    .source_track()
-                    .duration()
-                    .map(format_duration)
-                    .unwrap_or_else(|| "--:--".to_owned()),
-                candidate.format(),
-                human_size(candidate.file_size())
-            ))
-            .size(9)
-            .color(MUTED),
-            text(format!("Provenance: {}", candidate.provenance().summary()))
-                .size(9)
-                .color(MUTED),
+            text(format!("From {source_name}")).size(9).color(MUTED),
+            text(status).size(10).color(status_color),
         ]
-        .spacing(5);
-        if let Some(path) = candidate.lyrics_source_path() {
+        .spacing(6);
+
+        if candidate.metadata_incomplete() {
             body = body.push(
-                text(format!("Lyrics sidecar: {}", path.display()))
-                    .size(8)
+                text("Some details are missing. You can fill them in below.")
+                    .size(9)
                     .color(MUTED),
             );
         }
-        for note in candidate.sidecar_notes().iter().take(3) {
-            body = body.push(text(note.clone()).size(8).color(MUTED));
-        }
-        for conflict in candidate.conflicts().iter().take(4) {
-            body = body.push(
-                text(format!("Needs review: {conflict}"))
-                    .size(8)
-                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
-            );
-        }
-
         if !flux_app::is_track_playable(candidate.source_track()) {
             body = body.push(
-                text("This format can be indexed but is not playable by the current engine.")
+                text("Flux can store this file but cannot play this format.")
                     .size(9)
                     .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
             );
         }
         if let Some(existing) = candidate.existing_match() {
-            let target_relation = plan.target_album.as_ref().map_or(
-                "general destination; the existing TrackId remains authoritative",
-                |target| {
-                    if existing.album_id == Some(target.album_id) {
-                        "already in the fixed target album"
-                    } else {
-                        "in another album; the fixed target will never redirect it"
-                    }
-                },
-            );
             body = body.push(
                 text(format!(
-                    "EXISTING · TrackId {} · {} · {} · {} · {}",
-                    existing.track_id,
+                    "Already in your library: {} · {}",
                     existing.title,
-                    existing.artist_name.as_deref().unwrap_or("Unknown artist"),
-                    existing.album_title.as_deref().unwrap_or("Unknown album"),
-                    target_relation
+                    existing.artist_name.as_deref().unwrap_or("Unknown artist")
                 ))
                 .size(9)
                 .color(MUTED),
             );
-            body = body.push(
-                text(format!(
-                    "Existing credits: {} · album id: {} · managed audio: {} · fingerprint recorded: {} · physical owner is preserved by metadata updates",
-                    if existing.credited_artist_ids.is_empty() {
-                        "unknown".to_owned()
-                    } else {
-                        existing
-                            .credited_artist_ids
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    },
-                    existing
-                        .album_id
-                        .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
-                    existing.audio_path.display(),
-                    if existing.fingerprint.is_some() {
-                        "yes"
-                    } else {
-                        "no"
-                    }
-                ))
-                .size(8)
-                .color(MUTED),
-            );
-        }
-        if let CandidateStatus::AmbiguousAudio(ids) = candidate.status() {
-            body = body.push(
-                text(format!(
-                    "Ambiguous match candidates: {}",
-                    ids.iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-                .size(8)
-                .color(MUTED),
-            );
-        }
-        if candidate.status().has_conflict() {
-            body = body.push(
-                text("Audio replacement is unavailable in this build: it is not exposed through the transactional replacement workflow. Existing audio is never deleted or overwritten by duplicate resolution.")
-                    .size(8)
-                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
-            );
-        }
-        match candidate.status() {
-            CandidateStatus::ExistingPath(_) => {
-                body = body.push(
-                    text(status_description(candidate.status()))
-                        .size(9)
-                        .color(MUTED),
-                );
-                body = body.push(
-                    row![
-                        button(text("Skip").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
-                        button(text("Update metadata").size(10))
-                            .style(nav_style(
-                                candidate.decision() == ImportDecision::UpdateExisting
-                            ))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(
-                                index,
-                                ImportDecision::UpdateExisting,
-                            )),
-                    ]
-                    .spacing(6),
-                );
-            }
-            CandidateStatus::SameContent {
-                track_id: Some(_), ..
-            } => {
-                body = body.push(
-                    text(status_description(candidate.status()))
-                        .size(9)
-                        .color(MUTED),
-                );
-                body = body.push(
-                    row![
-                        button(text("Skip").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
-                        button(text("Update metadata").size(10))
-                            .style(nav_style(
-                                candidate.decision() == ImportDecision::UpdateExisting
-                            ))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(
-                                index,
-                                ImportDecision::UpdateExisting,
-                            )),
-                        button(text("Import separately").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(
-                                index,
-                                ImportDecision::ImportNew,
-                            )),
-                    ]
-                    .spacing(6),
-                );
-            }
-            CandidateStatus::SameContent { track_id: None, .. } => {
-                body = body.push(
-                    text(status_description(candidate.status()))
-                        .size(9)
-                        .color(MUTED),
-                );
-                body = body.push(
-                    row![
-                        button(text("Skip").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
-                        button(text("Import separately").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(
-                                index,
-                                ImportDecision::ImportNew,
-                            )),
-                    ]
-                    .spacing(6),
-                );
-            }
-            CandidateStatus::New
-            | CandidateStatus::SimilarMetadata(_)
-            | CandidateStatus::SameTitleDifferentAudio(_)
-            | CandidateStatus::ProbableAudio(_)
-            | CandidateStatus::AmbiguousAudio(_) => {
-                body = body.push(
-                    text(status_description(candidate.status()))
-                        .size(9)
-                        .color(MUTED),
-                );
-                body = body.push(
-                    row![
-                        button(text("Skip").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::Skip))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
-                        button(text("Import separately").size(10))
-                            .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
-                            .padding([6, 9])
-                            .on_press(Message::ImportDecisionChanged(
-                                index,
-                                ImportDecision::ImportNew,
-                            )),
-                    ]
-                    .spacing(6),
-                );
-            }
         }
 
-        let editable = manager.stage == ImportUiStage::Review;
-        let bulk_artists = self.artist_choices();
-        let fixed_target = plan.target_album.is_some();
-        let album_bulk_control: Element<'_, Message> = if fixed_target {
-            text("Album membership is fixed for this import. Album artwork below still applies to the locked target Album.")
-                .size(8)
-                .color(MUTED)
-                .into()
+        let mut decisions = row![].spacing(6);
+        if candidate.decision() == ImportDecision::Skip {
+            decisions = decisions.push(
+                button(text("Include").size(10))
+                    .style(accent_button_style)
+                    .padding([5, 9])
+                    .on_press(Message::ImportDecisionChanged(
+                        index,
+                        ImportDecision::ImportNew,
+                    )),
+            );
         } else {
-            row![
-                text_input(
-                    "Album title for checked candidates…",
-                    &manager.bulk_album_title
-                )
-                .on_input(Message::ImportBulkAlbumChanged)
-                .on_submit(Message::ImportBulkApplyAlbum)
-                .style(input_style)
-                .width(Length::Fill),
-                button(text("Apply Album").size(9))
+            decisions = decisions.push(
+                button(text("Skip").size(10))
                     .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkApplyAlbum),
-                button(text("Make standalone").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkMakeStandalone),
-            ]
-            .spacing(6)
-            .into()
-        };
-        let mut bulk = column![
-            text(format!(
-                "BULK APPLY · {} checked",
-                manager.checked.len()
-            ))
-            .size(9)
-            .color(ACCENT),
-            text(if fixed_target {
-                "Bulk Artist changes apply to checked candidates; Album membership stays locked. Per-candidate edits made afterward win."
-            } else {
-                "Bulk changes explicitly overwrite the selected candidates' Artist/Album fields. Per-candidate edits made afterward win; shared Album artwork, Track artwork and lyrics controls apply only to checked candidates."
-            })
-            .size(8)
-            .color(MUTED),
-            row![
-                pick_list(bulk_artists, manager.bulk_artist.clone(), |choice| {
-                    Message::ImportBulkArtistPicked(Some(choice))
-                })
-                .placeholder("Existing Artist for checked candidates…")
-                .text_size(10)
-                .padding([5, 7])
-                .width(Length::Fill),
-                button(text("Apply Artist").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkApplyArtist),
-            ]
-            .spacing(6),
-            row![
-                text_input("Or new Artist name for checked candidates…", &manager.bulk_new_artist_name)
-                    .on_input(Message::ImportBulkNewArtistChanged)
-                    .on_submit(Message::ImportBulkApplyNewArtist)
-                    .style(input_style)
-                    .width(Length::Fill),
-                button(text("Apply new name").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkApplyNewArtist),
-            ]
-            .spacing(6),
-            album_bulk_control,
-            text("Bulk release type for newly created Albums:").size(8).color(MUTED),
-            row![
-                button(text("Album").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Album)),
-                button(text("EP").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Ep)),
-                button(text("Single").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Single)),
-                button(text("Compilation").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Compilation)),
-                button(text("Other").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Other)),
-            ]
-            .spacing(4),
-            row![
-                text_input(
-                    if fixed_target {
-                        "Artwork path for the locked target Album…"
-                    } else {
-                        "Album artwork path for checked candidates…"
-                    },
-                    &manager.bulk_album_artwork_path
-                )
-                .on_input(Message::ImportBulkAlbumArtworkChanged)
-                .style(input_style)
-                .width(Length::Fill),
-                button(text("Choose…").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkAlbumArtworkChoose),
-                button(text("Apply artwork").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkApplyAlbumArtwork),
-                button(text("Clear artwork").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkClearAlbumArtwork),
-            ]
-            .spacing(6),
-            row![
-                text_input(
-                    "Track artwork override path for checked candidates…",
-                    &manager.bulk_track_artwork_path
-                )
-                .on_input(Message::ImportBulkTrackArtworkChanged)
-                .style(input_style)
-                .width(Length::Fill),
-                button(text("Choose…").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkTrackArtworkChoose),
-                button(text("Apply Track art").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkApplyTrackArtwork),
-                button(text("Clear Track art").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkClearTrackArtwork),
-            ]
-            .spacing(6),
-            row![
-                text_input(
-                    "LRC/TXT lyrics path for checked candidates…",
-                    &manager.bulk_lyrics_path
-                )
-                .on_input(Message::ImportBulkLyricsChanged)
-                .style(input_style)
-                .width(Length::Fill),
-                button(text("Choose…").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkLyricsChoose),
-                button(text("Apply lyrics").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkApplyLyrics),
-                button(text("Clear lyrics").size(9))
-                    .style(ghost_style)
-                    .padding([5, 7])
-                    .on_press(Message::ImportBulkClearLyrics),
-            ]
-            .spacing(6),
-        ]
-        .spacing(5)
-        .padding(8);
-        if let Some(error) = &manager.asset_error {
-            bulk = bulk.push(text(error).size(9).color(DANGER));
+                    .padding([5, 9])
+                    .on_press(Message::ImportDecisionChanged(index, ImportDecision::Skip)),
+            );
         }
-        body = body.push(container(bulk).style(card_style));
+        if candidate.existing_match().is_some() && candidate.status().can_update_metadata() {
+            decisions = decisions.push(
+                button(text("Update details").size(10))
+                    .style(nav_style(
+                        candidate.decision() == ImportDecision::UpdateExisting,
+                    ))
+                    .padding([5, 9])
+                    .on_press(Message::ImportDecisionChanged(
+                        index,
+                        ImportDecision::UpdateExisting,
+                    )),
+            );
+        }
+        if candidate.existing_match().is_some()
+            || matches!(
+                candidate.status(),
+                CandidateStatus::SameContent { .. }
+                    | CandidateStatus::SimilarMetadata(_)
+                    | CandidateStatus::SameTitleDifferentAudio(_)
+                    | CandidateStatus::ProbableAudio(_)
+                    | CandidateStatus::AmbiguousAudio(_)
+            )
+        {
+            decisions = decisions.push(
+                button(text("Import anyway").size(10))
+                    .style(nav_style(candidate.decision() == ImportDecision::ImportNew))
+                    .padding([5, 9])
+                    .on_press(Message::ImportDecisionChanged(
+                        index,
+                        ImportDecision::ImportNew,
+                    )),
+            );
+        }
+        if candidate.decision() != ImportDecision::ImportNew || candidate.existing_match().is_some()
+        {
+            body = body.push(decisions);
+        }
+
         body = body.push(text("TITLE").size(8).color(MUTED));
         body = body.push(
             text_input("Title", &manager.edit_title)
@@ -9930,285 +9595,40 @@ impl FluxReady {
                 .style(input_style)
                 .width(Length::Fill),
         );
-        let targeted = plan.target_album.is_some();
         if let Some(target) = &plan.target_album {
             body = body.push(
-                text(format!(
-                    "FIXED TARGET ALBUM · {} · AlbumId {} · owner {}",
-                    target.title, target.album_id, target.owner_name
-                ))
-                .size(9)
-                .color(ACCENT),
-            );
-            body = body.push(
-                text("The target album and physical owner cannot be changed inside this review. Close and start a new import to choose another destination.")
-                    .size(8)
+                text(format!("Album: {}", target.title))
+                    .size(9)
                     .color(MUTED),
             );
         } else {
             body = body.push(text("ARTIST").size(8).color(MUTED));
             body = body.push(
-                text_input("Artist name", &manager.edit_artist)
+                text_input("Artist", &manager.edit_artist)
                     .on_input(Message::ImportArtistChanged)
                     .style(input_style)
                     .width(Length::Fill),
             );
-            let mut choices = self.editor_artist_choices();
-            if let Some(choice) = choices.first_mut() {
-                choice.label = "No stable artist (create/link from artist name)".to_owned();
-            }
-            let selected_artist = candidate
-                .artist_id()
-                .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned())
-                .or_else(|| choices.first().cloned());
-            body = body.push(
-                pick_list(choices, selected_artist, |choice| {
-                    Message::ImportArtistPicked(Some(choice))
-                })
-                .text_size(11)
-                .padding([6, 8])
-                .width(Length::Fill),
-            );
-        }
-        body = body.push(text("ORDERED CREDITS").size(8).color(MUTED));
-        for (credit_index, credit) in candidate.credits().iter().enumerate() {
-            let owner = credit_index == candidate.owner_index();
-            body = body.push(
-                row![
-                    text(format!(
-                        "{}. {} ({})",
-                        credit_index + 1,
-                        credit.name,
-                        if credit.artist_id.is_some() {
-                            "existing artist"
-                        } else {
-                            "proposed / unresolved"
-                        }
-                    ))
-                    .size(10)
-                    .color(if owner { ACCENT } else { TEXT })
-                    .width(Length::Fill),
-                    if owner {
-                        Element::from(text("OWNER").size(8).color(ACCENT))
-                    } else if targeted {
-                        Element::from(text("credit").size(8).color(MUTED))
-                    } else {
-                        Element::from(
-                            button(text("Set owner").size(9))
-                                .style(ghost_style)
-                                .padding([4, 7])
-                                .on_press(Message::ImportCreditSetOwner(credit_index)),
-                        )
-                    },
-                    button(text("↑").size(10))
-                        .style(ghost_style)
-                        .padding([4, 6])
-                        .on_press(Message::ImportCreditMove(credit_index, -1)),
-                    button(text("↓").size(10))
-                        .style(ghost_style)
-                        .padding([4, 6])
-                        .on_press(Message::ImportCreditMove(credit_index, 1)),
-                    button(text("×").size(10))
-                        .style(ghost_style)
-                        .padding([4, 6])
-                        .on_press_maybe(
-                            (!owner && candidate.credits().len() > 1)
-                                .then_some(Message::ImportCreditRemove(credit_index)),
-                        ),
-                ]
-                .spacing(5)
-                .align_y(Alignment::Center),
-            );
-        }
-        body = body.push(
-            row![
-                text_input("Additional credited artist…", &manager.edit_credit)
-                    .on_input(Message::ImportCreditNameChanged)
-                    .on_submit(Message::ImportCreditAddNamed)
-                    .style(input_style)
-                    .width(Length::Fill),
-                button(text("Add credit").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportCreditAddNamed),
-            ]
-            .spacing(6),
-        );
-        let mut add_choices = self.editor_artist_choices();
-        add_choices.retain(|choice| choice.id.is_some());
-        body = body.push(
-            pick_list(
-                add_choices,
-                None::<ArtistChoice>,
-                Message::ImportCreditAddExisting,
-            )
-            .placeholder("Add existing artist…")
-            .text_size(10)
-            .padding([5, 7])
-            .width(Length::Fill),
-        );
-        body = body.push(
-            text("The owner must be one of the ordered credits. Ejecting the owner or adding an invalid credit blocks import.")
-                .size(9)
-                .color(MUTED),
-        );
-        if let Some(target) = &plan.target_album {
-            body = body.push(
-                text(format!(
-                    "Album: {} (fixed AlbumId {})",
-                    target.title, target.album_id
-                ))
-                .size(9)
-                .color(MUTED),
-            );
-        } else {
             body = body.push(text("ALBUM (OPTIONAL)").size(8).color(MUTED));
             body = body.push(
                 row![
-                    text_input(
-                        "Album title, or leave empty for standalone…",
-                        &manager.edit_album
-                    )
-                    .on_input(Message::ImportAlbumChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
-                    button(text("Make standalone").size(9))
+                    text_input("Album, or leave empty for a single", &manager.edit_album)
+                        .on_input(Message::ImportAlbumChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Single").size(9))
                         .style(ghost_style)
                         .padding([5, 7])
                         .on_press(Message::ImportAlbumChanged(String::new())),
                 ]
                 .spacing(6),
             );
-            let album_choices = self.import_album_choices(candidate);
-            if candidate.artist_id().is_some() {
-                let selected_album = album_choices
-                    .iter()
-                    .find(|choice| {
-                        self.controller
-                            .album(choice.id)
-                            .is_some_and(|album| candidate.album() == Some(album.title.as_str()))
-                    })
-                    .cloned();
-                body = body.push(
-                    pick_list(album_choices, selected_album, |choice| {
-                        Message::ImportAlbumPicked(Some(choice))
-                    })
-                    .placeholder("Create a new Album from this title, or select an existing Album…")
-                    .text_size(10)
-                    .padding([5, 7])
-                    .width(Length::Fill),
-                );
-            } else {
-                body = body.push(
-                    text("Assign a stable Artist above before selecting an existing Album. Typing a title creates a new Album only when no exact match exists for that owner.")
-                        .size(8)
-                        .color(MUTED),
-                );
-            }
-            if let Some(title) = candidate.album() {
-                let existing = candidate.artist_id().and_then(|owner| {
-                    self.controller.albums().into_iter().find(|album| {
-                        album.owner_artist_id == owner
-                            && entity_name_key(&album.title) == entity_name_key(title)
-                    })
-                });
-                if let Some(existing) = existing {
-                    body = body.push(
-                        text(format!(
-                            "Reuses existing AlbumId {} · owner {}",
-                            existing.id, existing.title
-                        ))
-                        .size(8)
-                        .color(SUCCESS),
-                    );
-                } else {
-                    body = body.push(
-                        text("Creates a new Album inside the import transaction.")
-                            .size(8)
-                            .color(ACCENT),
-                    );
-                    body = body.push(text("RELEASE TYPE FOR NEW ALBUM").size(8).color(MUTED));
-                    body = body.push(release_type_buttons(
-                        candidate.release_type(),
-                        Message::ImportReleaseTypeChanged,
-                    ));
-                }
-            } else if candidate.album().is_none() {
-                body = body.push(
-                    text("Standalone Track · no Album will be created or referenced.")
-                        .size(8)
-                        .color(ACCENT),
-                );
-            }
-            if candidate.album().is_some() && candidate.artist_id().is_none() {
-                body = body.push(
-                    text("The typed Artist will be created only when this batch commits.")
-                        .size(8)
-                        .color(MUTED),
-                );
-            }
-            if candidate.decision() == ImportDecision::UpdateExisting {
-                body = body.push(
-                    text("Metadata updates preserve the existing album membership and managed audio.")
-                        .size(8)
-                        .color(MUTED),
-                );
-            }
         }
-        body = body.push(
-            row![
-                text_input("Track #", &manager.edit_track_number)
-                    .on_input(Message::ImportTrackNumberChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
-                text_input("Disc #", &manager.edit_disc_number)
-                    .on_input(Message::ImportDiscNumberChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
-            ]
-            .spacing(6),
-        );
-        if let Some(error) = &manager.number_error {
-            body = body.push(text(error).size(9).color(DANGER));
-        }
-        body = body.push(text("TRACK ARTWORK OVERRIDE").size(8).color(MUTED));
-        body = body.push(
-            text_input("Optional Track artwork image path…", &manager.edit_artwork)
-                .on_input(Message::ImportArtworkChanged)
-                .on_submit(Message::ImportArtworkApply)
-                .style(input_style)
-                .width(Length::Fill),
-        );
-        body = body.push(
-            row![
-                button(text("Choose image…").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportArtworkChoose),
-                button(text("Attach path").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportArtworkApply),
-                button(text("Use Album artwork").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportArtworkClear),
-            ]
-            .spacing(6),
-        );
-        body = body.push(
-            text(if candidate.artwork_path().is_some() {
-                "Track-specific artwork attached. It overrides Album artwork for this Track."
-            } else {
-                "No override attached; the Track inherits Album artwork when available."
-            })
-            .size(8)
-            .color(MUTED),
-        );
-        body = body.push(text("ALBUM ARTWORK").size(8).color(MUTED));
+
+        body = body.push(text("ARTWORK").size(8).color(MUTED));
         body = body.push(
             text_input(
-                "Optional Album artwork image path…",
+                "Album artwork path (optional)…",
                 &manager.edit_album_artwork,
             )
             .on_input(Message::ImportAlbumArtworkChanged)
@@ -10218,14 +9638,10 @@ impl FluxReady {
         );
         body = body.push(
             row![
-                button(text("Choose image…").size(10))
+                button(text("Choose album image…").size(10))
                     .style(ghost_style)
                     .padding([5, 8])
                     .on_press(Message::ImportAlbumArtworkChoose),
-                button(text("Attach path").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::ImportAlbumArtworkApply),
                 button(text("Clear").size(10))
                     .style(ghost_style)
                     .padding([5, 8])
@@ -10234,14 +9650,33 @@ impl FluxReady {
             .spacing(6),
         );
         body = body.push(
-            text("Album artwork is shared by all Tracks in that Album. Attaching it during import replaces existing Album artwork; Track overrides stay independent.")
-                .size(8)
-                .color(MUTED),
+            text_input(
+                "Track artwork override path (optional)…",
+                &manager.edit_artwork,
+            )
+            .on_input(Message::ImportArtworkChanged)
+            .on_submit(Message::ImportArtworkApply)
+            .style(input_style)
+            .width(Length::Fill),
         );
-        body = body.push(text("LYRICS FILE (LRC / TXT)").size(8).color(MUTED));
+        body = body.push(
+            row![
+                button(text("Choose track image…").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportArtworkChoose),
+                button(text("Use album artwork").size(10))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::ImportArtworkClear),
+            ]
+            .spacing(6),
+        );
+
+        body = body.push(text("LYRICS").size(8).color(MUTED));
         body = body.push(
             text_input(
-                "Optional .lrc or .txt lyrics path…",
+                "Lyrics file path (.lrc or .txt, optional)…",
                 &manager.edit_lyrics_path,
             )
             .on_input(Message::ImportLyricsPathChanged)
@@ -10265,7 +9700,7 @@ impl FluxReady {
         if let Some(lyrics) = candidate.lyrics_text() {
             body = body.push(
                 text(format!(
-                    "Lyrics attached during review ({} lines). Managed by TrackId after commit.",
+                    "Lyrics attached ({} lines).",
                     lyrics.lines().count()
                 ))
                 .size(8)
@@ -10275,35 +9710,356 @@ impl FluxReady {
         if let Some(error) = &manager.asset_error {
             body = body.push(text(error).size(9).color(DANGER));
         }
-        if matches!(self.controller.storage_mode(), StorageMode::Canonical) {
+
+        body = body.push(
+            button(
+                text(if manager.advanced_open {
+                    "▾ Advanced Options"
+                } else {
+                    "▸ Advanced Options"
+                })
+                .size(10),
+            )
+            .style(ghost_style)
+            .padding([5, 8])
+            .on_press(Message::ImportAdvancedToggled),
+        );
+
+        if manager.advanced_open {
+            body = body.push(text("TRACK NUMBER").size(8).color(MUTED));
             body = body.push(
-                text("Destination: assigned inside the canonical album directory at commit.")
-                    .size(9)
+                row![
+                    text_input("Track #", &manager.edit_track_number)
+                        .on_input(Message::ImportTrackNumberChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    text_input("Disc #", &manager.edit_disc_number)
+                        .on_input(Message::ImportDiscNumberChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
+                ]
+                .spacing(6),
+            );
+            if let Some(error) = &manager.number_error {
+                body = body.push(text(error).size(9).color(DANGER));
+            }
+
+            if !targeted {
+                let mut choices = self.editor_artist_choices();
+                if let Some(choice) = choices.first_mut() {
+                    choice.label = "Use the typed artist name".to_owned();
+                }
+                let selected_artist = candidate
+                    .artist_id()
+                    .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned())
+                    .or_else(|| choices.first().cloned());
+                body = body.push(text("EXISTING ARTIST").size(8).color(MUTED));
+                body = body.push(
+                    pick_list(choices, selected_artist, |choice| {
+                        Message::ImportArtistPicked(Some(choice))
+                    })
+                    .text_size(10)
+                    .padding([5, 7])
+                    .width(Length::Fill),
+                );
+            }
+
+            body = body.push(text("ORDERED CREDITS").size(8).color(MUTED));
+            for (credit_index, credit) in candidate.credits().iter().enumerate() {
+                let owner = credit_index == candidate.owner_index();
+                body = body.push(
+                    row![
+                        text(format!(
+                            "{}. {}{}",
+                            credit_index + 1,
+                            credit.name,
+                            if owner { " (owner)" } else { "" }
+                        ))
+                        .size(10)
+                        .color(if owner { ACCENT } else { TEXT })
+                        .width(Length::Fill),
+                        if owner {
+                            Element::from(iced::widget::Space::new().width(0))
+                        } else {
+                            Element::from(
+                                button(text("Owner").size(9))
+                                    .style(ghost_style)
+                                    .padding([3, 6])
+                                    .on_press(Message::ImportCreditSetOwner(credit_index)),
+                            )
+                        },
+                        button(text("↑").size(10))
+                            .style(ghost_style)
+                            .padding([3, 5])
+                            .on_press(Message::ImportCreditMove(credit_index, -1)),
+                        button(text("↓").size(10))
+                            .style(ghost_style)
+                            .padding([3, 5])
+                            .on_press(Message::ImportCreditMove(credit_index, 1)),
+                        button(text("×").size(10))
+                            .style(ghost_style)
+                            .padding([3, 5])
+                            .on_press_maybe(
+                                (!owner && candidate.credits().len() > 1)
+                                    .then_some(Message::ImportCreditRemove(credit_index)),
+                            ),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                );
+            }
+            body = body.push(
+                row![
+                    text_input("Add another credited artist…", &manager.edit_credit)
+                        .on_input(Message::ImportCreditNameChanged)
+                        .on_submit(Message::ImportCreditAddNamed)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Add").size(10))
+                        .style(ghost_style)
+                        .padding([5, 7])
+                        .on_press(Message::ImportCreditAddNamed),
+                ]
+                .spacing(6),
+            );
+            let mut add_choices = self.editor_artist_choices();
+            add_choices.retain(|choice| choice.id.is_some());
+            body = body.push(
+                pick_list(
+                    add_choices,
+                    None::<ArtistChoice>,
+                    Message::ImportCreditAddExisting,
+                )
+                .placeholder("Add an existing artist…")
+                .text_size(10)
+                .padding([5, 7])
+                .width(Length::Fill),
+            );
+
+            if !targeted {
+                let album_choices = self.import_album_choices(candidate);
+                body = body.push(text("EXISTING ALBUM").size(8).color(MUTED));
+                body = body.push(
+                    pick_list(album_choices, None::<AlbumChoice>, |choice| {
+                        Message::ImportAlbumPicked(Some(choice))
+                    })
+                    .placeholder("Use an existing album…")
+                    .text_size(10)
+                    .padding([5, 7])
+                    .width(Length::Fill),
+                );
+                if candidate.album().is_some() {
+                    body = body.push(text("RELEASE TYPE FOR NEW ALBUM").size(8).color(MUTED));
+                    body = body.push(release_type_buttons(
+                        candidate.release_type(),
+                        Message::ImportReleaseTypeChanged,
+                    ));
+                }
+            }
+
+            body = body.push(
+                row![
+                    button(text("Check all").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportCheckAll),
+                    button(text("Clear checks").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportClearChecked),
+                    button(text("Skip all").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkSkip),
+                    button(text("Import new").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkImport),
+                    button(text("Update exact").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkUpdate),
+                ]
+                .spacing(5)
+                .wrap(),
+            );
+            body = body.push(
+                text(format!(
+                    "{} checked for bulk actions",
+                    manager.checked.len()
+                ))
+                .size(8)
+                .color(MUTED),
+            );
+            body = body.push(
+                row![
+                    text_input("Artist for checked tracks…", &manager.bulk_new_artist_name)
+                        .on_input(Message::ImportBulkNewArtistChanged)
+                        .on_submit(Message::ImportBulkApplyNewArtist)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Apply artist").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkApplyNewArtist),
+                ]
+                .spacing(6),
+            );
+            if !targeted {
+                body = body.push(
+                    row![
+                        text_input("Album for checked tracks…", &manager.bulk_album_title)
+                            .on_input(Message::ImportBulkAlbumChanged)
+                            .on_submit(Message::ImportBulkApplyAlbum)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text("Apply album").size(9))
+                            .style(ghost_style)
+                            .padding([4, 7])
+                            .on_press(Message::ImportBulkApplyAlbum),
+                    ]
+                    .spacing(6),
+                );
+            }
+            body = body.push(
+                row![
+                    button(text("Album").size(8))
+                        .style(ghost_style)
+                        .padding([3, 6])
+                        .on_press(Message::ImportBulkReleaseType(ReleaseType::Album)),
+                    button(text("EP").size(8))
+                        .style(ghost_style)
+                        .padding([3, 6])
+                        .on_press(Message::ImportBulkReleaseType(ReleaseType::Ep)),
+                    button(text("Single").size(8))
+                        .style(ghost_style)
+                        .padding([3, 6])
+                        .on_press(Message::ImportBulkReleaseType(ReleaseType::Single)),
+                    button(text("Compilation").size(8))
+                        .style(ghost_style)
+                        .padding([3, 6])
+                        .on_press(Message::ImportBulkReleaseType(ReleaseType::Compilation)),
+                    button(text("Other").size(8))
+                        .style(ghost_style)
+                        .padding([3, 6])
+                        .on_press(Message::ImportBulkReleaseType(ReleaseType::Other)),
+                ]
+                .spacing(4),
+            );
+            let bulk_artists = self.artist_choices();
+            body = body.push(
+                row![
+                    pick_list(bulk_artists, manager.bulk_artist.clone(), |choice| {
+                        Message::ImportBulkArtistPicked(Some(choice))
+                    })
+                    .placeholder("Existing artist for checked tracks…")
+                    .text_size(9)
+                    .padding([4, 6])
+                    .width(Length::Fill),
+                    button(text("Apply").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkApplyArtist),
+                ]
+                .spacing(6),
+            );
+            if !targeted {
+                body = body.push(
+                    button(text("Make checked tracks standalone").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkMakeStandalone),
+                );
+            }
+            body = body.push(
+                row![
+                    text_input(
+                        "Album artwork path for checked tracks…",
+                        &manager.bulk_album_artwork_path
+                    )
+                    .on_input(Message::ImportBulkAlbumArtworkChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+                    button(text("Choose…").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkAlbumArtworkChoose),
+                    button(text("Apply").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkApplyAlbumArtwork),
+                    button(text("Clear").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkClearAlbumArtwork),
+                ]
+                .spacing(5),
+            );
+            body = body.push(
+                row![
+                    text_input(
+                        "Track artwork path for checked tracks…",
+                        &manager.bulk_track_artwork_path
+                    )
+                    .on_input(Message::ImportBulkTrackArtworkChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+                    button(text("Choose…").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkTrackArtworkChoose),
+                    button(text("Apply").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkApplyTrackArtwork),
+                    button(text("Clear").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkClearTrackArtwork),
+                ]
+                .spacing(5),
+            );
+            body = body.push(
+                row![
+                    text_input("Lyrics path for checked tracks…", &manager.bulk_lyrics_path)
+                        .on_input(Message::ImportBulkLyricsChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Choose…").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkLyricsChoose),
+                    button(text("Apply").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkApplyLyrics),
+                    button(text("Clear").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::ImportBulkClearLyrics),
+                ]
+                .spacing(5),
+            );
+            body = body.push(
+                text(format!("Source: {}", candidate.source_path().display()))
+                    .size(8)
                     .color(MUTED),
             );
-        } else if let Some(destination) = candidate.destination() {
-            body = body.push(
-                text(format!("Destination: {}", destination.display()))
-                    .size(9)
-                    .color(MUTED),
-            );
+            if candidate.status().has_conflict() {
+                body = body.push(
+                    text(status_description(candidate.status()))
+                        .size(8)
+                        .color(MUTED),
+                );
+            }
         }
+
         if let Some(error) = candidate.storage_error() {
             body = body.push(text(error).size(9).color(DANGER));
         }
-        body = body.push(
-            text(
-                "Metadata was inferred only from filenames and folders. Review edits, explicitly \
-                 attached artwork, and lyrics files become canonical Flux data in one atomic \
-                 commit; audio tags are never read or written. Artwork is not extracted from \
-                 embedded tags.",
-            )
-            .size(9)
-            .color(MUTED),
-        );
         if !editable {
             body = body.push(
-                text("Editing is disabled while files/catalogue changes are in progress.")
+                text("Editing is unavailable while the import is running.")
                     .size(9)
                     .color(MUTED),
             );
@@ -10315,15 +10071,14 @@ impl FluxReady {
         let mut footer = row![].spacing(8).align_y(Alignment::Center);
         let summary = match manager.stage {
             ImportUiStage::Review => manager.plan.as_ref().map_or_else(
-                || "No reviewed plan".to_owned(),
+                || "Nothing selected".to_owned(),
                 |plan| {
-                    format!(
-                        "{} new · {} update · {} skip · {} issue(s)",
-                        plan.new_count(),
-                        plan.update_count(),
-                        plan.skip_count(),
-                        plan.issues.len()
-                    )
+                    let ready = plan.new_count() + plan.update_count();
+                    if plan.skip_count() > 0 {
+                        format!("{ready} track(s) ready · {} skipped", plan.skip_count())
+                    } else {
+                        format!("{ready} track(s) ready")
+                    }
                 },
             ),
             ImportUiStage::Importing => manager.progress_view.message.clone(),
@@ -10336,8 +10091,8 @@ impl FluxReady {
                     )
                 },
             ),
-            ImportUiStage::Cancelled => "Cancelled before catalogue publication".to_owned(),
-            ImportUiStage::Failed => "Import could not complete".to_owned(),
+            ImportUiStage::Cancelled => "Cancelled · library unchanged".to_owned(),
+            ImportUiStage::Failed => "Import did not complete · library unchanged".to_owned(),
             ImportUiStage::Choose | ImportUiStage::Scanning => String::new(),
         };
         footer = footer.push(text(summary).size(10).color(MUTED).width(Length::Fill));
@@ -10354,7 +10109,7 @@ impl FluxReady {
                 footer = footer.push(
                     button(
                         text(format!(
-                            "Import {} item(s)",
+                            "Import {} track(s)",
                             manager
                                 .plan
                                 .as_ref()
@@ -10414,73 +10169,59 @@ impl FluxReady {
                     .style(error_banner_style),
             );
             body = body.push(
-                text("A failed transaction publishes no partial catalogue or managed-resource changes. Review the issue, then choose again or close.")
+                text("Nothing was partially published. Choose again or close.")
                     .size(10)
                     .color(MUTED),
             );
         }
         if let Some(report) = &manager.report {
             body = body.push(
-                text(format!(
-                    "{} imported · {} updated · {} skipped · {} failed",
-                    report.imported, report.updated, report.skipped, report.failed
-                ))
-                .size(16)
-                .color(TEXT),
+                text(format!("{} track(s) imported", report.imported))
+                    .size(18)
+                    .color(TEXT),
             );
+            let mut summary = Vec::new();
+            if report.updated > 0 {
+                summary.push(format!("{} updated", report.updated));
+            }
+            if report.skipped > 0 {
+                summary.push(format!("{} skipped", report.skipped));
+            }
+            if report.failed > 0 {
+                summary.push(format!("{} need attention", report.failed));
+            }
+            if !summary.is_empty() {
+                body = body.push(text(summary.join(" · ")).size(10).color(MUTED));
+            }
             body = body.push(
-                text("Imported items are now in the canonical library. Close this manager to review them in Tracks or Albums.")
+                text("Find the music in Tracks or Albums.")
                     .size(10)
                     .color(MUTED),
             );
-            for item in &report.items {
-                let (state, color) = match item.state {
-                    ImportItemState::Imported => ("imported", SUCCESS),
-                    ImportItemState::Skipped => ("skipped", MUTED),
-                    ImportItemState::Failed => ("failed", DANGER),
-                    _ => ("pending", MUTED),
-                };
-                let source = manager
-                    .plan
-                    .as_ref()
-                    .and_then(|plan| plan.candidates.get(item.index))
-                    .map_or_else(
-                        || "Source unavailable".to_owned(),
-                        |candidate| candidate.source_path().display().to_string(),
-                    );
-                let detail = match (item.track_id, item.message.trim()) {
-                    (Some(id), "") => format!("Track {id}"),
-                    (Some(id), message) => format!("Track {id} · {message}"),
-                    (None, "") => "No detail was recorded.".to_owned(),
-                    (None, message) => message.to_owned(),
-                };
-                let source_label = tooltip(
-                    text(truncate_label(&source, 96)).size(10).color(TEXT),
-                    container(text(source).size(9).color(TEXT))
-                        .padding([4, 7])
-                        .style(tooltip_style),
-                    tooltip::Position::Top,
-                )
-                .gap(6)
-                .delay(Duration::from_millis(350));
-                body = body.push(
-                    row![
-                        text(state).size(9).color(color).width(Length::Fixed(56.0)),
-                        column![source_label, text(detail).size(9).color(MUTED)]
-                            .spacing(1)
-                            .width(Length::Fill),
-                    ]
-                    .spacing(8),
-                );
+            for item in report
+                .items
+                .iter()
+                .filter(|item| item.state == ImportItemState::Failed)
+            {
+                body = body.push(text(item.message.clone()).size(9).color(DANGER));
             }
         }
         if let Some(plan) = &manager.plan
             && !plan.issues.is_empty()
         {
-            body = body.push(text("Issues").size(10).color(ACCENT));
-            for issue in plan.issues.iter().take(20) {
+            body = body.push(
+                text(format!("{} file(s) could not be read", plan.issues.len()))
+                    .size(10)
+                    .color(ACCENT),
+            );
+            for issue in plan.issues.iter().take(8) {
+                let name = issue
+                    .path()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| issue.path().display().to_string());
                 body = body.push(
-                    text(format!("{} — {}", issue.path().display(), issue.reason()))
+                    text(format!("{name}: {}", issue.reason()))
                         .size(9)
                         .color(MUTED),
                 );
@@ -10515,6 +10256,7 @@ impl FluxReady {
         .into()
     }
 
+    #[cfg(test)]
     fn nav_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
         let mut folders: HashSet<Option<&Path>> = HashSet::new();
         for (_, track) in self.controller.tracks() {
@@ -10535,163 +10277,71 @@ impl FluxReady {
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
-        let counts = self.nav_counts();
         let brand = row![
             container(iced::widget::Space::new().width(4).height(28))
                 .style(|_| container::Style::default().background(ACCENT)),
-            column![
-                text("Flux").size(22).color(TEXT),
-                text("LOCAL MUSIC").size(9).color(MUTED),
-            ]
-            .spacing(1),
+            text("Flux").size(22).color(TEXT),
         ]
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let count_for = |view: LibraryView| -> String {
-            if view == LibraryView::Settings {
-                return String::new();
-            }
-            match view {
-                LibraryView::Tracks => counts.0,
-                LibraryView::Artists => counts.1,
-                LibraryView::Albums => counts.2,
-                LibraryView::Folders => counts.3,
-                LibraryView::Playlists => counts.4,
-                LibraryView::Lyrics => counts.5,
-                LibraryView::Dashboard => self.controller.tracks().len(),
-                LibraryView::Collections => SmartCollection::ALL.len(),
-                LibraryView::RecentlyAdded => self
-                    .controller
-                    .tracks()
-                    .iter()
-                    .filter(|(id, _)| {
-                        self.controller
-                            .track_created_unix_ms(*id)
-                            .is_some_and(|created| created > 0)
-                    })
-                    .count(),
-                LibraryView::RecentlyPlayed | LibraryView::MostPlayed => {
-                    self.controller.playback_history().len()
-                }
-                LibraryView::Settings => 0,
-            }
-            .to_string()
-        };
-
-        let sections: [(&str, &[LibraryView]); 3] = [
-            (
-                "LIBRARY",
-                &[
-                    LibraryView::Tracks,
-                    LibraryView::Artists,
-                    LibraryView::Albums,
-                    LibraryView::Folders,
-                ],
-            ),
-            (
-                "CURATED",
-                &[
-                    LibraryView::Playlists,
-                    LibraryView::Collections,
-                    LibraryView::RecentlyAdded,
-                    LibraryView::RecentlyPlayed,
-                    LibraryView::MostPlayed,
-                ],
-            ),
-            (
-                "TOOLS",
-                &[
-                    LibraryView::Lyrics,
-                    LibraryView::Dashboard,
-                    LibraryView::Settings,
-                ],
-            ),
-        ];
         let mut nav_items = column![].spacing(2);
-        for (index, (heading, views)) in sections.iter().enumerate() {
-            if index > 0 {
-                nav_items = nav_items.push(iced::widget::Space::new().height(4));
-            }
-            nav_items =
-                nav_items.push(container(text(*heading).size(8).color(MUTED)).padding([3, 8]));
-            for view in *views {
-                nav_items = nav_items.push(
-                    button(
-                        row![
-                            text(view.label()).size(12),
-                            iced::widget::Space::new().width(Length::Fill),
-                            text(count_for(*view)).size(9).color(MUTED),
-                        ]
-                        .align_y(Alignment::Center),
-                    )
+        nav_items = nav_items.push(container(text("LIBRARY").size(8).color(MUTED)).padding([3, 8]));
+        for view in [
+            LibraryView::Tracks,
+            LibraryView::Artists,
+            LibraryView::Albums,
+            LibraryView::Playlists,
+        ] {
+            nav_items = nav_items.push(
+                button(text(view.label()).size(12))
                     .width(Length::Fill)
-                    .padding([5, 8])
-                    .style(nav_style(self.view == *view && !self.show_setup))
-                    .on_press(Message::SelectView(*view)),
-                );
-            }
+                    .padding([6, 8])
+                    .style(nav_style(self.view == view && !self.show_setup))
+                    .on_press(Message::SelectView(view)),
+            );
         }
-
-        let library_state = match self.controller.storage_mode() {
-            StorageMode::Legacy => "App index",
-            StorageMode::Portable => "Portable (migration source)",
-            StorageMode::Canonical => "Canonical library",
-        };
-        let library_label = format!(
-            "{library_state} · {}",
-            truncate_label(&self.active_library_label(), 16)
-        );
-        let library_detail = self.active_library_path().map_or_else(
-            || "No persistent root".to_owned(),
-            |path| path.display().to_string(),
-        );
-        let library_label = tooltip(
-            text(library_label).size(9).color(TEXT),
-            container(text(library_detail).size(9).color(TEXT))
-                .padding([4, 7])
-                .style(tooltip_style),
-            tooltip::Position::Top,
-        )
-        .gap(6)
-        .delay(Duration::from_millis(350));
+        nav_items = nav_items.push(iced::widget::Space::new().height(6));
+        nav_items = nav_items.push(container(text("BROWSE").size(8).color(MUTED)).padding([3, 8]));
+        for view in [
+            LibraryView::Folders,
+            LibraryView::Collections,
+            LibraryView::Dashboard,
+        ] {
+            nav_items = nav_items.push(
+                button(text(view.label()).size(12))
+                    .width(Length::Fill)
+                    .padding([6, 8])
+                    .style(nav_style(self.view == view && !self.show_setup))
+                    .on_press(Message::SelectView(view)),
+            );
+        }
 
         let mut nav = column![
             brand,
-            iced::widget::Space::new().height(16),
+            iced::widget::Space::new().height(14),
             button(text("Import music").size(12))
                 .width(Length::Fill)
                 .padding([8, 10])
                 .style(accent_button_style)
                 .on_press(Message::ImportOpen),
-            iced::widget::Space::new().height(5),
-            button(text("Library setup").size(12))
-                .width(Length::Fill)
-                .padding([8, 10])
-                .style(nav_style(self.show_setup))
-                .on_press(Message::ToggleSetup),
-            iced::widget::Space::new().height(10),
+            iced::widget::Space::new().height(8),
         ]
         .spacing(0);
         nav = nav.push(scrollable(nav_items).height(Length::Fill));
         nav = nav.push(iced::widget::Space::new().height(8));
-        nav = nav.push(text("SPACE PLAY · N/P SKIP · Q QUEUE").size(8).color(MUTED));
         nav = nav.push(
-            text("←/→ SEEK · SHIFT ±30S · / SEARCH")
-                .size(8)
-                .color(MUTED),
+            button(text("Settings").size(11))
+                .width(Length::Fill)
+                .padding([6, 8])
+                .style(nav_style(
+                    self.view == LibraryView::Settings && !self.show_setup,
+                ))
+                .on_press(Message::SelectView(LibraryView::Settings)),
         );
-        nav = nav.push(
-            text("1-0 VIEWS · K SETTINGS · L SETUP")
-                .size(8)
-                .color(MUTED),
-        );
-        nav = nav.push(iced::widget::Space::new().height(10));
-        nav = nav.push(text("ACTIVE LIBRARY").size(8).color(MUTED));
-        nav = nav.push(library_label);
 
         container(nav)
-            .width(Length::Fixed(200.0))
+            .width(Length::Fixed(184.0))
             .height(Length::Fill)
             .padding(14)
             .style(sidebar_style)
@@ -10765,30 +10415,27 @@ impl FluxReady {
         let (title, subtitle) = if self.show_setup {
             (
                 "Library setup".to_owned(),
-                "Choose what Flux scans and where it keeps the catalogue.".to_owned(),
+                "Choose the active library and audio output.".to_owned(),
             )
-        } else if let Some(editor) = &self.track_editor {
+        } else if self.track_editor.is_some() {
             (
-                "Edit track metadata".to_owned(),
-                format!(
-                    "Track {} · Flux stores canonical metadata; the audio file and its tags stay untouched.",
-                    editor.id
-                ),
+                "Edit track".to_owned(),
+                "Changes are saved in Flux only. The audio file is untouched.".to_owned(),
             )
         } else if !self.search.trim().is_empty() {
             (
                 "Search results".to_owned(),
-                "Artists, albums and tracks from the canonical catalogue.".to_owned(),
+                "Artists, albums and tracks in your library.".to_owned(),
             )
         } else if self.view == LibraryView::Settings {
             (
                 "Settings".to_owned(),
-                "Playback preferences shared by the GUI and TUI.".to_owned(),
+                "Playback and library preferences.".to_owned(),
             )
         } else if self.view == LibraryView::Dashboard {
             (
                 "Dashboard".to_owned(),
-                "Canonical library summary and locally recorded listening statistics.".to_owned(),
+                "Library totals and listening history.".to_owned(),
             )
         } else if let Some(collection) = self.collection {
             (
@@ -10802,7 +10449,7 @@ impl FluxReady {
         } else if self.view == LibraryView::Collections {
             (
                 "Smart Collections".to_owned(),
-                "Dynamic catalogue queries; separate from manually ordered playlists.".to_owned(),
+                "Smart views of your music.".to_owned(),
             )
         } else if matches!(
             self.view,
@@ -10810,10 +10457,7 @@ impl FluxReady {
         ) {
             (
                 self.view.label().to_owned(),
-                format!(
-                    "{} track(s) · deterministic ordering",
-                    self.filtered_track_ids().len()
-                ),
+                format!("{} track(s)", self.filtered_track_ids().len()),
             )
         } else if let Some(track_id) = self.selected_lyrics {
             let title = self
@@ -10821,15 +10465,9 @@ impl FluxReady {
                 .track(track_id)
                 .map(|track| track.title().to_owned())
                 .unwrap_or_else(|| "Lyrics".to_owned());
-            (
-                title,
-                format!("Lyrics for track {track_id} · managed canonical text"),
-            )
+            (title, format!("Saved locally with Track {track_id}."))
         } else if self.view == LibraryView::Lyrics {
-            (
-                "Lyrics".to_owned(),
-                "Tracks with managed plain-text or synchronized lyrics.".to_owned(),
-            )
+            ("Lyrics".to_owned(), "Tracks with saved lyrics.".to_owned())
         } else if let Some(playlist_id) = self.selected_playlist {
             (
                 self.controller
@@ -10837,9 +10475,8 @@ impl FluxReady {
                     .map(|playlist| playlist.name.clone())
                     .unwrap_or_else(|| "Playlist".to_owned()),
                 format!(
-                    "Playlist {playlist_id} · {count} entr(ies)",
-                    count = self
-                        .controller
+                    "{} track(s)",
+                    self.controller
                         .playlist(playlist_id)
                         .map_or(0, |playlist| playlist.track_ids.len())
                 ),
@@ -10847,10 +10484,7 @@ impl FluxReady {
         } else if self.view == LibraryView::Playlists {
             (
                 "Playlists".to_owned(),
-                format!(
-                    "{} canonical playlist(s)",
-                    self.controller.playlists().len()
-                ),
+                format!("{} playlist(s)", self.controller.playlists().len()),
             )
         } else if let Some(artist_id) = self.selected_artist_id() {
             let name = self
@@ -10876,9 +10510,9 @@ impl FluxReady {
             )
         } else if self.view == LibraryView::Tracks {
             (
-                "All tracks".to_owned(),
+                "Tracks".to_owned(),
                 format!(
-                    "{} indexed track(s){}",
+                    "{} track(s){}",
                     self.controller.tracks().len(),
                     if self.search.trim().is_empty() {
                         String::new()
@@ -10935,7 +10569,7 @@ impl FluxReady {
 
         if !self.show_setup && self.track_editor.is_none() {
             bar = bar.push(
-                text_input("Search artists, albums, tracks…", &self.search)
+                text_input("Search", &self.search)
                     .id(iced::widget::Id::new("flux-search"))
                     .on_input(Message::SearchChanged)
                     .style(input_style)
@@ -11282,8 +10916,7 @@ impl FluxReady {
             text("♪").size(46).color(ACCENT),
             text("Your library is empty").size(22).color(TEXT),
             text(
-                "Import music to begin. Flux infers metadata from filenames and folders, \
-                 lets you review it, and copies every file into the canonical library."
+                "Add a folder of music to get started. You can review everything before it is imported."
             )
             .size(12)
             .color(MUTED)
@@ -11531,329 +11164,147 @@ impl FluxReady {
             .find(|choice| choice.id == editor.artist_id)
             .cloned()
             .or_else(|| choices.first().cloned());
-        let source_path = self
-            .controller
-            .track(editor.id)
-            .map(|track| track.source().path().display().to_string())
-            .unwrap_or_else(|| "track no longer in the library".to_owned());
         let audio_state = self.controller.track_audio_resource_state(editor.id);
         let missing = matches!(audio_state, Some(ResourceState::Missing));
+        let has_track_art = self.controller.track_artwork_path(editor.id).is_some();
+        let lyrics = self.controller.track_lyrics(editor.id);
+        let owner_name = self
+            .controller
+            .track_artist_id(editor.id)
+            .and_then(|artist| self.controller.artist(artist))
+            .map(|artist| artist.name().to_owned())
+            .unwrap_or_else(|| "Unknown artist".to_owned());
 
-        let artist_row = row![
-            pick_list(choices, selected, |choice| Message::EditorArtistChanged(
-                Some(choice)
-            ))
-            .text_size(12)
-            .padding([7, 9])
-            .width(Length::Fill),
-        ]
-        .spacing(8);
-        let new_artist_row = row![
-            text_input("New artist name…", &editor.new_artist)
-                .on_input(Message::EditorNewArtistChanged)
-                .on_submit(Message::EditorCreateArtist)
-                .style(input_style)
-                .width(Length::Fill),
-            button(text("Create & select").size(11))
-                .style(ghost_style)
-                .padding([7, 10])
-                .on_press_maybe(
-                    (!editor.new_artist.trim().is_empty()).then_some(Message::EditorCreateArtist)
-                ),
-        ]
-        .spacing(8);
-
-        let credit_choices = self.artist_choices();
-        let credit_selected = editor.credit_artist.and_then(|id| {
-            credit_choices
-                .iter()
-                .find(|choice| choice.id == Some(id))
-                .cloned()
-        });
-        let move_choices = self.editor_move_album_choices(editor.id);
-        let move_selected = editor.move_destination.as_ref().and_then(|choice| {
-            move_choices
-                .iter()
-                .find(|entry| entry.id == choice.id)
-                .cloned()
-        });
-
-        let mut body = column![
-            text("Flux-owned overrides").size(9).color(ACCENT),
-            text("These values are stored in the canonical library. The audio file and its embedded tags are never rewritten.")
-                .size(10)
-                .color(MUTED),
-            text(source_path).size(10).color(MUTED),
-            if editor.dirty {
-                Element::from(
-                    text("Unsaved metadata edits · Save to publish or Cancel twice to discard.")
-                        .size(10)
-                        .color(ACCENT),
-                )
-            } else {
-                Element::from(iced::widget::Space::new().height(0))
-            },
-        ]
-        .spacing(6);
+        let mut body = column![].spacing(10);
+        if editor.dirty {
+            body = body.push(
+                text("Unsaved changes · Save to publish them to the library.")
+                    .size(10)
+                    .color(ACCENT),
+            );
+        }
         if missing {
             body = body.push(
-                text("This managed audio file is missing. Metadata can still be edited; use Choose replacement / Review replacement below to repair it while preserving the TrackId and all references.")
-                    .size(10)
-                    .color(DANGER),
+                text(
+                    "This track's audio file is missing. You can still edit its details; \
+                     repair the file under Advanced Options.",
+                )
+                .size(10)
+                .color(DANGER),
             );
         } else if let Some(ResourceState::Unavailable(reason)) = &audio_state {
             body = body.push(
                 text(format!(
-                    "This audio path exists but cannot be used ({reason}). Flux will not overwrite or delete an inaccessible resource; repair permissions or relink it first."
+                    "This track's audio cannot be opened ({reason}). Details can still be edited."
                 ))
                 .size(10)
                 .color(DANGER),
             );
         }
+
+        body = body.push(text("TITLE").size(8).color(MUTED));
         body = body.push(
-            text_input("Track title…", &editor.title)
+            text_input("Track title", &editor.title)
                 .on_input(Message::EditorTitleChanged)
                 .style(input_style)
                 .width(Length::Fill),
         );
+
+        body = body.push(text("ARTIST").size(8).color(MUTED));
+        body = body.push(
+            pick_list(choices, selected, |choice| {
+                Message::EditorArtistChanged(Some(choice))
+            })
+            .text_size(12)
+            .padding([7, 9])
+            .width(Length::Fill),
+        );
+
+        body = body.push(text("ALBUM").size(8).color(MUTED));
         if self.controller.track_album_id(editor.id).is_some() {
             body = body.push(
-                text_input("Album…", &editor.album)
+                text_input("Album", &editor.album)
                     .on_input(Message::EditorAlbumChanged)
                     .style(input_style)
                     .width(Length::Fill),
             );
         } else {
             body = body.push(
-                text("Standalone Track · no Album membership. Use Album membership below to add it to an Album.")
-                    .size(9)
-                    .color(ACCENT),
-            );
-        }
-        body = body.push(
-            row![
-                text_input("Track number", &editor.track_number)
-                    .on_input(Message::EditorTrackNumberChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
-                text_input("Disc number", &editor.disc_number)
-                    .on_input(Message::EditorDiscNumberChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
-            ]
-            .spacing(8),
-        );
-        body = body.push(text("ORDERED CREDITS").size(9).color(ACCENT));
-        body = body.push(
-            text(format!(
-                "Physical owner: {} — ownership is separate from credits and cannot be changed here.",
-                self.controller
-                    .track_artist_id(editor.id)
-                    .and_then(|artist| self.controller.artist(artist))
-                    .map(|artist| artist.name().to_owned())
-                    .unwrap_or_else(|| "unknown".to_owned())
-            ))
-            .size(9)
-            .color(MUTED),
-        );
-        let owner = self.controller.track_artist_id(editor.id);
-        for (credit_index, artist_id) in editor.credits.iter().enumerate() {
-            let name = self
-                .controller
-                .artist(*artist_id)
-                .map(|artist| artist.name().to_owned())
-                .unwrap_or_else(|| format!("Artist {artist_id}"));
-            body = body.push(
-                row![
-                    text(format!(
-                        "{}. {}{}",
-                        credit_index + 1,
-                        name,
-                        if owner == Some(*artist_id) {
-                            " · OWNER"
-                        } else {
-                            ""
-                        }
-                    ))
+                text("Standalone track · not in an album")
                     .size(10)
-                    .color(if owner == Some(*artist_id) {
-                        ACCENT
-                    } else {
-                        TEXT
-                    })
-                    .width(Length::Fill),
-                    button(text("↑").size(10))
-                        .style(ghost_style)
-                        .padding([4, 6])
-                        .on_press(Message::EditorCreditMove(credit_index, -1)),
-                    button(text("↓").size(10))
-                        .style(ghost_style)
-                        .padding([4, 6])
-                        .on_press(Message::EditorCreditMove(credit_index, 1)),
-                    button(text("×").size(10))
-                        .style(ghost_style)
-                        .padding([4, 6])
-                        .on_press_maybe(
-                            (editor.credits.len() > 1 && owner != Some(*artist_id))
-                                .then_some(Message::EditorCreditRemove(credit_index))
-                        ),
-                ]
-                .spacing(5)
-                .align_y(Alignment::Center),
-            );
-        }
-        body = body.push(
-            row![
-                pick_list(credit_choices, credit_selected, |choice| {
-                    Message::EditorCreditSelected(Some(choice))
-                })
-                .text_size(11)
-                .padding([6, 8])
-                .width(Length::Fill),
-                button(text("Add credit").size(10))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::EditorCreditAdd),
-            ]
-            .spacing(8),
-        );
-        body = body.push(
-            text("Transfer owner is a separate reviewed operation; changing this picker does not change metadata ownership.")
-                .size(9)
-                .color(MUTED),
-        );
-        body = body.push(artist_row);
-        body = body.push(new_artist_row);
-        body = body.push(
-            text("Clear album or number fields to fall back to the current canonical values. The title always has a filename fallback.")
-                .size(9)
-                .color(MUTED),
-        );
-        body = body.push(text("REPLACE MANAGED AUDIO").size(9).color(ACCENT));
-        body = body.push(
-            text("The replacement is staged and verified; the old managed audio remains available until the catalogue commit. The source file is never modified. Save metadata changes before confirming; replacement closes the editor and does not apply unsaved fields.")
-                .size(9)
-                .color(MUTED),
-        );
-        body = body.push(
-            text_input("Replacement audio path…", &editor.replacement_source)
-                .on_input(Message::EditorReplacementChanged)
-                .style(input_style)
-                .width(Length::Fill),
-        );
-        body = body.push(
-            row![
-                button(text("Choose replacement…").size(10))
-                    .style(accent_button_style)
-                    .padding([6, 9])
-                    .on_press(Message::EditorReplacementChoose),
-                button(text("Review replacement").size(10))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::EditorPlanReplacement),
-                button(text("Confirm replacement").size(10))
-                    .style(accent_button_style)
-                    .padding([6, 9])
-                    .on_press_maybe(
-                        editor
-                            .replacement_plan
-                            .is_some()
-                            .then_some(Message::EditorConfirmReplacement)
-                    ),
-            ]
-            .spacing(8),
-        );
-        if let Some(plan) = &editor.replacement_plan {
-            body = body.push(
-                text(format!(
-                    "REVIEWED: Track {} · source {} · new managed path {} · {}",
-                    plan.track_id(),
-                    plan.source().display(),
-                    plan.destination_audio_path().display_lossy(),
-                    if plan.restores_missing_audio() {
-                        "missing managed audio will be repaired; TrackId and references preserved"
-                    } else {
-                        "old audio fingerprinted and preserved until commit"
-                    }
-                ))
-                .size(9)
-                .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
-            );
-        } else {
-            body = body.push(
-                text("Replacement is unavailable until a source is reviewed. No preview writes to the library.")
-                    .size(9)
                     .color(MUTED),
             );
         }
-        body = body.push(text("TRACK ARTWORK").size(9).color(ACCENT));
-        let has_track_art = self.controller.track_artwork_path(editor.id).is_some();
-        body = body.push(
-            row![
-                self.track_artwork(
-                    editor.id,
-                    self.controller.track_album_id(editor.id),
-                    86.0,
-                    ContentFit::Cover
-                ),
-                column![
-                    text(if has_track_art {
-                        "Using a Track-specific artwork override."
-                    } else {
-                        "Using Album artwork fallback (no Track override)."
-                    })
-                    .size(10)
-                    .color(if has_track_art { TEXT } else { MUTED }),
-                    text("Managed PNG/JPEG/WebP override. Removing it restores Album artwork without changing album metadata.")
-                        .size(9)
-                        .color(MUTED),
-                ]
-                .spacing(3)
-                .width(Length::Fill),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-        );
-        body = body.push(
-            row![
-                text_input("Track artwork path…", &editor.artwork_input)
-                    .on_input(Message::TrackArtworkChanged)
-                    .on_submit(Message::TrackArtworkApply)
-                    .style(input_style)
-                    .width(Length::Fill),
-                button(text("Choose image…").size(10))
-                    .style(accent_button_style)
-                    .padding([6, 9])
-                    .on_press(Message::TrackArtworkChoose),
-                button(text("Preview").size(10))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::TrackArtworkPreview),
-                button(text("Assign / replace").size(10))
+
+        body = body.push(text("ARTWORK").size(8).color(MUTED));
+        let artwork_status = if let Some(picked) = &editor.artwork_picked {
+            format!(
+                "Selected: {} · not published yet",
+                picked
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| picked.display().to_string())
+            )
+        } else if has_track_art {
+            "Using track artwork. Album artwork is unchanged.".to_owned()
+        } else {
+            "Using album artwork.".to_owned()
+        };
+        let mut artwork_actions = row![
+            button(text("Choose image…").size(10))
+                .style(accent_button_style)
+                .padding([6, 9])
+                .on_press(Message::TrackArtworkChoose),
+        ]
+        .spacing(6);
+        if editor.artwork_picked.is_some() || !editor.artwork_input.trim().is_empty() {
+            artwork_actions = artwork_actions.push(
+                button(text("Use this image").size(10))
                     .style(ghost_style)
                     .padding([6, 9])
                     .on_press(Message::TrackArtworkApply),
+            );
+        }
+        if has_track_art {
+            artwork_actions = artwork_actions.push(
                 button(
                     text(if editor.artwork_remove_confirm {
-                        "Confirm restore album artwork"
+                        "Confirm remove artwork"
                     } else {
-                        "Remove override"
+                        "Remove artwork"
                     })
                     .size(10),
                 )
                 .style(danger_button_style)
                 .padding([6, 9])
-                .on_press_maybe(has_track_art.then_some(Message::TrackArtworkRemove)),
+                .on_press(Message::TrackArtworkRemove),
+            );
+        }
+        body = body.push(
+            row![
+                self.track_artwork(
+                    editor.id,
+                    self.controller.track_album_id(editor.id),
+                    76.0,
+                    ContentFit::Cover
+                ),
+                column![
+                    text(artwork_status)
+                        .size(10)
+                        .color(if has_track_art { TEXT } else { MUTED }),
+                    artwork_actions,
+                ]
+                .spacing(6)
+                .width(Length::Fill),
             ]
-            .spacing(6),
+            .spacing(12)
+            .align_y(Alignment::Center),
         );
         if let Some(handle) = &editor.artwork_preview {
             body = body.push(
                 row![
-                    artwork_image(handle, 64.0, ContentFit::Cover),
-                    text("Selected Track-artwork preview — Assign publishes it; Album fallback is unchanged until then.")
-                        .size(9)
-                        .color(MUTED),
+                    artwork_image(handle, 56.0, ContentFit::Cover),
+                    text("Preview of the selected image.").size(9).color(MUTED),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -11861,183 +11312,424 @@ impl FluxReady {
         }
         match self.controller.track_artwork_resource_state(editor.id) {
             Some(ResourceState::Missing) => body = body.push(
-                text("The catalogue references a Track-artwork override that is missing. Choose a replacement or remove the override to restore Album artwork.")
+                text(
+                    "The saved track artwork is missing. Choose a replacement or remove the override.",
+                )
+                .size(9)
+                .color(DANGER),
+            ),
+            Some(ResourceState::Unavailable(reason)) => body = body.push(
+                text(format!("The saved track artwork cannot be opened ({reason})."))
                     .size(9)
                     .color(DANGER),
             ),
-            Some(ResourceState::Unavailable(reason)) => body = body.push(
-                text(format!(
-                    "The Track-artwork override cannot be inspected ({reason}). Flux will not overwrite or remove an inaccessible resource; repair permissions first."
-                ))
-                .size(9)
-                .color(DANGER),
-            ),
             _ => {}
         }
-        body = body.push(text("DELETE THIS TRACK").size(9).color(DANGER));
+
+        body = body.push(text("LYRICS").size(8).color(MUTED));
         body = body.push(
-            text("Removes this TrackId, its managed audio, metadata record, lyrics, Track artwork override, rating and queue entries. The album, artist and inherited album artwork are retained even when empty. Other tracks and playlist order are preserved. This is not a bulk delete.")
+            row![
+                text(if lyrics.is_some() {
+                    "Lyrics saved with this track."
+                } else {
+                    "No lyrics yet."
+                })
                 .size(10)
-                .color(MUTED),
+                .color(MUTED)
+                .width(Length::Fill),
+                button(text("Edit lyrics").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press(Message::TrackEditorOpenLyrics),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
         );
-        if let Some(plan) = &editor.deletion_plan {
-            body = body.push(
-                text(format!(
-                    "REVIEWED DELETE: {} · {} retained · {} · {}{}",
-                    plan.title(),
-                    plan.album_id().map_or_else(
-                        || "standalone state".to_owned(),
-                        |album| format!("album {album}")
-                    ),
-                    if plan.audio_present() {
-                        "managed audio will be deleted after the catalogue commit"
-                    } else {
-                        "managed audio is already missing; no audio file will be removed"
-                    },
-                    if plan.playlists().is_empty() {
-                        "no playlist references".to_owned()
-                    } else {
-                        format!("playlists updated: {}", plan.playlists().join(", "))
-                    },
-                    if matches!(audio_state, Some(ResourceState::Unavailable(_))) {
-                        " · inaccessible files are kept and reported"
-                    } else {
-                        ""
-                    }
-                ))
-                .size(9)
-                .color(DANGER),
-            );
+
+        body = body.push(
+            button(
+                text(if self.track_editor_advanced_open {
+                    "▾ Hide Advanced Options"
+                } else {
+                    "▸ Advanced Options"
+                })
+                .size(10),
+            )
+            .style(ghost_style)
+            .padding([5, 8])
+            .on_press(Message::TrackEditorAdvancedToggled),
+        );
+
+        if self.track_editor_advanced_open {
+            body = body.push(text("Advanced Options".to_owned()).size(9).color(ACCENT));
+
+            body = body.push(text("TRACK AND DISC NUMBER").size(8).color(MUTED));
             body = body.push(
                 row![
-                    button(text("Cancel deletion review").size(10))
-                        .style(ghost_style)
-                        .padding([6, 9])
-                        .on_press(Message::EditorCancelDeletion),
-                    button(text("Confirm delete track").size(10))
-                        .style(danger_button_style)
-                        .padding([6, 9])
-                        .on_press(Message::EditorConfirmDeletion),
+                    text_input("Track number", &editor.track_number)
+                        .on_input(Message::EditorTrackNumberChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    text_input("Disc number", &editor.disc_number)
+                        .on_input(Message::EditorDiscNumberChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
                 ]
                 .spacing(8),
             );
-        } else {
+
+            body = body.push(text("CREDITS").size(8).color(MUTED));
             body = body.push(
-                button(text("Review track deletion…").size(10))
-                    .style(danger_button_style)
-                    .padding([6, 9])
-                    .on_press(Message::EditorPlanDeletion),
-            );
-        }
-        body = body.push(text("ALBUM MEMBERSHIP").size(9).color(ACCENT));
-        body = body.push(
-            text("Save metadata changes before changing membership. The source album remains even if it becomes empty. Track artwork and lyrics follow the TrackId.")
+                text(format!(
+                    "Physical owner: {owner_name} · ownership is separate from credits."
+                ))
                 .size(9)
                 .color(MUTED),
-        );
-        if self.controller.track_album_id(editor.id).is_some() {
-            body = body.push(
-                button(text("Review conversion to standalone Track…").size(10))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::EditorPlanDetach),
             );
-        }
-        if move_choices.is_empty() {
-            body = body.push(
-                text("No Album owned by this Track's physical owner can be selected. Ownership transfer is a separate operation.")
-                    .size(9)
-                    .color(MUTED),
-            );
-        } else {
-            body = body.push(
-                pick_list(move_choices, move_selected, |choice| {
-                    Message::EditorMoveDestination(Some(choice))
-                })
-                .text_size(11)
-                .padding([6, 8])
-                .width(Length::Fill),
-            );
+            let owner = self.controller.track_artist_id(editor.id);
+            for (credit_index, artist_id) in editor.credits.iter().enumerate() {
+                let name = self
+                    .controller
+                    .artist(*artist_id)
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| format!("Artist {artist_id}"));
+                body = body.push(
+                    row![
+                        text(format!(
+                            "{}. {}{}",
+                            credit_index + 1,
+                            name,
+                            if owner == Some(*artist_id) {
+                                " · owner"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .size(10)
+                        .color(if owner == Some(*artist_id) {
+                            ACCENT
+                        } else {
+                            TEXT
+                        })
+                        .width(Length::Fill),
+                        button(text("↑").size(10))
+                            .style(ghost_style)
+                            .padding([4, 6])
+                            .on_press(Message::EditorCreditMove(credit_index, -1)),
+                        button(text("↓").size(10))
+                            .style(ghost_style)
+                            .padding([4, 6])
+                            .on_press(Message::EditorCreditMove(credit_index, 1)),
+                        button(text("×").size(10))
+                            .style(ghost_style)
+                            .padding([4, 6])
+                            .on_press_maybe(
+                                (editor.credits.len() > 1 && owner != Some(*artist_id))
+                                    .then_some(Message::EditorCreditRemove(credit_index))
+                            ),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                );
+            }
+            let credit_choices = self.artist_choices();
+            let credit_selected = editor.credit_artist.and_then(|id| {
+                credit_choices
+                    .iter()
+                    .find(|choice| choice.id == Some(id))
+                    .cloned()
+            });
             body = body.push(
                 row![
-                    text_input("Insertion position", &editor.move_position)
-                        .on_input(Message::EditorMovePositionChanged)
-                        .style(input_style)
-                        .width(Length::Fill),
-                    button(text("Review move").size(10))
+                    pick_list(credit_choices, credit_selected, |choice| {
+                        Message::EditorCreditSelected(Some(choice))
+                    })
+                    .text_size(11)
+                    .padding([6, 8])
+                    .width(Length::Fill),
+                    button(text("Add credit").size(10))
                         .style(ghost_style)
                         .padding([6, 9])
-                        .on_press(Message::EditorPlanMove),
-                    button(text("Confirm move").size(10))
-                        .style(accent_button_style)
-                        .padding([6, 9])
+                        .on_press(Message::EditorCreditAdd),
+                ]
+                .spacing(8),
+            );
+
+            body = body.push(text("NEW ARTIST").size(8).color(MUTED));
+            body = body.push(
+                row![
+                    text_input("New artist name…", &editor.new_artist)
+                        .on_input(Message::EditorNewArtistChanged)
+                        .on_submit(Message::EditorCreateArtist)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Create & select").size(11))
+                        .style(ghost_style)
+                        .padding([7, 10])
                         .on_press_maybe(
-                            editor
-                                .move_plan
-                                .is_some()
-                                .then_some(Message::EditorConfirmMove)
+                            (!editor.new_artist.trim().is_empty())
+                                .then_some(Message::EditorCreateArtist)
                         ),
                 ]
                 .spacing(8),
             );
-            if let Some(plan) = &editor.move_plan {
+            body = body.push(
+                button(text("Transfer ownership…").size(10))
+                    .style(ghost_style)
+                    .padding([6, 9])
+                    .on_press_maybe(
+                        matches!(self.controller.storage_mode(), StorageMode::Canonical)
+                            .then_some(Message::EditorTransferOwner),
+                    ),
+            );
+
+            body = body.push(text("ARTWORK FILE").size(8).color(MUTED));
+            body = body.push(
+                row![
+                    text_input("Image path…", &editor.artwork_input)
+                        .on_input(Message::TrackArtworkChanged)
+                        .on_submit(Message::TrackArtworkApply)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Preview").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::TrackArtworkPreview),
+                    button(text("Apply").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::TrackArtworkApply),
+                ]
+                .spacing(6),
+            );
+
+            body = body.push(text("REPLACE AUDIO FILE").size(8).color(MUTED));
+            body = body.push(
+                text(
+                    "The replacement is verified before it is published. The current file \
+                     stays available until then, and the source file is never modified.",
+                )
+                .size(9)
+                .color(MUTED),
+            );
+            body = body.push(
+                text_input("Replacement audio path…", &editor.replacement_source)
+                    .on_input(Message::EditorReplacementChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+            );
+            body = body.push(
+                row![
+                    button(text("Choose file…").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorReplacementChoose),
+                    button(text("Review").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorPlanReplacement),
+                    button(text("Confirm replacement").size(10))
+                        .style(accent_button_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            editor
+                                .replacement_plan
+                                .is_some()
+                                .then_some(Message::EditorConfirmReplacement)
+                        ),
+                ]
+                .spacing(8),
+            );
+            if let Some(plan) = &editor.replacement_plan {
                 body = body.push(
                     text(format!(
-                        "REVIEWED: {} → {} at position {} · final order {} · {}",
-                        plan.from_album_title.as_deref().unwrap_or("Standalone"),
-                        plan.to_album_title.as_deref().unwrap_or("Standalone"),
-                        plan.insertion_index + 1,
-                        plan.destination_order
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        if plan.to_album_id.is_some() {
-                            "source album remains even if empty"
+                        "Reviewed: Track {} · source {} · new managed path {} · {}",
+                        plan.track_id(),
+                        plan.source().display(),
+                        plan.destination_audio_path().display_lossy(),
+                        if plan.restores_missing_audio() {
+                            "missing audio will be repaired; the track keeps its identity"
                         } else {
-                            "source album becomes empty and is retained; Album artwork inheritance stops"
+                            "the old file is kept until the change is published"
                         }
                     ))
                     .size(9)
                     .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
                 );
-            } else {
+            }
+
+            body = body.push(text("ALBUM MEMBERSHIP").size(8).color(MUTED));
+            body = body.push(
+                text("Save metadata changes before changing album membership.")
+                    .size(9)
+                    .color(MUTED),
+            );
+            if self.controller.track_album_id(editor.id).is_some() {
                 body = body.push(
-                    text("The move is unavailable until reviewed. It never redirects to a different owner or deletes the source album.")
+                    button(text("Convert to standalone track…").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorPlanDetach),
+                );
+            }
+            let move_choices = self.editor_move_album_choices(editor.id);
+            let move_selected = editor.move_destination.as_ref().and_then(|choice| {
+                move_choices
+                    .iter()
+                    .find(|entry| entry.id == choice.id)
+                    .cloned()
+            });
+            if move_choices.is_empty() {
+                body = body.push(
+                    text("No other album owned by this track's artist is available.")
                         .size(9)
                         .color(MUTED),
                 );
+            } else {
+                body = body.push(
+                    pick_list(move_choices, move_selected, |choice| {
+                        Message::EditorMoveDestination(Some(choice))
+                    })
+                    .text_size(11)
+                    .padding([6, 8])
+                    .width(Length::Fill),
+                );
+                body = body.push(
+                    row![
+                        text_input("Position", &editor.move_position)
+                            .on_input(Message::EditorMovePositionChanged)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        button(text("Review move").size(10))
+                            .style(ghost_style)
+                            .padding([6, 9])
+                            .on_press(Message::EditorPlanMove),
+                        button(text("Confirm move").size(10))
+                            .style(accent_button_style)
+                            .padding([6, 9])
+                            .on_press_maybe(
+                                editor
+                                    .move_plan
+                                    .is_some()
+                                    .then_some(Message::EditorConfirmMove)
+                            ),
+                    ]
+                    .spacing(8),
+                );
+                if let Some(plan) = &editor.move_plan {
+                    body = body.push(
+                        text(format!(
+                            "Reviewed: {} → {} at position {} · {}",
+                            plan.from_album_title.as_deref().unwrap_or("Standalone"),
+                            plan.to_album_title.as_deref().unwrap_or("Standalone"),
+                            plan.insertion_index + 1,
+                            if plan.to_album_id.is_some() {
+                                "the source album is kept even if empty"
+                            } else {
+                                "the source album is kept; album artwork inheritance stops"
+                            }
+                        ))
+                        .size(9)
+                        .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+                    );
+                }
             }
+
+            body = body.push(text("DELETE TRACK").size(8).color(DANGER));
+            body = body.push(
+                text(
+                    "Deletes this track, its audio file, lyrics, track artwork, rating and \
+                     queue entries. The album and artist are kept, and other tracks are untouched.",
+                )
+                .size(9)
+                .color(MUTED),
+            );
+            if let Some(plan) = &editor.deletion_plan {
+                body = body.push(
+                    text(format!(
+                        "Reviewed delete: {} · {}{}",
+                        plan.title(),
+                        if plan.audio_present() {
+                            "the audio file will be deleted after the change is published"
+                        } else {
+                            "the audio file is already missing"
+                        },
+                        if matches!(audio_state, Some(ResourceState::Unavailable(_))) {
+                            " · inaccessible files are kept"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .size(9)
+                    .color(DANGER),
+                );
+                body = body.push(
+                    row![
+                        button(text("Cancel deletion").size(10))
+                            .style(ghost_style)
+                            .padding([6, 9])
+                            .on_press(Message::EditorCancelDeletion),
+                        button(text("Confirm delete").size(10))
+                            .style(danger_button_style)
+                            .padding([6, 9])
+                            .on_press(Message::EditorConfirmDeletion),
+                    ]
+                    .spacing(8),
+                );
+            } else {
+                body = body.push(
+                    button(text("Review deletion…").size(10))
+                        .style(danger_button_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorPlanDeletion),
+                );
+            }
+
+            body = body.push(
+                text(format!(
+                    "Source file: {}",
+                    self.controller
+                        .track(editor.id)
+                        .map(|track| track.source().path().display().to_string())
+                        .unwrap_or_else(|| "not available".to_owned())
+                ))
+                .size(8)
+                .color(MUTED),
+            );
         }
+
         if let Some(error) = &editor.error {
             body = body.push(text(error).size(10).color(DANGER));
         }
-        body = body.push(
-            row![
-                button(text("Save metadata").size(12))
-                    .style(accent_button_style)
-                    .padding([8, 14])
-                    .on_press(Message::EditorSave),
-                button(text("Transfer owner").size(11))
-                    .style(ghost_style)
-                    .padding([8, 12])
-                    .on_press_maybe(
-                        matches!(self.controller.storage_mode(), StorageMode::Canonical)
-                            .then_some(Message::EditorTransferOwner)
-                    ),
-                button(text("Cancel").size(11))
-                    .style(ghost_style)
-                    .padding([8, 12])
-                    .on_press(Message::EditorCancel),
-            ]
-            .spacing(8),
-        );
 
-        container(scrollable(body).height(Length::Fill))
-            .padding(18)
-            .width(Length::Fill)
-            .style(card_style)
-            .into()
+        let mut footer = row![
+            button(text("Save metadata").size(12))
+                .style(accent_button_style)
+                .padding([8, 14])
+                .on_press(Message::EditorSave),
+            button(text("Cancel").size(11))
+                .style(ghost_style)
+                .padding([8, 12])
+                .on_press(Message::EditorCancel),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if editor.dirty {
+            footer = footer.push(text("Unsaved changes").size(9).color(ACCENT));
+        }
+
+        container(
+            column![
+                scrollable(body).height(Length::Fill),
+                horizontal_rule(),
+                container(footer).padding([10, 0]).width(Length::Fill),
+            ]
+            .height(Length::Fill),
+        )
+        .padding(18)
+        .width(Length::Fill)
+        .style(card_style)
+        .into()
     }
 
     fn credit_display(&self, id: TrackId) -> String {
@@ -12705,54 +12397,77 @@ impl FluxReady {
 
     fn library_controls(&self) -> Element<'_, Message> {
         let album_mode = self.selected_album_id().is_some();
+        let active = self.filters_active();
         let mut controls = row![
-            text("FILTER").size(8).color(MUTED),
-            button(text("Favorites").size(10))
-                .style(nav_style(self.filter_favorites))
-                .padding([5, 8])
-                .on_press(Message::FilterFavoritesToggled),
-            button(text(format!("Lyrics: {}", self.filter_lyrics)).size(10))
-                .style(nav_style(self.filter_lyrics != TriFilter::Any))
-                .padding([5, 8])
-                .on_press(Message::FilterLyricsCycle),
-            button(text(format!("Artwork: {}", self.filter_artwork)).size(10))
-                .style(nav_style(self.filter_artwork != TriFilter::Any))
-                .padding([5, 8])
-                .on_press(Message::FilterArtworkCycle),
-            pick_list(
-                vec![
-                    ReleaseFilter::Any,
-                    ReleaseFilter::Album,
-                    ReleaseFilter::Ep,
-                    ReleaseFilter::Single,
-                    ReleaseFilter::Compilation,
-                    ReleaseFilter::Other,
-                ],
-                Some(self.filter_release),
-                Message::FilterReleaseChanged,
+            button(
+                text(if active {
+                    "Filters · active"
+                } else {
+                    "Filters"
+                })
+                .size(10)
             )
-            .text_size(10)
-            .padding([5, 7]),
-            pick_list(
-                vec![
-                    RatingFilter::Any,
-                    RatingFilter::One,
-                    RatingFilter::Two,
-                    RatingFilter::Three,
-                    RatingFilter::Four,
-                    RatingFilter::Five,
-                ],
-                Some(self.filter_rating),
-                Message::FilterRatingChanged,
-            )
-            .text_size(10)
-            .padding([5, 7]),
-            text("SORT").size(8).color(MUTED),
+            .style(nav_style(self.filters_open || active))
+            .padding([5, 8])
+            .on_press(Message::ToggleFilters),
+            iced::widget::Space::new().width(Length::Fill),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
+        if self.filters_open {
+            controls = controls.push(
+                button(text("Favorites").size(10))
+                    .style(nav_style(self.filter_favorites))
+                    .padding([4, 7])
+                    .on_press(Message::FilterFavoritesToggled),
+            );
+            controls = controls.push(
+                button(text(format!("Lyrics: {}", self.filter_lyrics)).size(10))
+                    .style(nav_style(self.filter_lyrics != TriFilter::Any))
+                    .padding([4, 7])
+                    .on_press(Message::FilterLyricsCycle),
+            );
+            controls = controls.push(
+                button(text(format!("Artwork: {}", self.filter_artwork)).size(10))
+                    .style(nav_style(self.filter_artwork != TriFilter::Any))
+                    .padding([4, 7])
+                    .on_press(Message::FilterArtworkCycle),
+            );
+            controls = controls.push(
+                pick_list(
+                    vec![
+                        ReleaseFilter::Any,
+                        ReleaseFilter::Album,
+                        ReleaseFilter::Ep,
+                        ReleaseFilter::Single,
+                        ReleaseFilter::Compilation,
+                        ReleaseFilter::Other,
+                    ],
+                    Some(self.filter_release),
+                    Message::FilterReleaseChanged,
+                )
+                .text_size(9)
+                .padding([4, 6]),
+            );
+            controls = controls.push(
+                pick_list(
+                    vec![
+                        RatingFilter::Any,
+                        RatingFilter::One,
+                        RatingFilter::Two,
+                        RatingFilter::Three,
+                        RatingFilter::Four,
+                        RatingFilter::Five,
+                    ],
+                    Some(self.filter_rating),
+                    Message::FilterRatingChanged,
+                )
+                .text_size(9)
+                .padding([4, 6]),
+            );
+        }
         if album_mode {
-            controls = controls.push(text("Album order preserved").size(9).color(MUTED));
+            controls = controls.push(text("Album order").size(9).color(MUTED));
         } else {
             controls = controls.push(
                 pick_list(
@@ -12772,26 +12487,26 @@ impl FluxReady {
                     Some(self.sort_tracks),
                     Message::SortTracksChanged,
                 )
-                .text_size(10)
-                .padding([5, 7]),
+                .text_size(9)
+                .padding([4, 6]),
             );
             controls = controls.push(
                 button(text(if self.sort_descending { "Desc" } else { "Asc" }).size(9))
                     .style(nav_style(self.sort_descending))
-                    .padding([5, 7])
+                    .padding([4, 7])
                     .on_press(Message::SortDirectionToggled),
             );
         }
-        if self.filters_active() {
+        if active {
             controls = controls.push(
-                button(text("Reset filters").size(10))
+                button(text("Reset").size(9))
                     .style(ghost_style)
-                    .padding([5, 8])
+                    .padding([4, 7])
                     .on_press(Message::ResetLibraryFilters),
             );
         }
         container(controls.wrap())
-            .padding([6, 8])
+            .padding([5, 8])
             .width(Length::Fill)
             .style(card_style)
             .into()
@@ -15541,22 +15256,15 @@ impl FluxReady {
 
     fn setup_view(&self) -> Element<'_, Message> {
         let scanning = self.controller.is_scanning();
-        let protected = self.controller.legacy_index_write_protected();
         let lib_ready = !scanning && !self.lib_input.trim().is_empty();
 
         let mut setup = column![].spacing(12);
         if self.controller.default_library_created() {
             setup = setup.push(
                 container(
-                    text(format!(
-                        "Flux created a new empty library at {}. Use Choose folder/files to import music, or open another existing library below. No music or existing settings were modified.",
-                        self.controller
-                            .canonical_root()
-                            .map(|root| root.display().to_string())
-                            .unwrap_or_else(|| "the per-user data directory".to_owned())
-                    ))
-                    .size(10)
-                    .color(ACCENT),
+                    text("Your library is ready. Import music whenever you are ready.")
+                        .size(10)
+                        .color(ACCENT),
                 )
                 .padding(10)
                 .style(card_style),
@@ -15622,9 +15330,9 @@ impl FluxReady {
         audio_status = audio_status.push(text(active_label).size(10).color(TEXT));
         audio_status = audio_status.push(
             text(if selected_id.is_some() {
-                "Policy: explicit device selection. A disappearing device is not silently replaced."
+                "Selected device"
             } else {
-                "Policy: follow the current system default output."
+                "Using the system default"
             })
             .size(9)
             .color(MUTED),
@@ -15676,14 +15384,14 @@ impl FluxReady {
             && !matches!(self.controller.audio_status(), AudioStatus::Recovering(_));
         audio_status = audio_status.push(
             row![
-                button(text("Follow system default").size(10))
+                button(text("Use system default").size(10))
                     .style(nav_style(selected_id.is_none()))
                     .padding([6, 9])
                     .on_press_maybe(switch_enabled.then_some(Message::SelectAudioDevice(None))),
                 text(if selected_id.is_none() {
-                    "current policy"
+                    "current"
                 } else {
-                    "select default"
+                    "switch"
                 })
                 .size(8)
                 .color(MUTED),
@@ -15693,11 +15401,8 @@ impl FluxReady {
         );
         if self.audio_devices.is_empty() {
             if !self.audio_devices_loading {
-                audio_status = audio_status.push(
-                    text("No output devices are listed. Refreshing is safe; a no-CPAL build does not expose fake devices.")
-                        .size(9)
-                        .color(MUTED),
-                );
+                audio_status =
+                    audio_status.push(text("No audio devices found.").size(9).color(MUTED));
             }
         } else {
             let mut name_counts = BTreeMap::new();
@@ -15756,43 +15461,8 @@ impl FluxReady {
         }
         setup = setup.push(setup_card(
             "AUDIO OUTPUT",
-            "The actual result of initializing this session's output backend. This is \
-             information about the build or device, not a library error.",
+            "Where Flux will play audio.",
             audio_status,
-        ));
-
-        setup = setup.push(setup_card(
-            "IMPORT LOCAL MUSIC",
-            "Import through the review-first manager. Every audio file is copied into the \
-             canonical library; filenames and folders provide provisional metadata and \
-             audio tags are never read.",
-            column![
-                row![
-                    button(text("Choose folder…").size(11))
-                        .style(accent_button_style)
-                        .padding([7, 12])
-                        .on_press(Message::ImportNativeFolder),
-                    button(text("Choose files…").size(11))
-                        .style(ghost_style)
-                        .padding([7, 12])
-                        .on_press(Message::ImportNativeFiles),
-                    button(text("Refresh").size(11))
-                        .style(ghost_style)
-                        .padding([7, 12])
-                        .on_press_maybe(
-                            (!scanning && !protected).then_some(Message::RefreshPressed)
-                        ),
-                ]
-                .spacing(8),
-                text(if scanning {
-                    "Scanning… the library updates when the worker finishes."
-                } else {
-                    "Metadata is reviewed before commit; external references are not supported."
-                })
-                .size(10)
-                .color(MUTED),
-            ]
-            .spacing(8),
         ));
 
         let portable = matches!(
@@ -15800,25 +15470,15 @@ impl FluxReady {
             StorageMode::Portable | StorageMode::Canonical
         );
 
-        let library_label = match self.controller.storage_mode() {
-            StorageMode::Legacy => match self.controller.legacy_index_path() {
-                Some(path) => format!("Active: app index — {}", path.display()),
-                None => "Active: session-only legacy library".to_owned(),
-            },
-            StorageMode::Portable => match self.controller.portable_root() {
-                Some(root) => format!("Active: portable library — {}", root.display()),
-                None => "Active: portable library".to_owned(),
-            },
-            StorageMode::Canonical => match self.controller.canonical_root() {
-                Some(root) => format!("Active: canonical library — {}", root.display()),
-                None => "Active: canonical library".to_owned(),
-            },
-        };
+        let library_label = self.active_library_path().map_or_else(
+            || "This session only".to_owned(),
+            |path| path.display().to_string(),
+        );
 
         let mut portable_body = column![text(library_label).size(10).color(MUTED)].spacing(8);
         portable_body = portable_body.push(
             row![
-                text_input("Canonical library folder…", &self.lib_input)
+                text_input("Library folder…", &self.lib_input)
                     .on_input(Message::LibInputChanged)
                     .on_submit(Message::OpenLibraryPressed)
                     .style(input_style)
@@ -15855,107 +15515,120 @@ impl FluxReady {
         }
 
         setup = setup.push(setup_card(
-            "CANONICAL LIBRARY",
-            "A canonical library keeps managed audio, catalogue and metadata together in \
-             one portable root. Every persisted resource path is relative to that root.",
+            "LIBRARY",
+            "The folder Flux uses for your music and metadata.",
             portable_body,
         ));
 
-        let choices = self.artist_choices();
-        let selected_artist = self
-            .artist_selected
-            .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned());
-        let artist_editable = portable && !scanning;
-        let mut artist_body = column![
-            text(
-                "Stable artist identities are catalogue data. Renaming one updates every \
+        setup = setup.push(
+            button(
+                text(if self.setup_advanced_open {
+                    "▾ Hide advanced library tools"
+                } else {
+                    "▸ Advanced library tools"
+                })
+                .size(10),
+            )
+            .style(ghost_style)
+            .padding([5, 8])
+            .on_press(Message::ToggleSetupAdvanced),
+        );
+        if self.setup_advanced_open {
+            let choices = self.artist_choices();
+            let selected_artist = self
+                .artist_selected
+                .and_then(|id| choices.iter().find(|choice| choice.id == Some(id)).cloned());
+            let artist_editable = portable && !scanning;
+            let mut artist_body = column![
+                text(
+                    "Stable artist identities are catalogue data. Renaming one updates every \
                  related track without changing its overrides or audio; equal display names \
                  remain distinct identities."
-            )
-            .size(10)
-            .color(MUTED),
-            pick_list(choices, selected_artist, |choice| Message::ArtistSelected(
-                Some(choice)
-            ))
-            .text_size(12)
-            .padding([7, 9])
-            .width(Length::Fill),
-            row![
-                text_input("New artist name…", &self.artist_name_input)
-                    .on_input(Message::ArtistNameChanged)
-                    .on_submit(Message::ArtistCreatePressed)
-                    .style(input_style)
-                    .width(Length::Fill),
-                button(text("Create artist").size(11))
-                    .style(ghost_style)
+                )
+                .size(10)
+                .color(MUTED),
+                pick_list(choices, selected_artist, |choice| Message::ArtistSelected(
+                    Some(choice)
+                ))
+                .text_size(12)
+                .padding([7, 9])
+                .width(Length::Fill),
+                row![
+                    text_input("New artist name…", &self.artist_name_input)
+                        .on_input(Message::ArtistNameChanged)
+                        .on_submit(Message::ArtistCreatePressed)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Create artist").size(11))
+                        .style(ghost_style)
+                        .padding([7, 10])
+                        .on_press_maybe(
+                            (artist_editable && !self.artist_name_input.trim().is_empty())
+                                .then_some(Message::ArtistCreatePressed)
+                        ),
+                ]
+                .spacing(8),
+                row![
+                    text_input("Rename selected artist…", &self.artist_rename_input)
+                        .on_input(Message::ArtistRenameNameChanged)
+                        .on_submit(Message::ArtistRenamePressed)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Rename").size(11))
+                        .style(ghost_style)
+                        .padding([7, 10])
+                        .on_press_maybe(
+                            (artist_editable
+                                && self.artist_selected.is_some()
+                                && !self.artist_rename_input.trim().is_empty())
+                            .then_some(Message::ArtistRenamePressed)
+                        ),
+                ]
+                .spacing(8),
+                button(text("Delete artist…").size(11))
+                    .style(danger_button_style)
                     .padding([7, 10])
                     .on_press_maybe(
-                        (artist_editable && !self.artist_name_input.trim().is_empty())
-                            .then_some(Message::ArtistCreatePressed)
+                        (artist_editable && self.artist_selected.is_some())
+                            .then_some(Message::ArtistDeleteOpen)
                     ),
-            ]
-            .spacing(8),
-            row![
-                text_input("Rename selected artist…", &self.artist_rename_input)
-                    .on_input(Message::ArtistRenameNameChanged)
-                    .on_submit(Message::ArtistRenamePressed)
+                text("CREATE EMPTY ALBUM").size(8).color(ACCENT),
+                text_input("New album title…", &self.new_album_title)
+                    .on_input(Message::NewAlbumTitleChanged)
+                    .on_submit(Message::AlbumCreatePressed)
                     .style(input_style)
                     .width(Length::Fill),
-                button(text("Rename").size(11))
-                    .style(ghost_style)
+                row![
+                    text("RELEASE TYPE").size(8).color(MUTED),
+                    release_type_buttons(self.new_album_type, Message::NewAlbumType),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                button(text("Create empty album").size(11))
+                    .style(accent_button_style)
                     .padding([7, 10])
                     .on_press_maybe(
                         (artist_editable
                             && self.artist_selected.is_some()
-                            && !self.artist_rename_input.trim().is_empty())
-                        .then_some(Message::ArtistRenamePressed)
+                            && !self.new_album_title.trim().is_empty())
+                        .then_some(Message::AlbumCreatePressed)
                     ),
             ]
-            .spacing(8),
-            button(text("Delete artist…").size(11))
-                .style(danger_button_style)
-                .padding([7, 10])
-                .on_press_maybe(
-                    (artist_editable && self.artist_selected.is_some())
-                        .then_some(Message::ArtistDeleteOpen)
-                ),
-            text("CREATE EMPTY ALBUM").size(8).color(ACCENT),
-            text_input("New album title…", &self.new_album_title)
-                .on_input(Message::NewAlbumTitleChanged)
-                .on_submit(Message::AlbumCreatePressed)
-                .style(input_style)
-                .width(Length::Fill),
-            row![
-                text("RELEASE TYPE").size(8).color(MUTED),
-                release_type_buttons(self.new_album_type, Message::NewAlbumType),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            button(text("Create empty album").size(11))
-                .style(accent_button_style)
-                .padding([7, 10])
-                .on_press_maybe(
-                    (artist_editable
-                        && self.artist_selected.is_some()
-                        && !self.new_album_title.trim().is_empty())
-                    .then_some(Message::AlbumCreatePressed)
-                ),
-        ]
-        .spacing(8);
-        if !portable {
-            artist_body = artist_body.push(
-                text("Artist management requires a canonical library.")
-                    .size(10)
-                    .color(DANGER),
-            );
-        }
-        setup = setup.push(setup_card(
-            "ARTISTS",
-            "Create, select, and rename stable canonical artist identities.",
-            artist_body,
-        ));
+            .spacing(8);
+            if !portable {
+                artist_body = artist_body.push(
+                    text("Artist management requires a canonical library.")
+                        .size(10)
+                        .color(DANGER),
+                );
+            }
+            setup = setup.push(setup_card(
+                "ARTISTS",
+                "Create, select, and rename stable canonical artist identities.",
+                artist_body,
+            ));
 
-        let mut health_body = column![
+            let mut health_body = column![
             row![
                 button(
                     text(if self.controller.storage_mode() == StorageMode::Canonical {
@@ -15982,33 +15655,37 @@ impl FluxReady {
             .spacing(8),
         ]
         .spacing(8);
-        if let Some(report) = &self.last_reconcile {
-            health_body = health_body.push(text(reconcile_summary(report)).size(10).color(MUTED));
-            for candidates in &report.relink_candidates {
-                if let [candidate] = candidates.candidates.as_slice() {
-                    let title = self
-                        .controller
-                        .track(candidates.id)
-                        .map(|track| track.title().to_owned())
-                        .unwrap_or_else(|| format!("Track {}", candidates.id));
-                    health_body = health_body.push(
-                        row![
-                            column![
-                                text(title).size(11).color(TEXT),
-                                text(candidate.display_lossy()).size(9).color(MUTED),
+            if let Some(report) = &self.last_reconcile {
+                health_body =
+                    health_body.push(text(reconcile_summary(report)).size(10).color(MUTED));
+                for candidates in &report.relink_candidates {
+                    if let [candidate] = candidates.candidates.as_slice() {
+                        let title = self
+                            .controller
+                            .track(candidates.id)
+                            .map(|track| track.title().to_owned())
+                            .unwrap_or_else(|| format!("Track {}", candidates.id));
+                        health_body = health_body.push(
+                            row![
+                                column![
+                                    text(title).size(11).color(TEXT),
+                                    text(candidate.display_lossy()).size(9).color(MUTED),
+                                ]
+                                .spacing(2)
+                                .width(Length::Fill),
+                                button(text("Relink").size(10))
+                                    .style(ghost_style)
+                                    .padding([5, 9])
+                                    .on_press(Message::RelinkTrack(
+                                        candidates.id,
+                                        candidate.clone()
+                                    )),
                             ]
-                            .spacing(2)
-                            .width(Length::Fill),
-                            button(text("Relink").size(10))
-                                .style(ghost_style)
-                                .padding([5, 9])
-                                .on_press(Message::RelinkTrack(candidates.id, candidate.clone())),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                    );
-                } else {
-                    health_body = health_body.push(
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        );
+                    } else {
+                        health_body = health_body.push(
                         text(format!(
                             "Track {} has {} possible locations; resolve the ambiguity outside Flux first.",
                             candidates.id,
@@ -16017,91 +15694,72 @@ impl FluxReady {
                         .size(9)
                         .color(DANGER),
                     );
+                    }
                 }
             }
-        }
-        setup = setup.push(setup_card(
-            "LIBRARY HEALTH",
-            "Missing records are retained with their IDs and metadata.",
-            health_body,
-        ));
+            setup = setup.push(setup_card(
+                "LIBRARY HEALTH",
+                "Missing records are retained with their IDs and metadata.",
+                health_body,
+            ));
 
-        let mut migration_body = column![
-            row![
-                text_input(
-                    "Legacy index file or portable library folder…",
-                    &self.migrate_source
-                )
-                .on_input(Message::MigrateSourceChanged)
-                .style(input_style)
-                .width(Length::Fill),
-                button(text("Plan migration").size(11))
-                    .style(ghost_style)
-                    .padding([7, 12])
-                    .on_press_maybe(
-                        (lib_ready && !self.migrate_source.trim().is_empty())
-                            .then_some(Message::PlanMigrationPressed)
-                    ),
-            ]
-            .spacing(8),
-            text(
-                "Planning is read-only. Nothing is written or activated until you \
-                     review the plan and execute it."
-            )
-            .size(10)
-            .color(MUTED),
-        ]
-        .spacing(8);
-
-        if self.pending_plan.is_some() {
-            migration_body = migration_body.push(
+            let mut migration_body = column![
                 row![
-                    button(text("Execute migration").size(11))
-                        .style(accent_button_style)
-                        .padding([7, 12])
-                        .on_press(Message::ExecuteMigrationPressed),
-                    button(text("Cancel").size(11))
+                    text_input(
+                        "Legacy index file or portable library folder…",
+                        &self.migrate_source
+                    )
+                    .on_input(Message::MigrateSourceChanged)
+                    .style(input_style)
+                    .width(Length::Fill),
+                    button(text("Plan migration").size(11))
                         .style(ghost_style)
                         .padding([7, 12])
-                        .on_press(Message::CancelMigrationPressed),
+                        .on_press_maybe(
+                            (lib_ready && !self.migrate_source.trim().is_empty())
+                                .then_some(Message::PlanMigrationPressed)
+                        ),
                 ]
                 .spacing(8),
-            );
-        }
-        if self.migrated_dest.is_some() {
-            migration_body = migration_body.push(
-                button(text("Open migrated library").size(11))
-                    .style(ghost_style)
-                    .padding([7, 12])
-                    .on_press(Message::OpenMigratedPressed),
-            );
-        }
-        setup = setup.push(setup_card(
-            "MIGRATE TO CANONICAL",
-            "Inventory a legacy index or portable schema-v3 library and build a separate \
-             canonical library. The source is never modified or activated automatically.",
-            migration_body,
-        ));
-
-        if let Some(message) = &self.lifecycle_msg {
-            setup = setup.push(
-                container(
-                    row![
-                        text(message).size(11).color(MUTED).width(Length::Fill),
-                        button(text("Dismiss").size(9))
-                            .style(ghost_style)
-                            .padding([3, 6])
-                            .on_press(Message::DismissNotice),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
+                text(
+                    "Planning is read-only. Nothing is written or activated until you \
+                     review the plan and execute it."
                 )
-                .padding(12)
-                .width(Length::Fill)
-                .style(card_style),
-            );
-        }
+                .size(10)
+                .color(MUTED),
+            ]
+            .spacing(8);
 
+            if self.pending_plan.is_some() {
+                migration_body = migration_body.push(
+                    row![
+                        button(text("Execute migration").size(11))
+                            .style(accent_button_style)
+                            .padding([7, 12])
+                            .on_press(Message::ExecuteMigrationPressed),
+                        button(text("Cancel").size(11))
+                            .style(ghost_style)
+                            .padding([7, 12])
+                            .on_press(Message::CancelMigrationPressed),
+                    ]
+                    .spacing(8),
+                );
+            }
+            if self.migrated_dest.is_some() {
+                migration_body = migration_body.push(
+                    button(text("Open migrated library").size(11))
+                        .style(ghost_style)
+                        .padding([7, 12])
+                        .on_press(Message::OpenMigratedPressed),
+                );
+            }
+            setup = setup.push(setup_card(
+                "MIGRATE TO CANONICAL",
+                "Inventory a legacy index or portable schema-v3 library and build a separate \
+             canonical library. The source is never modified or activated automatically.",
+                migration_body,
+            ));
+        }
         scrollable(setup).height(Length::Fill).into()
     }
 
@@ -16149,7 +15807,7 @@ impl FluxReady {
             ),
             (None, _) => (
                 "Nothing playing".to_owned(),
-                "The queue is empty.".to_owned(),
+                "Add a track to get started.".to_owned(),
             ),
         };
 
@@ -16199,21 +15857,11 @@ impl FluxReady {
             ]
             .align_y(Alignment::Center),
         );
-        panel = panel.push(
-            text("DRAG TO REORDER · CTRL+↑/↓ CURRENT")
-                .size(8)
-                .color(MUTED),
-        );
-
         if total == 0 {
             panel = panel.push(
-                column![
-                    text("The queue is empty.").size(11).color(TEXT),
-                    text("Play a library track, or use + to add one.")
-                        .size(10)
-                        .color(MUTED),
-                ]
-                .spacing(3),
+                text("Use + on any track to add it to the queue.")
+                    .size(10)
+                    .color(MUTED),
             );
         } else {
             let mut rows = column![].spacing(0);
@@ -17167,6 +16815,7 @@ mod tests {
             selected_tracks: Vec::new(),
             focused_track: None,
             filter_favorites: false,
+            filters_open: false,
             filter_lyrics: TriFilter::Any,
             filter_artwork: TriFilter::Any,
             filter_release: ReleaseFilter::Any,
@@ -17198,6 +16847,7 @@ mod tests {
             lyrics_cache: RefCell::new(BTreeMap::new()),
             lib_input: String::new(),
             track_editor: None,
+            track_editor_advanced_open: false,
             import_manager: None,
             import_request_seq: 0,
             deletion_manager: None,
@@ -17253,6 +16903,7 @@ mod tests {
             queue_overlay_open: false,
             window_width: 1_180.0,
             close_confirm: false,
+            setup_advanced_open: false,
             closed: false,
         }
     }
@@ -17269,6 +16920,64 @@ mod tests {
     fn send(gui: &mut FluxReady, message: Message) {
         let session = gui.controller.library_session();
         let _task = gui.update(message.with_library_session(session));
+    }
+
+    #[test]
+    fn progressive_disclosure_defaults_are_collapsed() {
+        let dir = TempDir::new("gui-progressive-disclosure");
+        let mut gui = gui(&dir);
+        assert!(!gui.filters_open);
+        assert!(!gui.setup_advanced_open);
+        send(&mut gui, Message::ToggleFilters);
+        assert!(gui.filters_open);
+        send(&mut gui, Message::ToggleSetupAdvanced);
+        assert!(gui.setup_advanced_open);
+        let mut manager = ImportManager::new();
+        assert!(!manager.advanced_open);
+        manager.advanced_open = true;
+        gui.import_manager = Some(manager);
+        send(&mut gui, Message::ImportAdvancedToggled);
+        assert!(!gui.import_manager.as_ref().expect("manager").advanced_open);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn track_editor_collapses_advanced_fields_and_opens_lyrics() {
+        let dir = TempDir::new("gui-track-editor-disclosure");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("create canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let id = import_named_track(
+            &mut gui,
+            &dir,
+            "Simple Song",
+            "Simple Artist",
+            "Simple Album",
+            ReleaseType::Album,
+            1,
+        );
+        gui.controller
+            .set_lyrics(id, Some("A simple line."))
+            .expect("lyrics");
+        send(&mut gui, Message::EditTrack(id));
+        assert!(gui.track_editor.is_some());
+        assert!(!gui.track_editor_advanced_open);
+        let _ = gui.view();
+        send(&mut gui, Message::TrackEditorAdvancedToggled);
+        assert!(gui.track_editor_advanced_open);
+        let _ = gui.view();
+        send(&mut gui, Message::TrackEditorOpenLyrics);
+        assert!(gui.track_editor.is_none());
+        assert_eq!(gui.view, LibraryView::Lyrics);
+        assert_eq!(gui.selected_lyrics, Some(id));
+        assert_eq!(gui.lyrics_mode, LyricsMode::Edit);
+        assert!(gui.lyrics_editor.is_some());
+        gui.controller.shutdown();
     }
 
     #[test]
