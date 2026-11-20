@@ -4431,7 +4431,11 @@ mod tests {
     #[test]
     fn duplicate_paths_rejected_on_add_and_set_path() {
         let dir = TempDir::new("portable_dup_path");
-        let mut store = PortableStore::create(dir.path()).expect("create");
+        // Pin the sensitive policy so the assertions below describe the
+        // policy contract rather than the host volume's default.
+        let mut store =
+            PortableStore::create_with_case_policy(dir.path(), PathCasePolicy::Sensitive)
+                .expect("create");
         let first = store
             .add_track(
                 rel("A/B.flac"),
@@ -4467,7 +4471,7 @@ mod tests {
             matches!(err, PortableStoreError::DuplicatePath { .. }),
             "got: {err}"
         );
-        // Case-sensitive by default on this platform policy:
+        // Sensitive policy: case variants are distinct paths.
         assert_eq!(store.id_for_path(&rel("a/b.flac")), None);
         assert_eq!(store.id_for_path(&rel("A/B.flac")), Some(first));
 
