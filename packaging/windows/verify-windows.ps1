@@ -57,7 +57,9 @@ try {
             throw "$Path is not a PE executable (missing PE signature)."
         }
         $optional = $pe + 24
-        return [BitConverter]::ToUInt16($bytes, $optional + 0x5C)
+        # Subsystem is at offset 0x44 in both IMAGE_OPTIONAL_HEADER32 and
+        # IMAGE_OPTIONAL_HEADER64.
+        return [BitConverter]::ToUInt16($bytes, $optional + 0x44)
     }
     if ((Get-PeSubsystem $Gui) -ne 2) { throw 'flux.exe is not a Windows GUI-subsystem executable.' }
     if ((Get-PeSubsystem $Tui) -ne 3) { throw 'flux-tui.exe is not a console-subsystem executable.' }
