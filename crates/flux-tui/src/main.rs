@@ -8,10 +8,10 @@
 //! import, catalogue and persistence decisions all stay in the shared
 //! Controller; this thread only draws and routes keys.
 //!
-//! Usage: `flux-tui [MUSIC_DIR]` — with a directory argument, a copy-only
-//! recursive import starts immediately. Real audio output requires a build
-//! with `--features cpal`; otherwise the app says so and playback commands
-//! report why (see the README).
+//! Usage: `flux-tui [MUSIC_DIR]` — with a directory argument, the same
+//! cancellable review-first import opens immediately. Real audio output requires
+//! a build with `--features cpal`; otherwise the app says so and playback
+//! commands report why (see the README).
 //!
 //! Keys:
 //! - `↑`/`k`, `↓`/`j` move; `PgUp`/`PgDn`, `g`/`G` jump
@@ -62,7 +62,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -71,9 +71,9 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 use crossterm::{execute, queue};
 use flux_app::{
     AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller, ImportDecision, ImportPlan,
-    ImportProgress, ImportReport, ImportRequest, ImportStage, ImportStorage, PreparedImport,
-    ReconcileReport, StorageMode, TrackMetadataEdit, format_duration, is_track_playable,
-    prepare_import_files, prepare_import_plan,
+    ImportProgress, ImportRequest, ImportStage, ImportStorage, PreparedImport, ReconcileReport,
+    StorageMode, TrackMetadataEdit, format_duration, is_track_playable, prepare_import_files,
+    prepare_import_plan,
 };
 use flux_core::{ArtistId, MILESTONE, PlaybackState, Track, TrackId};
 use unicode_width::UnicodeWidthChar;
@@ -190,6 +190,21 @@ struct TuiImport {
 enum ImportWorkerMessage {
     Plan(Box<ImportPlan>),
     Prepared(Box<PreparedImport>),
+}
+
+/// Waits briefly for an import worker. Cancellation is cooperative at file
+/// and copy-chunk boundaries, so a blocked OS read cannot be interrupted; the
+/// UI is not made to hang indefinitely waiting for it.
+fn join_worker_bounded(worker: JoinHandle<()>) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !worker.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if worker.is_finished() {
+        let _ = worker.join();
+    } else {
+        drop(worker);
+    }
 }
 
 struct Tui {
@@ -432,6 +447,9 @@ impl Tui {
             Some(Ok(message)) => message,
             Some(Err(TryRecvError::Empty)) | None => return,
             Some(Err(TryRecvError::Disconnected)) => {
+                if let Some(worker) = self.import_ui.as_mut().and_then(|ui| ui.worker.take()) {
+                    join_worker_bounded(worker);
+                }
                 self.import_ui = None;
                 self.mode = Mode::Normal;
                 self.lifecycle_msg = Some("The import worker stopped without a result.".to_owned());
@@ -441,11 +459,11 @@ impl Tui {
         if let Some(ui) = self.import_ui.as_mut()
             && let Some(worker) = ui.worker.take()
         {
-            let _ = worker.join();
+            join_worker_bounded(worker);
         }
         match message {
             ImportWorkerMessage::Plan(plan) => {
-                let mut plan = *plan;
+                let plan = *plan;
                 let cancelled = plan.cancelled
                     || self
                         .import_ui
@@ -473,9 +491,6 @@ impl Tui {
                     self.open_info("Import scan results", lines);
                     return;
                 }
-                plan.candidates
-                    .iter_mut()
-                    .for_each(|candidate| candidate.set_decision(ImportDecision::ImportNew));
                 if let Some(ui) = self.import_ui.as_mut() {
                     ui.selected = plan
                         .candidates
@@ -493,8 +508,17 @@ impl Tui {
             }
             ImportWorkerMessage::Prepared(prepared) => {
                 let prepared = *prepared;
+                let cancel_requested = self
+                    .import_ui
+                    .as_ref()
+                    .is_some_and(|ui| ui.cancel.load(Ordering::Acquire));
                 let plan = self.import_ui.as_mut().and_then(|ui| ui.plan.take());
-                if prepared.cancelled {
+                if prepared.cancelled || cancel_requested {
+                    if cancel_requested && !prepared.cancelled {
+                        for path in &prepared.created_files {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
                     self.import_ui = None;
                     self.mode = Mode::Normal;
                     self.lifecycle_msg =
@@ -637,6 +661,12 @@ impl Tui {
             ui.error = Some("Select at least one candidate to import or update.".to_owned());
             return;
         }
+        if !plan.can_import() {
+            ui.error = Some(plan.blocking_reason().unwrap_or_else(|| {
+                "Fix the highlighted review fields before preparing the import.".to_owned()
+            }));
+            return;
+        }
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -660,7 +690,7 @@ impl Tui {
         if let Some(ui) = self.import_ui.as_mut() {
             ui.cancel.store(true, Ordering::Release);
             if let Some(worker) = ui.worker.take() {
-                let _ = worker.join();
+                join_worker_bounded(worker);
             }
         }
         self.import_ui = None;
@@ -681,12 +711,20 @@ impl Tui {
                 Some("Cancelling import; waiting for the worker to release files…".to_owned());
             return;
         }
+        let issues = self
+            .import_ui
+            .as_ref()
+            .and_then(|ui| ui.plan.as_ref())
+            .map_or(0, |plan| plan.issues.len());
         self.import_ui = None;
         self.mode = Mode::Normal;
-        self.lifecycle_msg = Some(
-            "Import review closed; no files were copied and no catalogue changes were made."
-                .to_owned(),
-        );
+        self.lifecycle_msg = Some(if issues > 0 {
+            format!(
+                "Import review closed; nothing was copied or published. {issues} discovery issue(s) were not shown in the review."
+            )
+        } else {
+            "Import review closed; nothing was copied or published.".to_owned()
+        });
     }
 
     fn handle_import_progress_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
@@ -792,7 +830,7 @@ impl Tui {
             }
             return Ok(());
         }
-        let (count, rows, error) = {
+        let (count, issue_count, rows, error) = {
             let Some(ui) = self.import_ui.as_mut() else {
                 return Ok(());
             };
@@ -800,15 +838,16 @@ impl Tui {
                 return Ok(());
             };
             let count = plan.candidates.len();
+            let issue_count = plan.issues.len();
+            let rows_height = height.saturating_sub(1).max(1);
             ui.selected = ui.selected.min(count.saturating_sub(1));
             if ui.selected < ui.scroll {
                 ui.scroll = ui.selected;
             }
-            if ui.selected >= ui.scroll + height {
-                ui.scroll = ui.selected + 1 - height;
+            if ui.selected >= ui.scroll + rows_height {
+                ui.scroll = ui.selected + 1 - rows_height;
             }
-            ui.scroll = ui.scroll.min(count.saturating_sub(height));
-            let rows_height = height.saturating_sub(1);
+            ui.scroll = ui.scroll.min(count.saturating_sub(rows_height));
             let rows = plan.candidates[ui.scroll.min(count)..count.min(ui.scroll + rows_height)]
                 .iter()
                 .enumerate()
@@ -845,10 +884,11 @@ impl Tui {
                     )
                 })
                 .collect::<Vec<_>>();
-            (count, rows, ui.error.clone())
+            (count, issue_count, rows, ui.error.clone())
         };
         let title = format!(
-            "IMPORT REVIEW · {count} candidate(s) · Space include · u update · a all · s skip · y prepare · Esc cancel"
+            "IMPORT REVIEW · {count} candidate(s) · {} discovery issue(s) · Space include · u update · a all · s skip · y prepare · Esc cancel",
+            issue_count
         );
         self.line(out, top as u16, &title, width, true)?;
         for (row, (selected, text)) in rows.into_iter().enumerate() {
@@ -2836,35 +2876,6 @@ fn fit_input_line(prefix: &str, input: &str, width: usize) -> String {
     tail
 }
 
-fn import_summary(label: &str, report: &ImportReport) -> String {
-    format!(
-        "{label}: {} added, {} updated, {} already indexed, {} copied, {} issue(s).",
-        report.added,
-        report.updated,
-        report.deduplicated,
-        report.copied.len(),
-        report.issues.len()
-    )
-}
-
-fn import_detail_lines(label: &str, report: &ImportReport) -> Vec<String> {
-    let mut lines = vec![import_summary(label, report)];
-    if report.issues.is_empty() {
-        lines.push("No per-path issues were reported.".to_owned());
-        return lines;
-    }
-    lines.push(format!("Per-path issues ({}):", report.issues.len()));
-    lines.extend(report.issues.iter().enumerate().map(|(index, issue)| {
-        format!(
-            "{}. {} — {}",
-            index + 1,
-            issue.path().display(),
-            issue.reason()
-        )
-    }));
-    lines
-}
-
 fn cancel_message(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::ScanInput => Some("Scan cancelled; no folder was scanned."),
@@ -2966,7 +2977,7 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "SAFETY AND LIMITS".to_owned(),
         "TUI import review supports decisions only; rich metadata/artwork editing is GUI-only."
             .to_owned(),
-        "Discovery, hashing and copy preparation are cancellable; the final atomic publish is not."
+        "Discovery, hashing and portable copy preparation are cancellable; the final canonical transaction is not."
             .to_owned(),
         "Missing resources are retained; inaccessible paths are not treated as missing.".to_owned(),
         "The TUI never deletes external audio and never deletes library tracks.".to_owned(),
@@ -2995,19 +3006,8 @@ fn pad_with_right(left: &str, right: &str, width: usize) -> String {
 }
 
 fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
-    let mut controller =
+    let controller =
         Controller::open_default().map_err(|err| std::io::Error::other(err.to_string()))?;
-    let (initial_import, initial_info) = initial_dir.map_or((None, None), |dir| {
-        match controller.import_folder(&dir, true) {
-            Ok(report) => {
-                let summary = import_summary("Startup folder import", &report);
-                let details = (!report.issues.is_empty())
-                    .then(|| import_detail_lines("Startup folder import", &report));
-                (Some(summary), details)
-            }
-            Err(error) => (Some(format!("Startup folder import failed: {error}")), None),
-        }
-    });
 
     let guard = TerminalGuard::enter()?;
     // Restore the terminal even if a panic unwinds through the loop.
@@ -3022,11 +3022,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         import_ui: None,
         cursor: 0,
         offset: 0,
-        mode: if initial_info.is_some() {
-            Mode::InfoView
-        } else {
-            Mode::Normal
-        },
+        mode: Mode::Normal,
         input: String::new(),
         search: String::new(),
         rows_cache: RefCell::new(None),
@@ -3037,18 +3033,19 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         lyrics_title: String::new(),
         queue_cursor: 0,
         queue_offset: 0,
-        info_title: if initial_info.is_some() {
-            "Startup folder import results".to_owned()
-        } else {
-            String::new()
-        },
-        info_lines: initial_info.unwrap_or_default(),
+        info_title: String::new(),
+        info_lines: Vec::new(),
         info_scroll: 0,
         pending_plan: None,
         migrated_dest: None,
-        lifecycle_msg: initial_import,
+        lifecycle_msg: None,
         last_reconcile: None,
     };
+    if let Some(dir) = initial_dir
+        && let Err(error) = tui.start_import_review(vec![dir], true)
+    {
+        tui.lifecycle_msg = Some(format!("Startup folder import failed: {error}"));
+    }
     let mut stdout = std::io::stdout();
     let result = tui.event_loop(&mut stdout);
 
@@ -3061,9 +3058,9 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Mode, StorageMode, Track, Tui, clamp_terminal_size, detail_view_fits, display_width,
-        fit_input_line, help_lines, normal_help, pad_with_right, resource_label,
-        terminal_too_small, truncate_to_width,
+        ImportWorkerMessage, Mode, StorageMode, Track, Tui, TuiImport, clamp_terminal_size,
+        detail_view_fits, display_width, fit_input_line, help_lines, normal_help, pad_with_right,
+        resource_label, terminal_too_small, truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use flux_app::ImportDecision;
@@ -3563,6 +3560,89 @@ mod tests {
     }
 
     #[test]
+    fn tui_import_review_preserves_safe_defaults_for_exact_audio_duplicates() {
+        let dir = TempDir::new("tui-import-duplicate-default");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source_dir = dir.path().join("Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &source);
+        finish_import(&mut tui);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        let managed = tui.controller.tracks()[0].1.source().path().to_path_buf();
+        let duplicate = dir.path().join("same-content-copy.wav");
+        std::fs::copy(&managed, &duplicate).expect("duplicate content");
+
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &duplicate);
+        wait_for_mode(&mut tui, Mode::ImportReview);
+        let candidate = tui
+            .import_ui
+            .as_ref()
+            .and_then(|ui| ui.plan.as_ref())
+            .and_then(|plan| plan.candidates.first())
+            .expect("candidate");
+        assert!(candidate.status().can_update_metadata());
+        assert_eq!(
+            candidate.decision(),
+            ImportDecision::Skip,
+            "same-content duplicates must not be imported again by default"
+        );
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_import_preparation_cancelled_after_worker_completion_publishes_nothing() {
+        let dir = TempDir::new("tui-import-late-cancel");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source_dir = dir.path().join("Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &source);
+        wait_for_mode(&mut tui, Mode::ImportReview);
+
+        let copied = dir.path().join("unpublished-copy.wav");
+        std::fs::write(&copied, minimal_wav()).expect("copy");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut prepared = flux_app::import::PreparedImport::default();
+        prepared.created_files.push(copied.clone());
+        tx.send(ImportWorkerMessage::Prepared(Box::new(prepared)))
+            .expect("send prepared");
+        {
+            let ui = tui.import_ui.as_mut().expect("review state");
+            ui.cancel.store(true, Ordering::Release);
+            ui.rx = rx;
+        }
+        tui.mode = Mode::ImportPreparing;
+        tui.poll_import_worker();
+        assert_eq!(tui.mode, Mode::Normal);
+        assert_eq!(tui.controller.tracks().len(), 0);
+        assert!(!copied.exists(), "unpublished copy is removed");
+        assert!(
+            tui.lifecycle_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("cancelled")),
+            "{:?}",
+            tui.lifecycle_msg
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
     fn tui_import_review_updates_an_exact_duplicate_without_duplicating_it() {
         let dir = TempDir::new("tui-import-update");
         let root = dir.path().join("library");
@@ -3974,7 +4054,10 @@ mod tests {
         assert!(help.contains("device selection are GUI-only"), "{help}");
         assert!(help.contains("GUI review workflows"), "{help}");
         assert!(help.contains("cancellable discovery/review"), "{help}");
-        assert!(help.contains("final atomic publish is not"), "{help}");
+        assert!(
+            help.contains("final canonical transaction is not"),
+            "{help}"
+        );
         key(&mut tui, KeyCode::Down);
         assert_eq!(tui.info_scroll, 1);
         key(&mut tui, KeyCode::Esc);

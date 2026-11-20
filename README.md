@@ -83,7 +83,7 @@ unavailable instead of pretending):
 
 ```sh
 cargo run -p flux-gui --features cpal            # binary name: flux
-cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
+cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import review
 ```
 
 - **GUI:** create or open a canonical library in *Library setup*. Each
@@ -206,10 +206,11 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder to scan
   `o` imports a folder recursively, and `i` imports paths separated by `;`
   into the canonical library. Both open a cancellable discovery/review phase:
   Space includes or excludes a candidate, `u` selects a unique exact-audio
-  update, `a`/`s` apply a bulk decision, and `y` starts cancellable copy
-  preparation before the atomic publish. Esc cancels discovery or preparation;
-  discovery issues open a scrollable result panel containing every issue rather
-  than only the first. The final catalogue publish is synchronous. Rich
+  update, `a`/`s` apply a bulk decision, and `y` starts preparation before the
+  atomic publish. Esc cancels discovery or portable copy preparation; canonical
+  copies and hashing inside the final synchronous transaction are not
+  cancellable. Discovery issues open a scrollable result panel containing every
+  issue rather than only the first, and are counted in the review header. Rich
   metadata, artwork and lyrics editing remains GUI-only.
   `e` edits the selected track as
   `title|album|track|disc|artist-id|credit-ids`, `P` creates an artist, `Y`

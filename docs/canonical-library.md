@@ -194,12 +194,14 @@ removes queue entries, never catalogue tracks or audio files.
 TUI imports open a cancellable discovery/review phase before any copy. The
 review lists every candidate with its import/update/skip decision and duplicate
 status; Space toggles one candidate, `u` selects a unique exact-audio update,
-`a`/`s` apply a bulk decision, and `y`/Enter starts cancellable copy preparation.
-Esc cancels discovery or preparation; the catalogue publishes only after the
-worker finishes. Per-path discovery failures are retained and shown in a
-scrollable result panel. Rich metadata, artwork and lyrics editing remains
-GUI-only. H1 decoder preflight, fingerprints, canonical transaction rules and
-Controller report semantics are unchanged.
+`a`/`s` apply a bulk decision, and `y`/Enter starts preparation. Esc cancels
+discovery or portable copy preparation; the catalogue publishes only after the
+worker finishes. Canonical file copies and hashing for the final batch happen
+inside the synchronous atomic transaction, so that last step has no progress or
+cancel UI. Per-path discovery failures are retained, counted in the review title
+and shown in a scrollable result panel. Rich metadata, artwork and lyrics
+editing remains GUI-only. H1 decoder preflight, fingerprints, canonical
+transaction rules and Controller report semantics are unchanged.
 
 `U` (preserve/replace protected legacy index) and `A` (acknowledge portable
 recovery by restoring the catalogue backup) require explicit `y` confirmation;
