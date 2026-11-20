@@ -17129,6 +17129,15 @@ mod tests {
         }
     }
 
+    /// Encodes a filesystem path as JSON string contents. Windows paths contain
+    /// backslashes, which are escape characters in JSON; embedding display()
+    /// directly produces an unreadable legacy index.
+    fn json_path(path: &std::path::Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
     fn gui(dir: &TempDir) -> FluxReady {
         let (engine, audio) = flux_app::default_engine();
         let controller =
@@ -17421,7 +17430,14 @@ mod tests {
         flux_app::create_canonical_library(&other_root).expect("other canonical");
         gui.lib_input = other_root.display().to_string();
         send(&mut gui, Message::OpenLibraryPressed);
-        assert_eq!(gui.controller.canonical_root(), Some(root.as_path()));
+        assert_eq!(
+            gui.controller.canonical_root(),
+            Some(
+                std::fs::canonicalize(&root)
+                    .expect("canonical root")
+                    .as_path()
+            )
+        );
         assert!(
             gui.track_editor.is_some(),
             "switching libraries must not discard a dirty Track editor"
@@ -17973,7 +17989,11 @@ mod tests {
             sources: vec![source.clone()],
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: root.clone(),
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
             existing_credits: Vec::new(),
@@ -18202,7 +18222,14 @@ mod tests {
         );
         send(&mut gui, Message::OpenLibraryPressed);
         assert_ne!(gui.controller.library_session(), old_session);
-        assert_eq!(gui.controller.canonical_root(), Some(root_b.as_path()));
+        assert_eq!(
+            gui.controller.canonical_root(),
+            Some(
+                std::fs::canonicalize(&root_b)
+                    .expect("canonical root")
+                    .as_path()
+            )
+        );
         assert!(gui.controller.tracks().is_empty());
         assert_eq!(gui.controller.current_queue_entry_id(), None);
         assert_eq!(gui.controller.player_state(), PlaybackState::Stopped);
@@ -18260,7 +18287,7 @@ mod tests {
             &index,
             format!(
                 r#"{{"version":1,"next_id":2,"tracks":[{{"id":1,"title":"Song","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
-                song.display()
+                json_path(&song)
             ),
         )
         .expect("index");
@@ -18361,8 +18388,8 @@ mod tests {
             dir.path().join("library-index.json"),
             format!(
                 r#"{{"version":1,"next_id":3,"tracks":[{{"id":1,"title":"One","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}},{{"id":2,"title":"Two","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":null,"path":{{"utf8":"{}"}}}}]}}"#,
-                one.display(),
-                two.display()
+                json_path(&one),
+                json_path(&two)
             ),
         )
         .expect("index");
@@ -18670,7 +18697,11 @@ mod tests {
             sources: vec![source],
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: root,
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
             existing_tracks: Vec::new(),
             existing_artists: Vec::new(),
             existing_credits: Vec::new(),
@@ -18746,7 +18777,11 @@ mod tests {
             sources: vec![one, two],
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: root.clone(),
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
             existing_credits: Vec::new(),
@@ -18890,7 +18925,11 @@ mod tests {
             sources: vec![source],
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: root.clone(),
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
             existing_credits: Vec::new(),
@@ -19134,8 +19173,8 @@ mod tests {
             dir.path().join("library-index.json"),
             format!(
                 r#"{{"version":1,"next_id":3,"tracks":[{{"id":1,"title":"One","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":1000,"path":{{"utf8":"{}"}}}},{{"id":2,"title":"Two","artist":null,"album":null,"track_number":null,"disc_number":null,"duration_ms":1000,"path":{{"utf8":"{}"}}}}]}}"#,
-                one.display(),
-                two.display()
+                json_path(&one),
+                json_path(&two)
             ),
         )
         .expect("index");
@@ -20431,7 +20470,11 @@ mod tests {
             sources: vec![two.clone(), one.clone()],
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: root.clone(),
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
             existing_tracks: gui.controller.tracks().to_vec(),
             existing_artists: Vec::new(),
             existing_credits: Vec::new(),
@@ -20516,7 +20559,11 @@ mod tests {
                 sources: vec![stale_source],
                 recursive: false,
                 storage: ImportStorage::Copy,
-                library_root: root,
+                library_root: gui
+                    .controller
+                    .canonical_root()
+                    .expect("canonical root")
+                    .to_path_buf(),
                 existing_tracks: gui.controller.tracks().to_vec(),
                 existing_artists: Vec::new(),
                 existing_credits: Vec::new(),
@@ -22196,7 +22243,11 @@ mod tests {
             sources: vec![source],
             recursive: false,
             storage: ImportStorage::Copy,
-            library_root: root,
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
             existing_tracks: Vec::new(),
             existing_artists: Vec::new(),
             existing_credits: Vec::new(),
