@@ -4582,7 +4582,7 @@ mod tests {
             format!(r#"{{"version":1,"next_id":5001,"tracks":[{tracks}]}}"#),
         )
         .expect("large index");
-        let mut tui = tui(&dir);
+        let tui = tui(&dir);
         let started = std::time::Instant::now();
         let first = tui.rows();
         let first_elapsed = started.elapsed();
