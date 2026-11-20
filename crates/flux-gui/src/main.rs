@@ -2402,6 +2402,7 @@ enum Message {
     ImportBulkLyricsChoose,
     ImportBulkApplyLyrics,
     ImportBulkClearLyrics,
+    ImportBulkReleaseType(ReleaseType),
     ImportDecisionChanged(usize, ImportDecision),
     ImportBulkSkip,
     ImportBulkImport,
@@ -5776,6 +5777,23 @@ impl FluxReady {
                             }
                         }
                         Err(error) => manager.asset_error = Some(error),
+                    }
+                }
+            }
+            Message::ImportBulkReleaseType(kind) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    let indices = manager.checked_indices();
+                    if indices.is_empty() {
+                        manager.asset_error =
+                            Some("Select one or more candidates first.".to_owned());
+                    } else {
+                        if let Some(plan) = manager.plan.as_mut() {
+                            plan.apply_release_type_to(&indices, kind);
+                        }
+                        manager.asset_error = None;
+                        if let Some(selected) = manager.selected {
+                            manager.select_candidate(selected);
+                        }
                     }
                 }
             }
@@ -9747,6 +9765,15 @@ impl FluxReady {
             ]
             .spacing(6),
             album_bulk_control,
+            text("Bulk release type for newly created Albums:").size(8).color(MUTED),
+            row![
+                button(text("Album").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Album)),
+                button(text("EP").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Ep)),
+                button(text("Single").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Single)),
+                button(text("Compilation").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Compilation)),
+                button(text("Other").size(9)).style(ghost_style).padding([4, 7]).on_press(Message::ImportBulkReleaseType(ReleaseType::Other)),
+            ]
+            .spacing(4),
             row![
                 text_input(
                     if fixed_target {
@@ -18547,6 +18574,7 @@ mod tests {
             Message::ImportBulkTrackArtworkPicked(0, Ok(Some(vec![track_art]))),
         );
         send(&mut gui, Message::ImportBulkApplyTrackArtwork);
+        send(&mut gui, Message::ImportBulkReleaseType(ReleaseType::Ep));
         let lyrics = dir.path().join("bulk-gui.lrc");
         std::fs::write(&lyrics, "[00:01.00]bulk lyric\n").expect("lyrics");
         send(
@@ -18586,6 +18614,12 @@ mod tests {
                 .is_some_and(|text| text.contains("bulk lyric"))),
             "bulk lyrics apply to every checked candidate"
         );
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| candidate.release_type() == ReleaseType::Ep),
+            "bulk release type applies to every checked candidate"
+        );
         assert!(plan.candidates.iter().all(|candidate| {
             candidate.provenance().lyrics == Some(flux_app::MetadataSource::Manual)
         }));
@@ -18597,6 +18631,7 @@ mod tests {
         send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
         let albums = gui.controller.albums();
         assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].release_type, ReleaseType::Ep);
         assert_eq!(gui.controller.album_tracks(albums[0].id).len(), 2);
         assert!(
             gui.controller

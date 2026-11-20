@@ -1178,6 +1178,16 @@ impl ImportPlan {
         }
     }
 
+    /// Applies one release type to the newly created Album of selected
+    /// candidates. Existing Album membership keeps its stored type.
+    pub fn apply_release_type_to(&mut self, indices: &[usize], kind: ReleaseType) {
+        for index in indices {
+            if let Some(candidate) = self.candidates.get_mut(*index) {
+                candidate.set_release_type(kind);
+            }
+        }
+    }
+
     /// Number of candidates that will produce a new record.
     #[must_use]
     pub fn new_count(&self) -> usize {
