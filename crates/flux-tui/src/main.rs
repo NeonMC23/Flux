@@ -57,10 +57,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use flux_app::{
-    AlbumId, ArtistDeletionDecision, ArtistDeletionDestination, ArtistDeletionPlan,
-    AudioOutputDevice, AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller,
-    ImportAlbumTarget, ImportDecision, OpenedAudioOutput, PlaylistId, ReconcileReport, ReleaseType,
-    SmartCollection, StorageMode, TrackDeletionPlan, TrackMetadataEdit, TrackMovePlan,
+    AlbumId, AlbumTransferPlan, ArtistDeletionDecision, ArtistDeletionDestination,
+    ArtistDeletionPlan, AudioOutputDevice, AudioStatus, CandidateStatus, CanonicalMigrationPlan,
+    Controller, ImportAlbumTarget, ImportDecision, OpenedAudioOutput, PlaylistId, ReconcileReport,
+    ReleaseType, SmartCollection, StorageMode, TrackDeletionPlan, TrackMetadataEdit, TrackMovePlan,
     WaveformScope, format_duration, is_track_playable,
 };
 use flux_core::{APP_VERSION, ArtistId, PlaybackState, Track, TrackId};
@@ -334,6 +334,14 @@ enum Mode {
     ConfirmArtistDelete,
     /// Choosing a fixed target album for import review.
     ImportAlbumPick,
+    /// Choosing a destination artist for album ownership transfer.
+    AlbumTransferPick,
+    /// Reviewing an album ownership transfer.
+    AlbumTransferReview,
+    /// Choosing an explicit destination owner for one artist-deletion track.
+    ArtistOwnerPick,
+    /// Choosing an existing destination album or a new album.
+    ArtistAlbumPick,
     /// Exporting managed lyrics to a user path.
     LyricsExportInput,
     /// Attaching import album artwork, track artwork or lyrics.
@@ -413,6 +421,10 @@ enum FormKind {
         expected_tracks: Vec<TrackId>,
     },
     ImportCandidate(usize),
+    ArtistTransferAlbum {
+        track: TrackId,
+        owner: ArtistId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -514,6 +526,13 @@ struct Tui {
     artist_deletion: Option<ArtistDeletionPlan>,
     artist_delete_cursor: usize,
     artist_delete_armed: Option<TrackId>,
+    artist_transfer_track: Option<TrackId>,
+    artist_transfer_owner: Option<ArtistId>,
+    artist_owner_cursor: usize,
+    artist_album_cursor: usize,
+    album_transfer: Option<AlbumTransferPlan>,
+    album_transfer_cursor: usize,
+    album_transfer_artist_cursor: usize,
     import_album_cursor: usize,
     /// Audio-device list and asynchronous selection state.
     audio_devices: Vec<AudioOutputDevice>,
@@ -1212,10 +1231,10 @@ impl Tui {
             self.mode = Mode::Normal;
             return;
         };
-        let return_mode = if matches!(form.kind, FormKind::ImportCandidate(_)) {
-            Mode::ImportReview
-        } else {
-            Mode::Normal
+        let return_mode = match form.kind {
+            FormKind::ImportCandidate(_) => Mode::ImportReview,
+            FormKind::ArtistTransferAlbum { .. } => Mode::ArtistDeletion,
+            _ => Mode::Normal,
         };
         let values = form
             .fields
@@ -1375,6 +1394,37 @@ impl Tui {
                         .map(|()| format!("Renamed playlist {id}."))
                 }
             }
+            FormKind::ArtistTransferAlbum { track, owner } => {
+                if values[0].is_empty() {
+                    Err("Destination album title must not be empty.".to_owned())
+                } else {
+                    match parse_release_type(&values[1]) {
+                        Ok(release_type) => {
+                            let Some(plan) = self.artist_deletion.as_mut() else {
+                                return self.reject_form("The artist deletion review closed.");
+                            };
+                            match plan.set_transfer(
+                                track,
+                                owner,
+                                ArtistDeletionDestination::New {
+                                    title: values[0].clone(),
+                                    release_type,
+                                },
+                            ) {
+                                Ok(()) => {
+                                    self.artist_delete_armed = None;
+                                    Ok(format!(
+                                        "Track {track} will transfer into a new album “{}”.",
+                                        values[0]
+                                    ))
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
             FormKind::ImportCandidate(index) => {
                 if values[0].is_empty() {
                     Err("Title must not be empty.".to_owned())
@@ -1433,12 +1483,10 @@ impl Tui {
                 let return_mode = self
                     .form
                     .as_ref()
-                    .map(|form| {
-                        if matches!(form.kind, FormKind::ImportCandidate(_)) {
-                            Mode::ImportReview
-                        } else {
-                            Mode::Normal
-                        }
+                    .map(|form| match form.kind {
+                        FormKind::ImportCandidate(_) => Mode::ImportReview,
+                        FormKind::ArtistTransferAlbum { .. } => Mode::ArtistDeletion,
+                        _ => Mode::Normal,
                     })
                     .unwrap_or(Mode::Normal);
                 self.form = None;
@@ -1810,6 +1858,101 @@ impl Tui {
                 }
                 return key.code == KeyCode::Char('q');
             }
+            Mode::AlbumTransferPick => {
+                if ctrl_c {
+                    return true;
+                }
+                let count = self.album_transfer_artists().len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.mode = Mode::Normal;
+                        self.lifecycle_msg = Some("Album transfer cancelled.".to_owned());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.album_transfer_artist_cursor =
+                            self.album_transfer_artist_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.album_transfer_artist_cursor =
+                            (self.album_transfer_artist_cursor + 1).min(count.saturating_sub(1));
+                    }
+                    KeyCode::Enter => self.apply_album_transfer_artist(),
+                    _ => {}
+                }
+                return key.code == KeyCode::Char('q');
+            }
+            Mode::AlbumTransferReview => {
+                if ctrl_c {
+                    return true;
+                }
+                let count = self
+                    .album_transfer
+                    .as_ref()
+                    .map_or(0, |plan| plan.tracks.len());
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.album_transfer = None;
+                        self.mode = Mode::Normal;
+                        self.lifecycle_msg = Some("Album transfer cancelled.".to_owned());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.album_transfer_cursor = self.album_transfer_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.album_transfer_cursor =
+                            (self.album_transfer_cursor + 1).min(count.saturating_sub(1));
+                    }
+                    KeyCode::Char('c') => self.toggle_album_transfer_credit(),
+                    KeyCode::Char('y') => self.execute_album_transfer(),
+                    _ => {}
+                }
+                return key.code == KeyCode::Char('q');
+            }
+            Mode::ArtistOwnerPick => {
+                if ctrl_c {
+                    return true;
+                }
+                let count = self
+                    .artist_deletion_track()
+                    .map_or(0, |track| track.eligible_owners.len());
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.artist_transfer_owner = None;
+                        self.mode = Mode::ArtistDeletion;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.artist_owner_cursor = self.artist_owner_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.artist_owner_cursor =
+                            (self.artist_owner_cursor + 1).min(count.saturating_sub(1));
+                    }
+                    KeyCode::Enter => self.apply_artist_owner(),
+                    _ => {}
+                }
+                return key.code == KeyCode::Char('q');
+            }
+            Mode::ArtistAlbumPick => {
+                if ctrl_c {
+                    return true;
+                }
+                let count = self.artist_transfer_albums().len() + 1;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.mode = Mode::ArtistOwnerPick;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.artist_album_cursor = self.artist_album_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.artist_album_cursor =
+                            (self.artist_album_cursor + 1).min(count.saturating_sub(1));
+                    }
+                    KeyCode::Enter => self.apply_artist_album(),
+                    _ => {}
+                }
+                return key.code == KeyCode::Char('q');
+            }
             Mode::ImportAlbumPick => {
                 if ctrl_c {
                     return true;
@@ -1861,7 +2004,7 @@ impl Tui {
                     KeyCode::End | KeyCode::Char('G') => {
                         self.artist_delete_cursor = count.saturating_sub(1);
                     }
-                    KeyCode::Char('t') => self.resolve_artist_transfer(),
+                    KeyCode::Char('t') => self.open_artist_owner_picker(),
                     KeyCode::Char('r') => self.resolve_artist_credit(),
                     KeyCode::Char('d') => self.resolve_artist_track_delete(),
                     KeyCode::Char('u') => self.reset_artist_track_decisions(),
@@ -2012,6 +2155,7 @@ impl Tui {
                     self.lifecycle_msg =
                         Some(format!("Visualizer sensitivity: {:.2}×.", self.viz_gain));
                 }
+                KeyCode::Char('t') => self.open_album_transfer_picker(),
                 KeyCode::Char('m') => self.open_move_picker(),
                 KeyCode::Char('r') => {
                     if let Some(id) = self.current_track() {
@@ -3485,47 +3629,238 @@ impl Tui {
         })
     }
 
-    fn resolve_artist_transfer(&mut self) {
-        let Some(plan) = self.artist_deletion.as_mut() else {
-            return;
+    fn album_transfer_artists(&self) -> Vec<ArtistId> {
+        let Some(Detail::Album(album)) = self.detail else {
+            return Vec::new();
         };
-        let index = self.artist_delete_cursor;
-        let track = plan.owned_tracks.get(index).cloned().or_else(|| {
-            plan.credited_tracks
-                .get(index - plan.owned_tracks.len())
-                .cloned()
-        });
-        let Some(track) = track else {
-            return;
+        let Some(current) = self.controller.album_owner(album) else {
+            return Vec::new();
         };
-        if track.owner_artist_id != plan.artist_id {
-            self.lifecycle_msg = Some(
-                "Credited-only tracks use remove-credit; they do not move ownership.".to_owned(),
-            );
+        self.controller
+            .artists()
+            .into_iter()
+            .map(|artist| artist.id())
+            .filter(|artist| *artist != current)
+            .collect()
+    }
+
+    fn open_album_transfer_picker(&mut self) {
+        if !matches!(self.detail, Some(Detail::Album(_))) {
+            self.lifecycle_msg = Some("Open an album to transfer ownership.".to_owned());
             return;
         }
-        let Some(new_owner) = track.eligible_owners.first().copied() else {
-            self.lifecycle_msg = Some(
-                "This track has no surviving credited artist eligible to own it; use explicit deletion."
-                    .to_owned(),
-            );
+        self.album_transfer_artist_cursor = 0;
+        self.mode = Mode::AlbumTransferPick;
+    }
+
+    fn apply_album_transfer_artist(&mut self) {
+        let Some(Detail::Album(album)) = self.detail else {
+            self.mode = Mode::Normal;
             return;
         };
-        let destination = plan
-            .destination_albums
+        let artists = self.album_transfer_artists();
+        let Some(target) = artists.get(self.album_transfer_artist_cursor).copied() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match self.controller.plan_album_transfer(album, target) {
+            Ok(plan) => {
+                self.album_transfer_cursor = 0;
+                self.album_transfer = Some(plan);
+                self.mode = Mode::AlbumTransferReview;
+                self.lifecycle_msg = Some(
+                    "Review the new owner and per-track credit decisions. c toggles a required destination credit; y executes when ready."
+                        .to_owned(),
+                );
+            }
+            Err(error) => {
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
+    fn toggle_album_transfer_credit(&mut self) {
+        let Some(plan) = self.album_transfer.as_mut() else {
+            return;
+        };
+        let Some(track) = plan.tracks.get(self.album_transfer_cursor) else {
+            return;
+        };
+        if !track.requires_credit {
+            self.lifecycle_msg =
+                Some("This track already credits the destination artist.".to_owned());
+            return;
+        }
+        let allowed = !track.credit_allowed;
+        let id = track.track_id;
+        match plan.set_credit_allowed(id, allowed) {
+            Ok(()) => {
+                self.lifecycle_msg = Some(if allowed {
+                    "Destination artist will be added to this track's credits.".to_owned()
+                } else {
+                    "Destination artist will own the album but not appear in this track's credits."
+                        .to_owned()
+                });
+            }
+            Err(error) => self.lifecycle_msg = Some(error),
+        }
+    }
+
+    fn execute_album_transfer(&mut self) {
+        let Some(plan) = self.album_transfer.clone() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        if !plan.is_ready() {
+            self.lifecycle_msg = Some(format!(
+                "Album transfer is blocked: {}",
+                plan.blocking_reason()
+                    .unwrap_or("unresolved credit decisions")
+            ));
+            return;
+        }
+        match self.controller.execute_album_transfer(&plan) {
+            Ok(report) => {
+                self.album_transfer = None;
+                self.mode = Mode::Normal;
+                self.reset_selection();
+                self.lifecycle_msg = Some(format!(
+                    "Moved album {} from owner {} to owner {} while preserving {} track(s).",
+                    report.album_id, report.from_owner, report.to_owner, report.tracks
+                ));
+            }
+            Err(error) => self.lifecycle_msg = Some(error),
+        }
+    }
+
+    fn artist_deletion_track(&self) -> Option<flux_app::ArtistDeletionTrack> {
+        let plan = self.artist_deletion.as_ref()?;
+        let index = self.artist_delete_cursor;
+        plan.owned_tracks
+            .get(index)
+            .or_else(|| {
+                plan.credited_tracks
+                    .get(index.saturating_sub(plan.owned_tracks.len()))
+            })
+            .cloned()
+    }
+
+    fn open_artist_owner_picker(&mut self) {
+        let Some(track) = self.artist_deletion_track() else {
+            return;
+        };
+        if track.owner_artist_id
+            != self
+                .artist_deletion
+                .as_ref()
+                .map(|plan| plan.artist_id)
+                .unwrap_or(track.owner_artist_id)
+        {
+            self.lifecycle_msg =
+                Some("Credited-only tracks use remove-credit, not ownership transfer.".to_owned());
+            return;
+        }
+        if track.eligible_owners.is_empty() {
+            self.lifecycle_msg =
+                Some("No surviving credited artist can become the owner.".to_owned());
+            return;
+        }
+        self.artist_transfer_track = Some(track.track_id);
+        self.artist_owner_cursor = 0;
+        self.mode = Mode::ArtistOwnerPick;
+    }
+
+    fn apply_artist_owner(&mut self) {
+        let Some(plan) = self.artist_deletion.as_ref() else {
+            self.mode = Mode::ArtistDeletion;
+            return;
+        };
+        let Some(track) = self.artist_deletion_track() else {
+            self.mode = Mode::ArtistDeletion;
+            return;
+        };
+        let Some(owner) = track.eligible_owners.get(self.artist_owner_cursor).copied() else {
+            self.mode = Mode::ArtistDeletion;
+            return;
+        };
+        let _ = plan;
+        self.artist_transfer_owner = Some(owner);
+        self.artist_album_cursor = 0;
+        self.mode = Mode::ArtistAlbumPick;
+    }
+
+    fn artist_transfer_albums(&self) -> Vec<(AlbumId, String)> {
+        let Some(plan) = self.artist_deletion.as_ref() else {
+            return Vec::new();
+        };
+        let Some(owner) = self.artist_transfer_owner else {
+            return Vec::new();
+        };
+        plan.destination_albums
             .iter()
-            .find(|album| album.owner_artist_id == new_owner)
-            .map_or_else(
-                || ArtistDeletionDestination::New {
-                    title: format!("Transferred from {} — {}", plan.artist_name, track.title),
-                    release_type: ReleaseType::Album,
-                },
-                |album| ArtistDeletionDestination::Existing(album.id),
-            );
-        match plan.set_transfer(track.track_id, new_owner, destination) {
+            .filter(|album| album.owner_artist_id == owner)
+            .map(|album| (album.id, album.title.clone()))
+            .collect()
+    }
+
+    fn apply_artist_album(&mut self) {
+        let Some(track) = self.artist_transfer_track else {
+            self.mode = Mode::ArtistDeletion;
+            return;
+        };
+        let Some(owner) = self.artist_transfer_owner else {
+            self.mode = Mode::ArtistDeletion;
+            return;
+        };
+        let albums = self.artist_transfer_albums();
+        eprintln!(
+            "DEBUG apply_artist_album track={track:?} owner={owner:?} cursor={} albums={albums:?}",
+            self.artist_album_cursor
+        );
+        if self.artist_album_cursor >= albums.len() {
+            let owner_name = self
+                .controller
+                .artist(owner)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {owner}"));
+            let track_title = self
+                .controller
+                .track(track)
+                .map(display_title)
+                .unwrap_or_else(|| format!("Track {track}"));
+            self.form = Some(FormState::new(
+                "New destination album",
+                FormKind::ArtistTransferAlbum { track, owner },
+                vec![
+                    FormField {
+                        label: "Title",
+                        value: format!("Transferred from {owner_name} — {track_title}"),
+                        hint: "Required unique album title",
+                    },
+                    FormField {
+                        label: "Release type",
+                        value: "album".to_owned(),
+                        hint: "Album, EP, Single, Compilation or Other",
+                    },
+                ],
+            ));
+            self.mode = Mode::FormInput;
+            return;
+        }
+        let Some((album_id, title)) = albums.get(self.artist_album_cursor).cloned() else {
+            self.mode = Mode::ArtistDeletion;
+            return;
+        };
+        let Some(plan) = self.artist_deletion.as_mut() else {
+            self.mode = Mode::ArtistDeletion;
+            return;
+        };
+        match plan.set_transfer(track, owner, ArtistDeletionDestination::Existing(album_id)) {
             Ok(()) => {
                 self.artist_delete_armed = None;
-                self.lifecycle_msg = Some(format!("Track {} will transfer.", track.track_id));
+                self.mode = Mode::ArtistDeletion;
+                self.lifecycle_msg = Some(format!("Track will transfer into “{title}”."));
             }
             Err(error) => self.lifecycle_msg = Some(error),
         }
@@ -4310,7 +4645,11 @@ impl Tui {
                     | Mode::TrackReplacementInput
                     | Mode::ConfirmTrackReplacement
                     | Mode::ArtistDeletion
-                    | Mode::ImportAlbumPick => {}
+                    | Mode::ImportAlbumPick
+                    | Mode::AlbumTransferPick
+                    | Mode::AlbumTransferReview
+                    | Mode::ArtistOwnerPick
+                    | Mode::ArtistAlbumPick => {}
                 }
                 self.mode = next;
             }
@@ -4536,6 +4875,10 @@ fn cancel_message(mode: Mode) -> Option<&'static str> {
         Mode::ArtistDeletion => Some("Artist deletion cancelled."),
         Mode::ConfirmArtistDelete => Some("Artist deletion cancelled."),
         Mode::ImportAlbumPick => Some("Fixed-target import cancelled; the review is unchanged."),
+        Mode::AlbumTransferPick => Some("Album transfer cancelled."),
+        Mode::AlbumTransferReview => Some("Album transfer cancelled."),
+        Mode::ArtistOwnerPick => Some("Destination owner selection cancelled."),
+        Mode::ArtistAlbumPick => Some("Destination album selection cancelled."),
         Mode::LyricsExportInput => Some("Lyrics export cancelled."),
         Mode::ImportAssetInput => Some("Asset attachment cancelled."),
         Mode::ArtistCreateInput => Some("Artist creation cancelled."),
@@ -4626,6 +4969,13 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         artist_deletion: None,
         artist_delete_cursor: 0,
         artist_delete_armed: None,
+        artist_transfer_track: None,
+        artist_transfer_owner: None,
+        artist_owner_cursor: 0,
+        artist_album_cursor: 0,
+        album_transfer: None,
+        album_transfer_cursor: 0,
+        album_transfer_artist_cursor: 0,
         import_album_cursor: 0,
         audio_devices: Vec::new(),
         audio_error: None,
@@ -4657,8 +5007,8 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtistDeletionPlan, Detail, ImageEdit, ImportWorkerMessage, LayoutMode, Mode, Row,
-        StorageMode, Track, Tui, View, VizMode, WaveformScope, album_edit_form,
+        AlbumTransferPlan, ArtistDeletionPlan, Detail, ImageEdit, ImportWorkerMessage, LayoutMode,
+        Mode, Row, StorageMode, Track, Tui, View, VizMode, WaveformScope, album_edit_form,
         clamp_terminal_size, detail_view_fits, display_width, fit_input_line, help_lines,
         normal_help, pad_with_right, parse_album_edit_form, parse_artist_edit_form,
         parse_release_type, resource_label, terminal_too_small, truncate_to_width,
@@ -4766,6 +5116,13 @@ mod tests {
             artist_deletion: None,
             artist_delete_cursor: 0,
             artist_delete_armed: None,
+            artist_transfer_track: None,
+            artist_transfer_owner: None,
+            artist_owner_cursor: 0,
+            artist_album_cursor: 0,
+            album_transfer: None,
+            album_transfer_cursor: 0,
+            album_transfer_artist_cursor: 0,
             import_album_cursor: 0,
             audio_devices: Vec::new(),
             audio_error: None,
@@ -6565,6 +6922,11 @@ mod tests {
         key(&mut tui, KeyCode::Delete);
         assert_eq!(tui.mode, Mode::ArtistDeletion);
         key(&mut tui, KeyCode::Char('t'));
+        assert_eq!(tui.mode, Mode::ArtistOwnerPick);
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.mode, Mode::ArtistAlbumPick);
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.mode, Mode::ArtistDeletion);
         assert!(
             tui.artist_deletion
                 .as_ref()
@@ -6633,6 +6995,61 @@ mod tests {
             flux_app::ReleaseType::Ep
         );
         key(&mut tui, KeyCode::Esc);
+        tui.controller.shutdown();
+    }
+    #[test]
+    fn tui_album_transfer_selects_destination_and_resolves_credits() {
+        let dir = TempDir::new("tui-album-transfer");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("source/Alpha/Album/01 - Song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, wav_with_sample(5)).expect("wav");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        let alpha = tui.controller.create_artist("Alpha").expect("alpha");
+        let beta = tui.controller.create_artist("Beta").expect("beta");
+        tui.controller
+            .import_files(&[source], false)
+            .expect("import");
+        let album = tui
+            .controller
+            .tracks()
+            .iter()
+            .find_map(|(id, _)| tui.controller.track_album_id(*id))
+            .expect("album");
+        tui.view = View::Albums;
+        tui.detail = Some(Detail::Album(album));
+        key_mod(&mut tui, KeyCode::Char('t'), KeyModifiers::ALT);
+        assert_eq!(tui.mode, Mode::AlbumTransferPick);
+        let artists = tui.album_transfer_artists();
+        tui.album_transfer_artist_cursor = artists
+            .iter()
+            .position(|artist| *artist == beta)
+            .expect("beta destination");
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.mode, Mode::AlbumTransferReview);
+        assert!(
+            tui.album_transfer
+                .as_ref()
+                .is_some_and(|plan| !plan.is_ready()),
+            "destination credit requires an explicit decision"
+        );
+        key(&mut tui, KeyCode::Char('c'));
+        assert!(
+            tui.album_transfer
+                .as_ref()
+                .is_some_and(AlbumTransferPlan::is_ready)
+        );
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.controller.album_owner(album), Some(beta));
+        assert_eq!(
+            tui.controller.track_artist_id(tui.controller.tracks()[0].0),
+            Some(beta)
+        );
+        assert_ne!(alpha, beta);
         tui.controller.shutdown();
     }
 }

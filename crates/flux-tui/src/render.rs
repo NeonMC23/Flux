@@ -76,6 +76,8 @@ impl Tui {
             Mode::TrackMovePick => "move",
             Mode::ArtistDeletion => "delete",
             Mode::ImportAlbumPick => "import",
+            Mode::AlbumTransferPick | Mode::AlbumTransferReview => "transfer",
+            Mode::ArtistOwnerPick | Mode::ArtistAlbumPick => "transfer",
             Mode::ConfirmTrackMove
             | Mode::ConfirmTrackReplacement
             | Mode::ConfirmTrackDelete
@@ -148,6 +150,28 @@ impl Tui {
             Mode::ConfirmTrackDelete => "Confirm track deletion".to_owned(),
             Mode::ConfirmAlbumDelete => "Confirm empty-album deletion".to_owned(),
             Mode::ImportAlbumPick => "Import into an existing album · choose a target".to_owned(),
+            Mode::AlbumTransferPick => "Transfer album · choose a destination artist".to_owned(),
+            Mode::AlbumTransferReview => self
+                .album_transfer
+                .as_ref()
+                .map(|plan| {
+                    format!(
+                        "Transfer album · {} → {} · {} track(s) · {} issue(s)",
+                        self.controller
+                            .artist(plan.from_owner)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| plan.from_owner.to_string()),
+                        self.controller
+                            .artist(plan.to_owner)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| plan.to_owner.to_string()),
+                        plan.tracks.len(),
+                        plan.issues.len()
+                    )
+                })
+                .unwrap_or_else(|| "Album transfer".to_owned()),
+            Mode::ArtistOwnerPick => "Transfer track · choose a surviving owner".to_owned(),
+            Mode::ArtistAlbumPick => "Transfer track · choose an album or create one".to_owned(),
             Mode::ArtistDeletion => self
                 .artist_deletion
                 .as_ref()
@@ -204,6 +228,14 @@ impl Tui {
             self.draw_import_view(out, list_top, detail_height, width)?;
         } else if self.mode == Mode::ImportAlbumPick {
             self.draw_import_album_picker(out, list_top, detail_height, width)?;
+        } else if self.mode == Mode::AlbumTransferPick {
+            self.draw_album_transfer_picker(out, list_top, detail_height, width)?;
+        } else if self.mode == Mode::AlbumTransferReview {
+            self.draw_album_transfer_review(out, list_top, detail_height, width)?;
+        } else if self.mode == Mode::ArtistOwnerPick {
+            self.draw_artist_owner_picker(out, list_top, detail_height, width)?;
+        } else if self.mode == Mode::ArtistAlbumPick {
+            self.draw_artist_album_picker(out, list_top, detail_height, width)?;
         } else if self.mode == Mode::ArtistDeletion {
             self.draw_artist_deletion(out, list_top, detail_height, width)?;
         } else if self.mode == Mode::TrackMovePick {
@@ -258,6 +290,18 @@ impl Tui {
             }
             Mode::ImportAlbumPick => {
                 "Fixed target — ↑/↓ choose album · Enter apply to every candidate · Esc cancel".to_owned()
+            }
+            Mode::AlbumTransferPick => {
+                "Album transfer — ↑/↓ choose destination artist · Enter review · Esc cancel".to_owned()
+            }
+            Mode::AlbumTransferReview => {
+                "Album transfer — ↑/↓ track · c toggle destination credit · y execute when ready · Esc cancel".to_owned()
+            }
+            Mode::ArtistOwnerPick => {
+                "Track transfer — ↑/↓ choose surviving owner · Enter next · Esc cancel".to_owned()
+            }
+            Mode::ArtistAlbumPick => {
+                "Track transfer — ↑/↓ choose album or New album · Enter apply · Esc back".to_owned()
             }
             Mode::ArtistDeletion => {
                 "Artist deletion — ↑/↓ select · t transfer · r remove credit · d delete twice · u reset · a auto · y publish · Esc cancel".to_owned()
@@ -840,6 +884,183 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.artist_delete_cursor {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_album_transfer_picker(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let artists = self.album_transfer_artists();
+        if artists.is_empty() {
+            self.line(
+                out,
+                top as u16,
+                "No other artist is available as a destination.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
+        self.album_transfer_artist_cursor = self
+            .album_transfer_artist_cursor
+            .min(artists.len().saturating_sub(1));
+        for (index, artist) in artists.iter().take(height).enumerate() {
+            let name = self
+                .controller
+                .artist(*artist)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {artist}"));
+            let text = format!(
+                "{} {}",
+                if index == self.album_transfer_artist_cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                name
+            );
+            let y = (top + index) as u16;
+            if index == self.album_transfer_artist_cursor {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_album_transfer_review(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let Some(plan) = self.album_transfer.as_ref() else {
+            return Ok(());
+        };
+        self.album_transfer_cursor = self
+            .album_transfer_cursor
+            .min(plan.tracks.len().saturating_sub(1));
+        for (index, track) in plan.tracks.iter().take(height).enumerate() {
+            let credit = if track.requires_credit {
+                if track.credit_allowed {
+                    "destination credit added"
+                } else {
+                    "destination credit rejected"
+                }
+            } else {
+                "destination already credited"
+            };
+            let text = format!(
+                "{} {} · {} · {}",
+                if index == self.album_transfer_cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                track.title,
+                credit,
+                track.track_id
+            );
+            let y = (top + index) as u16;
+            if index == self.album_transfer_cursor {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_artist_owner_picker(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let Some(track) = self.artist_deletion_track() else {
+            return Ok(());
+        };
+        self.artist_owner_cursor = self
+            .artist_owner_cursor
+            .min(track.eligible_owners.len().saturating_sub(1));
+        for (index, artist) in track.eligible_owners.iter().take(height).enumerate() {
+            let name = self
+                .controller
+                .artist(*artist)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {artist}"));
+            let text = format!(
+                "{} {}",
+                if index == self.artist_owner_cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                name
+            );
+            let y = (top + index) as u16;
+            if index == self.artist_owner_cursor {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_artist_album_picker(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let albums = self.artist_transfer_albums();
+        let count = albums.len() + 1;
+        self.artist_album_cursor = self.artist_album_cursor.min(count.saturating_sub(1));
+        for index in 0..count.min(height) {
+            let text = if let Some((_id, title)) = albums.get(index) {
+                format!(
+                    "{} {}",
+                    if index == self.artist_album_cursor {
+                        ">"
+                    } else {
+                        " "
+                    },
+                    title
+                )
+            } else {
+                format!(
+                    "{} New album…",
+                    if index == self.artist_album_cursor {
+                        ">"
+                    } else {
+                        " "
+                    }
+                )
+            };
+            let y = (top + index) as u16;
+            if index == self.artist_album_cursor {
                 queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
