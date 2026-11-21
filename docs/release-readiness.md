@@ -7,10 +7,11 @@ authorized signing/notarization procedure is in
 
 ## Release blockers
 
-M21 suspended the public release pending renewed product validation. The GUI
-and TUI composition, import review, artwork repair and library navigation were
-redesigned; subjective design quality and real pointer/keyboard interaction
-still require human validation before any public artifact is authorized.
+M21 suspended the public release pending renewed product validation. M22 adds
+canonical schema 2 with explicit Album participation and an automatic schema-1
+upgrade. Synthetic migration, rollback and commit-recovery tests pass, but
+human validation of collaborative Album workflows and real user libraries is
+still required before any public artifact is authorized.
 
 No source, metadata, license, packaging-script or CI blocker was found in this
 development environment.
@@ -28,6 +29,9 @@ for a **public signed release**, not for development validation:
 
 ## Important pre-release improvements
 
+- Schema 2 migration is automatic and transactionally safe, but there is no
+  automatic downgrade after commit. Recovery from a completed upgrade requires
+  the pre-upgrade catalogue backup or an external library copy.
 - Single-track ownership transfer remains GUI-only. Album and Artist transfer
   decisions are available in both frontends.
 - TUI import uses typed paths instead of native file pickers and has no

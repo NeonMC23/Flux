@@ -6,6 +6,36 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M22 canonical multi-artist Albums and schema migration
+
+- Canonical schema 2 adds an explicit, ordered, many-to-many Album participant
+  set while retaining `owner_artist_id` strictly as the physical directory and
+  Track-owner role. Participation is independent of Track credits in both
+  directions, and participant-less Albums remain valid.
+- Schema 1 libraries upgrade atomically on open: every physical owner becomes
+  the initial participant, all version-1 entity files are rewritten as schema 2
+  with unknown JSON fields preserved, and the normal catalogue backup and C1
+  journal provide rollback/roll-forward. Malformed schema-2 participant lists
+  and unsupported versions fail closed.
+- Artist pages now distinguish physical ownership, explicit Album participation
+  and Track-credit-only reachability. Album pages list and navigate every
+  participant and support searchable add/remove without touching tracks, audio,
+  artwork or credits.
+- Import review supports collaborative Albums: existing participants are
+  preserved, additional participants can be added, and selecting a participant-
+  owned Album changes only the physical Track owner while keeping the selected
+  Artist credited. Album selection is now filterable.
+- Artist deletion no longer cascades shared Albums: participant-only Artists are
+  removed from associations without deleting releases, owned shared Albums
+  require ownership transfer first, and owned Albums require explicit deletion
+  confirmation. Resource cleanup remains post-commit and reference-safe.
+- TUI Album detail exposes `Alt+p` participant navigation/editing with explicit
+  removal confirmation, and Artist views include participating Albums.
+- Added migration fixtures/tests for empty libraries, duplicate Artist names,
+  collaborative credits, empty participant sets, interrupted/committed
+  migration recovery, unknown-field preservation, participant editing, import
+  into collaborative Albums, shared-Album deletion safety and GUI/TUI workflows.
+
 ### M21 product redesign and library trust
 
 - Embedded artwork is now extracted read-only as a bounded import suggestion

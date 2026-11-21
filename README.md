@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: public release suspended pending M21 product validation.** Signing and native/manual validation remain external.
+**Status: public release suspended pending M22 product validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -24,10 +24,13 @@ and the real-time oscilloscope continue to use the same engine. Managed album
 and artist artwork plus optional per-Track artwork overrides are decoded and
 displayed throughout the library. Artists and Albums are first-class editable
 entities with detail pages, relationships and navigation to their Tracks.
-The current collaboration model is documented in
-[`docs/library-architecture-decision.md`](docs/library-architecture-decision.md):
-an Album has one physical owner, while ordered Track credits expose shared
-releases to every participating Artist.
+Canonical schema 2 gives every Album an explicit ordered participant set in
+addition to its physical owner. Participation is independent of Track credits;
+collaborative releases are one Album entity with one cover, order and audio set,
+reachable from every participant, physical owner and credited Artist. Schema 1
+libraries upgrade atomically on open. The full model, migration and deletion
+semantics are documented in
+[`docs/library-architecture-decision.md`](docs/library-architecture-decision.md).
 Album membership is optional: standalone Tracks, singles and incomplete imports
 remain fully functional without a placeholder Album. Import review supports
 multi-candidate selection, shared Artist/Album assignment and shared Album
@@ -63,9 +66,9 @@ selects or writes those backends.
 | Crate | Kind | Responsibility |
 |---|---|---|
 | `flux-core` | library | Backend-independent domain model: tracks, IDs, sources, the play queue with stable per-entry identities (duplicates allowed), repeat/playback states, and the shared error type. No UI, filesystem, database, audio-device, or network implementation. |
-| `flux-library` | library | Canonical self-contained library engine: stable artist/album/track/playlist IDs, relative managed paths, per-entity `.flux` metadata, transaction journal, copy verification, playlists/ratings/lyrics, album/artist images, per-Track artwork overrides, atomic enriched imports, and isolated migration from legacy/schema-v3 sources. The older in-memory scanner and portable store remain for compatibility tests and migration inventory. |
+| `flux-library` | library | Canonical self-contained library engine: stable artist/album/track/playlist IDs, explicit multi-Artist Album participation, schema-1 to schema-2 migration, relative managed paths, per-entity `.flux` metadata, transaction journal, copy verification, playlists/ratings/lyrics, album/artist images, per-Track artwork overrides, atomic enriched imports, and isolated migration from legacy/schema-v3 sources. The older in-memory scanner and portable store remain for compatibility tests and migration inventory. |
 | `flux-audio` | library | Playback, in two strictly separate layers: `Player`, the pure playback-control state machine and single authority for playback decisions; and a threaded engine that decodes WAV (hound), FLAC (claxon), MP3 (rmp3/minimp3), AAC in ADTS streams and MP4/M4A files (rusty_aac with the mp4 demuxer), and Ogg Vorbis and Opus (lewton and opus-pure over the ogg demuxer) on a worker thread and feeds an output backend (device-free `NullOutput`, or CPAL behind the non-default `cpal` feature) through a lock-free ring buffer. |
-| `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, enriched import review, duplicate decisions, copy-only publication, artist/album/track edits, owned/credited relationships, playlist management, lyrics parsing/editing/import/export APIs, playlists/ratings/lyrics persistence, and the canonical migration workflow. Both front-ends use this one controller. |
+| `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, enriched import review, duplicate decisions, copy-only publication, artist/album/track edits, owned/participating/credited relationships, playlist management, lyrics parsing/editing/import/export APIs, playlists/ratings/lyrics persistence, and the canonical migration workflow. Both front-ends use this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). Dialog output preserves spaces and Unix non-UTF-8 path bytes; Windows PowerShell output is forced to UTF-8. |
 | `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, enriched artwork/lyrics attachment, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, dedicated Artist and Album detail pages, metadata/relationship/artwork editing, reviewed track move/audio replacement, decoded managed Album/Artist/Track artwork with override semantics, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart collections/rating controls, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
@@ -173,11 +176,13 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   UTF-8 export with overwrite confirmation, and a karaoke view. The player has a
   Lyrics entry point and can follow current playback without changing audio.
   Artist and album views group canonical stable identities. An Artist detail
-  page edits display name, description and managed image, lists owned and
-  credited Albums plus related Tracks, and navigates directly to those entities.
-  Album detail edits title/release metadata and cover artwork, shows owner and
-  ordered membership, and supports reorder, fixed-target import, transfer and
-  safe empty deletion. The Albums view includes a **Standalone tracks** group for
+  page edits display name, description and managed image, lists physically
+  owned, explicitly participating and Track-credit-only Albums plus related
+  Tracks, and navigates directly to those entities. Album detail edits
+  title/release metadata and cover artwork, shows the physical owner, every
+  participating Artist and ordered membership, and supports searchable
+  participant add/remove, reorder, fixed-target import, transfer and safe empty
+  deletion. The Albums view includes a **Standalone tracks** group for
   Tracks with no Album. Track editing can add a standalone Track to an Album,
   move a member between Albums owned by the same Artist, convert a member to
   standalone while retaining the Track and its empty source Album, correct
@@ -237,7 +242,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   `F1`–`F7` open Tracks, Artists, Albums, Playlists, Collections, Lyrics and
   Settings. Enter opens artists, albums and playlists; Esc returns; `/` searches
   the current view. Track, artist and album editing uses prefilled labelled
-  forms rather than delimiter syntax. Queue, playlist, lyrics, favorite, rating,
+  forms rather than delimiter syntax. Album detail exposes `Alt+p` participant
+  navigation and editing with explicit removal confirmation. Queue, playlist, lyrics, favorite, rating,
   history, import, library lifecycle and audio-device workflows remain available.
   Album tracks reorder in place and tracks can move between albums or to
   standalone state; track deletion, empty-album deletion and populated artist
@@ -280,9 +286,12 @@ and are not required for a normal import.
 - **Advanced Options:** edit ordered credits, add existing or named artists,
   remove/reorder credits, and choose the physical owner from the credits; the
   first credit is the default owner;
-- choose an existing stable Artist in the primary review, or use
-  **Advanced Options** to select an existing Album owned by that Artist, create
-  a new Album by title, or leave Album empty for a standalone Track;
+- choose an existing stable Artist in the primary review, then filter and select
+  an existing Album owned by or associated with that Artist, create a new Album
+  by title, or leave Album empty for a standalone Track;
+- add or remove Album participants independently of Track credits. Selecting a
+  collaborative Album owned by another participant stores the Track under the
+  Album's physical owner while retaining the selected Artist's credit;
   case/whitespace-normalized unique matches are reused, while ambiguous or
   merely similar names are never merged automatically;
 - **Advanced Options:** check multiple candidates and apply one existing Artist
