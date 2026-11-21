@@ -1938,6 +1938,9 @@ struct ImportManager {
     edit_credit: String,
     edit_album: String,
     edit_release_type: ReleaseType,
+    album_filter: String,
+    album_participant_filter: String,
+    album_participant_choice: Option<ArtistChoice>,
     edit_track_number: String,
     edit_disc_number: String,
     edit_artwork: String,
@@ -1982,6 +1985,9 @@ impl ImportManager {
             edit_credit: String::new(),
             edit_album: String::new(),
             edit_release_type: ReleaseType::Album,
+            album_filter: String::new(),
+            album_participant_filter: String::new(),
+            album_participant_choice: None,
             edit_track_number: String::new(),
             edit_disc_number: String::new(),
             edit_artwork: String::new(),
@@ -2065,6 +2071,9 @@ impl ImportManager {
         self.edit_credit.clear();
         self.edit_album = candidate.album().unwrap_or_default().to_owned();
         self.edit_release_type = candidate.release_type();
+        self.album_filter.clear();
+        self.album_participant_filter.clear();
+        self.album_participant_choice = None;
         self.edit_track_number = candidate
             .track_number()
             .map(|number| number.to_string())
@@ -2165,6 +2174,9 @@ struct FluxReady {
     new_album_type: ReleaseType,
     album_title_input: String,
     album_type: ReleaseType,
+    album_participants: Vec<ArtistId>,
+    album_participant_filter: String,
+    album_participant_choice: Option<ArtistChoice>,
     album_cover_input: String,
     album_cover_picked: Option<PathBuf>,
     album_cover_preview: Option<ImageHandle>,
@@ -2258,6 +2270,7 @@ enum Message {
     ArtistDeletionSetDelete,
     ArtistDeletionSetRemoveCredit,
     ArtistDeletionResetDecision,
+    ArtistDeletionToggleDeleteAlbums(bool),
     ArtistDeletionExecute,
     ArtistDeletionCommit,
     ArtistDeletionCancel,
@@ -2272,6 +2285,10 @@ enum Message {
     NewAlbumType(ReleaseType),
     AlbumTitleChanged(String),
     AlbumType(ReleaseType),
+    AlbumParticipantFilterChanged(String),
+    AlbumParticipantPicked(Option<ArtistChoice>),
+    AlbumParticipantAdd,
+    AlbumParticipantRemove(ArtistId),
     AlbumMetadataSave,
     AlbumCoverChanged(String),
     AlbumCoverChoose,
@@ -2363,6 +2380,11 @@ enum Message {
     ImportAlbumChanged(String),
     ImportReleaseTypeChanged(ReleaseType),
     ImportAlbumPicked(Option<AlbumChoice>),
+    ImportAlbumFilterChanged(String),
+    ImportAlbumParticipantFilterChanged(String),
+    ImportAlbumParticipantPicked(Option<ArtistChoice>),
+    ImportAlbumParticipantAdd,
+    ImportAlbumParticipantRemove(ArtistId),
     ImportTrackNumberChanged(String),
     ImportDiscNumberChanged(String),
     ImportArtistPicked(Option<ArtistChoice>),
@@ -2653,6 +2675,9 @@ impl FluxReady {
             new_album_type: ReleaseType::Album,
             album_title_input: String::new(),
             album_type: ReleaseType::Album,
+            album_participants: Vec::new(),
+            album_participant_filter: String::new(),
+            album_participant_choice: None,
             album_cover_input: String::new(),
             album_cover_picked: None,
             album_cover_preview: None,
@@ -2751,6 +2776,9 @@ impl FluxReady {
         self.artist_rename_input.clear();
         self.new_album_title.clear();
         self.album_title_input.clear();
+        self.album_participants.clear();
+        self.album_participant_filter.clear();
+        self.album_participant_choice = None;
         self.album_cover_input.clear();
         self.album_cover_picked = None;
         self.album_cover_preview = None;
@@ -2968,6 +2996,19 @@ impl FluxReady {
         }
     }
 
+    fn album_participant_choices(&self) -> Vec<ArtistChoice> {
+        let filter = self.album_participant_filter.trim().to_lowercase();
+        self.artist_choices()
+            .into_iter()
+            .filter(|choice| {
+                choice
+                    .id
+                    .is_some_and(|id| !self.album_participants.contains(&id))
+            })
+            .filter(|choice| filter.is_empty() || choice.label.to_lowercase().contains(&filter))
+            .collect()
+    }
+
     fn editor_artist_choices(&self) -> Vec<ArtistChoice> {
         let mut choices = vec![ArtistChoice {
             id: None,
@@ -3059,6 +3100,9 @@ impl FluxReady {
         };
         self.album_title_input = album.title;
         self.album_type = album.release_type;
+        self.album_participants = self.controller.album_participants(album_id);
+        self.album_participant_filter.clear();
+        self.album_participant_choice = None;
         self.album_cover_input.clear();
         self.album_cover_picked = None;
         self.album_cover_preview = None;
@@ -3198,10 +3242,23 @@ impl FluxReady {
         self.controller
             .albums()
             .into_iter()
-            .filter(|album| album.owner_artist_id == owner)
+            .filter(|album| {
+                album.owner_artist_id == owner || album.participant_artist_ids.contains(&owner)
+            })
             .map(|album| AlbumChoice {
                 id: album.id,
-                label: self.album_choice_label(album.id, &album.title, album.owner_artist_id),
+                label: if album.owner_artist_id == owner {
+                    self.album_choice_label(album.id, &album.title, album.owner_artist_id)
+                } else {
+                    format!(
+                        "{} · owned by {}",
+                        self.album_choice_label(album.id, &album.title, album.owner_artist_id),
+                        self.controller
+                            .artist(album.owner_artist_id)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id))
+                    )
+                },
             })
             .collect()
     }
@@ -4621,6 +4678,12 @@ impl FluxReady {
                     }
                 }
             }
+            Message::ArtistDeletionToggleDeleteAlbums(confirmed) => {
+                if let Some(manager) = self.deletion_manager.as_mut() {
+                    manager.plan.set_delete_owned_albums(confirmed);
+                    manager.error = None;
+                }
+            }
             Message::ArtistDeletionResetDecision => {
                 if let Some(manager) = self.deletion_manager.as_mut()
                     && let Some(id) = manager.selected
@@ -4791,6 +4854,50 @@ impl FluxReady {
             Message::NewAlbumType(kind) => self.new_album_type = kind,
             Message::AlbumTitleChanged(value) => self.album_title_input = value,
             Message::AlbumType(kind) => self.album_type = kind,
+            Message::AlbumParticipantFilterChanged(value) => {
+                self.album_participant_filter = value;
+            }
+            Message::AlbumParticipantPicked(choice) => {
+                self.album_participant_choice = choice;
+            }
+            Message::AlbumParticipantAdd => {
+                let Some(album_id) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                let Some(artist) = self.album_participant_choice.as_ref().and_then(|c| c.id) else {
+                    self.lifecycle_msg = Some("Choose an artist to add.".to_owned());
+                    return Task::none();
+                };
+                match self.controller.add_album_participant(album_id, artist) {
+                    Ok(()) => {
+                        self.sync_album_editor();
+                        let name = self
+                            .controller
+                            .artist(artist)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| format!("artist {artist}"));
+                        self.lifecycle_msg = Some(format!(
+                            "Added {name} to the Album's participants. Track credits are unchanged."
+                        ));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            Message::AlbumParticipantRemove(artist) => {
+                let Some(album_id) = self.selected_album_id() else {
+                    return Task::none();
+                };
+                match self.controller.remove_album_participant(album_id, artist) {
+                    Ok(()) => {
+                        self.sync_album_editor();
+                        self.lifecycle_msg = Some(
+                            "Removed the Album participant. The Album, its tracks and Track credits are unchanged."
+                                .to_owned(),
+                        );
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
             Message::AlbumMetadataSave => {
                 let Some(album) = self.selected_album_id() else {
                     return Task::none();
@@ -6039,11 +6146,33 @@ impl FluxReady {
                     && let Some(candidate) = plan.candidates.get_mut(index)
                 {
                     if candidate.artist_id() != Some(album.owner_artist_id) {
-                        manager.asset_error = Some(
-                            "That existing Album belongs to a different owner Artist. Select that Artist first."
-                                .to_owned(),
-                        );
-                        return Task::none();
+                        // Physical tracks live under the Album's owner. A
+                        // participant may import into the shared Album by
+                        // retaining their own credit while the owner is the
+                        // physical owner.
+                        let owner_name = self
+                            .controller
+                            .artist(album.owner_artist_id)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+                        let owner_index = candidate
+                            .credits()
+                            .iter()
+                            .position(|credit| credit.artist_id == Some(album.owner_artist_id))
+                            .unwrap_or_else(|| {
+                                candidate.add_credit(flux_app::ImportCredit::new(
+                                    Some(album.owner_artist_id),
+                                    owner_name,
+                                    false,
+                                ));
+                                candidate.credits().len() - 1
+                            });
+                        if !candidate.set_owner_index(owner_index) {
+                            manager.asset_error = Some(
+                                "Could not select the Album owner as physical owner.".to_owned(),
+                            );
+                            return Task::none();
+                        }
                     }
                     candidate.set_album(Some(album.title.clone()));
                     manager.edit_album = album.title;
@@ -6086,6 +6215,49 @@ impl FluxReady {
                         }
                         Err(error) => manager.number_error = Some(error),
                     }
+                }
+            }
+            Message::ImportAlbumFilterChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.album_filter = value;
+                }
+            }
+            Message::ImportAlbumParticipantFilterChanged(value) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.album_participant_filter = value;
+                }
+            }
+            Message::ImportAlbumParticipantPicked(choice) => {
+                if let Some(manager) = self.import_manager.as_mut() {
+                    manager.album_participant_choice = choice;
+                }
+            }
+            Message::ImportAlbumParticipantAdd => {
+                let artist = self
+                    .import_manager
+                    .as_ref()
+                    .and_then(|manager| manager.album_participant_choice.as_ref())
+                    .and_then(|choice| choice.id);
+                let Some(artist) = artist else {
+                    return Task::none();
+                };
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(plan) = manager.plan.as_mut()
+                    && let Some(index) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    candidate.add_album_participant(artist);
+                    manager.album_participant_choice = None;
+                    manager.asset_error = None;
+                }
+            }
+            Message::ImportAlbumParticipantRemove(artist) => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && let Some(plan) = manager.plan.as_mut()
+                    && let Some(index) = manager.selected
+                    && let Some(candidate) = plan.candidates.get_mut(index)
+                {
+                    candidate.remove_album_participant(artist);
                 }
             }
             Message::ImportArtistPicked(choice) => {
@@ -8603,6 +8775,75 @@ impl FluxReady {
                 .color(DANGER),
             );
         }
+        if !manager.plan.shared_owned_albums.is_empty() {
+            let titles = manager
+                .plan
+                .albums
+                .iter()
+                .filter(|album| manager.plan.shared_owned_albums.contains(&album.id))
+                .map(|album| album.title.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            panel = panel.push(
+                text(format!(
+                    "Transfer ownership of shared Album(s) before deleting this Artist: {titles}."
+                ))
+                .size(10)
+                .color(DANGER),
+            );
+        }
+        if !manager.plan.owned_albums.is_empty() {
+            panel = panel.push(
+                container(
+                    row![
+                        column![
+                            text(format!(
+                                "{} owned Album(s) have no other participants",
+                                manager.plan.owned_albums.len()
+                            ))
+                            .size(10)
+                            .color(TEXT),
+                            text("They can only be removed with explicit confirmation. Shared Albums are never deleted here.")
+                                .size(9)
+                                .color(MUTED),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(
+                            text(if manager.plan.delete_owned_albums {
+                                "Keep Albums"
+                            } else {
+                                "Delete owned Albums"
+                            })
+                            .size(9)
+                        )
+                        .style(if manager.plan.delete_owned_albums {
+                            danger_button_style
+                        } else {
+                            ghost_style
+                        })
+                        .padding([5, 8])
+                        .on_press(Message::ArtistDeletionToggleDeleteAlbums(
+                            !manager.plan.delete_owned_albums
+                        )),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding(9)
+                .style(card_style),
+            );
+        }
+        if !manager.plan.participant_albums.is_empty() {
+            panel = panel.push(
+                text(format!(
+                    "{} shared Album participation association(s) will be removed; the Albums and their audio remain.",
+                    manager.plan.participant_albums.len()
+                ))
+                .size(9)
+                .color(MUTED),
+            );
+        }
         if let Some(error) = &manager.error {
             panel = panel.push(text(error).size(10).color(DANGER));
         }
@@ -8646,9 +8887,10 @@ impl FluxReady {
         panel = panel.push(
             row![
                 text(format!(
-                    "{} explicit deletion(s) · {} album(s) will be removed",
+                    "{} explicit deletion(s) · {} owned album(s) selected for removal · {} participation association(s)",
                     manager.plan.deleted_track_ids().len(),
-                    manager.plan.albums.len()
+                    manager.plan.owned_albums.len(),
+                    manager.plan.participant_albums.len()
                 ))
                 .size(9)
                 .color(MUTED)
@@ -9661,17 +9903,35 @@ impl FluxReady {
                 ]
                 .spacing(6),
             );
-            let album_choices = self.import_album_choices(candidate);
-            if !album_choices.is_empty() {
+            let all_album_choices = self.import_album_choices(candidate);
+            if !all_album_choices.is_empty() {
+                let album_filter = manager.album_filter.trim().to_lowercase();
                 body = body.push(
-                    pick_list(album_choices, None::<AlbumChoice>, |choice| {
-                        Message::ImportAlbumPicked(Some(choice))
-                    })
-                    .placeholder("Or choose an existing album…")
-                    .text_size(10)
-                    .padding([5, 7])
-                    .width(Length::Fill),
+                    text_input("Filter albums…", &manager.album_filter)
+                        .on_input(Message::ImportAlbumFilterChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
                 );
+                let album_choices = all_album_choices
+                    .into_iter()
+                    .filter(|choice| {
+                        album_filter.is_empty()
+                            || choice.label.to_lowercase().contains(&album_filter)
+                    })
+                    .collect::<Vec<_>>();
+                if !album_choices.is_empty() {
+                    body = body.push(
+                        pick_list(album_choices, None::<AlbumChoice>, |choice| {
+                            Message::ImportAlbumPicked(Some(choice))
+                        })
+                        .placeholder("Or choose an existing album…")
+                        .text_size(10)
+                        .padding([5, 7])
+                        .width(Length::Fill),
+                    );
+                } else {
+                    body = body.push(text("No Album matches that filter.").size(9).color(MUTED));
+                }
             }
         }
 
@@ -9919,6 +10179,123 @@ impl FluxReady {
                     candidate.release_type(),
                     Message::ImportReleaseTypeChanged,
                 ));
+            }
+
+            if candidate.album().is_some() {
+                let album_title = candidate.album().unwrap_or_default().trim();
+                let owner = candidate.artist_id();
+                let existing_album = owner.and_then(|owner| {
+                    self.controller
+                        .albums_owned_by(owner)
+                        .into_iter()
+                        .find(|id| {
+                            self.controller
+                                .album(*id)
+                                .is_some_and(|album| album.title.eq_ignore_ascii_case(album_title))
+                        })
+                });
+                let mut participant_ids = existing_album
+                    .map(|id| self.controller.album_participants(id))
+                    .unwrap_or_default();
+                for participant in candidate.album_participants() {
+                    if !participant_ids.contains(participant) {
+                        participant_ids.push(*participant);
+                    }
+                }
+                let mut participant_rows = column![].spacing(2);
+                if participant_ids.is_empty() {
+                    participant_rows = participant_rows.push(
+                        text("The physical owner becomes the initial participant when this Album is created.")
+                            .size(9)
+                            .color(MUTED),
+                    );
+                } else {
+                    for participant in &participant_ids {
+                        let name = self
+                            .controller
+                            .artist(*participant)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| format!("Artist {participant}"));
+                        let added = candidate.album_participants().contains(participant);
+                        participant_rows = participant_rows.push(
+                            row![
+                                button(text(name).size(10))
+                                    .style(ghost_style)
+                                    .padding([3, 6])
+                                    .on_press(Message::ImportOpenExistingArtist(*participant)),
+                                if owner == Some(*participant) {
+                                    text("owner").size(8).color(MUTED)
+                                } else if added {
+                                    text("added").size(8).color(ACCENT)
+                                } else {
+                                    text("existing").size(8).color(MUTED)
+                                },
+                                iced::widget::Space::new().width(Length::Fill),
+                                if added {
+                                    Element::from(
+                                        button(text("Remove").size(9))
+                                            .style(ghost_style)
+                                            .padding([2, 6])
+                                            .on_press(Message::ImportAlbumParticipantRemove(
+                                                *participant,
+                                            )),
+                                    )
+                                } else {
+                                    Element::from(iced::widget::Space::new().height(0))
+                                },
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        );
+                    }
+                }
+                let filter = manager.album_participant_filter.trim().to_lowercase();
+                let choices = self
+                    .artist_choices()
+                    .into_iter()
+                    .filter(|choice| choice.id.is_some_and(|id| !participant_ids.contains(&id)))
+                    .filter(|choice| {
+                        filter.is_empty() || choice.label.to_lowercase().contains(&filter)
+                    })
+                    .collect::<Vec<_>>();
+                body = body.push(
+                    container(
+                        column![
+                            text("ALBUM PARTICIPANTS").size(8).color(MUTED),
+                            text("Album participation is independent of Track credits. Existing participants are preserved; adding one never duplicates the Album or audio.")
+                                .size(8)
+                                .color(MUTED),
+                            participant_rows,
+                            row![
+                                text_input(
+                                    "Filter Artists…",
+                                    &manager.album_participant_filter
+                                )
+                                .on_input(Message::ImportAlbumParticipantFilterChanged)
+                                .style(input_style)
+                                .width(Length::Fixed(170.0)),
+                                pick_list(
+                                    choices,
+                                    manager.album_participant_choice.clone(),
+                                    |choice| Message::ImportAlbumParticipantPicked(Some(choice)),
+                                )
+                                .placeholder("Add participating Artist…")
+                                .text_size(10)
+                                .padding([4, 6])
+                                .width(Length::Fill),
+                                button(text("Add").size(9))
+                                    .style(ghost_style)
+                                    .padding([4, 7])
+                                    .on_press(Message::ImportAlbumParticipantAdd),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        ]
+                        .spacing(4),
+                    )
+                    .padding(8)
+                    .style(card_style),
+                );
             }
 
             body = body.push(
@@ -10594,8 +10971,12 @@ impl FluxReady {
                 .artist(artist_id)
                 .map(|artist| artist.name().to_owned())
                 .unwrap_or_else(|| format!("Artist {artist_id}"));
-            let albums = self.controller.albums_owned_by(artist_id).len()
-                + self.controller.albums_credited_for(artist_id).len();
+            let mut associated = self.controller.albums_owned_by(artist_id);
+            associated.extend(self.controller.albums_participating_for(artist_id));
+            associated.extend(self.controller.albums_credited_for(artist_id));
+            associated.sort_by_key(|id| id.get());
+            associated.dedup();
+            let albums = associated.len();
             (
                 name,
                 format!("Artist detail · {albums} album association(s) · artist {artist_id}"),
@@ -11964,7 +12345,21 @@ impl FluxReady {
                 if album_id == "none" {
                     format!("{count} standalone track(s) · no Album membership")
                 } else {
-                    format!("{count} track(s) · album {album_id}")
+                    let album = album_id
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|id| self.controller.album(AlbumId::new(id)));
+                    match album {
+                        Some(album) => format!(
+                            "{count} track(s) · {} participant(s) · owner {}",
+                            album.participant_artist_ids.len(),
+                            self.controller
+                                .artist(album.owner_artist_id)
+                                .map(|artist| artist.name().to_owned())
+                                .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id))
+                        ),
+                        None => format!("{count} track(s) · album {album_id}"),
+                    }
                 }
             } else {
                 format!("{count} track(s)")
@@ -14808,6 +15203,7 @@ impl FluxReady {
                 .into();
         };
         let mut album_ids = self.controller.albums_owned_by(artist_id);
+        album_ids.extend(self.controller.albums_participating_for(artist_id));
         album_ids.extend(self.controller.albums_credited_for(artist_id));
         album_ids.sort_by_key(|id| id.get());
         album_ids.dedup();
@@ -14991,14 +15387,22 @@ impl FluxReady {
                             column![
                                 text(album.title.clone()).size(12).color(TEXT),
                                 text(format!(
-                                    "{} · {} track(s) · owner {}",
+                                    "{} · {} track(s) · {}",
                                     release_type_label(album.release_type),
                                     album.track_order.len(),
-                                    self.controller
-                                        .album_owner(album_id)
-                                        .and_then(|owner| self.controller.artist(owner))
-                                        .map(|owner| owner.name().to_owned())
-                                        .unwrap_or_else(|| "unknown".to_owned())
+                                    if album.owner_artist_id == artist_id {
+                                        "physical owner".to_owned()
+                                    } else if album.participant_artist_ids.contains(&artist_id) {
+                                        format!(
+                                            "participating · owner {}",
+                                            self.controller
+                                                .artist(album.owner_artist_id)
+                                                .map(|owner| owner.name().to_owned())
+                                                .unwrap_or_else(|| "unknown".to_owned())
+                                        )
+                                    } else {
+                                        "track credits only".to_owned()
+                                    }
                                 ))
                                 .size(9)
                                 .color(MUTED),
@@ -15106,9 +15510,10 @@ impl FluxReady {
                 column![
                     text(album.title.clone()).size(22).color(TEXT),
                     text(format!(
-                        "AlbumId {} · owner {} · {} · {} track(s) · cover {}",
+                        "AlbumId {} · owner {} · {} participant(s) · {} · {} track(s) · cover {}",
                         album.id,
                         owner,
+                        album.participant_artist_ids.len(),
                         release_type_label(album.release_type),
                         album.track_order.len(),
                         if album.cover.is_some() {
@@ -15172,6 +15577,84 @@ impl FluxReady {
                     row![
                         text("RELEASE TYPE").size(8).color(MUTED),
                         release_type_buttons(self.album_type, Message::AlbumType),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .style(card_style),
+        );
+        let mut participant_rows = column![].spacing(2);
+        if self.album_participants.is_empty() {
+            participant_rows = participant_rows.push(
+                text(
+                    "No Artists are associated with this Album. The Album remains a valid entity.",
+                )
+                .size(10)
+                .color(MUTED),
+            );
+        } else {
+            for participant in &self.album_participants {
+                let name = self
+                    .controller
+                    .artist(*participant)
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| format!("Artist {participant}"));
+                participant_rows = participant_rows.push(
+                    row![
+                        button(text(name).size(10))
+                            .style(ghost_style)
+                            .padding([4, 7])
+                            .on_press(Message::OpenArtist(*participant)),
+                        if *participant == album.owner_artist_id {
+                            text("physical owner").size(8).color(MUTED)
+                        } else {
+                            text("").size(8)
+                        },
+                        iced::widget::Space::new().width(Length::Fill),
+                        button(text("Remove").size(9))
+                            .style(ghost_style)
+                            .padding([3, 6])
+                            .on_press(Message::AlbumParticipantRemove(*participant)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+        let participant_choices = self.album_participant_choices();
+        let participant_picker = pick_list(
+            participant_choices,
+            self.album_participant_choice.clone(),
+            |choice| Message::AlbumParticipantPicked(Some(choice)),
+        )
+        .placeholder("Choose an existing Artist…")
+        .text_size(10)
+        .padding([5, 7])
+        .width(Length::Fill);
+        body = body.push(
+            container(
+                column![
+                    text("ALBUM PARTICIPANTS").size(9).color(ACCENT),
+                    text("Album participation is independent of track-level credits. Removing an Artist never deletes the Album or its audio.")
+                        .size(9)
+                        .color(MUTED),
+                    participant_rows,
+                    row![
+                        text_input(
+                            "Filter Artists…",
+                            &self.album_participant_filter
+                        )
+                        .on_input(Message::AlbumParticipantFilterChanged)
+                        .style(input_style)
+                        .width(Length::Fixed(190.0)),
+                        participant_picker,
+                        button(text("Add").size(10))
+                            .style(accent_button_style)
+                            .padding([5, 9])
+                            .on_press(Message::AlbumParticipantAdd),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -17293,6 +17776,9 @@ mod tests {
             new_album_type: ReleaseType::Album,
             album_title_input: String::new(),
             album_type: ReleaseType::Album,
+            album_participants: Vec::new(),
+            album_participant_filter: String::new(),
+            album_participant_choice: None,
             album_cover_input: String::new(),
             album_cover_picked: None,
             album_cover_preview: None,
@@ -18886,6 +19372,176 @@ mod tests {
     }
 
     #[test]
+    fn importing_into_a_collaborative_album_keeps_the_physical_owner_and_participant_credit() {
+        let dir = TempDir::new("gui-collaborative-import");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("Beta/Single");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("Song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let alpha = gui.controller.create_artist("Alpha").expect("alpha");
+        let beta = gui.controller.create_artist("Beta").expect("beta");
+        let album = gui
+            .controller
+            .create_album(alpha, "Shared", ReleaseType::Album)
+            .expect("album");
+        gui.controller
+            .set_album_participants(album, &[alpha, beta])
+            .expect("participants");
+        open_gui_import_review(&mut gui, vec![source]);
+        send(
+            &mut gui,
+            Message::ImportArtistPicked(Some(ArtistChoice {
+                id: Some(beta),
+                label: "Beta".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::ImportAlbumChanged("Shared".to_owned()));
+        send(
+            &mut gui,
+            Message::ImportAlbumPicked(Some(AlbumChoice {
+                id: album,
+                label: "Shared · owned by Alpha".to_owned(),
+            })),
+        );
+        let plan = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.clone())
+            .expect("plan");
+        let candidate = &plan.candidates[0];
+        assert_eq!(
+            candidate.artist_id(),
+            Some(alpha),
+            "the Album's physical owner becomes the Track owner"
+        );
+        assert!(
+            candidate
+                .credits()
+                .iter()
+                .any(|credit| credit.artist_id == Some(beta)),
+            "the selected participant remains credited"
+        );
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
+        let track = gui.controller.tracks()[0].0;
+        assert_eq!(gui.controller.track_album_id(track), Some(album));
+        assert_eq!(gui.controller.track_artist_id(track), Some(alpha));
+        assert!(gui.controller.track_credits(track).contains(&beta));
+        assert_eq!(
+            gui.controller.album_participants(album),
+            vec![alpha, beta],
+            "the shared Album is reused without duplication"
+        );
+        assert_eq!(gui.controller.albums().len(), 1);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn album_detail_participants_can_be_added_and_removed_without_touching_tracks() {
+        let dir = TempDir::new("gui-album-participants");
+        let root = dir.path().join("library");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let alpha = gui.controller.create_artist("Alpha").expect("alpha");
+        let beta = gui.controller.create_artist("Beta").expect("beta");
+        let album = gui
+            .controller
+            .create_album(alpha, "Shared", ReleaseType::Album)
+            .expect("album");
+        send(&mut gui, Message::SearchNavigateAlbum(album));
+        assert_eq!(gui.selected_album_id(), Some(album));
+        assert_eq!(gui.controller.album_participants(album), vec![alpha]);
+
+        send(
+            &mut gui,
+            Message::AlbumParticipantPicked(Some(ArtistChoice {
+                id: Some(beta),
+                label: "Beta".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::AlbumParticipantAdd);
+        assert_eq!(gui.controller.album_participants(album), vec![alpha, beta]);
+        assert!(gui.controller.album(album).is_some());
+        let _ = gui.album_detail_view(album);
+
+        send(&mut gui, Message::AlbumParticipantRemove(beta));
+        assert_eq!(gui.controller.album_participants(album), vec![alpha]);
+        assert!(
+            gui.controller.album(album).is_some(),
+            "removing a participant never deletes the Album"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn import_review_adds_album_participants_independently_from_track_credits() {
+        let dir = TempDir::new("gui-import-participants");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("Alpha/Album");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("Song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let alpha = gui.controller.create_artist("Alpha").expect("alpha");
+        let beta = gui.controller.create_artist("Beta").expect("beta");
+        let album = gui
+            .controller
+            .create_album(alpha, "Album", ReleaseType::Album)
+            .expect("album");
+        gui.controller
+            .set_album_participants(album, &[alpha])
+            .expect("participants");
+        open_gui_import_review(&mut gui, vec![source]);
+        send(
+            &mut gui,
+            Message::ImportArtistPicked(Some(ArtistChoice {
+                id: Some(alpha),
+                label: "Alpha".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::ImportAlbumChanged("Album".to_owned()));
+        send(
+            &mut gui,
+            Message::ImportAlbumPicked(Some(AlbumChoice {
+                id: album,
+                label: "Album".to_owned(),
+            })),
+        );
+        send(
+            &mut gui,
+            Message::ImportAlbumParticipantPicked(Some(ArtistChoice {
+                id: Some(beta),
+                label: "Beta".to_owned(),
+            })),
+        );
+        send(&mut gui, Message::ImportAlbumParticipantAdd);
+        let plan = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.clone())
+            .expect("plan");
+        assert_eq!(plan.candidates[0].album_participants(), &[beta]);
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
+        assert_eq!(
+            gui.controller.album_participants(album),
+            vec![alpha, beta],
+            "existing participants are preserved and the new association is added"
+        );
+        assert_eq!(gui.controller.tracks().len(), plan.candidates.len());
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn track_menu_routes_related_entities_and_playback_actions() {
         let dir = TempDir::new("gui-track-menu");
         let root = dir.path().join("library");
@@ -20053,6 +20709,7 @@ mod tests {
         send(&mut gui, Message::ArtistDeletionSetDelete);
         send(&mut gui, Message::ArtistDeletionSelect(guest));
         send(&mut gui, Message::ArtistDeletionSetRemoveCredit);
+        send(&mut gui, Message::ArtistDeletionToggleDeleteAlbums(true));
         let plan = gui.deletion_manager.as_ref().expect("manager").plan.clone();
         assert!(plan.is_ready(), "{:?}", plan.issues);
         send(&mut gui, Message::ArtistDeletionExecute);

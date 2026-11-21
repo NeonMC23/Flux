@@ -413,6 +413,8 @@ pub struct ImportCandidate {
     source_fingerprint: Option<flux_library::canonical::ContentFingerprint>,
     artwork: Option<flux_library::canonical::CanonicalImportAsset>,
     album_artwork: Option<flux_library::canonical::CanonicalImportAsset>,
+    /// Additional existing Artists to associate with the destination Album.
+    album_participants: Vec<ArtistId>,
     lyrics: Option<String>,
     lyrics_source: Option<PathBuf>,
     provenance: MetadataProvenance,
@@ -529,6 +531,30 @@ impl ImportCandidate {
     #[must_use]
     pub fn artist_id(&self) -> Option<ArtistId> {
         self.artist_id
+    }
+
+    /// Additional Album participants selected during review.
+    #[must_use]
+    pub fn album_participants(&self) -> &[ArtistId] {
+        &self.album_participants
+    }
+
+    /// Adds an existing Artist to the Album participant set.
+    pub fn add_album_participant(&mut self, artist: ArtistId) {
+        if !self.album_participants.contains(&artist) {
+            self.album_participants.push(artist);
+        }
+    }
+
+    /// Removes an Artist from the additional Album participant set.
+    pub fn remove_album_participant(&mut self, artist: ArtistId) {
+        self.album_participants
+            .retain(|candidate| *candidate != artist);
+    }
+
+    /// Clears additional Album participant selections.
+    pub fn clear_album_participants(&mut self) {
+        self.album_participants.clear();
     }
 
     /// Ordered credits currently under review.
@@ -2173,6 +2199,7 @@ fn make_candidate(
         source_fingerprint: flux_library::canonical::ContentFingerprint::of_file(&source_path).ok(),
         artwork: None,
         album_artwork: None,
+        album_participants: Vec::new(),
         lyrics: None,
         lyrics_source: None,
         provenance,
@@ -3199,6 +3226,12 @@ fn apply_import_plan_canonical(
                     credited_artists: refs,
                     owner_index: candidate.owner_index(),
                     album,
+                    album_participants: candidate
+                        .album_participants()
+                        .iter()
+                        .copied()
+                        .map(CanonicalImportArtistRef::Existing)
+                        .collect(),
                     track_number: candidate.track_number(),
                     disc_number: candidate.disc_number(),
                     duration_ms: None,
