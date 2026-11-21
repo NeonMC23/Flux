@@ -27,7 +27,7 @@ use flux_app::{
     ImportProgress, ImportRequest, ImportStage, ImportStorage, LyricLine, LyricsDocument,
     LyricsKind, PlaybackMode, PlaylistId, PreparedImport, ReconcileReport, RelPath, ReleaseType,
     ResourceState, StorageMode, TrackAudioReplacementPlan, TrackDeletionPlan, TrackMetadataEdit,
-    TrackMetadataUpdatePlan, TrackMovePlan, WAVEFORM_WINDOW, format_duration, is_track_playable,
+    TrackMetadataUpdatePlan, TrackMovePlan, format_duration, is_track_playable,
     prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
@@ -508,95 +508,7 @@ fn group_style(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// Flow's oscilloscope processing, reproduced from `src/javascript/effect.js`.
-///
-/// Flow reads 4096 byte time-domain samples from a Web Audio
-/// `AnalyserNode`, converts each byte back to a roughly -1..1 centred
-/// value, computes RMS, smooths it with `0.85/0.15`, derives a gain
-/// target of `0.45 / smoothRms` clamped to `1.0..=2.6`, and applies
-/// different attack/release interpolations (`0.25`/`0.05`). This state
-/// keeps the same per-frame calculations and the resulting normalized
-/// waveform consumed by the renderer.
-#[derive(Debug, Clone)]
-struct FlowScope {
-    samples: [f32; WAVEFORM_WINDOW],
-    smooth_rms: f32,
-    gain: f32,
-}
-
-impl Default for FlowScope {
-    fn default() -> Self {
-        Self {
-            samples: [0.0; WAVEFORM_WINDOW],
-            smooth_rms: 0.0,
-            gain: 1.0,
-        }
-    }
-}
-
-impl FlowScope {
-    fn update(&mut self, input: &[f32; WAVEFORM_WINDOW]) {
-        let mut sum = 0.0;
-        for (target, sample) in self.samples.iter_mut().zip(input) {
-            let centered = flow_centered(*sample);
-            *target = centered;
-            sum += centered * centered;
-        }
-
-        let rms = (sum / WAVEFORM_WINDOW as f32).sqrt();
-        self.smooth_rms = self.smooth_rms * 0.85 + rms * 0.15;
-        let target = if self.smooth_rms > 0.0001 {
-            0.45 / self.smooth_rms
-        } else {
-            1.0
-        }
-        .clamp(1.0, 2.6);
-        let rate = if target > self.gain { 0.25 } else { 0.05 };
-        self.gain += (target - self.gain) * rate;
-
-        for sample in &mut self.samples {
-            *sample *= self.gain;
-        }
-    }
-
-    fn reset(&mut self) {
-        self.samples.fill(0.0);
-        self.smooth_rms = 0.0;
-        self.gain = 1.0;
-    }
-
-    fn samples(&self) -> &[f32] {
-        &self.samples
-    }
-}
-
-/// Converts a float sample into Flow's Web Audio byte-domain value and
-/// back to the centred float Flow draws. Web Audio returns 8-bit time
-/// samples where 128 is silence.
-fn flow_centered(sample: f32) -> f32 {
-    let byte = (128.0 * (sample + 1.0)).clamp(0.0, 255.0) as u8;
-    byte as f32 / 128.0 - 1.0
-}
-
-/// Samples the real waveform at a normalized horizontal position.
-///
-/// The oscilloscope has fewer horizontal pixels than the 4096-sample
-/// window on most layouts. Linear interpolation avoids the visible
-/// stair-stepping of nearest-neighbour sampling while preserving the
-/// measured peaks at the window edges.
-fn scope_sample(samples: &[f32], t: f32) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    if samples.len() == 1 {
-        return samples[0];
-    }
-    let position = t.clamp(0.0, 1.0) * (samples.len() - 1) as f32;
-    let low = position.floor() as usize;
-    let high = (low + 1).min(samples.len() - 1);
-    let fraction = position - low as f32;
-    samples[low] * (1.0 - fraction) + samples[high] * fraction
-}
+use flux_app::{WaveformScope as FlowScope, waveform_sample as scope_sample};
 
 struct FlowOscilloscope<'a> {
     samples: &'a [f32],
@@ -1566,7 +1478,7 @@ enum TrackSort {
 impl std::fmt::Display for TrackSort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Default => "Catalogue order",
+            Self::Default => "Library order",
             Self::Title => "Title",
             Self::Artist => "Artist",
             Self::Album => "Album",
@@ -11967,105 +11879,17 @@ impl FluxReady {
     }
 
     fn smart_collection_ids(&self, collection: SmartCollection) -> Vec<TrackId> {
-        match collection {
-            SmartCollection::Favorites => self
-                .controller
-                .tracks()
-                .iter()
-                .filter(|(id, _)| {
-                    self.controller
-                        .rating(*id)
-                        .is_some_and(|rating| rating.favorite)
-                })
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>(),
-            SmartCollection::HighlyRated => self
-                .controller
-                .tracks()
-                .iter()
-                .filter(|(id, _)| {
-                    self.controller
-                        .rating(*id)
-                        .and_then(|rating| rating.rating)
-                        .is_some_and(|rating| rating >= 4)
-                })
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>(),
-            SmartCollection::RecentlyAdded => {
-                let mut entries = self
-                    .controller
-                    .tracks()
-                    .iter()
-                    .filter_map(|(id, _)| {
-                        self.controller
-                            .track_created_unix_ms(*id)
-                            .filter(|created| *created > 0)
-                            .map(|created| (*id, created))
-                    })
-                    .collect::<Vec<_>>();
-                entries.sort_by(|(left_id, left), (right_id, right)| {
-                    right.cmp(left).then_with(|| left_id.cmp(right_id))
-                });
-                entries.into_iter().map(|(id, _)| id).collect()
-            }
-            SmartCollection::RecentlyPlayed => {
-                let mut entries = self
-                    .controller
-                    .playback_history()
-                    .entries()
-                    .collect::<Vec<_>>();
-                entries.retain(|(id, _)| self.controller.track(*id).is_some());
-                entries.sort_by(|(left_id, left), (right_id, right)| {
-                    right
-                        .last_played_unix_ms
-                        .cmp(&left.last_played_unix_ms)
-                        .then_with(|| left_id.cmp(right_id))
-                });
-                entries.into_iter().map(|(id, _)| id).collect()
-            }
-            SmartCollection::MostPlayed => {
-                let mut entries = self
-                    .controller
-                    .playback_history()
-                    .entries()
-                    .collect::<Vec<_>>();
-                entries.retain(|(id, _)| self.controller.track(*id).is_some());
-                entries.sort_by(|(left_id, left), (right_id, right)| {
-                    right
-                        .play_count
-                        .cmp(&left.play_count)
-                        .then_with(|| right.last_played_unix_ms.cmp(&left.last_played_unix_ms))
-                        .then_with(|| left_id.cmp(right_id))
-                });
-                entries.into_iter().map(|(id, _)| id).collect()
-            }
-            SmartCollection::NoLyrics => self
-                .controller
-                .tracks()
-                .iter()
-                .filter(|(id, _)| !self.controller.track_has_lyrics(*id))
-                .map(|(id, _)| *id)
-                .collect(),
-            SmartCollection::SyncedLyrics => self
-                .controller
-                .tracks()
-                .iter()
-                .filter(|(id, _)| self.lyrics_kind_for(*id) == LyricsKind::Synced)
-                .map(|(id, _)| *id)
-                .collect(),
-            SmartCollection::NoArtwork => self
-                .controller
-                .tracks()
-                .iter()
-                .filter(|(id, _)| {
-                    self.controller
-                        .track_album_id(*id)
-                        .and_then(|album| self.controller.album(album))
-                        .is_none_or(|album| album.cover.is_none())
-                })
-                .map(|(id, _)| *id)
-                .collect(),
-        }
+        let shared = match collection {
+            SmartCollection::Favorites => flux_app::SmartCollection::Favorites,
+            SmartCollection::HighlyRated => flux_app::SmartCollection::HighlyRated,
+            SmartCollection::RecentlyAdded => flux_app::SmartCollection::RecentlyAdded,
+            SmartCollection::RecentlyPlayed => flux_app::SmartCollection::RecentlyPlayed,
+            SmartCollection::MostPlayed => flux_app::SmartCollection::MostPlayed,
+            SmartCollection::NoLyrics => flux_app::SmartCollection::NoLyrics,
+            SmartCollection::SyncedLyrics => flux_app::SmartCollection::SyncedLyrics,
+            SmartCollection::NoArtwork => flux_app::SmartCollection::NoArtwork,
+        };
+        self.controller.smart_collection_tracks(shared)
     }
 
     fn filtered_track_ids(&self) -> Rc<Vec<TrackId>> {
@@ -12688,7 +12512,7 @@ impl FluxReady {
             row![
                 column![
                     text("Playlists").size(22).color(TEXT),
-                    text(format!("{} canonical playlist(s)", playlists.len()))
+                    text(format!("{} playlist(s)", playlists.len()))
                         .size(10)
                         .color(MUTED),
                 ]
@@ -13714,7 +13538,7 @@ impl FluxReady {
             if !document.metadata.is_empty() {
                 body = body.push(
                     text(format!(
-                        "{} LRC metadata tag(s) preserved; they never override canonical track metadata.",
+                        "{} LRC metadata tag(s) preserved; they never override track metadata.",
                         document.metadata.len()
                     ))
                     .size(9)
@@ -13770,7 +13594,7 @@ impl FluxReady {
                 body = body.push(scrollable(column![].extend(lines)).height(Length::Fill));
             }
             body = body.push(
-                text("Playback highlighting uses the actual player position; seek, pause, resume and track changes update it without changing the canonical text.")
+                text("Playback highlighting follows the actual player position without changing the saved lyrics.")
                     .size(9)
                     .color(MUTED),
             );
@@ -14100,7 +13924,7 @@ impl FluxReady {
                     body = body.push(column![].extend(upcoming).spacing(5));
                 }
                 body = body.push(
-                    text("Karaoke follows the actual playback clock. Pausing, seeking and track changes do not alter the canonical lyrics.")
+                    text("Karaoke follows the actual playback clock without changing the saved lyrics.")
                         .size(9)
                         .color(MUTED),
                 );
@@ -16763,6 +16587,7 @@ fn window_settings() -> window::Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_app::{WAVEFORM_WINDOW, centered_waveform as flow_centered};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct TempDir(PathBuf);
@@ -18983,8 +18808,8 @@ mod tests {
         let loud = [0.5f32; WAVEFORM_WINDOW];
         scope.update(&loud);
 
-        assert!((scope.smooth_rms - 0.075).abs() < 1e-6);
-        assert!((scope.gain - 1.4).abs() < 1e-6);
+        assert!((scope.smooth_rms() - 0.075).abs() < 1e-6);
+        assert!((scope.gain() - 1.4).abs() < 1e-6);
         assert!(
             scope
                 .samples()
@@ -18994,13 +18819,13 @@ mod tests {
 
         let silence = [0.0f32; WAVEFORM_WINDOW];
         scope.update(&silence);
-        assert!((scope.smooth_rms - 0.06375).abs() < 1e-6);
-        assert!((scope.gain - 1.7).abs() < 1e-6);
+        assert!((scope.smooth_rms() - 0.06375).abs() < 1e-6);
+        assert!((scope.gain() - 1.7).abs() < 1e-6);
         assert!(scope.samples().iter().all(|sample| *sample == 0.0));
 
         scope.reset();
-        assert_eq!(scope.gain, 1.0);
-        assert_eq!(scope.smooth_rms, 0.0);
+        assert_eq!(scope.gain(), 1.0);
+        assert_eq!(scope.smooth_rms(), 0.0);
         assert!(scope.samples().iter().all(|sample| *sample == 0.0));
     }
 

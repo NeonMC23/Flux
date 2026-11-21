@@ -908,6 +908,104 @@ pub enum ControllerEvent {
     Error(String),
 }
 
+/// Frontend-neutral oscilloscope state derived from the engine's real
+/// post-gain waveform tap.
+///
+/// The smoothing, RMS gain target and attack/release rates preserve Flow's
+/// original analyser feel while remaining independent of any renderer. Both
+/// the GUI and TUI consume the same state and sample interpolation.
+#[derive(Debug, Clone)]
+pub struct WaveformScope {
+    samples: [f32; WAVEFORM_WINDOW],
+    smooth_rms: f32,
+    gain: f32,
+}
+
+impl Default for WaveformScope {
+    fn default() -> Self {
+        Self {
+            samples: [0.0; WAVEFORM_WINDOW],
+            smooth_rms: 0.0,
+            gain: 1.0,
+        }
+    }
+}
+
+impl WaveformScope {
+    /// Updates the displayed window from a fresh engine waveform snapshot.
+    pub fn update(&mut self, input: &[f32; WAVEFORM_WINDOW]) {
+        let mut sum = 0.0;
+        for (target, sample) in self.samples.iter_mut().zip(input) {
+            let centered = centered_waveform(*sample);
+            *target = centered;
+            sum += centered * centered;
+        }
+
+        let rms = (sum / WAVEFORM_WINDOW as f32).sqrt();
+        self.smooth_rms = self.smooth_rms * 0.85 + rms * 0.15;
+        let target = if self.smooth_rms > 0.0001 {
+            0.45 / self.smooth_rms
+        } else {
+            1.0
+        }
+        .clamp(1.0, 2.6);
+        let rate = if target > self.gain { 0.25 } else { 0.05 };
+        self.gain += (target - self.gain) * rate;
+
+        for sample in &mut self.samples {
+            *sample *= self.gain;
+        }
+    }
+
+    /// Clears the display when playback is stopped or unavailable.
+    pub fn reset(&mut self) {
+        self.samples.fill(0.0);
+        self.smooth_rms = 0.0;
+        self.gain = 1.0;
+    }
+
+    /// Latest normalized display samples.
+    #[must_use]
+    pub fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+
+    /// Smoothed RMS used to derive the display gain.
+    #[must_use]
+    pub fn smooth_rms(&self) -> f32 {
+        self.smooth_rms
+    }
+
+    /// Current display gain.
+    #[must_use]
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+}
+
+/// Converts one float sample into Flow's 8-bit Web Audio domain and back.
+#[must_use]
+pub fn centered_waveform(sample: f32) -> f32 {
+    let byte = (128.0 * (sample + 1.0)).clamp(0.0, 255.0) as u8;
+    byte as f32 / 128.0 - 1.0
+}
+
+/// Linearly samples a normalized horizontal position in the waveform window.
+#[must_use]
+pub fn waveform_sample(samples: &[f32], t: f32) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    if samples.len() == 1 {
+        return samples[0];
+    }
+    let position = t.clamp(0.0, 1.0) * (samples.len() - 1) as f32;
+    let low = position.floor() as usize;
+    let high = (low + 1).min(samples.len() - 1);
+    let fraction = position - low as f32;
+    samples[low] * (1.0 - fraction) + samples[high] * fraction
+}
+
 /// User-facing playback mode combining repeat and shuffle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackMode {
@@ -921,6 +1019,74 @@ pub enum PlaybackMode {
     Shuffle,
     /// Shuffle and repeat the full queue.
     ShuffleAll,
+}
+
+/// A dynamic, read-only view over the active canonical library.
+///
+/// These are presentation-level queries over shared catalogue, rating and
+/// history state. They never write and never create synthetic entities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartCollection {
+    /// Tracks marked as favorites.
+    Favorites,
+    /// Tracks rated four stars or higher.
+    HighlyRated,
+    /// Tracks with a reliable canonical creation time, newest first.
+    RecentlyAdded,
+    /// Tracks ordered by last meaningful play.
+    RecentlyPlayed,
+    /// Tracks ordered by meaningful play count.
+    MostPlayed,
+    /// Tracks without managed lyrics.
+    NoLyrics,
+    /// Tracks with parseable synchronized lyrics.
+    SyncedLyrics,
+    /// Tracks without a Track or Album artwork source.
+    NoArtwork,
+}
+
+impl SmartCollection {
+    /// Every supported collection in presentation order.
+    pub const ALL: [Self; 8] = [
+        Self::Favorites,
+        Self::HighlyRated,
+        Self::RecentlyAdded,
+        Self::RecentlyPlayed,
+        Self::MostPlayed,
+        Self::NoLyrics,
+        Self::SyncedLyrics,
+        Self::NoArtwork,
+    ];
+
+    /// Short user-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Favorites => "Favorites",
+            Self::HighlyRated => "Highly rated",
+            Self::RecentlyAdded => "Recently added",
+            Self::RecentlyPlayed => "Recently played",
+            Self::MostPlayed => "Most played",
+            Self::NoLyrics => "Without lyrics",
+            Self::SyncedLyrics => "Synchronized lyrics",
+            Self::NoArtwork => "Without artwork",
+        }
+    }
+
+    /// One-line explanation of what the collection contains.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Favorites => "Tracks marked as favorites.",
+            Self::HighlyRated => "Tracks rated four stars or higher.",
+            Self::RecentlyAdded => "Newest tracks with a reliable import time.",
+            Self::RecentlyPlayed => "Tracks ordered by their last meaningful play.",
+            Self::MostPlayed => "Tracks ordered by meaningful play count.",
+            Self::NoLyrics => "Tracks without managed lyrics.",
+            Self::SyncedLyrics => "Tracks with synchronized lyrics.",
+            Self::NoArtwork => "Tracks without track or album artwork.",
+        }
+    }
 }
 
 impl PlaybackMode {
@@ -2765,6 +2931,98 @@ impl Controller {
         self.playback_history
             .entry(id)
             .map_or(0, |entry| entry.play_count)
+    }
+
+    /// Tracks in one derived smart collection, using shared catalogue,
+    /// rating, lyrics, artwork and history state.
+    #[must_use]
+    pub fn smart_collection_tracks(&self, collection: SmartCollection) -> Vec<TrackId> {
+        match collection {
+            SmartCollection::Favorites => self
+                .tracks()
+                .iter()
+                .filter(|(id, _)| self.rating(*id).is_some_and(|rating| rating.favorite))
+                .map(|(id, _)| *id)
+                .collect(),
+            SmartCollection::HighlyRated => self
+                .tracks()
+                .iter()
+                .filter(|(id, _)| {
+                    self.rating(*id)
+                        .and_then(|rating| rating.rating)
+                        .is_some_and(|rating| rating >= 4)
+                })
+                .map(|(id, _)| *id)
+                .collect(),
+            SmartCollection::RecentlyAdded => {
+                let mut entries = self
+                    .tracks()
+                    .iter()
+                    .filter_map(|(id, _)| {
+                        self.track_created_unix_ms(*id)
+                            .filter(|created| *created > 0)
+                            .map(|created| (*id, created))
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left_id, left), (right_id, right)| {
+                    right.cmp(left).then_with(|| left_id.cmp(right_id))
+                });
+                entries.into_iter().map(|(id, _)| id).collect()
+            }
+            SmartCollection::RecentlyPlayed => {
+                let mut entries = self.playback_history.entries().collect::<Vec<_>>();
+                entries.retain(|(id, _)| self.track(*id).is_some());
+                entries.sort_by(|(left_id, left), (right_id, right)| {
+                    right
+                        .last_played_unix_ms
+                        .cmp(&left.last_played_unix_ms)
+                        .then_with(|| left_id.cmp(right_id))
+                });
+                entries.into_iter().map(|(id, _)| id).collect()
+            }
+            SmartCollection::MostPlayed => {
+                let mut entries = self.playback_history.entries().collect::<Vec<_>>();
+                entries.retain(|(id, _)| self.track(*id).is_some());
+                entries.sort_by(|(left_id, left), (right_id, right)| {
+                    right
+                        .play_count
+                        .cmp(&left.play_count)
+                        .then_with(|| right.last_played_unix_ms.cmp(&left.last_played_unix_ms))
+                        .then_with(|| left_id.cmp(right_id))
+                });
+                entries.into_iter().map(|(id, _)| id).collect()
+            }
+            SmartCollection::NoLyrics => self
+                .tracks()
+                .iter()
+                .filter(|(id, _)| !self.track_has_lyrics(*id))
+                .map(|(id, _)| *id)
+                .collect(),
+            SmartCollection::SyncedLyrics => self
+                .tracks()
+                .iter()
+                .filter(|(id, _)| {
+                    self.track_lyrics(*id)
+                        .and_then(|raw| crate::lyrics::LyricsDocument::parse(&raw).ok())
+                        .is_some_and(|document| {
+                            document.kind() == crate::lyrics::LyricsKind::Synced
+                        })
+                })
+                .map(|(id, _)| *id)
+                .collect(),
+            SmartCollection::NoArtwork => self
+                .tracks()
+                .iter()
+                .filter(|(id, _)| {
+                    self.track_artwork_path(*id).is_none()
+                        && self
+                            .track_album_id(*id)
+                            .and_then(|album| self.album(album))
+                            .is_none_or(|album| album.cover.is_none())
+                })
+                .map(|(id, _)| *id)
+                .collect(),
+        }
     }
 
     /// Last meaningful-play time in Unix milliseconds, when recorded.
@@ -6162,6 +6420,33 @@ impl Controller {
             self.set_play_session_baseline(0);
         }
         Ok(())
+    }
+
+    /// Clears every queue entry and stops playback.
+    ///
+    /// Stable entry identities are retired by the queue itself. Catalogue
+    /// tracks, playlists, history, ratings and the current library are
+    /// untouched. Returns the number of removed entries.
+    pub fn clear_queue(&mut self) -> usize {
+        let count = self.player.queue().len();
+        if count == 0 {
+            return 0;
+        }
+        self.update_playback_history();
+        self.player.stop();
+        self.engine.stop();
+        self.player.queue_mut().clear();
+        self.engine_loaded = None;
+        self.engine_entry = None;
+        self.engine_session = None;
+        self.engine_loaded_session = None;
+        self.stream_info = None;
+        self.reset_play_session_for_current(0);
+        self.queue_auto_library = false;
+        self.after_queue_change();
+        self.outbox.push(ControllerEvent::PlaybackChanged);
+        self.report_status(format!("Cleared {count} queue entr(ies)."));
+        count
     }
 
     /// Appends a library track to the queue without changing playback.
@@ -17872,5 +18157,81 @@ mod tests {
             3,
             "entry IDs are never reused after filtering"
         );
+    }
+    #[test]
+    fn smart_collections_share_rating_lyrics_and_artwork_state() {
+        let dir = TempDir::new("smart-collections");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+
+        assert!(
+            controller
+                .smart_collection_tracks(crate::SmartCollection::Favorites)
+                .is_empty()
+        );
+        controller.set_rating(id, Some(5), true).expect("rating");
+        assert_eq!(
+            controller.smart_collection_tracks(crate::SmartCollection::Favorites),
+            vec![id]
+        );
+        assert_eq!(
+            controller.smart_collection_tracks(crate::SmartCollection::HighlyRated),
+            vec![id]
+        );
+
+        assert_eq!(
+            controller.smart_collection_tracks(crate::SmartCollection::NoLyrics),
+            vec![id]
+        );
+        controller
+            .set_lyrics(id, Some("plain lyrics"))
+            .expect("plain lyrics");
+        assert!(
+            controller
+                .smart_collection_tracks(crate::SmartCollection::NoLyrics)
+                .is_empty()
+        );
+        assert!(
+            controller
+                .smart_collection_tracks(crate::SmartCollection::SyncedLyrics)
+                .is_empty()
+        );
+        controller
+            .set_lyrics(id, Some("[00:01.000]synchronized"))
+            .expect("synced lyrics");
+        assert_eq!(
+            controller.smart_collection_tracks(crate::SmartCollection::SyncedLyrics),
+            vec![id]
+        );
+        assert_eq!(
+            controller.smart_collection_tracks(crate::SmartCollection::NoArtwork),
+            vec![id]
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn clear_queue_retires_entries_without_touching_the_catalogue() {
+        let dir = TempDir::new("clear-queue");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        controller.clear_queue();
+        controller.enqueue_track(id).expect("first");
+        controller.enqueue_track(id).expect("second");
+        assert_eq!(controller.queue_len(), 2);
+        assert_eq!(controller.clear_queue(), 2);
+        assert_eq!(controller.queue_len(), 0);
+        assert_eq!(controller.current_queue_entry_id(), None);
+        assert!(controller.track(id).is_some());
+        assert_eq!(controller.clear_queue(), 0);
+        controller.shutdown();
     }
 }
