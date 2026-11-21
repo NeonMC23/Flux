@@ -495,6 +495,8 @@ struct Tui {
     queue_follow: bool,
     /// First visible queue row.
     queue_offset: usize,
+    /// Left offset reserved by the persistent destination sidebar.
+    content_offset: usize,
     /// Title and lines for help/import-detail info views.
     info_title: String,
     info_lines: Vec<String>,
@@ -4939,6 +4941,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         queue_cursor: 0,
         queue_follow: true,
         queue_offset: 0,
+        content_offset: 0,
         info_title: String::new(),
         info_lines: Vec::new(),
         info_scroll: 0,
@@ -5086,6 +5089,7 @@ mod tests {
             queue_cursor: 0,
             queue_follow: true,
             queue_offset: 0,
+            content_offset: 0,
             info_title: String::new(),
             info_lines: Vec::new(),
             info_scroll: 0,
@@ -6657,6 +6661,46 @@ mod tests {
             "catalogue track remains"
         );
         tui.controller.shutdown();
+    }
+
+    #[test]
+    fn persistent_sidebar_requires_width_and_height_and_hides_for_modals() {
+        let dir = TempDir::new("tui-sidebar-adaptive");
+        let mut subject = tui(&dir);
+        assert_eq!(subject.sidebar_width(120, 30), 24);
+        assert_eq!(subject.sidebar_width(92, 30), 18);
+        assert_eq!(subject.sidebar_width(91, 30), 0);
+        assert_eq!(subject.sidebar_width(120, 17), 0);
+        subject.layout = LayoutMode::Compact;
+        assert_eq!(subject.sidebar_width(120, 30), 0);
+        subject.layout = LayoutMode::Standard;
+        subject.mode = Mode::ImportReview;
+        assert_eq!(subject.sidebar_width(120, 30), 0);
+        subject.mode = Mode::Normal;
+        subject.view = View::Artists;
+        assert_eq!(subject.sidebar_width(120, 30), 24);
+        subject.controller.shutdown();
+    }
+
+    #[test]
+    fn playback_progress_is_a_single_primary_timeline() {
+        let dir = TempDir::new("tui-single-timeline");
+        let subject = tui(&dir);
+        let summary = subject.now_playing_line(120);
+        assert!(
+            !summary.contains('█') && !summary.contains('░'),
+            "the header/summary must not duplicate the playback timeline: {summary}"
+        );
+        let mut output = Vec::new();
+        subject
+            .draw_timeline(&mut output, 5, 80)
+            .expect("timeline draws");
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(
+            rendered.contains('█') || rendered.contains('░'),
+            "the primary timeline renders a real progress bar: {rendered:?}"
+        );
+        subject.controller.shutdown();
     }
 
     #[test]

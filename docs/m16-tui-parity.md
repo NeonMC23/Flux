@@ -13,12 +13,15 @@ persistence or domain rules.
 
 The visual hierarchy is:
 
-1. Library destination tabs.
-2. Contextual title for the current view/detail.
-3. Main content.
-4. Optional side panel with now playing, visualizer and up-next.
-5. Playback summary.
-6. Status and contextual help.
+1. Library destinations: a persistent sidebar on wide terminals, otherwise
+   compact tabs.
+2. Transport status and contextual title for the current view/detail.
+3. Main content, with an optional now-playing/visualizer/up-next side panel.
+4. One primary playback timeline.
+5. Status and contextual help.
+
+M21 added the persistent sidebar and removed duplicate progress displays from
+the header, side panel and player page.
 
 Five layout presets replace arbitrary panel configuration:
 

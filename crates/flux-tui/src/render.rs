@@ -40,6 +40,9 @@ impl Tui {
         // A fresh pty can report 0 columns; lay out for at least a
         // minimal sane width rather than dividing the void.
         queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+        let sidebar = self.sidebar_width(width, height);
+        self.content_offset = if sidebar > 0 { sidebar + 2 } else { 0 };
+        let content_width = width.saturating_sub(self.content_offset);
 
         if !detail_view_fits(height)
             && matches!(
@@ -114,22 +117,28 @@ impl Tui {
         if self.controller.is_scanning() {
             header.push_str(" · scanning…");
         }
-        self.line(out, 0, &header, width, true)?;
+        self.line_absolute(out, 0, &header, width, true)?;
 
         let compact_layout = width < 70 || height < 16 || self.layout == LayoutMode::Compact;
-        if !compact_layout {
+        if sidebar > 0 {
+            self.draw_sidebar(out, 1, height.saturating_sub(4), sidebar, content_width)?;
+        } else if !compact_layout {
             self.draw_tabs(out, 1, width)?;
         }
-        let playing_y = if compact_layout { 1 } else { 2 };
-        let mut playing = self.now_playing_line(width);
-        if compact_layout {
-            playing = truncate_to_width(&playing, width);
-        }
-        self.line(out, playing_y, &playing, width, false)?;
-
-        let context_y = if compact_layout { 2 } else { 3 };
+        let context_y = if sidebar > 0 {
+            self.draw_now_playing_summary(out, 1, content_width)?;
+            2
+        } else {
+            let playing_y = if compact_layout { 1 } else { 2 };
+            let mut playing = self.now_playing_line(width);
+            if compact_layout {
+                playing = truncate_to_width(&playing, width);
+            }
+            self.line(out, playing_y, &playing, content_width, false)?;
+            if compact_layout { 2 } else { 3 }
+        };
         let list_top = (context_y + 1) as usize;
-        let detail_height = height.saturating_sub(list_top + 2).max(1);
+        let detail_height = height.saturating_sub(list_top + 3).max(1);
         let context = match self.mode {
             Mode::InfoView => self.info_title.clone(),
             Mode::QueueView => "Queue · stable entry order".to_owned(),
@@ -191,7 +200,7 @@ impl Tui {
             _ => self.view_title(),
         };
         queue!(out, SetForegroundColor(self.accent()))?;
-        self.line(out, context_y, &context, width, true)?;
+        self.line(out, context_y, &context, content_width, true)?;
         queue!(out, SetForegroundColor(Color::Reset))?;
 
         if self.mode == Mode::InfoView {
@@ -204,10 +213,10 @@ impl Tui {
                 .take(detail_height)
                 .enumerate()
             {
-                self.line(out, (list_top + row) as u16, line, width, false)?;
+                self.line(out, (list_top + row) as u16, line, content_width, false)?;
             }
         } else if self.mode == Mode::QueueView {
-            self.draw_queue_view(out, list_top, detail_height, width)?;
+            self.draw_queue_view(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::LyricsView {
             self.update_lyrics_follow();
             let max_scroll = self.lyrics_lines.len().saturating_sub(detail_height);
@@ -225,41 +234,44 @@ impl Tui {
             self.mode,
             Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing
         ) {
-            self.draw_import_view(out, list_top, detail_height, width)?;
+            self.draw_import_view(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::ImportAlbumPick {
-            self.draw_import_album_picker(out, list_top, detail_height, width)?;
+            self.draw_import_album_picker(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::AlbumTransferPick {
-            self.draw_album_transfer_picker(out, list_top, detail_height, width)?;
+            self.draw_album_transfer_picker(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::AlbumTransferReview {
-            self.draw_album_transfer_review(out, list_top, detail_height, width)?;
+            self.draw_album_transfer_review(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::ArtistOwnerPick {
-            self.draw_artist_owner_picker(out, list_top, detail_height, width)?;
+            self.draw_artist_owner_picker(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::ArtistAlbumPick {
-            self.draw_artist_album_picker(out, list_top, detail_height, width)?;
+            self.draw_artist_album_picker(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::ArtistDeletion {
-            self.draw_artist_deletion(out, list_top, detail_height, width)?;
+            self.draw_artist_deletion(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::TrackMovePick {
-            self.draw_move_picker(out, list_top, detail_height, width)?;
+            self.draw_move_picker(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::FormInput {
-            self.draw_form(out, list_top, detail_height, width)?;
+            self.draw_form(out, list_top, detail_height, content_width)?;
         } else {
-            self.draw_workspace(out, list_top, detail_height, width)?;
+            self.draw_workspace(out, list_top, detail_height, content_width)?;
         }
+
+        // One primary playback timeline, shared by every layout.
+        self.draw_timeline(out, (height - 3) as u16, content_width)?;
 
         // Status / error line.
         let status_y = (height - 2) as u16;
         if let Some(error) = &self.audio_error {
             queue!(out, SetForegroundColor(Color::Red))?;
-            self.line(out, status_y, error, width, false)?;
+            self.line_absolute(out, status_y, error, width, false)?;
             queue!(out, SetForegroundColor(Color::Reset))?;
         } else if let Some(error) = self.controller.last_error() {
             queue!(out, SetForegroundColor(Color::Red))?;
-            self.line(out, status_y, error, width, false)?;
+            self.line_absolute(out, status_y, error, width, false)?;
             queue!(out, SetForegroundColor(Color::Reset))?;
         } else if let Some(message) = &self.lifecycle_msg {
-            self.line(out, status_y, message, width, false)?;
+            self.line_absolute(out, status_y, message, width, false)?;
         } else if let Some(status) = self.controller.last_status() {
-            self.line(out, status_y, status, width, false)?;
+            self.line_absolute(out, status_y, status, width, false)?;
         }
 
         // Help / input line.
@@ -375,7 +387,7 @@ impl Tui {
                 "Acknowledge portable recovery? y confirms; any other key cancels.".to_owned()
             }
         };
-        self.line(out, (height - 1) as u16, &help, width, false)?;
+        self.line_absolute(out, (height - 1) as u16, &help, width, false)?;
 
         out.flush()
     }
@@ -452,7 +464,7 @@ impl Tui {
         for (row, line) in canvas.into_iter().enumerate() {
             queue!(
                 out,
-                MoveTo(x as u16, y + row as u16),
+                MoveTo((self.content_offset + x) as u16, y + row as u16),
                 SetForegroundColor(accent),
                 Print(truncate_to_width(&line, width)),
                 SetForegroundColor(Color::Reset)
@@ -558,7 +570,11 @@ impl Tui {
             let text = truncate_to_width(&text, width);
             let y = (top + row) as u16;
             if index == self.cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -610,13 +626,11 @@ impl Tui {
                 .current_duration()
                 .map(format_duration)
                 .unwrap_or_else(|| "--:--".to_owned());
-            let bar_width =
-                width.saturating_sub(display_width(&elapsed) + display_width(&total) + 2);
             self.line_at(
                 out,
                 x,
                 y as u16,
-                &format!("{elapsed} {} {total}", self.progress_text(bar_width)),
+                &format!("{elapsed} / {total} · timeline below"),
                 width,
                 false,
             )?;
@@ -646,7 +660,7 @@ impl Tui {
             )?;
             queue!(out, SetForegroundColor(Color::Reset))?;
             y += 1;
-            let viz_height = (top + height).saturating_sub(y + 2).clamp(2, 7);
+            let viz_height = (top + height).saturating_sub(y + 2).clamp(2, 10);
             self.draw_visualizer(out, x, y as u16, width, viz_height)?;
             y += viz_height;
         }
@@ -725,23 +739,6 @@ impl Tui {
             )?;
             y += 1;
         }
-        let elapsed = format_duration(self.controller.position());
-        let total = self
-            .controller
-            .current_duration()
-            .map(format_duration)
-            .unwrap_or_else(|| "--:--".to_owned());
-        self.line(
-            out,
-            y as u16,
-            &format!(
-                "{elapsed} {} {total}",
-                self.progress_text(width.saturating_sub(14))
-            ),
-            width,
-            false,
-        )?;
-        y += 1;
         if self.viz_visible && y + 2 < top + height {
             queue!(out, SetForegroundColor(self.accent()))?;
             self.line(
@@ -819,7 +816,11 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.move_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -884,7 +885,11 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.artist_delete_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -932,7 +937,11 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.album_transfer_artist_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -978,7 +987,11 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.album_transfer_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -1018,7 +1031,11 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.artist_owner_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -1061,7 +1078,11 @@ impl Tui {
             };
             let y = (top + index) as u16;
             if index == self.artist_album_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -1107,7 +1128,11 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.import_album_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -1138,7 +1163,11 @@ impl Tui {
                 field.value
             );
             if index == form.focus {
-                queue!(out, MoveTo(0, y as u16), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y as u16),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y as u16, &line, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -1225,7 +1254,11 @@ impl Tui {
             let text = pad_with_right(&text, &duration, width);
             let y = (top + row) as u16;
             if index == self.queue_cursor {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -1350,7 +1383,11 @@ impl Tui {
         for (row, (selected, text)) in rows.into_iter().enumerate() {
             let y = (top + 1 + row) as u16;
             if selected {
-                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
                 self.line(out, y, &text, width, false)?;
                 queue!(out, SetAttribute(Attribute::Reset))?;
             } else {
@@ -1691,14 +1728,13 @@ impl Tui {
                     .map(format_duration)
                     .unwrap_or_else(|| "--:--".to_owned());
                 format!(
-                    "{state_icon} {} — {}    {} / {total}    {}    Vol {volume}%    {crossfade}",
+                    "{state_icon} {} — {}    {} / {total}    Vol {volume}%    {crossfade}",
                     track.title(),
                     self.controller
                         .current_id()
                         .map(|id| credit_display(&self.controller, id))
                         .unwrap_or_default(),
                     format_duration(self.controller.position()),
-                    self.progress_text(12),
                 )
             }
             None if self.controller.current_queue_entry_id().is_some() => {
@@ -1710,6 +1746,199 @@ impl Tui {
         }
     }
 
+    /// Persistent destination rail width, or zero when the terminal should
+    /// keep the compact tab layout. Modal workflows hide the rail so their
+    /// content gets the full width.
+    pub(crate) fn sidebar_width(&self, width: usize, height: usize) -> usize {
+        let browsing = matches!(
+            self.mode,
+            Mode::Normal | Mode::InfoView | Mode::QueueView | Mode::LyricsView
+        );
+        if browsing
+            && self.layout != LayoutMode::Compact
+            && self.layout != LayoutMode::Visualizer
+            && width >= 92
+            && height >= 18
+        {
+            (width / 5).clamp(18, 24)
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn draw_sidebar(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+        content_width: usize,
+    ) -> std::io::Result<()> {
+        if width < 12 || height == 0 {
+            return Ok(());
+        }
+        let mut y = top;
+        queue!(out, SetForegroundColor(self.accent()))?;
+        self.line_raw(out, 1, y as u16, "FLUX", width.saturating_sub(1), true)?;
+        queue!(out, SetForegroundColor(Color::Reset))?;
+        y += 2;
+        if y < top + height {
+            queue!(out, SetForegroundColor(Color::DarkGrey))?;
+            self.line_raw(out, 1, y as u16, "LIBRARY", width.saturating_sub(1), false)?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+        }
+        for view in View::ALL {
+            if y >= top + height {
+                break;
+            }
+            let active = view == self.view && self.detail.is_none();
+            if active {
+                queue!(out, SetForegroundColor(self.accent()))?;
+            } else {
+                queue!(out, SetForegroundColor(Color::Grey))?;
+            }
+            let label = format!("{} {}", if active { "▸" } else { " " }, view.label());
+            self.line_raw(out, 1, y as u16, &label, width.saturating_sub(1), active)?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+        }
+        if y + 2 < top + height {
+            queue!(out, SetForegroundColor(Color::DarkGrey))?;
+            self.line_raw(out, 1, y as u16, "PLAYBACK", width.saturating_sub(1), false)?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+            let layout = format!("· {} layout", self.layout.label());
+            self.line_raw(out, 1, y as u16, &layout, width.saturating_sub(1), false)?;
+            y += 1;
+            let queue = format!("· {} queued", self.controller.queue_len());
+            self.line_raw(out, 1, y as u16, &queue, width.saturating_sub(1), false)?;
+        }
+
+        // Now-playing block anchored to the bottom of the rail, without a
+        // second progress bar: the single timeline lives above the status line.
+        if let Some(track) = self.controller.current_track() {
+            let block_top = (top + height).saturating_sub(4);
+            if block_top > y {
+                let elapsed = format_duration(self.controller.position());
+                let total = self
+                    .controller
+                    .current_duration()
+                    .map(format_duration)
+                    .unwrap_or_else(|| "--:--".to_owned());
+                queue!(out, SetForegroundColor(self.accent()))?;
+                self.line_raw(
+                    out,
+                    1,
+                    block_top as u16,
+                    "NOW PLAYING",
+                    width.saturating_sub(1),
+                    true,
+                )?;
+                queue!(out, SetForegroundColor(Color::Reset))?;
+                self.line_raw(
+                    out,
+                    1,
+                    (block_top + 1) as u16,
+                    &truncate_to_width(&display_title(track), width.saturating_sub(2)),
+                    width.saturating_sub(1),
+                    true,
+                )?;
+                self.line_raw(
+                    out,
+                    1,
+                    (block_top + 2) as u16,
+                    &truncate_to_width(
+                        &self
+                            .controller
+                            .current_id()
+                            .map(|id| credit_display(&self.controller, id))
+                            .unwrap_or_default(),
+                        width.saturating_sub(2),
+                    ),
+                    width.saturating_sub(1),
+                    false,
+                )?;
+                self.line_raw(
+                    out,
+                    1,
+                    (block_top + 3) as u16,
+                    &format!("{elapsed} / {total}"),
+                    width.saturating_sub(1),
+                    false,
+                )?;
+            }
+        }
+
+        // A restrained boundary between navigation and content.
+        queue!(out, SetForegroundColor(Color::DarkGrey))?;
+        for row in top..(top + height).min(top + height) {
+            queue!(out, MoveTo((width + 1) as u16, row as u16), Print("│"))?;
+        }
+        queue!(out, SetForegroundColor(Color::Reset))?;
+        let _ = content_width;
+        Ok(())
+    }
+
+    pub(crate) fn draw_now_playing_summary(
+        &self,
+        out: &mut impl Write,
+        y: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        // The sidebar owns title/artist/time; this line carries transport
+        // state only, avoiding a second copy of the same metadata.
+        let state = match self.controller.player_state() {
+            PlaybackState::Playing => "Playing",
+            PlaybackState::Paused => "Paused",
+            PlaybackState::Stopped => "Stopped",
+        };
+        let volume = (self.controller.volume() * 100.0).round() as u32;
+        let crossfade = if self.controller.crossfade_enabled() {
+            format!(
+                "Xfade {:.1}s",
+                self.controller.crossfade_duration_ms() as f64 / 1_000.0
+            )
+        } else {
+            "Xfade off".to_owned()
+        };
+        let line = format!(
+            "{state} · Vol {volume}% · {crossfade} · {} queued · {} layout",
+            self.controller.queue_len(),
+            self.layout.label()
+        );
+        self.line(out, y as u16, &line, width, false)
+    }
+
+    pub(crate) fn draw_timeline(
+        &self,
+        out: &mut impl Write,
+        y: u16,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let state = match self.controller.player_state() {
+            PlaybackState::Playing => "▶",
+            PlaybackState::Paused => "⏸",
+            PlaybackState::Stopped => "■",
+        };
+        let elapsed = format_duration(self.controller.position());
+        let total = self
+            .controller
+            .current_duration()
+            .map(format_duration)
+            .unwrap_or_else(|| "--:--".to_owned());
+        let used = display_width(state) + display_width(&elapsed) + display_width(&total) + 4;
+        let bar_width = width.saturating_sub(used).max(4);
+        let line = format!(
+            "{state} {elapsed} {} {total}",
+            self.progress_text(bar_width)
+        );
+        queue!(out, SetForegroundColor(self.accent()))?;
+        self.line(out, y, &line, width, false)?;
+        queue!(out, SetForegroundColor(Color::Reset))?;
+        Ok(())
+    }
+
     pub(crate) fn line(
         &self,
         out: &mut impl Write,
@@ -1718,21 +1947,33 @@ impl Tui {
         width: usize,
         bold: bool,
     ) -> std::io::Result<()> {
-        let text = truncate_to_width(text, width);
-        queue!(out, MoveTo(0, y), Clear(ClearType::UntilNewLine))?;
-        if bold {
-            queue!(
-                out,
-                SetAttribute(Attribute::Bold),
-                Print(text),
-                SetAttribute(Attribute::Reset)
-            )
-        } else {
-            queue!(out, Print(text))
-        }
+        self.line_raw(out, self.content_offset, y, text, width, bold)
+    }
+
+    pub(crate) fn line_absolute(
+        &self,
+        out: &mut impl Write,
+        y: u16,
+        text: &str,
+        width: usize,
+        bold: bool,
+    ) -> std::io::Result<()> {
+        self.line_raw(out, 0, y, text, width, bold)
     }
 
     pub(crate) fn line_at(
+        &self,
+        out: &mut impl Write,
+        x: usize,
+        y: u16,
+        text: &str,
+        width: usize,
+        bold: bool,
+    ) -> std::io::Result<()> {
+        self.line_raw(out, self.content_offset + x, y, text, width, bold)
+    }
+
+    fn line_raw(
         &self,
         out: &mut impl Write,
         x: usize,
