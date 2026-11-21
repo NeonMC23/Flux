@@ -1,0 +1,144 @@
+# M16 TUI feature parity and interaction model
+
+This document records the M16 audit of the GUI feature set, the TUI equivalent,
+the shared `flux-app::Controller` boundary, and regression coverage. It is a
+working product document, not a claim of human usability validation.
+
+## Design direction
+
+The terminal interface is a first-class Flux frontend. It uses the same
+canonical library, playback engine, queue, history, ratings, playlists, import
+pipeline, lyrics and artwork records as the GUI. `flux-tui` contains no parallel
+persistence or domain rules.
+
+The visual hierarchy is:
+
+1. Library destination tabs.
+2. Contextual title for the current view/detail.
+3. Main content.
+4. Optional side panel with now playing, visualizer and up-next.
+5. Playback summary.
+6. Status and contextual help.
+
+Five layout presets replace arbitrary panel configuration:
+
+- **Standard** — library plus now-playing/visualizer/up-next panel.
+- **Library** — library only.
+- **Player** — large now playing, visualizer and up-next.
+- **Visualizer** — full-area visualization.
+- **Compact** — library and playback summary, no tabs or side panel.
+
+`Tab`/`Shift+Tab` cycle destinations, `F1`–`F7` select one directly, `m` cycles
+layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
+`tui.conf` under the Flux config directory. User data never moves there.
+
+## Parity matrix
+
+| Capability | Pre-M16 TUI | M16 TUI equivalent | Shared API / boundary | Status | Tests |
+|---|---|---|---|---|---|
+| Browse tracks | Flat list | Tracks destination, search, favorites, collection filter | `Controller::search`, `tracks` | Complete | Existing TUI tests, large-list test |
+| Browse artists | Info panel only | Artists list and artist detail with albums and tracks | `artists`, `artist`, `albums_owned_by`, `albums_credited_for`, credits | Complete | `tui_navigation_opens_artists_albums_playlists_and_collections` |
+| Browse albums | Info panel only | Albums list and album track listing | `albums`, `album`, `album_tracks` | Complete | Same navigation test |
+| Browse playlists | Key-only info | Playlists destination and playlist detail | `playlists`, `playlist` | Complete | Navigation and playlist tests |
+| Smart collections | Not exposed | Collections destination with counts | `Controller::smart_collection_tracks` | Complete | `smart_collections_share_rating_lyrics_and_artwork_state` |
+| Search | Tracks only | Current-view search | `search`, `search_artists`, `search_albums` and local name filtering over shared entities | Complete | Existing search tests |
+| Empty/loading states | Basic | Per-view empty messages and audio-device loading state | Frontend presentation | Complete | Existing empty-state tests |
+| Missing resources | Badges | Track badges in lists and queue | `track_audio_resource_state` | Complete | Existing resource tests |
+| Artist create/edit | Delimiter form | Structured Name/Aliases/Description/Image form; stable ID preserved | `create_artist`, `update_artist_metadata`, `set/remove_artist_image` | Complete | Artist workflow test |
+| Artist image status | Basic | Missing/inaccessible details remain in resource APIs and editor | `artist_image_resource_state` | Partial presentation; no destructive repair action | Existing app tests |
+| Album edit | Delimiter form | Structured Title/Release type/Cover form | `update_album_metadata`, `set/remove_album_cover` | Complete | Album form tests |
+| Album track order/membership | GUI-only | Track listing is read-only in TUI | `album_tracks`; transactional move APIs exist | Limitation: use GUI review workflow | Not applicable |
+| Album delete/transfer | GUI workflow | Not exposed | Shared plan/execute APIs | Limitation: use GUI | Not applicable |
+| Track title/artist credit/album/numbering | Delimiter form | Structured prefilled form | `edit_track_metadata`, `create_artist` | Complete | `import_edit_and_artist_keys_use_the_shared_controller` |
+| Track credits/ownership | Read-only info | Advanced delimiter form remains as `Alt+e`; ownership transfer remains GUI-only | `edit_track_metadata`, transfer plans | Limitation: advanced edits stay documented | Existing app tests |
+| Track artwork | Path form | `W` managed override set/remove | `set/remove_track_artwork`, resource state | Complete | Artwork workflow test |
+| Lyrics view | Read-only | Lyrics destination, dedicated reader, follow-playback | `track_lyrics`, `LyricsDocument` | Complete | Existing lyrics tests |
+| Lyrics edit/import/remove | Path form | `S` attaches/replaces/removes managed UTF-8/LRC text | `set_lyrics` | Complete | Lyrics tests |
+| Lyrics export | GUI-only | Not exposed | `Controller` has no TUI-specific export path API | Limitation: use GUI | Not applicable |
+| Favorites and ratings | Complete | Unchanged keys, shared collection views | `set_track_rating`, `toggle_track_favorite`, `smart_collection_tracks` | Complete | Existing rating tests |
+| History views | Summary message | Recently played / Most played collections | `playback_history` | Complete | Smart collection test |
+| Folder/file import | Delimiter/path input | Source → Destination → Verify → Import, same pipeline | `prepare_import_plan`, `prepare_import_files` | Complete for normal path | Existing import lifecycle tests |
+| Import metadata editing | None | `e` opens a structured form for title/artist/album/numbers | `ImportCandidate` setters | Complete | Import edit test |
+| Import artwork/lyrics attachment | GUI-only | Not exposed in TUI review | Import plan asset APIs exist | Limitation: attach in GUI before/after import | Not applicable |
+| Import destination | Active library | Explicit review of active canonical destination | Shared import request | Complete | Existing destination tests |
+| Duplicate decisions | Complete | Include/skip/update and bulk actions | `ImportDecision`, plan bulk helpers | Complete | Duplicate import tests |
+| Import cancellation | Complete | Esc cancels discovery/preparation; final commit honest | Shared worker/cancel flag | Complete | Cancellation tests |
+| Create/rename/delete playlist | None | `N`, `R`, `x` with confirmation | `create/rename/delete_playlist` | Complete | Navigation and confirmation tests |
+| Add/remove/reorder playlist entries | None | `:playlist <name>`, `d`, `Ctrl+↑/↓` | `add_tracks_to_playlist`, `remove_playlist_entries`, `reorder_playlist_entry` | Complete | Queue/playlist tests |
+| Play/shuffle playlist | None | `l` plays; `R` cycles shuffle modes; command palette available | `play_playlist`, `play_playlist_shuffled` | Complete | Existing app tests |
+| Queue view/reorder/remove | Complete | First-class queue view, follow, jump, clear | `queue_entries`, `move_queue_entry_by`, `remove_queue_entry`, `clear_queue` | Complete | `queue_clear_requires_confirmation...` |
+| Queue clear | None | `C` plus explicit confirmation | `Controller::clear_queue` | Complete | App and TUI tests |
+| Play/pause/stop/next/previous | Complete | Unchanged | Engine/controller | Complete | Existing tests |
+| Seek | Not exposed | `←`/`→` 5 s, Shift 30 s, `:seek` | `Controller::seek` | Complete | App seek tests |
+| Volume | Complete | `+`/`-` and `:vol` | `set_volume` | Complete | Existing tests |
+| Repeat/shuffle | Repeat only | `R` cycles full playback modes | `cycle_playback_mode` | Complete | Existing tests |
+| Audio device selection | GUI-only | Settings lists devices, default/active markers, asynchronous open | `enumerate_audio_output_devices`, `open_audio_output`, `install_audio_output` | Complete when built with CPAL | Existing GUI/audio tests; TUI list smoke |
+| Crossfade | Complete | Unchanged | Shared settings | Complete | Existing tests |
+| Lyrics follow playback | None | Reader follows synchronized timestamps; manual scroll pauses follow | `position`, lyrics timestamps | Complete | Lyrics tests |
+| Oscilloscope | GUI only | Standard/Player/Visualizer layouts, Waveform/Bars/Pulse | `Controller::waveform`, shared `WaveformScope` | Complete | `visualization_is_derived_from_real_waveform_samples` |
+| Visualizer visibility/mode/sensitivity | None | `v`, `Alt+v`, `Alt+↑/↓`; hidden means no waveform sampling | `WaveformScope`, shared waveform tap | Complete | Visualization and preference tests |
+| Layout presets | None | `m` cycles five presets; persisted | TUI preference file | Complete | Preferences test |
+| Help and discovery | Large static help | Contextual footer, `?` help, command palette | Frontend presentation | Complete | Help test |
+| Library open/create/migrate | Complete | Preserved | Shared lifecycle APIs | Complete | Existing migration tests |
+| Track/Artist/Album deletion | GUI review | Not exposed | Shared plans | Limitation: use GUI review | Not applicable |
+| Track audio replacement | GUI review | Not exposed | Shared replacement plans | Limitation: use GUI review | Not applicable |
+
+## Genuine limitations
+
+- Terminal cells cannot display embedded artwork. Track/Album artwork is
+  represented by presence badges and state messages, never by a fake image.
+- Album membership/order transactions, track or album deletion, artist deletion,
+  ownership transfer and managed-audio replacement are multi-step canonical
+  operations with GUI review screens. They remain GUI workflows rather than
+  duplicating transaction rules in the TUI.
+- Rich import artwork/lyrics attachment remains a GUI review workflow. TUI
+  import supports the ordinary Source → Destination → Verify → Import path and
+  structured metadata correction.
+- The renderer is hand-written; no mouse support is required or provided.
+- Keybindings are fixed and conflict-tested rather than user-configurable. The
+  command palette covers less frequent actions without creating a second
+  configuration surface.
+- Native runtime audio and human usability are separate from automated tests.
+
+## Keybindings
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Next/previous destination |
+| `F1`–`F7` | Tracks, Artists, Albums, Playlists, Collections, Lyrics, Settings |
+| `↑`/`↓`, `k`/`j`, PgUp/PgDn, `g`/`G` | Move/scroll |
+| `Enter` | Open selected entity / play selected track |
+| `Esc` | Back, clear search, or cancel |
+| `/` | Search current view |
+| `F` | Favorites-only track filter |
+| `f` | Toggle favorite (track rows) |
+| `0`–`5` | Clear/set rating |
+| `e` | Structured track edit |
+| `Y` / `Z` | Structured artist / album edit |
+| `W` / `S` | Track artwork / managed lyrics |
+| `y` | Read selected/current lyrics |
+| `N` / `R` / `x` | New / rename / delete playlist (context) |
+| `l` / `d` / `c` | Play playlist / remove entry / clear playlist (detail context) |
+| `Ctrl+↑`/`Ctrl+↓` | Reorder queue entry or playlist entry |
+| `Q` | Queue view |
+| `C` | Clear queue (confirmation) |
+| `J` / `f` | Jump to current / toggle queue follow |
+| `Space` / `s` / `n` / `p` | Play-pause / stop / next / previous |
+| `←`/`→` | Seek 5 s (Shift: 30 s) |
+| `+`/`-` | Volume |
+| `R` | Cycle repeat/shuffle modes outside playlist context |
+| `K`, `[`, `]` | Crossfade state and duration |
+| `m` | Cycle layout |
+| `v` / `Alt+v` | Show-hide / cycle visualizer mode |
+| `Alt+↑`/`Alt+↓` | Visualizer sensitivity |
+| `:` | Command palette |
+| `?` | Full help |
+| `q` / `Ctrl-C` | Quit |
+
+## Validation boundaries
+
+Automated tests verify shared data flow, form validation, view navigation,
+queue confirmation, playlist state, preference persistence, visualization
+mapping and large-library performance. Real PTY captures at 120×36, 80×24 and
+40×12 verify rendering and truncation. These do not constitute human usability
+testing.

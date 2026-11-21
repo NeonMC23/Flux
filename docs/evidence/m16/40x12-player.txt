@@ -1,0 +1,12 @@
+Flux · Tracks · normal · queue 1
+⏸ First Song — Artist    0:00 / --:--
+Tracks · 2 tracks
+First Song — Artist
+Artist · Album
+0:00 ░░░░░░░░░░░░░░░░░░░░░░░░░░ --:--
+VISUALIZER · Waveform
+
+••••••••••••••••••••••••••••••••••••••••
+
+Layout: Player · m cycles layouts.
+↑/↓ move · Enter play · a queue · x next

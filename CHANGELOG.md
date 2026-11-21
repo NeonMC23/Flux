@@ -6,6 +6,25 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### Terminal player
+
+- The TUI is now a complete keyboard-first player: Tracks, Artists, Albums,
+  Playlists, Collections, Lyrics and Settings destinations; artist and album
+  detail navigation; structured prefilled metadata forms; playlist create,
+  rename, delete, entry add/remove/reorder and playback; ratings, favorites,
+  history collections and audio-device selection.
+- Five persisted layouts (Standard, Library, Player, Visualizer, Compact), a
+  command palette, contextual help and an explicit queue with follow, jump and
+  confirmed clear.
+- A real audio visualizer with Waveform, Bars and Pulse modes, shared
+  `WaveformScope` processing and the engine's post-gain waveform tap. Hidden
+  visualizers stop sampling.
+- The GUI and TUI now share smart-collection queries and queue clearing through
+  `flux-app::Controller`; neither frontend duplicates domain rules.
+- PTY captures and automated tests cover navigation, forms, queue confirmation,
+  playlist state, visualization data mapping, preference persistence and a
+  5,000-track performance fixture.
+
 ### Usability
 
 - The ordinary import now follows Source → Destination → Verify → Import. The

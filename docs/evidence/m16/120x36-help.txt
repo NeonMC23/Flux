@@ -1,0 +1,36 @@
+Flux · canonical /tmp/opencode/m15-ui-w/data/flux/FluxLibrary · help · queue 1 · normal
+ Tracks  Artists  Albums  Playlists  Collections  Lyrics  Settings
+⏸ First Song — Artist    0:00 / --:--    ░░░░░░░░░░░░    Vol 100%    Xfade off
+Flux TUI help
+Flux TUI quick reference
+A complete keyboard-first player: library, queue, playlists, lyrics, metadata and a real audio visualizer.
+Active library: canonical /tmp/opencode/m15-ui-w/data/flux/FluxLibrary
+Audio output: this build has no audio output backend (compiled without the `cpal` feature) · unknown device · system def
+
+NAVIGATION
+Tab / Shift+Tab cycles Tracks, Artists, Albums, Playlists, Collections, Lyrics, Settings.
+F1–F7 open a destination directly · ↑/↓ or k/j move · PgUp/PgDn · g/G first/last
+Enter opens the selected entity or plays the selected track · Esc goes back.
+/ searches the current view · Esc clears search · F filters favorites · ? opens help.
+: opens the command palette (:tracks :queue :viz bars :layout player :seek +10).
+
+PLAYBACK
+Enter play · Space play/pause · s stop · n/p next/previous · ←/→ seek 5s (Shift 30s).
++/- volume · R cycles repeat/shuffle modes · K crossfade · [ ] crossfade duration.
+The player remains visible in every library view; Player layout gives it the whole screen.
+Output loss triggers bounded automatic recovery; after exhaustion, Play starts a fresh retry.
+
+LAYOUT AND VISUALIZER
+m cycles Standard, Library, Player, Visualizer and Compact layouts.
+v shows/hides the visualizer · Alt+v cycles Waveform, Bars and Pulse.
+Alt+↑/↓ changes visualization sensitivity. Preferences persist in the Flux config directory.
+The visualizer reads the engine's real post-gain waveform tap; it is not a simulated animation.
+
+LIBRARY
+Artists: Enter opens albums and tracks · Y edits · P creates.
+Albums: Enter opens the track listing · Z edits title, release type and cover.
+Tracks: e edits title, artist credit, album and numbering · y reads lyrics.
+W sets/removes Track artwork · S sets/removes managed lyrics · 0–5 rating · f favorite.
+Collections: Favorites, Highly rated, Recently added/played, Most played, lyrics and artwork views.
+This build has no audio-output backend; device selection is unavailable.
+Help/details — ↑/↓ scroll · PgUp/PgDn · Esc/Q back · 1-30 of 58

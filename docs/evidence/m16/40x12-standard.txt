@@ -1,0 +1,12 @@
+Flux · Tracks · normal · queue 1
+⏸ First Song — Artist    0:00 / --:--
+Tracks · 2 tracks
+> ▶  First Song  · Artist  · Album
+     Second Song  · Artist  · Album
+
+
+
+
+
+Library ready.
+↑/↓ move · Enter play · a queue · x next

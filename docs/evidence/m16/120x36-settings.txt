@@ -1,0 +1,36 @@
+Flux · canonical /tmp/opencode/m15-ui-w/data/flux/FluxLibrary · Settings · queue 1 · normal
+ Tracks  Artists  Albums  Playlists  Collections  Lyrics  Settings
+⏸ First Song — Artist    0:00 / --:--    ░░░░░░░░░░░░    Vol 100%    Xfade off
+Settings · Enter toggles · d refreshes audio devices
+> Layout  · Standard                                                              NOW PLAYING
+  Visualizer  · Shown                                                             First Song — Artist
+  Visualization mode  · Waveform                                                  Artist · Album
+  Lyrics follow playback  · On                                                    0:00 ░░░░░░░░░░░░░░░░░░░░░░░░░░░ --:--
+  Refresh audio devices  · 0 found                                                VISUALIZER · Waveform
+  Library setup  · Open
+  System default output  · system default  · active
+
+                                                                                  ••••••••••••••••••••••••••••••••••••••
+
+
+
+                                                                                  UP NEXT
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+This build has no audio-output backend; device selection is unavailable.
+↑/↓ select · Enter toggles · d refresh devices · Tab views · ? help
