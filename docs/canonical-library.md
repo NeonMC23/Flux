@@ -90,7 +90,8 @@ root may leave its documented temporary leftovers there after the switch.
   explicit sidecar or manual choice wins, and existing duplicates apply repairs
   only through **Update details**. See
   [`library-architecture-decision.md`](library-architecture-decision.md) for
-  the collaboration model and deferred multi-artist Album migration. These assets are staged in the same canonical transaction as
+  the collaboration model, schema-2 migration and lifecycle rules. These assets
+  are staged in the same canonical transaction as
   the audio, Album/Artist creation and metadata updates. Selected existing
   Artists/Albums use stable IDs or exact owner/title resolution; no fuzzy entity
   merge exists.
@@ -360,11 +361,15 @@ counters and are never reused.
 - Album cover, Artist image, Track artwork and lyrics are optional managed
   files with relative, validated names. Artist `description`/`image`, Track
   `artwork` and the managed asset fields are optional serde-defaulted additions
-  to canonical schema version 1. `TrackEntityDto.album_id` and the catalogue
+  to canonical schema version 2. `TrackEntityDto.album_id` and the catalogue
   Track `album_id` are optional; a missing field deserializes as standalone,
   while every pre-M3 library has a numeric value and remains an Album member.
-  Libraries written before M2/M3 remain readable; no version bump or migration
-  is required. Missing artwork never invalidates the owning entity.
+  Schema 1 libraries remain readable and are upgraded atomically on open: each
+  physical Album owner becomes the initial explicit participant, every
+  version-1 entity file is rewritten as schema 2 with unknown fields preserved,
+  and the normal catalogue backup/journal supplies rollback and recovery.
+  Schema 2 requires an explicit (possibly empty) participant list per Album.
+  Missing artwork never invalidates the owning entity.
 - Artist name/description/image are Artist-owned. Album title/release/cover and
   order are Album-owned. Track title/track-disc numbers/credits/lyrics and its
   optional artwork override are Track-owned. Displaying an owner or Album name
@@ -447,6 +452,14 @@ A track stores an ordered `credited_artist_ids` list plus exactly one
 owner because the album directory is the physical container. The owner need not
 be first after an explicit ownership choice. Artist discographies resolve both
 owned and credited tracks from the same TrackId without copying audio.
+
+Albums separately store an ordered `participant_artist_ids` list. Participation
+is explicit and independent of Track credits: it may include the physical owner
+or not, may contain several Artists, and may be empty. Removing a participant
+only removes the association; the Album, Tracks, audio, artwork and Track
+credits remain. An Album without participants is valid. Artist pages label
+physical ownership, explicit participation and Track-credit-only reachability
+as distinct relationships.
 
 Canonical import inference creates one provisional credit from the folder/file
 name. The GUI review can add existing artists, add named credits, remove/reorder
@@ -1927,8 +1940,8 @@ than merged into one database or cross-file transaction:
 
 | State | Owner | Authority | Format/version | Publication and recovery |
 |---|---|---|---|---|
-| `library.flux` manifest, `catalog.flux`, artist/album/track/playlist records, `ratings.flux` | `flux-library::canonical` | Authoritative catalogue | Canonical schema 1 JSON entity files | C1 journal, generation/counter validation, backups and startup recovery |
-| `transactions/`, `backups/`, `catalog.flux.bak` | `flux-library::canonical` | Recovery metadata / historical copy | Canonical journal schema 1 | Journal-owned staging, rollback/roll-forward, cleanup recovery |
+| `library.flux` manifest, `catalog.flux`, artist/album/track/playlist records, `ratings.flux` | `flux-library::canonical` | Authoritative catalogue | Canonical schema 2 JSON entity files (schema 1 read and upgraded on open) | C1 journal, generation/counter validation, backups, schema migration and startup recovery |
+| `transactions/`, `backups/`, `catalog.flux.bak` | `flux-library::canonical` | Recovery metadata / historical copy | Canonical journal schema 1–2 | Journal-owned staging, rollback/roll-forward, migration and cleanup recovery |
 | Managed audio/artwork/lyrics files | `flux-library::canonical` resources | Authoritative only through catalogue references | Media/image/LRC bytes | Staged and verified in canonical transactions; unreferenced cleanup only after commit |
 | `<library>/queue.flux` | `flux-app` policy + `flux-library::queue_store` | Independent application state | Queue schema 1 | Shared atomic writer; malformed file preserved and queue writes disabled |
 | `history.flux` | `flux-app` policy + `flux-library::playback_history` | Derived aggregate for live canonical TrackIds | History schema 1 | Shared atomic writer; malformed file preserved and history writes disabled |

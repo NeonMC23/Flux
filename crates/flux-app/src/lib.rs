@@ -2399,11 +2399,31 @@ impl Controller {
     }
 
     /// Albums containing credited tracks but not physically owned by the artist.
+    /// This is a Track-credit relationship, independent of Album participation.
     #[must_use]
     pub fn albums_credited_for(&self, artist: ArtistId) -> Vec<AlbumId> {
         self.canonical_store
             .as_ref()
             .map(|store| store.albums_credited_for(artist))
+            .unwrap_or_default()
+    }
+
+    /// Explicit ordered participants of one canonical Album.
+    #[must_use]
+    pub fn album_participants(&self, id: AlbumId) -> Vec<ArtistId> {
+        self.canonical_store
+            .as_ref()
+            .and_then(|store| store.album_participants(id))
+            .map(ToOwned::to_owned)
+            .unwrap_or_default()
+    }
+
+    /// Albums explicitly listing an artist as a participant.
+    #[must_use]
+    pub fn albums_participating_for(&self, artist: ArtistId) -> Vec<AlbumId> {
+        self.canonical_store
+            .as_ref()
+            .map(|store| store.albums_participating_for(artist))
             .unwrap_or_default()
     }
 
@@ -4925,6 +4945,70 @@ impl Controller {
         Ok(id)
     }
 
+    /// Replaces an Album's ordered participants without touching tracks,
+    /// credits, artwork or the physical owner.
+    pub fn set_album_participants(
+        &mut self,
+        album_id: AlbumId,
+        participants: &[ArtistId],
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Album participants require a canonical library.".to_owned());
+        };
+        store
+            .set_album_participants(album_id, participants)
+            .map_err(|err| format!("Could not update Album participants: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
+    /// Adds one Album participant, preserving existing order.
+    pub fn add_album_participant(
+        &mut self,
+        album_id: AlbumId,
+        artist: ArtistId,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Album participants require a canonical library.".to_owned());
+        };
+        store
+            .add_album_participant(album_id, artist)
+            .map_err(|err| format!("Could not add Album participant: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
+    /// Removes one Album participant. Track credits and audio are untouched.
+    pub fn remove_album_participant(
+        &mut self,
+        album_id: AlbumId,
+        artist: ArtistId,
+    ) -> Result<(), String> {
+        if let Err(message) = self.portable_maintenance_guard() {
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        let Some(store) = self.canonical_store.as_mut() else {
+            return Err("Album participants require a canonical library.".to_owned());
+        };
+        store
+            .remove_album_participant(album_id, artist)
+            .map_err(|err| format!("Could not remove Album participant: {err}"))?;
+        self.refresh_from_canonical();
+        self.outbox.push(ControllerEvent::LibraryChanged);
+        Ok(())
+    }
+
     /// Updates album title and release type, preserving AlbumId and tracks.
     pub fn update_album_metadata(
         &mut self,
@@ -6248,6 +6332,7 @@ impl Controller {
                 credited_artists: vec![artist_ref],
                 owner_index: 0,
                 album,
+                album_participants: Vec::new(),
                 track_number: inferred.track_number,
                 disc_number: inferred.disc_number,
                 duration_ms: inferred.duration_ms,
@@ -16841,6 +16926,7 @@ mod tests {
         .expect("transfer");
         plan.set_delete(solo, true).expect("delete");
         plan.set_remove_credit(guest, None).expect("credit");
+        plan.set_delete_owned_albums(true);
         assert!(plan.is_ready(), "{:?}", plan.issues);
         let report = controller.execute_artist_deletion(&plan).expect("execute");
         assert_eq!(report.deleted_tracks, vec![solo]);

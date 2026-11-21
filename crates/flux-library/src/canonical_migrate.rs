@@ -537,6 +537,7 @@ pub fn plan_portable_v3(
         seed.albums.push(CanonicalAlbum {
             id,
             owner_artist_id: owner,
+            participant_artist_ids: vec![owner],
             title,
             release_type,
             cover: None,
@@ -736,6 +737,7 @@ pub fn plan_legacy_index(
         seed.albums.push(CanonicalAlbum {
             id,
             owner_artist_id: owner,
+            participant_artist_ids: vec![owner],
             title,
             release_type,
             cover: None,

@@ -1,39 +1,44 @@
 # Library architecture decision: Artists, Albums, Tracks and collaborations
 
-Status: **accepted for M21; no schema migration applied.**
+Status: **implemented in M22 as canonical schema version 2.**
 
-This document records the current canonical model, the alternatives considered
-for collaborative releases, the decision taken for this milestone, and the
-migration work that would be required before any explicit multi-artist Album
-schema could be introduced.
+This document records the canonical model, the alternatives considered for
+collaborative releases, the selected model, and the migration and rollback
+behavior now implemented.
 
-## Current model (schema version 1)
+## Current model (schema version 2)
 
 The canonical store already uses stable entities and explicit relationships;
 Track rows do not own copies of Artist or Album strings.
 
 ```text
 Artist (stable ArtistId, name, aliases, description, image)
-  └── Album (stable AlbumId, owner ArtistId, title, release type, cover,
-             ordered TrackIds)
-        └── Track (stable TrackId, ordered credited ArtistIds,
-                   physical owner ArtistId, optional AlbumId,
-                   track/disc numbers, lyrics, optional artwork override)
+  ↕ ordered participation (many-to-many)
+Album (stable AlbumId, physical owner ArtistId, ordered participant ArtistIds,
+       title, release type, cover, ordered TrackIds)
+  └── Track (stable TrackId, ordered credited ArtistIds,
+             physical owner ArtistId, optional AlbumId,
+             track/disc numbers, lyrics, optional artwork override)
 ```
 
 - `CanonicalArtist.id` is the identity. Display names are not unique keys.
   Import resolution only reuses an Artist by an exact stable reference or an
   unambiguous exact normalized name; otherwise it proposes a new Artist.
-- `CanonicalAlbum` is owned by one Artist. The owner supplies the physical
-  directory, the Album cover and the consistency boundary for membership.
+- `CanonicalAlbum.owner_artist_id` is a physical/organizing role: it selects
+  the Album directory and the physical owner required for every member Track.
+  It is **not** the same as Album participation.
+- `CanonicalAlbum.participant_artist_ids` is the explicit ordered many-to-many
+  association. It may contain several Artists, may include or omit the physical
+  owner, and may be empty. Track credits never populate it implicitly.
 - `CanonicalTrack.credited_artist_ids` is an ordered list. The first credit is
   the default owner at import time; the physical owner may explicitly be a
   later credit. This expresses collaborations and features without duplicating
   audio.
-- `Controller::albums_credited_for(artist)` returns Albums that the Artist
-  reaches only through Track credits. Artist detail pages combine owned and
-  credited Albums, so a guest artist can navigate to a collaborative release
-  without owning its files.
+- `Controller::albums_participating_for(artist)` returns explicit Album
+  associations; `albums_owned_by` reports physical ownership; and
+  `albums_credited_for` reports Track-credit-only reachability. Artist surfaces
+  union these views while labelling the relationship, so a participant can
+  navigate to a shared release without owning files or appearing on a Track.
 
 This is already an entity model. The M21 investigation did not find a need to
 replace it; it found gaps in selection, duplicate presentation and artwork
@@ -44,8 +49,9 @@ destructive rewrite.
 
 ### 1. One canonical Album associated with multiple Artists
 
-`Album.artist_ids: Vec<ArtistId>` (or a join table) plus one owner for physical
-resources.
+`Album.participant_artist_ids: Vec<ArtistId>` (or a join table) plus one
+physical owner for resources. The owner may be a participant or only the
+organizing/physical role.
 
 - Duplicate identity: strongest — one title, one cover, one order.
 - Track membership/order: unchanged.
@@ -112,46 +118,64 @@ This model was rejected. It duplicates identity and creates exactly the
 conflicting metadata/artwork and unsafe deletion behavior the milestone
 prohibits.
 
-## Decision
+## Decision (implemented)
 
-Keep the existing **Album physical owner + ordered Track credits** model for
-M21.
+M22 adopts alternative 1: **one canonical Album entity with an explicit ordered
+participant set**, while retaining `owner_artist_id` strictly as the physical
+and organizing role.
 
-Reasons:
+Semantics:
 
-1. It already preserves stable identity, one Album cover, one track order and
-   one managed audio resource per Track.
-2. Collaborative releases remain reachable from every credited Artist through
-   `albums_credited_for`, without duplicating the Album or its files.
-3. No irreversible migration is needed, and existing libraries remain
-   bit-compatible.
-4. The product problems reported by the user are selection, duplicate
-   presentation and artwork repair. Those are solved without changing storage
-   semantics.
+- Album participation is independent of Track credits in both directions.
+- The physical owner must own every member Track and therefore appears in each
+  Track's ordered credits, but need not participate in the Album.
+- Removing a participant changes only the association. It never deletes the
+  Album, Tracks, audio, artwork or Track credits.
+- Removing the last participant leaves a valid participant-less Album.
+- Album identity, cover, title, release type and track order remain singular.
+- Editing an Album's participants is one atomic catalogue transaction.
+- No second Album entity or audio copy is created for collaboration.
 
-The limitation is explicit: Album-level participants are derived from Track
-credits and the owner. A release with an artist who appears on no Track, or an
-Album-level credit display independent of Track credits, is not representable.
-That limitation is acceptable until user validation shows it matters.
+Artist pages union physical ownership, explicit participation and Track-credit
+reachability, and label which relationship applies. Album pages expose every
+participant as a navigable Artist entity.
 
-### Deferred proposal: explicit multi-artist Album
+## Schema 2 and migration
 
-If validation requires Album-level participation, use alternative 1, not 3:
-one Album entity plus an ordered `artist_ids` set (owner included) and a
-schema version bump with forward migration. Required work before applying it:
+`catalog.flux` stores `participant_artist_ids` for every Album as an optional
+ordered list. Schema 2 requires the field; an explicitly empty list is valid.
+Schema 1 had no such field. On open:
 
-- new catalogue/entity fields with serde defaults for old libraries;
-- validation that the owner is a member and remains the physical path owner;
-- Album transfer that can change owner without dropping other participants;
-- Artist deletion planner that refuses to delete an Album still owned by the
-  Artist until ownership is transferred;
-- relationship queries that merge owned and participating Albums;
-- GUI/TUI participant editors and pickers;
-- downgrade behavior: refuse to write a newer schema, or export one owner and a
-  lossy participant list;
-- migration fixtures for every prior schema version.
+1. Recover any outstanding journal exactly as before.
+2. If manifest/catalogue are schema 1, add each Album's physical owner as its
+   deterministic initial participant.
+3. Validate artists, duplicates, Album/Track relationships and the schema-2
+   catalogue before writing.
+4. Publish one transaction that upgrades the manifest, catalogue, and every
+   version-1 entity file. Raw JSON is edited as `serde_json::Value`, preserving
+   unknown fields.
+5. Reopen and validate the committed schema-2 library.
 
-No part of this proposal has been implemented.
+The existing catalogue backup and C1 journal provide rollback before the
+catalogue commit and roll-forward after it. A failure before the commit leaves
+schema 1 intact and the next open retries; a failure after the catalogue commit
+is recovered from the journal. Unsupported or malformed versions fail closed;
+a schema-2 catalogue with a missing participant list is rejected.
+
+## Lifecycle
+
+- **Deleting a participant Artist** removes only participation associations and
+  the existing Track-credit decisions. Shared Albums and audio remain.
+- **Deleting a physical owner** requires every owned Album to be either
+  participant-free with explicit owned-Album deletion confirmation, or
+  ownership-transferred first when other participants exist. Shared Albums are
+  never deleted as a side effect.
+- **Deleting an Album** still requires it to be empty and explicit; its
+  participants are removed with the entity.
+- **Track move/reassignment** preserves the Album-owner physical rule and leaves
+  Album participation unchanged.
+- **Resource safety** is unchanged: audio cleanup only occurs through reviewed
+  Track deletions or Album transfer cleanup, after the catalogue commit.
 
 ## Duplicate Artist names
 
@@ -227,18 +251,17 @@ Release type remains optional in practice:
 
 ## Compatibility
 
-No catalogue, entity or settings schema version changed. Existing libraries
-continue to load and publish unchanged. The only new persisted artifacts are
-temporary extracted images, which live outside the library and are removed when
-the import plan drops. Embedded artwork that the user accepts is copied through
-the existing managed artwork publication path.
+Schema 2 remains forward-migratable from schema 1. Older binaries cannot read
+schema 2 and therefore must not be pointed at an upgraded library; this is the
+explicit downgrade boundary. Unknown fields are preserved during migration, and
+entity files are upgraded to schema 2 in the same transaction. Settings, queue
+and history schemas are unchanged.
 
 ## Ordered roadmap
 
-1. **M21 (implemented):** bounded embedded-artwork suggestion, duplicate
-   artwork repair, existing-Album picker, duplicate open actions, same-name
-   disambiguation, hover isolation, GUI/TUI composition work.
-2. **Next:** explicit hardening tests for shared-resource deletion and
-   collaboration navigation across both front ends.
-3. **Only if validated:** explicit multi-artist Album schema with the migration
-   and rollback plan above.
+1. **M21 (implemented):** artwork repair, entity pickers, duplicate navigation,
+   hover isolation, GUI/TUI composition.
+2. **M22 (implemented):** explicit participants, schema-2 migration, participant
+   editing in GUI/TUI, collaboration-aware Artist/Album pages and safe deletion.
+3. **Next:** human validation of collaborative workflows and any additional
+   release metadata needed by real users.
