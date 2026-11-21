@@ -68,8 +68,9 @@ root may leave its documented temporary leftovers there after the switch.
   immutable track segments, catalogue backups, generation checks, path
   validation and an explicit legacy migration (`migrate.rs`).
 - The legacy scanner still uses `lofty` (`scan.rs`), but canonical startup,
-  import inference, editing and migration never call it. The review importer
-  now derives metadata only from filenames/folders.
+  import inference, editing and migration never use tags for metadata. The
+  review importer derives canonical metadata only from filenames/folders and
+  reads embedded pictures solely as a bounded artwork suggestion.
 - Tracks are physically addressed by absolute paths in the runtime library and
   queue data. Portable records are relative, but the legacy index and runtime
   queue are not guaranteed to be library-owned.
@@ -84,7 +85,12 @@ root may leave its documented temporary leftovers there after the switch.
   before Album artwork and restores the inherited Album image when the override
   is removed.
 - Import review can attach validated Album artwork, Track artwork and lyrics to
-  each candidate. These assets are staged in the same canonical transaction as
+  each candidate. Embedded pictures (PNG/JPEG/WebP, ≤16 MiB, ≤4096 px / 16 MP)
+  are staged in a plan-owned temporary directory and remain suggestions; an
+  explicit sidecar or manual choice wins, and existing duplicates apply repairs
+  only through **Update details**. See
+  [`library-architecture-decision.md`](library-architecture-decision.md) for
+  the collaboration model and deferred multi-artist Album migration. These assets are staged in the same canonical transaction as
   the audio, Album/Artist creation and metadata updates. Selected existing
   Artists/Albums use stable IDs or exact owner/title resolution; no fuzzy entity
   merge exists.
@@ -345,8 +351,12 @@ counters and are never reused.
   first credit is the default owner at import time; an explicit review decision
   may select a later credit as physical owner. Featuring/collaboration is
   represented by additional ordered credits, never by duplicate audio.
-- Audio tags are never read or written. Stored duration comes from Flux
-  metadata (or is absent); content fingerprints are streamed bytes.
+- Audio tags are never written and never supply canonical title, artist, album
+  or lyrics metadata. Stored duration comes from Flux metadata (or is absent);
+  content fingerprints are streamed bytes. Embedded pictures are read only as
+  an import-review artwork suggestion: PNG/JPEG/WebP payloads are bounded to
+  16 MiB and 4096 px / 16 MP, and are attached only when the user accepts them
+  (explicit artwork choices always win).
 - Album cover, Artist image, Track artwork and lyrics are optional managed
   files with relative, validated names. Artist `description`/`image`, Track
   `artwork` and the managed asset fields are optional serde-defaulted additions
@@ -1426,7 +1436,8 @@ and batch rating/favorite editing remain GUI-only.
 Lyrics remain a single managed UTF-8 text file referenced by the existing
 `TrackEntityDto.lyrics` filename inside the track directory. Both plain and
 synchronized lyrics use that managed `.lrc` filename; no schema migration or
-second lyrics store was added. Audio tags are never read or written. Replacing
+second lyrics store was added. Audio tags are never used as a lyrics source and
+are never written. Replacing
 or moving audio preserves the managed lyrics file through the existing track
 lifecycle/album-transfer transactions.
 

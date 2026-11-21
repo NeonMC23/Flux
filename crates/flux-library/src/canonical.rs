@@ -13948,6 +13948,76 @@ mod atomic_import_tests {
         assert_eq!(library.album_tracks(album), ids);
     }
 
+    #[test]
+    fn same_named_artists_stay_distinct_and_reach_collaborative_albums() {
+        let dir = TempDir::new("same-name-artists");
+        let root = dir.path().join("FluxLibrary");
+        let mut library = CanonicalLibrary::create(&root).expect("create");
+        let owner = library
+            .create_artist("Nirvana", Vec::new())
+            .expect("first Nirvana");
+        let guest = library
+            .create_artist("Nirvana", Vec::new())
+            .expect("second Nirvana");
+        assert_ne!(owner, guest, "identical names must not collapse identities");
+        assert_eq!(library.artist(owner).unwrap().name, "Nirvana");
+        assert_eq!(library.artist(guest).unwrap().name, "Nirvana");
+        let album = library
+            .create_album(owner, "Nevermind", ReleaseType::Album)
+            .expect("album");
+        let source = dir.write("lithium.wav", b"audio");
+        let generation = library.generation();
+        let ids = library
+            .import_tracks_batch(
+                generation,
+                vec![CanonicalImportTrackRequest {
+                    source,
+                    title: "Lithium".to_owned(),
+                    credited_artists: vec![
+                        CanonicalImportArtistRef::Existing(owner),
+                        CanonicalImportArtistRef::Existing(guest),
+                    ],
+                    owner_index: 0,
+                    album: CanonicalImportAlbumRef::Existing(album),
+                    track_number: Some(1),
+                    disc_number: None,
+                    duration_ms: None,
+                    artwork: None,
+                    album_artwork: None,
+                    lyrics: None,
+                    allow_duplicate_content: false,
+                    expected_source_fingerprint: None,
+                }],
+            )
+            .expect("collaborative import");
+        let track = library.track(ids[0]).expect("track");
+        assert_eq!(track.owner_artist_id, owner);
+        assert_eq!(track.credited_artist_ids, vec![owner, guest]);
+        assert_eq!(library.album(album).unwrap().owner_artist_id, owner);
+        assert_eq!(library.album_tracks(album), vec![ids[0]]);
+        assert_eq!(
+            library
+                .albums_owned_by(owner)
+                .map(|album| album.id)
+                .collect::<Vec<_>>(),
+            vec![album]
+        );
+        assert!(
+            library.albums_owned_by(guest).next().is_none(),
+            "the guest does not own a duplicate physical album"
+        );
+        assert_eq!(
+            library.albums_credited_for(guest),
+            vec![album],
+            "the guest reaches the shared release through track credits"
+        );
+        assert!(library.albums_credited_for(owner).is_empty());
+        assert!(
+            library.delete_empty_album(album).is_err(),
+            "a collaborative album is not empty and cannot be removed blindly"
+        );
+    }
+
     fn base_track_fixture(
         dir: &TempDir,
         name: &str,

@@ -4,8 +4,10 @@
 //! The import manager is deliberately split into three phases:
 //!
 //! 1. [`prepare_import_plan`] discovers files and infers candidate metadata
-//!    only from filenames/directories without touching the active library
-//!    or reading audio tags. It produces editable
+//!    only from filenames/directories without touching the active library.
+//!    Audio tags never supply canonical title, artist, album or lyrics
+//!    metadata. Embedded pictures may be extracted read-only as a bounded
+//!    artwork suggestion for review. It produces editable
 //!    [`ImportCandidate`]s, duplicate/conflict hints, and issues.
 //! 2. [`prepare_import_files`] performs the potentially slow copy phase in
 //!    the background, with cooperative cancellation. It creates no
@@ -23,6 +25,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flux_core::{ArtistId, Track, TrackId, TrackSource};
 use flux_library::portable::{FLUX_DIR_NAME, sync_library_to_portable_store};
@@ -233,6 +236,8 @@ pub enum MetadataSource {
     SidecarLyrics,
     /// Read from a local image sidecar.
     SidecarArtwork,
+    /// Extracted from an embedded audio picture as a review suggestion.
+    EmbeddedArtwork,
     /// Changed by the user during review.
     Manual,
     /// Safe placeholder rather than discovered information.
@@ -249,6 +254,7 @@ impl MetadataSource {
             Self::ExistingLibrary => "existing library",
             Self::SidecarLyrics => "lyrics sidecar",
             Self::SidecarArtwork => "artwork sidecar",
+            Self::EmbeddedArtwork => "embedded artwork",
             Self::Manual => "manual review",
             Self::Fallback => "fallback",
         }
@@ -925,6 +931,8 @@ pub struct ImportPlan {
     existing_paths: Vec<PathBuf>,
     /// Fixed existing album target, when importing into an album.
     pub target_album: Option<ImportAlbumTarget>,
+    /// Bounded temporary directory holding extracted embedded artwork.
+    _temp_artwork: Arc<TempArtworkDir>,
 }
 
 impl ImportPlan {
@@ -1706,21 +1714,59 @@ fn base_for_existing(
     Some((track, artist))
 }
 
+#[derive(Debug)]
+pub(crate) struct TempArtworkDir {
+    path: PathBuf,
+}
+
+impl TempArtworkDir {
+    pub(crate) fn new() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "flux-embedded-art-{}-{stamp}-{sequence}",
+            std::process::id()
+        ));
+        if let Err(error) = std::fs::create_dir_all(&path) {
+            // Never fall back to a shared predictable location: artwork staging
+            // is best-effort, and a failed mkdir simply disables suggestions.
+            let _ = error;
+        }
+        Self { path }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempArtworkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 pub(crate) struct SidecarDiscovery {
     pub(crate) lyrics: Option<(PathBuf, String)>,
     pub(crate) track_artwork: Option<PathBuf>,
     pub(crate) album_artwork: Option<PathBuf>,
+    pub(crate) embedded_artwork: Option<PathBuf>,
     pub(crate) notes: Vec<String>,
 }
 
 pub(crate) fn discover_sidecars(
     audio: &Path,
     directory_files: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    temp_artwork: &Path,
 ) -> SidecarDiscovery {
     let mut discovery = SidecarDiscovery {
         lyrics: None,
         track_artwork: None,
         album_artwork: None,
+        embedded_artwork: None,
         notes: Vec::new(),
     };
     let Some(parent) = audio.parent() else {
@@ -1855,7 +1901,58 @@ pub(crate) fn discover_sidecars(
                     false
                 }
             });
+    if discovery.track_artwork.is_none() && discovery.album_artwork.is_none() {
+        match embedded_artwork_suggestion(audio, temp_artwork) {
+            Ok(Some(path)) => {
+                discovery.notes.push(
+                    "Embedded artwork was extracted as a review suggestion; it does not change canonical title, artist or album metadata."
+                        .to_owned(),
+                );
+                discovery.embedded_artwork = Some(path);
+            }
+            Ok(None) => {}
+            Err(error) => discovery
+                .notes
+                .push(format!("Embedded artwork was ignored: {error}")),
+        }
+    }
     discovery
+}
+
+fn embedded_artwork_suggestion(
+    audio: &Path,
+    temp_artwork: &Path,
+) -> Result<Option<PathBuf>, String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(art) = flux_library::read_embedded_artwork(audio)? else {
+        return Ok(None);
+    };
+    let reader = image::ImageReader::new(std::io::Cursor::new(&art.bytes))
+        .with_guessed_format()
+        .map_err(|error| format!("embedded image format is not readable: {error}"))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| format!("embedded image dimensions are not readable: {error}"))?;
+    if width == 0
+        || height == 0
+        || width > 4096
+        || height > 4096
+        || u64::from(width) * u64::from(height) > 16_000_000
+    {
+        return Err(format!(
+            "embedded image dimensions {width}x{height} exceed the 4096 px / 16 MP bound"
+        ));
+    }
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = audio
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.replace(['/', '\\'], "_"))
+        .unwrap_or_else(|| "artwork".to_owned());
+    let path = temp_artwork.join(format!("{stem}-{sequence}.{}", art.extension));
+    std::fs::write(&path, art.bytes)
+        .map_err(|error| format!("could not stage embedded artwork: {error}"))?;
+    Ok(Some(path))
 }
 
 fn is_image_sidecar(path: &Path) -> bool {
@@ -1928,6 +2025,7 @@ fn make_candidate(
     album_links: &[(TrackId, AlbumId)],
     inference: &crate::CanonicalImportInference,
     directory_files: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    temp_artwork: &Path,
 ) -> ImportCandidate {
     let existing_match = status.matched_track().and_then(|id| {
         let (_, track) = existing.iter().find(|(track_id, _)| *track_id == id)?;
@@ -2042,7 +2140,7 @@ fn make_candidate(
             conflicts.push("Incoming album differs from the existing canonical album.".to_owned());
         }
     }
-    let sidecars = discover_sidecars(&source_path, directory_files);
+    let sidecars = discover_sidecars(&source_path, directory_files, temp_artwork);
     let mut candidate = ImportCandidate {
         source_path: source_path.clone(),
         source_track,
@@ -2089,24 +2187,30 @@ fn make_candidate(
                 ..
             }
     );
-    if !existing_duplicate {
-        if let Some((path, text)) = sidecars.lyrics {
-            candidate.set_sidecar_lyrics(path, text);
-        }
-        if let Some(path) = sidecars.track_artwork {
-            let _ = candidate.set_artwork_with_source(&path, MetadataSource::SidecarArtwork);
-        }
-        if candidate.album.is_some()
-            && let Some(path) = sidecars.album_artwork
-        {
-            let _ = candidate.set_album_artwork_with_source(&path, MetadataSource::SidecarArtwork);
-        }
-    } else if sidecars.lyrics.is_some()
-        || sidecars.track_artwork.is_some()
-        || sidecars.album_artwork.is_some()
+    let had_track_art = sidecars.track_artwork.is_some();
+    let had_album_art = sidecars.album_artwork.is_some();
+    let had_embedded_art = sidecars.embedded_artwork.is_some();
+    if !existing_duplicate && let Some((path, text)) = sidecars.lyrics {
+        candidate.set_sidecar_lyrics(path, text);
+    }
+    if let Some(path) = sidecars.track_artwork {
+        let _ = candidate.set_artwork_with_source(&path, MetadataSource::SidecarArtwork);
+    }
+    if candidate.album.is_some()
+        && let Some(path) = sidecars.album_artwork
     {
+        let _ = candidate.set_album_artwork_with_source(&path, MetadataSource::SidecarArtwork);
+    }
+    if let Some(path) = sidecars.embedded_artwork {
+        if candidate.album.is_some() && candidate.album_artwork.is_none() {
+            let _ = candidate.set_album_artwork_with_source(&path, MetadataSource::EmbeddedArtwork);
+        } else if candidate.artwork.is_none() {
+            let _ = candidate.set_artwork_with_source(&path, MetadataSource::EmbeddedArtwork);
+        }
+    }
+    if existing_duplicate && (had_track_art || had_album_art || had_embedded_art) {
         candidate.sidecar_notes.push(
-            "Discovered sidecars were not attached automatically to this existing duplicate; review them explicitly if replacement is intended."
+            "Artwork suggestions are attached to this existing duplicate. Choose Update details to apply them explicitly; Skip leaves the existing artwork untouched."
                 .to_owned(),
         );
     }
@@ -2262,6 +2366,7 @@ pub fn prepare_import_plan(
     };
     was_cancelled |= is_cancelled(&cancel);
 
+    let temp_artwork = Arc::new(TempArtworkDir::new());
     let mut plan = ImportPlan {
         storage,
         library_root: library_root.clone(),
@@ -2274,6 +2379,7 @@ pub fn prepare_import_plan(
             .map(|(_, track)| track.source().path().to_path_buf())
             .collect(),
         target_album: target_album.clone(),
+        _temp_artwork: Arc::clone(&temp_artwork),
         generation,
         library_session,
     };
@@ -2335,6 +2441,7 @@ pub fn prepare_import_plan(
             &existing_album_ids,
             &inference,
             &mut directory_files,
+            temp_artwork.path(),
         ));
         set_progress_item(&progress, index, ImportItemState::Ready);
         update_progress(
@@ -3066,9 +3173,22 @@ fn apply_import_plan_canonical(
                 } else {
                     CanonicalImportAlbumRef::Standalone
                 };
+                let suggested_album_art = matches!(
+                    candidate.provenance().album_artwork,
+                    Some(
+                        MetadataSource::Filename
+                            | MetadataSource::Folder
+                            | MetadataSource::SidecarArtwork
+                            | MetadataSource::EmbeddedArtwork
+                            | MetadataSource::Fallback
+                    )
+                );
                 let album_artwork = if matches!(album, CanonicalImportAlbumRef::Existing(_))
-                    && candidate.provenance().album_artwork == Some(MetadataSource::SidecarArtwork)
+                    && suggested_album_art
                 {
+                    // Importing another track into an existing Album must not
+                    // replace its explicitly assigned cover with a discovered
+                    // suggestion. Only a manual review choice may do that.
                     None
                 } else {
                     candidate.album_artwork.clone()
@@ -4226,6 +4346,71 @@ mod tests {
     }
 
     #[test]
+    fn embedded_artwork_is_a_bounded_review_suggestion() {
+        let dir = TempDir::new("embedded-artwork-import");
+        let root = dir.path().join("FluxLibrary");
+        let source_dir = dir.path().join("source/Nirvana/Nevermind");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let source = source_dir.join("Lithium.flac");
+        fs::write(
+            &source,
+            include_bytes!("../../flux-library/tests/fixtures/tagged.flac"),
+        )
+        .expect("flac");
+        let (mut controller, _control) = canonical_controller(&root);
+        let plan_for = |controller: &Controller| {
+            prepare_import_plan(
+                canonical_request(controller, &root, vec![source.clone()], None),
+                Arc::new(Mutex::new(ImportProgress::default())),
+                Arc::new(AtomicBool::new(false)),
+            )
+        };
+        let plan = plan_for(&controller);
+        let candidate = &plan.candidates[0];
+        assert!(
+            candidate
+                .album_artwork_path()
+                .is_some_and(|path| path.extension().is_some_and(|ext| ext == "png")),
+            "embedded PNG should be staged as album artwork"
+        );
+        assert_eq!(
+            candidate.provenance().album_artwork,
+            Some(MetadataSource::EmbeddedArtwork)
+        );
+        assert!(
+            candidate
+                .sidecar_notes()
+                .iter()
+                .any(|note| note.contains("Embedded artwork"))
+        );
+
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let duplicate = plan_for(&controller);
+        let candidate = &duplicate.candidates[0];
+        assert!(
+            matches!(
+                candidate.status(),
+                CandidateStatus::ExistingPath(_) | CandidateStatus::SameContent { .. }
+            ),
+            "expected an existing duplicate: {:?}",
+            candidate.status()
+        );
+        assert!(
+            candidate.album_artwork_path().is_some(),
+            "existing duplicates retain an explicit artwork repair suggestion"
+        );
+        assert!(
+            candidate
+                .sidecar_notes()
+                .iter()
+                .any(|note| note.contains("Update details"))
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn reviewed_import_reuses_unique_normalized_artist_and_album_names() {
         let dir = TempDir::new("review-normalized-entities");
         let root = dir.path().join("FluxLibrary");
@@ -4492,13 +4677,63 @@ mod tests {
             CandidateStatus::ExistingPath(_)
         ));
         assert!(candidate.lyrics_text().is_none());
-        assert!(candidate.artwork_path().is_none());
-        assert!(candidate.album_artwork_path().is_none());
+        assert!(
+            candidate.artwork_path().is_some(),
+            "artwork repairs stay available as an explicit suggestion"
+        );
+        assert!(candidate.album_artwork_path().is_some());
         assert!(
             candidate
                 .sidecar_notes()
                 .iter()
-                .any(|note| note.contains("not attached automatically"))
+                .any(|note| note.contains("Update details"))
+        );
+        assert!(
+            controller
+                .album_cover_path(controller.albums()[0].id)
+                .is_none(),
+            "review suggestions never silently replace existing artwork"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn importing_into_an_existing_album_never_replaces_its_cover_silently() {
+        let dir = TempDir::new("existing-album-cover-preserved");
+        let root = dir.path().join("FluxLibrary");
+        let (mut controller, _control) = canonical_controller(&root);
+        let first_dir = dir.path().join("IncomingA/Artist/Album");
+        fs::create_dir_all(&first_dir).expect("first dirs");
+        let first = wav(&first_dir, "one.wav", 4_410, 0.2);
+        image_file(&first_dir, "cover.png", image::ImageFormat::Png);
+        let first_cover = fs::read(first_dir.join("cover.png")).expect("cover");
+        controller
+            .import_files(std::slice::from_ref(&first), true)
+            .expect("first import");
+        let album = controller
+            .track_album_id(controller.tracks()[0].0)
+            .expect("album");
+        let managed_cover = controller.album_cover_path(album).expect("managed cover");
+
+        let second_dir = dir.path().join("IncomingB/Artist/Album");
+        fs::create_dir_all(&second_dir).expect("second dirs");
+        let second = wav(&second_dir, "two.wav", 4_410, 0.3);
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(second_dir.join("cover.png"), image::ImageFormat::Png)
+            .expect("second cover");
+        controller
+            .import_files(std::slice::from_ref(&second), true)
+            .expect("second import");
+        assert_eq!(controller.tracks().len(), 2);
+        assert_eq!(
+            controller.track_album_id(controller.tracks()[1].0),
+            Some(album),
+            "the second track joins the existing Album"
+        );
+        assert_eq!(
+            fs::read(&managed_cover).expect("cover bytes"),
+            first_cover,
+            "a discovered cover suggestion must not replace an explicit Album cover"
         );
         controller.shutdown();
     }

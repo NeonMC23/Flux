@@ -48,6 +48,7 @@
 //! a track whose file has disappeared stays in the library until it is
 //! explicitly removed — scanning only ever adds or updates, never prunes.
 
+use lofty::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -840,5 +841,82 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// Maximum embedded artwork payload accepted from one audio file.
+pub const MAX_EMBEDDED_ARTWORK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest audio container Flux will parse solely to inspect embedded artwork.
+/// Larger files still import normally; artwork suggestion is skipped so parsing
+/// cannot become an unbounded read of an unexpectedly huge file.
+pub const MAX_EMBEDDED_ARTWORK_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
+
+/// One bounded embedded-artwork payload read from an audio file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedArtwork {
+    /// Image bytes exactly as embedded in the container.
+    pub bytes: Vec<u8>,
+    /// Detected image extension (`png`, `jpg`, or `webp`).
+    pub extension: &'static str,
+}
+
+/// Reads the first supported embedded image without treating any audio tag as
+/// canonical track metadata.
+///
+/// This is an import-review suggestion only. Only PNG, JPEG, and WebP payloads
+/// are accepted, empty images and payloads above
+/// [`MAX_EMBEDDED_ARTWORK_BYTES`] are rejected, and malformed containers simply
+/// produce no artwork. The caller must still apply its own decoded-dimension
+/// bounds before publishing the image.
+pub fn read_embedded_artwork(path: &Path) -> Result<Option<EmbeddedArtwork>, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .len();
+    if size > MAX_EMBEDDED_ARTWORK_CONTAINER_BYTES {
+        return Err(format!(
+            "audio container is {} bytes, above the {} byte artwork-inspection bound",
+            size, MAX_EMBEDDED_ARTWORK_CONTAINER_BYTES
+        ));
+    }
+    let tagged = lofty::read_from_path(path).map_err(|error| error.to_string())?;
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return Ok(None);
+    };
+    for picture in tag.pictures() {
+        let bytes = picture.data();
+        if bytes.is_empty() || bytes.len() > MAX_EMBEDDED_ARTWORK_BYTES {
+            continue;
+        }
+        let extension = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "png"
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            "jpg"
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            "webp"
+        } else {
+            continue;
+        };
+        return Ok(Some(EmbeddedArtwork {
+            bytes: bytes.to_vec(),
+            extension,
+        }));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod embedded_artwork_tests {
+    #[test]
+    fn embedded_artwork_is_bounded_and_signature_checked() {
+        let dir = crate::test_support::TempDir::new("embedded-artwork");
+        let flac = include_bytes!("../tests/fixtures/tagged.flac");
+        let path = dir.write("Lithium.flac", flac);
+        let artwork = super::read_embedded_artwork(&path)
+            .expect("read embedded artwork")
+            .expect("fixture contains artwork");
+        assert_eq!(artwork.extension, "png");
+        assert!(artwork.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(artwork.bytes.len() <= super::MAX_EMBEDDED_ARTWORK_BYTES);
     }
 }

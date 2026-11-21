@@ -6040,6 +6040,7 @@ impl Controller {
         paths: &[PathBuf],
         _copy: bool,
     ) -> Result<ImportReport, String> {
+        let embedded_artwork = crate::import::TempArtworkDir::new();
         use flux_library::canonical::{
             CanonicalImportAlbumRef, CanonicalImportArtistRef, CanonicalImportTrackRequest,
         };
@@ -6079,7 +6080,11 @@ impl Controller {
                 });
                 continue;
             }
-            let sidecars = crate::import::discover_sidecars(source, &mut sidecar_directories);
+            let sidecars = crate::import::discover_sidecars(
+                source,
+                &mut sidecar_directories,
+                embedded_artwork.path(),
+            );
             let sidecar_asset = |path: &Path| {
                 flux_library::canonical::ContentFingerprint::of_file(path)
                     .map(
