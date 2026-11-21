@@ -1636,7 +1636,7 @@ impl SmartCollection {
         match self {
             Self::Favorites => "Tracks marked as favorites.",
             Self::HighlyRated => "Tracks rated 4★ or higher.",
-            Self::RecentlyAdded => "Tracks with a reliable canonical creation timestamp.",
+            Self::RecentlyAdded => "Tracks with a reliable import time.",
             Self::RecentlyPlayed => "Tracks with meaningful local playback history, newest first.",
             Self::MostPlayed => {
                 "Historically most played tracks counted after the meaningful-play threshold."
@@ -5166,9 +5166,7 @@ impl FluxReady {
                     return Task::none();
                 };
                 match self.controller.reorder_album_track(album, track, delta) {
-                    Ok(()) => {
-                        self.lifecycle_msg = Some("Updated canonical album order.".to_owned())
-                    }
+                    Ok(()) => self.lifecycle_msg = Some("Updated album order.".to_owned()),
                     Err(error) => self.lifecycle_msg = Some(error),
                 }
             }
@@ -6786,7 +6784,7 @@ impl FluxReady {
                     Ok(()) => {
                         self.follow_queue_current();
                         self.lifecycle_msg = Some(format!(
-                            "Playing playlist {id} shuffled; canonical order unchanged."
+                            "Playing playlist {id} shuffled; playlist order is unchanged."
                         ));
                     }
                     Err(error) => self.playlist_error = Some(error),
@@ -7958,7 +7956,7 @@ impl FluxReady {
             row![
                 column![
                     text(format!("Transfer album · {}", plan.title)).size(20).color(TEXT),
-                    text("One canonical transaction. AlbumId, TrackIds, track order, cover, lyrics, ratings, playlists and queue identities are preserved.")
+                    text("One transaction. Track order, cover, lyrics, ratings, playlists and queue identities are preserved.")
                         .size(10)
                         .color(MUTED),
                 ]
@@ -8111,7 +8109,7 @@ impl FluxReady {
         }
         if manager.stage == AlbumTransferUiStage::Executing {
             panel = panel.push(
-                text("Executing one canonical transaction (staging, verification, publication and cleanup)…")
+                text("Executing one transaction (staging, verification, publication and cleanup)…")
                     .size(10)
                     .color(ACCENT),
             );
@@ -8528,7 +8526,7 @@ impl FluxReady {
         }
         if manager.stage == DeletionUiStage::Executing {
             panel = panel.push(
-                text("Executing one canonical transaction (staging, verification, publication and cleanup)…")
+                text("Executing one transaction (staging, verification, publication and cleanup)…")
                     .size(10)
                     .color(ACCENT),
             );
@@ -8623,7 +8621,7 @@ impl FluxReady {
         let mut body = column![
             text("Review playlist change").size(22).color(TEXT),
             text(format!(
-                "{} selected track(s) will be written in one canonical playlist transaction.",
+                "{} selected track(s) will be written in one playlist transaction.",
                 review.track_ids.len()
             ))
             .size(11)
@@ -12692,7 +12690,7 @@ impl FluxReady {
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
-                    text("Renaming and clearing preserve the PlaylistId. Clearing never deletes canonical tracks.")
+                    text("Renaming and clearing preserve the playlist. Clearing never deletes tracks.")
                         .size(9)
                         .color(MUTED),
                 ]
@@ -14332,7 +14330,7 @@ impl FluxReady {
     fn collections_view(&self) -> Element<'_, Message> {
         let mut body = column![
             text("Smart Collections").size(22).color(TEXT),
-            text("Dynamic canonical queries. Membership updates automatically; these are not editable playlists.")
+            text("Saved dynamic views. Membership updates automatically; these are not editable playlists.")
                 .size(10)
                 .color(MUTED),
         ]
@@ -15465,7 +15463,7 @@ impl FluxReady {
             }
             setup = setup.push(setup_card(
                 "ARTISTS",
-                "Create, select, and rename stable canonical artist identities.",
+                "Create, select, and rename stable artist identities.",
                 artist_body,
             ));
 
@@ -15486,7 +15484,7 @@ impl FluxReady {
                             .then_some(Message::ReconcilePressed)
                     ),
                 text(if self.controller.storage_mode() == StorageMode::Canonical {
-                    "Reopens the canonical library and validates its manifest, catalogue and managed resource paths."
+                    "Reopens the library and validates its manifest, catalogue and managed resource paths."
                 } else {
                     "Checks every recorded file for changes, missing files, and safe move candidates. Nothing is moved automatically."
                 })
@@ -16206,7 +16204,7 @@ fn track_row<'a>(
             text(if state.editable {
                 "Edit metadata"
             } else {
-                "Use a canonical library to edit"
+                "Open a library to edit"
             })
             .size(10)
             .color(TEXT),
