@@ -47,6 +47,42 @@ for a **public signed release**, not for development validation:
 - Further splitting entity actions out of `main.rs`.
 - Word-level synchronized lyrics and karaoke parity.
 
+## M20 packaging audit finding
+
+The local development host uses glibc 2.43. A host-built `.deb` therefore
+declared `libc6 (>= 2.43)` and could not install on Ubuntu 24.04, the supported
+Linux package baseline. This was a genuine host-artifact defect, not a source
+defect.
+
+`packaging/linux/build-packages.sh` now refuses to produce publishable packages
+when the binary's glibc floor exceeds the configured baseline (default `2.39`).
+Host-local diagnostic packages require the explicit
+`FLUX_ALLOW_NEWER_GLIBC=1` override and must not be published. Release artifacts
+must be built by the Ubuntu 24.04 CI packaging job, whose baseline matches the
+supported Debian/Ubuntu target.
+
+M20 runtime evidence on the Linux audit host:
+
+- release TUI started through a PTY at 80×24 and exited cleanly;
+- release GUI started under Xephyr with a fresh XDG root, created the first-run
+  canonical library, remained responsive until the expected timeout, and wrote
+  no stderr;
+- no physical audio device or acoustic validation is claimed.
+
+Local host-specific packaging validation passed:
+
+- portable `.tar.gz` extraction and version identity,
+- `.deb` and `.rpm` metadata/payload extraction,
+- first-run GUI startup under a disposable X session,
+- reinstall/upgrade sentinel preservation,
+- application removal without deleting user library/config sentinels,
+- SHA-256 checksum verification.
+
+The podman package-manager lifecycle was attempted and correctly failed because
+the host-built diagnostic `.deb` requires glibc 2.43. It cannot validate the CI
+artifact from this host. The native CI packaging job and the deferred Ubuntu
+package-manager validation remain the authoritative lifecycle evidence.
+
 ## Verified metadata and packaging inputs
 
 - Workspace/app identity `io.github.neonmc23.flux`.
@@ -63,6 +99,8 @@ for a **public signed release**, not for development validation:
 
 ## Current release classification
 
-Flux is functionally complete for continued development and native CI
-validation. A public signed release still requires external signing/notarization
-credentials and the deferred native/manual validation above.
+Flux is ready for final human/platform validation and CI-produced release
+candidates. A public signed release still requires external signing/notarization
+credentials, native-platform/manual lifecycle validation and acoustic/usability
+validation. The host glibc mismatch is guarded and must not be bypassed for a
+published package.

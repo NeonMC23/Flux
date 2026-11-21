@@ -6,6 +6,22 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M20 release-candidate consolidation
+
+- Added a glibc compatibility guard to Linux packaging. Host-local packages that
+  exceed the supported Ubuntu 24.04 baseline are refused unless the explicit
+  diagnostic override is set, preventing accidentally published incompatible
+  `.deb`/`.rpm` artifacts.
+- Rebuilt and validated portable, Debian and RPM payloads, first-run GUI startup,
+  upgrade/reinstall sentinel preservation, removal behavior and checksums on the
+  Linux audit host.
+- Regenerated third-party notices and aligned AppStream/RPM release metadata and
+  README status with the release-candidate state.
+- Consolidated release-readiness evidence, host-package limitations and deferred
+  native/manual validation in `docs/release-readiness.md`. Release TUI/GUI
+  startup, first-run library creation, package extraction, upgrade sentinels,
+  removal behavior and checksums were revalidated locally.
+
 ### M19 completion
 
 - TUI Artist deletion transfer now uses explicit destination selection: choose a

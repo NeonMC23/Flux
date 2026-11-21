@@ -115,7 +115,9 @@ The Ubuntu-built binary's highest referenced glibc symbol is `GLIBC_2.39`;
 the `.deb` declares `libc6 (>= 2.39)` plus ALSA, fontconfig, X11, xkbcommon and
 Wayland client libraries. The ARM64 artifact is a native AArch64 ELF with the
 same floor and declares `Architecture: arm64` / RPM `aarch64`. Local Fedora
-artifacts require glibc 2.43 and are not the broad-compatibility baseline.
+artifacts require glibc 2.43 and are not the broad-compatibility baseline. The
+packaging script now refuses a publishable artifact when the binary floor exceeds
+the configured baseline; `FLUX_ALLOW_NEWER_GLIBC=1` is diagnostic-only.
 
 The CI package verifier ran the packaged GUI under Xvfb, checked `--version`,
 first-run canonical-library creation, desktop/AppStream metadata, package

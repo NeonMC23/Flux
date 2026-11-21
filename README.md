@@ -6,8 +6,8 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: release engineering prepared.**
-Both applications now open, create and switch canonical self-contained Flux
+**Status: release candidate prepared; signing and native/manual validation remain external.**
+Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
 reviewed without reading tags, playback and queue identity use stable track IDs,
