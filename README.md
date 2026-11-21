@@ -6,22 +6,28 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: release candidate prepared; signing and native/manual validation remain external.**
+**Status: public release suspended pending M21 product validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
-reviewed without reading tags, playback and queue identity use stable track IDs,
-and queues persist per library. Legacy app-data indexes and schema-v3 portable
+reviewed without reading tag metadata, playback and queue identity use stable
+track IDs, and queues persist per library. Legacy app-data indexes and schema-v3 portable
 catalogues are migration sources only in the normal front-end workflows.
 
 The GUI includes a review-first Import Manager with native pickers,
 drag-and-drop, duplicate decisions, editable metadata, copy-only staging,
-progress and cancellation, including explicit Album/Track artwork and lyrics
-attachment before the atomic commit. Existing playback, seeking, queue behavior
+progress and cancellation, including explicit Album/Track artwork, bounded
+embedded-artwork suggestions and lyrics attachment before the atomic commit.
+Duplicate reviews can open the existing Album or Artist and apply artwork
+repairs only through an explicit update decision. Existing playback, seeking, queue behavior
 and the real-time oscilloscope continue to use the same engine. Managed album
 and artist artwork plus optional per-Track artwork overrides are decoded and
 displayed throughout the library. Artists and Albums are first-class editable
 entities with detail pages, relationships and navigation to their Tracks.
+The current collaboration model is documented in
+[`docs/library-architecture-decision.md`](docs/library-architecture-decision.md):
+an Album has one physical owner, while ordered Track credits expose shared
+releases to every participating Artist.
 Album membership is optional: standalone Tracks, singles and incomplete imports
 remain fully functional without a placeholder Album. Import review supports
 multi-candidate selection, shared Artist/Album assignment and shared Album
@@ -42,7 +48,9 @@ root. `catalog.flux` is authoritative for identity/ownership/paths and is
 published last; per-entity files are validated against it. A Track's Album
 reference is optional: Album members live under the Album directory, while
 standalone Tracks use an owner Artist `standalone/tracks/` container. Audio tags
-are not a metadata source and are never rewritten.
+are not a canonical metadata or lyrics source and are never rewritten. Embedded
+pictures may be extracted read-only as a bounded artwork suggestion during
+import review; the user must accept them.
 
 Older formats remain reachable only through the explicit migration planner:
 the legacy `library-index.json` and portable schema-v3 `.flux` catalogue are
@@ -61,7 +69,7 @@ selects or writes those backends.
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). Dialog output preserves spaces and Unix non-UTF-8 path bytes; Windows PowerShell output is forced to UTF-8. |
 | `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, enriched artwork/lyrics attachment, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, dedicated Artist and Album detail pages, metadata/relationship/artwork editing, reviewed track move/audio replacement, decoded managed Album/Artist/Track artwork with override semantics, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart collections/rating controls, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
-| `flux-tui` | binary `flux-tui` | Complete keyboard-first terminal player (crossterm): Artists/Albums/Tracks/Playlists/Collections/Lyrics/Settings destinations, structured metadata forms, canonical create/open/migration, review-first import, playlist and queue management, ratings/favorites/history, lyrics reader with follow, audio-device settings, five persisted layout presets, and a real waveform/bars/pulse visualizer over the shared Controller. Genuine GUI-only review workflows are documented in `docs/m16-tui-parity.md`. |
+| `flux-tui` | binary `flux-tui` | Complete keyboard-first terminal player (crossterm): persistent destination sidebar on wide terminals, one primary playback timeline, Artists/Albums/Tracks/Playlists/Collections/Lyrics/Settings destinations, structured metadata forms, canonical create/open/migration, review-first import, playlist and queue management, ratings/favorites/history, lyrics reader with follow, audio-device settings, five persisted layout presets, and a real waveform/bars/pulse visualizer over the shared Controller. Genuine GUI-only review workflows are documented in `docs/m16-tui-parity.md`. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
 `flux-tui → flux-app + flux-core + crossterm`,
@@ -261,7 +269,7 @@ and are not required for a normal import.
 - drop audio files or folders (Iced/winit X11/Windows/macOS; Wayland file-drop
   is not supported by the toolkit);
 - infer provisional artist, album, title, track number and disc number from
-  filenames and directory names — no embedded tag is read; each reviewed field
+  filenames and directory names — no embedded tag metadata is read; each reviewed field
   records its filename/folder/existing-library/manual provenance, and a missing
   Album remains a standalone Track and never creates an “Unknown Album”
   placeholder;
@@ -311,7 +319,9 @@ lyrics inside the library and only publishes `catalog.flux` after every copy
 verifies. A changed artwork/lyrics source fingerprint or conflicting cover for
 one Album rejects the batch with complete-old state; no artist, Album, Track or
 managed asset is left partially published. Managed covers are decoded
-asynchronously for display; no tag artwork extraction occurs. The TUI uses the
+asynchronously for display. Embedded pictures are extracted only as a bounded
+review suggestion (PNG/JPEG/WebP, ≤16 MiB, ≤4096 px and ≤16 MP) and never
+override an explicit artwork choice. The TUI uses the
 same filename inference, local sidecar discovery and review/preparation worker
 for its import keys. Both reviews correct title, artist, album, track and disc
 metadata; the TUI additionally attaches album/track artwork and lyrics from

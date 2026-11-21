@@ -7,6 +7,11 @@ authorized signing/notarization procedure is in
 
 ## Release blockers
 
+M21 suspended the public release pending renewed product validation. The GUI
+and TUI composition, import review, artwork repair and library navigation were
+redesigned; subjective design quality and real pointer/keyboard interaction
+still require human validation before any public artifact is authorized.
+
 No source, metadata, license, packaging-script or CI blocker was found in this
 development environment.
 

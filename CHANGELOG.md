@@ -6,6 +6,35 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M21 product redesign and library trust
+
+- Embedded artwork is now extracted read-only as a bounded import suggestion
+  (PNG/JPEG/WebP, 16 MiB, 4096 px / 16 MP), never as canonical metadata and
+  never written back to audio. Explicit sidecar/manual artwork always wins.
+- Existing duplicate reviews retain artwork repair suggestions; they apply only
+  through an explicit **Update details** decision, and **Skip** preserves the
+  existing Track, metadata and artwork.
+- Import review offers a primary existing-Album picker scoped to the chosen
+  Artist, shows provenance, artwork readiness and duplicate **Open album/artist**
+  actions, and disambiguates same-named Artists by stable ID.
+- GUI redesign foundation: icon-led navigation, a restrained accent hierarchy,
+  now-playing sidebar block, contextual Lyrics access moved out of the top bar,
+  compact collapsible filters with active-state summary, Track overflow menus,
+  and a frozen covered layer so hover cannot bleed through modals.
+- Dashboard now derives Top Artists, Top Albums, metadata/artwork coverage and
+  recent activity from real local plays and library state; no history is
+  fabricated.
+- TUI composition redesign: persistent destination sidebar on wide terminals,
+  adaptive fallback to tabs, one primary playback timeline, a larger real
+  visualizer, and balanced now-playing/queue context.
+- Documented the Artist/Album/collaboration decision, including the rejected
+  duplication model and the migration plan required before any explicit
+  multi-artist Album schema.
+- Added regressions for duplicate Artist identities, collaborative Album
+  reachability, bounded embedded artwork, duplicate artwork repair, entity
+  picker disambiguation, Track menus, collapsible filters, hover isolation,
+  responsive sidebar thresholds and the single TUI timeline.
+
 ### M20.1 CI artifact verification
 
 - Dispatched private packaging runs on the M20 source and, after documentation
