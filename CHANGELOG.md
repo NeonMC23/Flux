@@ -6,6 +6,27 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### Feature completion
+
+- TUI album order and membership now use shared reviewed plans: `Ctrl+↑/↓`
+  reorders canonical album tracks, `Alt+m` moves a track to an owner album or
+  standalone state, and stale plans remain rejected.
+- TUI safe deletion covers tracks, empty albums and track-free artists with
+  explicit confirmation and shared generation/session checks. Placement,
+  ratings, lyrics, artwork, queue, history and managed-resource cleanup follow
+  the existing canonical deletion semantics.
+- TUI managed-audio replacement/repair (`Alt+r`), lyrics export, and import
+  review attachment of album artwork, track artwork and lyrics close the main
+  terminal feature gaps. Typed paths replace the old `track-id|path` forms for
+  artwork, lyrics and replacement.
+- GUI queue clearing now exposes a confirmed "Clear queue" action backed by the
+  shared Controller operation.
+- The TUI renderer's pure text/width helpers and waveform visualizer were split
+  into `text` and `visualizer` modules; canonical business logic remains in
+  `flux-app`.
+- Documentation and the parity matrix were reconciled with the implemented
+  workflows and remaining GUI-only review operations.
+
 ### Terminal player
 
 - The TUI is now a complete keyboard-first player: Tracks, Artists, Albums,

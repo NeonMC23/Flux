@@ -231,9 +231,14 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   the current view. Track, artist and album editing uses prefilled labelled
   forms rather than delimiter syntax. Queue, playlist, lyrics, favorite, rating,
   history, import, library lifecycle and audio-device workflows remain available.
-  `m` cycles Standard, Library, Player, Visualizer and Compact layouts, and
-  `v`/`Alt+v` control a real audio visualizer fed by the engine waveform tap.
-  Preferences persist under the Flux config directory. See
+  Album tracks reorder in place and tracks can move between albums or to
+  standalone state; track deletion, empty-album deletion and track-free artist
+  deletion use explicit confirmation. `Alt+r` reviews managed-audio repair or
+  replacement. Import review can attach album art, track art and lyrics through
+  typed paths, and the lyrics reader exports to a new file. `m` cycles Standard,
+  Library, Player, Visualizer and Compact layouts, and `v`/`Alt+v` control a real
+  audio visualizer fed by the engine waveform tap. Preferences persist under the
+  Flux config directory. See
   [`docs/m16-tui-parity.md`](docs/m16-tui-parity.md) for the full parity matrix,
   keybindings and genuine terminal limitations. `?` opens the scrollable
   reference. Display-width-aware truncation, minimum-size handling and terminal
@@ -306,9 +311,9 @@ one Album rejects the batch with complete-old state; no artist, Album, Track or
 managed asset is left partially published. Managed covers are decoded
 asynchronously for display; no tag artwork extraction occurs. The TUI uses the
 same filename inference, local sidecar discovery and review/preparation worker
-for its import keys. The TUI review can correct title, artist, album, track and
-disc metadata; provenance inspection and picker-driven artwork/lyrics attachment
-remain GUI-only. Bulk Artist, Album/standalone
+for its import keys. Both reviews correct title, artist, album, track and disc
+metadata; the TUI additionally attaches album/track artwork and lyrics from
+typed paths. Native pickers and bulk provenance inspection remain GUI-only. Bulk Artist, Album/standalone
 assignment, shared Album artwork, shared Track artwork and one validated
 LRC/TXT lyrics file are explicit actions on checked candidates in the GUI;
 per-candidate lyrics edits made afterward still win. A bulk release-type control
@@ -353,8 +358,8 @@ background staging for very large migrations is still future work.
   metadata-only because canonical directories derive from IDs, so case-only
   renames cannot break paths. Single-track ownership
   transfer uses an explicit destination release, copy-first verification and
-  journal-owned cleanup; the GUI track editor exposes it, while the TUI refuses
-  and points to the GUI. **Delete artist** opens the canonical multi-item
+  journal-owned cleanup; both editors expose reviewed operations, while the TUI
+  keeps ownership transfer GUI-only. **Delete artist** opens the canonical multi-item
   deletion preview: transfers, credit-only retention and explicit permanent
   deletions are reviewed per track, with playlist/rating/lyrics consequences,
   stale-plan checks and one transactional commit. The artist is never removed
@@ -522,9 +527,9 @@ ownership-transfer workflow. The import manager applies shared Artist/Album and
 Album artwork to checked candidates, while Track artwork, lyrics and the release
 type of a newly created Album remain per-candidate; a featuring boolean and
 one-action metadata templates beyond that scope remain future work. The TUI
-exposes structured Artist/Album/Track metadata forms plus path-based artwork and
-lyrics edits, but not native pickers, import artwork/lyrics attachment,
-membership changes or ownership transfer.
+exposes structured Artist/Album/Track metadata forms, album order/membership,
+managed audio repair, artwork/lyrics attachment and safe deletion; native
+pickers and ownership/album transfer remain GUI-only.
 Lyrics must be valid UTF-8 LRC/TXT; embedded audio tags are neither read nor
 written.
 Native dialogs and file-drop are implemented; cross-platform runtime

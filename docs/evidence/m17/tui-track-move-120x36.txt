@@ -1,0 +1,36 @@
+Flux · canonical /tmp/opencode/m15-ui-w/data/flux/FluxLibrary · move · queue 1 · normal
+ Tracks  Artists  Albums  Playlists  Collections  Lyrics  Settings
+⏸ First Song — Artist    0:00 / --:--    ░░░░░░░░░░░░    Vol 100%    Xfade off
+Move track · choose an album or standalone
+> Album · 2 tracks  [current]
+  Standalone · First Song — Artist
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Library ready.
+Move — ↑/↓ choose · Enter review · s standalone · Esc cancel

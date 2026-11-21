@@ -47,19 +47,19 @@ layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
 | Artist create/edit | Delimiter form | Structured Name/Aliases/Description/Image form; stable ID preserved | `create_artist`, `update_artist_metadata`, `set/remove_artist_image` | Complete | Artist workflow test |
 | Artist image status | Basic | Missing/inaccessible details remain in resource APIs and editor | `artist_image_resource_state` | Partial presentation; no destructive repair action | Existing app tests |
 | Album edit | Delimiter form | Structured Title/Release type/Cover form | `update_album_metadata`, `set/remove_album_cover` | Complete | Album form tests |
-| Album track order/membership | GUI-only | Track listing is read-only in TUI | `album_tracks`; transactional move APIs exist | Limitation: use GUI review workflow | Not applicable |
-| Album delete/transfer | GUI workflow | Not exposed | Shared plan/execute APIs | Limitation: use GUI | Not applicable |
+| Album track order/membership | GUI-only | `Ctrl+↑/↓` reorders; `Alt+m` moves to an album or standalone | `reorder_album_track`, `plan/execute_track_move` | Complete | `tui_completes_album_order_membership_and_safe_deletion` |
+| Album delete/transfer | GUI workflow | Empty albums delete with confirmation; transfer remains GUI-only | `delete_empty_album`, shared transfer plans | Empty deletion complete; transfer limitation | Album deletion test |
 | Track title/artist credit/album/numbering | Delimiter form | Structured prefilled form | `edit_track_metadata`, `create_artist` | Complete | `import_edit_and_artist_keys_use_the_shared_controller` |
-| Track credits/ownership | Read-only info | Advanced delimiter form remains as `Alt+e`; ownership transfer remains GUI-only | `edit_track_metadata`, transfer plans | Limitation: advanced edits stay documented | Existing app tests |
-| Track artwork | Path form | `W` managed override set/remove | `set/remove_track_artwork`, resource state | Complete | Artwork workflow test |
+| Track credits/ownership | Read-only info | Structured common fields; `Alt+e` advanced credit/owner form; ownership transfer remains GUI-only | `edit_track_metadata`, transfer plans | Limit: ownership transfer | Existing app tests |
+| Track artwork | Path form | `W` managed override set/remove from a path; `-` removes | `set/remove_track_artwork`, resource state | Complete | Artwork workflow test |
 | Lyrics view | Read-only | Lyrics destination, dedicated reader, follow-playback | `track_lyrics`, `LyricsDocument` | Complete | Existing lyrics tests |
-| Lyrics edit/import/remove | Path form | `S` attaches/replaces/removes managed UTF-8/LRC text | `set_lyrics` | Complete | Lyrics tests |
-| Lyrics export | GUI-only | Not exposed | `Controller` has no TUI-specific export path API | Limitation: use GUI | Not applicable |
+| Lyrics edit/import/remove | Path form | `S` attaches/replaces/removes managed UTF-8/LRC text; `-` removes | `set_lyrics` | Complete | Lyrics tests |
+| Lyrics export | GUI-only | `x` in the lyrics reader writes to a new path; existing files are never overwritten | `track_lyrics`, local write | Complete | `tui_exports_lyrics_and_attaches_import_assets` |
 | Favorites and ratings | Complete | Unchanged keys, shared collection views | `set_track_rating`, `toggle_track_favorite`, `smart_collection_tracks` | Complete | Existing rating tests |
 | History views | Summary message | Recently played / Most played collections | `playback_history` | Complete | Smart collection test |
 | Folder/file import | Delimiter/path input | Source → Destination → Verify → Import, same pipeline | `prepare_import_plan`, `prepare_import_files` | Complete for normal path | Existing import lifecycle tests |
 | Import metadata editing | None | `e` opens a structured form for title/artist/album/numbers | `ImportCandidate` setters | Complete | Import edit test |
-| Import artwork/lyrics attachment | GUI-only | Not exposed in TUI review | Import plan asset APIs exist | Limitation: attach in GUI before/after import | Not applicable |
+| Import artwork/lyrics attachment | GUI-only | `A`/`T`/`L` attach album art, track art or lyrics; `-` clears | `ImportCandidate` asset APIs, `apply_lyrics_from_path` | Complete (typed paths, no native picker) | Import asset test |
 | Import destination | Active library | Explicit review of active canonical destination | Shared import request | Complete | Existing destination tests |
 | Duplicate decisions | Complete | Include/skip/update and bulk actions | `ImportDecision`, plan bulk helpers | Complete | Duplicate import tests |
 | Import cancellation | Complete | Esc cancels discovery/preparation; final commit honest | Shared worker/cancel flag | Complete | Cancellation tests |
@@ -80,20 +80,19 @@ layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
 | Layout presets | None | `m` cycles five presets; persisted | TUI preference file | Complete | Preferences test |
 | Help and discovery | Large static help | Contextual footer, `?` help, command palette | Frontend presentation | Complete | Help test |
 | Library open/create/migrate | Complete | Preserved | Shared lifecycle APIs | Complete | Existing migration tests |
-| Track/Artist/Album deletion | GUI review | Not exposed | Shared plans | Limitation: use GUI review | Not applicable |
-| Track audio replacement | GUI review | Not exposed | Shared replacement plans | Limitation: use GUI review | Not applicable |
+| Track/Artist/Album deletion | GUI review | Track deletion and empty album/artist deletion use shared plans and explicit confirmation | `plan/delete_track`, `delete_empty_album`, artist plan/execute | Complete for supported cases; populated artist deletion stays GUI | Album/artist deletion tests |
+| Track audio replacement | GUI review | `Alt+r` plans a replacement and confirms with `y` | `plan/execute_track_audio_replacement` | Complete | `tui_reviews_managed_audio_replacement...` |
 
 ## Genuine limitations
 
 - Terminal cells cannot display embedded artwork. Track/Album artwork is
   represented by presence badges and state messages, never by a fake image.
-- Album membership/order transactions, track or album deletion, artist deletion,
-  ownership transfer and managed-audio replacement are multi-step canonical
-  operations with GUI review screens. They remain GUI workflows rather than
-  duplicating transaction rules in the TUI.
-- Rich import artwork/lyrics attachment remains a GUI review workflow. TUI
-  import supports the ordinary Source → Destination → Verify → Import path and
-  structured metadata correction.
+- Populated artist deletion and ownership/album transfer still require the
+  GUI's multi-item decision screen. The TUI deletes only track-free artists and
+  empty albums, and never duplicates those transaction rules.
+- Import asset attachment uses typed paths in the TUI; native graphical pickers
+  remain GUI-only. The ordinary Source → Destination → Verify → Import path and
+  structured metadata correction are available in both frontends.
 - The renderer is hand-written; no mouse support is required or provided.
 - Keybindings are fixed and conflict-tested rather than user-configurable. The
   command palette covers less frequent actions without creating a second
@@ -114,9 +113,14 @@ layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
 | `f` | Toggle favorite (track rows) |
 | `0`–`5` | Clear/set rating |
 | `e` | Structured track edit |
+| `Alt+m` | Move selected track to an album or standalone |
+| `Alt+r` | Review managed-audio replacement or missing-file repair |
+| `Delete` | Review track, empty-album or track-free artist deletion |
 | `Y` / `Z` | Structured artist / album edit |
 | `W` / `S` | Track artwork / managed lyrics |
 | `y` | Read selected/current lyrics |
+| `x` in lyrics | Export lyrics to a new path |
+| `A`/`T`/`L` in import | Attach album artwork / track artwork / lyrics |
 | `N` / `R` / `x` | New / rename / delete playlist (context) |
 | `l` / `d` / `c` | Play playlist / remove entry / clear playlist (detail context) |
 | `Ctrl+↑`/`Ctrl+↓` | Reorder queue entry or playlist entry |

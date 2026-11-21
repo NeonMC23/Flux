@@ -5,7 +5,7 @@ Settings · Enter toggles · d refreshes audio devices
 > Layout  · Standard                                                              NOW PLAYING
   Visualizer  · Shown                                                             First Song — Artist
   Visualization mode  · Waveform                                                  Artist · Album
-  Lyrics follow playback  · On                                                    0:00 ░░░░░░░░░░░░░░░░░░░░░░░░░░░ --:--
+  Lyrics follow playback  · On                                                    0:00 ░░░░░░░░░░░░░░░░░░░░░░░░░░░ --:-m
   Refresh audio devices  · 0 found                                                VISUALIZER · Waveform
   Library setup  · Open
   System default output  · system default  · active
@@ -14,7 +14,7 @@ Settings · Enter toggles · d refreshes audio devices
 
 
 
-                                                                                  UP NEXT
+
 
 
 

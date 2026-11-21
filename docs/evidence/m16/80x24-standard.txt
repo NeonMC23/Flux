@@ -14,11 +14,11 @@ Tracks · 2 tracks
 
 
 
-                                                      UP NEXT
+
 
 
 
 
 
 Library ready.
-↑/↓ move · Enter play · a queue · x next · e edit · f favorite · 0–5 rate · / se
+↑/↓ move · Enter play · a queue · x next · e edit · Alt+m move · Delete delete ·

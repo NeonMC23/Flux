@@ -165,7 +165,11 @@ was introduced.
 
 ### TUI navigation and safety
 
-The TUI remains a single hand-rolled crossterm view over `flux_app::Controller`.
+The TUI is a destination-based, keyboard-first frontend over
+`flux_app::Controller`: Tracks, Artists, Albums, Playlists, Collections, Lyrics
+and Settings, with structured forms, five layout presets, a real waveform
+visualizer and confirmed destructive actions. Earlier milestone notes below are
+historical; `docs/m16-tui-parity.md` is the current capability matrix.
 It has no separate catalogue, playback, queue, history, import or persistence
 logic. The header shows the active storage mode/library identity (full path on
 wider terminals, final component on narrow ones), current view, queue length,
@@ -199,8 +203,8 @@ discovery or portable copy preparation; the catalogue publishes only after the
 worker finishes. Canonical file copies and hashing for the final batch happen
 inside the synchronous atomic transaction, so that last step has no progress or
 cancel UI. Per-path discovery failures are retained, counted in the review title
-and shown in a scrollable result panel. Rich metadata, artwork and lyrics
-editing remains GUI-only. H1 decoder preflight, fingerprints, canonical
+and shown in a scrollable result panel. Both frontends correct reviewed
+metadata; the TUI attaches album/track artwork and lyrics from typed paths. H1 decoder preflight, fingerprints, canonical
 transaction rules and Controller report semantics are unchanged.
 
 `U` (preserve/replace protected legacy index) and `A` (acknowledge portable
@@ -211,20 +215,17 @@ or cancelled library switches leave the active library untouched and report the
 cancellation/failure. Successful switches reset cursor/search/queue-view/help
 state and announce the newly active library.
 
-The TUI `V` view lists ArtistId, description/image presence, owned/credited
-Album relationships and Track counts; `E` lists canonical Albums with owner,
-cover state and ordered Track membership, plus standalone Tracks, marking
-Track-specific artwork and lyrics. `D` opens the selected Track's Album with
-inherited/override artwork labels, or its standalone state with no Album
-inheritance. `Y`/`P` support safe rename/create operations. `c` clears a
-transient status/error notice without changing playback or library state.
-
-Track deletion, audio/artwork/lyrics repair, Album metadata/cover/order or
-membership changes (including converting to standalone), ownership/artist/album
-transfer, rich import review with bulk selection/artwork/lyrics attachment,
-playlists, batch actions and global filters remain GUI-only. The TUI never bypasses H2 deletion/repair safety, never deletes
-external audio, and does not treat an inaccessible path as missing. These are
-documented capability differences, not hidden shortcuts.
+Artists and Albums have navigable detail views with owned/credited relationships
+and ordered Track membership. Track metadata, Artist name/aliases/description/
+image, Album title/release/cover, Track artwork, lyrics and managed audio repair
+use shared Controller operations. Album tracks reorder with `Ctrl+↑/↓`, and a
+track can move between owner Albums or to standalone state through a reviewed
+plan. Track deletion, empty-Album deletion and track-free Artist deletion require
+explicit confirmation; populated Artist deletion and ownership/Album transfer
+remain GUI review workflows. Playlists support create, rename, delete, add,
+remove, reorder, clear, play and shuffle-play. The TUI never bypasses deletion or
+repair safety, never deletes external audio, and does not treat an inaccessible
+path as missing.
 
 ### Cross-platform storage and platform notes
 
@@ -385,9 +386,9 @@ replacement can be previewed before assignment, and a failed replacement leaves
 the previous managed image intact. Missing or inaccessible managed Artist images
 are reported separately with repair guidance.
 
-The TUI `V` view lists ArtistId, optional description/image state, owned and
-credited Album relationships and related Track counts. `Y` renames an existing
-Artist and `P` creates one; description/image editing is GUI-only.
+Artist detail lists owned and credited Albums and related Tracks. `Y` edits the
+display name, aliases, description and managed image through a structured form;
+`P` creates an artist.
 
 ## Standalone Tracks and optional Album membership
 
@@ -419,9 +420,9 @@ title still becomes a canonical Album. The GUI Albums view contains a
 **Standalone tracks** group. Track editing offers
 reviewed **convert to standalone** and Album destination choices. The TUI marks
 standalone rows and shows Album or standalone detail with artwork inheritance
-state; membership mutations remain GUI-only. Track ownership transfer still
-requires an Album destination, so a standalone Track must first be attached to
-an Album before a cross-owner transfer.
+state. TUI `Alt+m` performs the same reviewed membership move and supports
+converting to standalone; Album detail reorders with `Ctrl+↑/↓`. Track ownership
+transfer still requires an Album destination and remains a GUI review workflow.
 
 Album artwork inheritance is strictly membership-derived. A Track override
 survives attach/detach/move unchanged; without an override, an Album member
@@ -621,7 +622,7 @@ implemented; use the selection-bar/album/search playlist action and explicit
 review instead. A drag snapshot captured at drag start is revalidated before the
 one-transaction reorder.
 
-The TUI does not expose playlist management; its help and documentation direct
+The TUI exposes playlist management; earlier documentation that directed
 these operations to the GUI.
 
 ### Advanced queue and playback modes
@@ -1322,8 +1323,9 @@ Selecting system default removes the ID. At startup a saved ID is opened
 explicitly. If it is unavailable, Flux keeps the preference, starts with
 `AudioStatus::DeviceUnavailable`, and subjects it to bounded recovery; it does
 not silently replace the user's choice with the system default. The GUI can
-then select the default or another device, while TUI exposes status/policy and
-recovery guidance but keeps selection GUI-only.
+then select the default or another device. The TUI Settings view lists the same
+devices, shows default/active/explicit state, and opens a selection off the UI
+thread; no-CPAL builds expose no fake devices.
 
 CPAL/PipeWire may report `DeviceChanged` and reroute a default-device stream;
 that is surfaced as a notice and the stream is retained. On backends such as
@@ -1415,10 +1417,9 @@ favorites, rating, play count, last played, date added and duration with an
 ascending/descending toggle and stable TrackId tie-breaks. Filters include
 favorites, lyrics, artwork, release type and minimum rating. Reset clears all
 filters/direction. Remove/clear actions never delete tracks. The TUI exposes
-`F` favorites-only browsing, `f` favorite toggling, `0–5` rating controls and
-`H` most-played history summaries. Dashboard, Smart Collections, global
-search/filtering, multi-selection and batch rating/favorite editing remain
-GUI-only.
+favorites filtering, favorite/rating controls, dynamic Collections using the
+shared `Controller::smart_collection_tracks`, and per-view search. Multi-selection
+and batch rating/favorite editing remain GUI-only.
 
 ### Lyrics
 
@@ -1487,8 +1488,9 @@ and a native save dialog (zenity/kdialog, macOS choose-file-name, Windows
 SaveFileDialog) with a sanitized Track filename suggestion. All operations are
 offline; no remote services are used.
 
-The TUI exposes read-only lyrics inspection with `y` (scrollable, Esc returns)
-but no editing/import/export/karaoke. Those remain GUI workflows.
+The TUI exposes a scrollable synchronized lyrics reader with playback follow,
+managed lyrics replacement/removal from a UTF-8 path, and export to a new file.
+Karaoke remains GUI-only.
 
 ### Album and Track artwork
 
@@ -1734,9 +1736,9 @@ never change. Ordered credits must be non-empty, unique, reference known artists
 and include the owner; the owner is never silently replaced. Lyrics, ratings,
 favorites, playlists, queue entries and playback selection stay keyed by the
 stable TrackId. Any catalogue-generation change or track/album snapshot change
-rejects the plan before publication. The TUI supports the same safe edit form as
-`title|album|track|disc|artist-id|credit-ids`; move and replacement review remain
-GUI-only.
+rejects the plan before publication. The TUI uses a structured metadata form,
+reviews album membership moves, reorders album tracks and reviews managed-audio
+replacement through the same Controller plans.
 
 **Track move.** A plan names the target TrackId, source AlbumId, destination
 AlbumId, explicit insertion index, source/destination order snapshots, metadata,
@@ -1872,8 +1874,8 @@ stale text, and invalidates the lyrics cache. Failed parsing or writes keep the
 previous reference/content. Imported or restored lyrics remain separate from
 audio tags.
 
-Single-track deletion is a GUI-only reviewed operation using a session- and
-generation-bound plan. Confirmed deletion removes exactly one TrackId and:
+Single-track deletion is a reviewed operation in both frontends using a
+session- and generation-bound plan. Confirmed deletion removes exactly one TrackId and:
 
 - rewrites album track order, retaining the album even when empty;
 - retains the artist even with no owned tracks;
@@ -1894,7 +1896,8 @@ generation-bound plan. Confirmed deletion removes exactly one TrackId and:
 
 Canonical audio is Flux-managed and lives inside the library. External audio
 files are never candidates for this canonical deletion path; portable/legacy
-single-track deletion is not exposed. If a managed resource is inaccessible, is
+single-track deletion is not exposed for portable libraries. If a managed
+resource is inaccessible, is
 a directory, or cleanup otherwise fails after the catalogue commit, the deletion
 remains authoritative, the ambiguous file is left in place, and the Controller
 reports the cleanup failure. Cleanup is best-effort and not journaled after the
@@ -2243,21 +2246,18 @@ cleanup.
    exercised on native runners. Windows file dialogs, Explorer integration,
    case-sensitive volumes, Linux privileged package installation, and audio
    output on Windows/macOS remain unverified.
-10. The TUI import review supports candidate import/update/skip decisions only;
-    fixed-target album selection and per-candidate artwork/lyrics attachment
-    remain GUI-only. After import, the TUI can edit Artist name/aliases/
-    description/image, Album title/release type/cover, and Track artwork/lyrics
-    through explicit paths using the shared Controller.
+10. The TUI import review supports decisions, structured metadata correction and
+    per-candidate album/track artwork and lyrics attachment from typed paths.
+    Fixed-target Album selection and native pickers remain GUI-only.
 11. Atomic import reuses exact and unique case/whitespace-normalized Artist and
     Album names. Approximate/fuzzy matching is deliberately not performed;
     ambiguous normalized names require explicit review.
-12. Artist deletion execution is exposed in the GUI only. The TUI deliberately
-    refuses deletion/transfer and points to the GUI; this is a product limitation,
-    not a separate transaction implementation.
-13. Move and managed-audio replacement review are GUI-only; the TUI supports
-    safe Track metadata/credit editing, Album metadata/cover, Artist metadata/
-    image, Track artwork and managed lyrics through shared Controller operations,
-    and directs membership/move/repair workflows to the GUI.
+12. The TUI deletes track-free artists and empty Albums through the shared
+    plans. Populated artist deletion, credit/transfer decisions and ownership/
+    Album transfer remain GUI review workflows.
+13. Track membership moves, album reorder and managed-audio replacement are
+    available in both frontends through shared Controller plans. Ownership/Album
+    transfer remains GUI-only.
 14. Audio replacement validates file existence, non-empty content, extension
     safety and fingerprints only; it does not decode the audio or read tags.
 15. On platforms that block deleting an open file, replacing or moving the
@@ -2270,11 +2270,9 @@ cleanup.
     Low-level `write_atomic` interruption is represented by deterministic journal
     artifacts rather than an in-process portable filesystem hook. A real process
     abort is tested, but not a kernel/power failure.
-17. Global artist/album/track search, filtering, multi-selection, playlist
-    management and batch playlist/favorite/rating actions are GUI-only; the TUI
-    retains track search and safe single-track operations, including per-Track
-    favorite and 0–5 rating edits. Range selection, library-to-playlist drag,
-    batch queue mutation and batch album moves are not implemented.
+17. Both frontends search the current view and expose playlists/collections.
+    GUI-only interaction remains multi-selection, range selection, drag-and-drop
+    and batch rating/favorite/queue operations.
 18. Search is substring matching only, not fuzzy; results are capped at 20 per
     entity type. Track lists retain the existing page-based rendering rather than
     adding a new virtualization layer.
@@ -2310,9 +2308,9 @@ cleanup.
     backend, not by measuring real hardware. One prepared successor is
     supported; a chain depends on the Controller preloading the following entry
     after each accepted transition.
-25. Multi-entry queue removal and a dedicated queue clear action are not exposed
-    in the GUI; individual removal/reorder and queue population from track/
-    playlist actions remain available.
+25. Both frontends expose a confirmed queue-clear action. Individual
+    removal/reorder and queue population from track/playlist actions remain
+    available.
 26. The GUI provides only its custom dark Flux theme. No light-theme variant or
     screen-reader/accessibility audit is implemented or claimed.
 27. Responsive queue placement, label truncation, empty-state copy and browser
@@ -2323,14 +2321,15 @@ cleanup.
     to follow, but a path that disappears before enumeration cannot be named;
     refresh and the authoritative H1 planning/preparation checks remain the
     safety boundary.
-29. The TUI import review does not expose fixed-target Album selection, rich
-    metadata/artwork/lyrics editing, or per-candidate release type. Discovery,
+29. The TUI import review does not expose fixed-target Album selection,
+    bulk release-type controls or native pickers. It does expose structured
+    metadata correction and album/track artwork and lyrics attachment. Discovery,
     hashing and copy preparation are cancellable; the final atomic catalogue
-    publish is synchronous. Users needing the full editor must use the GUI
-    Import Manager.
-30. TUI track deletion, audio/artwork/lyrics repair, ownership and album/artist
-    transfer, playlists, batch actions and global filters remain GUI-only. The
-    TUI does not expose a queue clear/bulk-removal operation.
+    publish is synchronous.
+30. TUI track deletion, managed-audio replacement, artwork/lyrics management,
+    album order/membership, playlists, collections, queue clear and audio-device
+    selection are implemented. Populated artist deletion, ownership/Album
+    transfer, batch actions and native pickers remain GUI-only.
 31. TUI truncation uses Unicode display-cell width for combining marks and
     wide characters. Complex emoji ZWJ sequences may still be conservatively
     approximated; broad terminal-emulator compatibility was not exhaustively

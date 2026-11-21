@@ -1,0 +1,36 @@
+Flux · canonical /tmp/opencode/m15-ui-w/data/flux/FluxLibrary · Tracks · queue 1 · normal
+ Tracks  Artists  Albums  Playlists  Collections  Lyrics  Settings
+⏸ First Song — Artist    0:00 / --:--    ░░░░░░░░░░░░    Vol 100%    Xfade off
+Tracks · 2 tracks
+> ▶  First Song  · Artist  · Album                                                NOW PLAYING
+     Second Song  · Artist  · Album                                               First Song — Artist
+                                                                                  Artist · Album
+                                                                                  0:00 ░░░░░░░░░░░░░░░░░░░░░░░░░░░ --:--
+                                                                                  VISUALIZER · Waveform
+
+
+
+                                                                                  ••••••••••••••••••••••••••••••••••••••
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Library ready.
+↑/↓ move · Enter play · a queue · x next · e edit · Alt+m move · Delete delete · f favorite · 0–5 rate · / search

@@ -129,6 +129,10 @@ if __name__ == '__main__':
     env['FLUX_TUI_CONFIG'] = os.path.join(outdir, 'tui.conf')
     actions = [
         ('startup-standard', ''),
+        ('track-move', '\x1bm'),
+        ('move-cancel', '\x1b'),
+        ('track-delete', '\x1b[3~'),
+        ('delete-cancel', '\x1b'),
         ('layout-library', 'm'),
         ('layout-player', 'm'),
         ('layout-visualizer', 'm'),

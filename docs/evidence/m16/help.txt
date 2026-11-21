@@ -30,7 +30,7 @@ LIBRARY
 Artists: Enter opens albums and tracks · Y edits · P creates.
 Albums: Enter opens the track listing · Z edits title, release type and cover.
 Tracks: e edits title, artist credit, album and numbering · y reads lyrics.
-W sets/removes Track artwork · S sets/removes managed lyrics · 0–5 rating · f favorite.
-Collections: Favorites, Highly rated, Recently added/played, Most played, lyrics and artwork views.
+Alt+m moves a track to an album or standalone state · Delete reviews track deletion.
+Album detail: Ctrl+↑/↓ reorders tracks · Delete removes an empty album.
 This build has no audio-output backend; device selection is unavailable.
-Help/details — ↑/↓ scroll · PgUp/PgDn · Esc/Q back · 1-30 of 58
+Help/details — ↑/↓ scroll · PgUp/PgDn · Esc/Q back · 1-30 of 61
