@@ -4,7 +4,7 @@ Flux is MIT-licensed. Release artifacts include the following third-party Rust c
 each under one of the license expressions below. Full standard license texts are in
 `packaging/licenses/`; the project copyright is in `LICENSE`.
 
-Generated from `Cargo.lock` on 2026-11-20.
+Generated from `Cargo.lock` on 2026-11-21.
 
 | Package | Version | License | Repository |
 |---|---|---|---|

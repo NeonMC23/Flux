@@ -37,10 +37,11 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.1.0" date="2026-11-20">
+    <release version="0.1.0" date="2026-11-21">
       <description>
-        <p>First release-engineering build with Linux packages, Windows and
-        macOS bundle automation, native build identity, icons and checksums.</p>
+        <p>Local-first music player with canonical library management, reviewed
+        import, metadata/artwork/lyrics editing, playlists, queue and history,
+        GUI/TUI layouts, and offline audio playback.</p>
       </description>
     </release>
   </releases>

@@ -7,6 +7,9 @@
 #   FLUX_ARCH=aarch64 packaging/linux/build-packages.sh
 #   FLUX_SKIP_BUILD=1 packaging/linux/build-packages.sh
 #   SOURCE_DATE_EPOCH=0 packaging/linux/build-packages.sh   # reproducible timestamps
+#   FLUX_ALLOW_NEWER_GLIBC=1 packaging/linux/build-packages.sh
+#       Permit a host-local diagnostic package when the host glibc is newer
+#       than the supported baseline. Such artifacts must not be published.
 #
 # Requirements: bash, cargo, dpkg-deb, rpmbuild, tar, gzip, sha256sum.
 # The build must run on the target architecture or with a configured target.
@@ -142,6 +145,15 @@ cp -a "$STAGE/share/." "$DEBROOT/usr/share/"
 INSTALLED_SIZE="$(du -sk "$DEBROOT" | awk '{print $1}')"
 GLIBC_MIN="$(objdump -T "$GUI_BIN" | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
 [ -n "$GLIBC_MIN" ] || GLIBC_MIN="2.39"
+GLIBC_BASELINE="${FLUX_GLIBC_BASELINE:-2.39}"
+if [ "${FLUX_ALLOW_NEWER_GLIBC:-0}" != "1" ] && \
+  [ "$(printf '%s\n%s\n' "$GLIBC_BASELINE" "$GLIBC_MIN" | sort -V | tail -1)" != "$GLIBC_BASELINE" ]; then
+  echo "error: release binaries require glibc $GLIBC_MIN, above the supported" >&2
+  echo "baseline $GLIBC_BASELINE. Build release artifacts on the oldest supported" >&2
+  echo "distribution (Ubuntu 24.04 in CI). For a host-local diagnostic package," >&2
+  echo "set FLUX_ALLOW_NEWER_GLIBC=1 and do not publish the result." >&2
+  exit 2
+fi
 cat > "$DEBROOT/DEBIAN/control" <<EOF
 Package: flux
 Version: $VERSION

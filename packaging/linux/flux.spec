@@ -40,5 +40,5 @@ cp -a "%{flux_stage}/share/." "%{buildroot}%{_datadir}/"
 %{_datadir}/doc/flux/licenses/*
 
 %changelog
-* Fri Nov 20 2026 NeonMC23 <piotr.souchon23@gmail.com> - %{flux_version}-1
-- Release-engineering build.
+* Sat Nov 21 2026 NeonMC23 <piotr.souchon23@gmail.com> - %{flux_version}-1
+- Release candidate build.
