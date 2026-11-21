@@ -21,7 +21,9 @@ The visual hierarchy is:
 5. Status and contextual help.
 
 M21 added the persistent sidebar and removed duplicate progress displays from
-the header, side panel and player page.
+the header, side panel and player page. M22 adds explicit Album participation:
+`Alt+p` opens the participant list from Album detail, and Artist/Album views
+distinguish physical ownership, participation and Track-credit reachability.
 
 Five layout presets replace arbitrary panel configuration:
 
@@ -46,7 +48,7 @@ renders real waveform data. Domain rules remain in `flux-app`.
 | Capability | Pre-M16 TUI | M16 TUI equivalent | Shared API / boundary | Status | Tests |
 |---|---|---|---|---|---|
 | Browse tracks | Flat list | Tracks destination, search, favorites, collection filter | `Controller::search`, `tracks` | Complete | Existing TUI tests, large-list test |
-| Browse artists | Info panel only | Artists list and artist detail with albums and tracks | `artists`, `artist`, `albums_owned_by`, `albums_credited_for`, credits | Complete | `tui_navigation_opens_artists_albums_playlists_and_collections` |
+| Browse artists | Info panel only | Artists list and artist detail with albums and tracks | `artists`, `artist`, `albums_owned_by`, `albums_participating_for`, `albums_credited_for`, credits | Complete | `tui_navigation_opens_artists_albums_playlists_and_collections` |
 | Browse albums | Info panel only | Albums list and album track listing | `albums`, `album`, `album_tracks` | Complete | Same navigation test |
 | Browse playlists | Key-only info | Playlists destination and playlist detail | `playlists`, `playlist` | Complete | Navigation and playlist tests |
 | Smart collections | Not exposed | Collections destination with counts | `Controller::smart_collection_tracks` | Complete | `smart_collections_share_rating_lyrics_and_artwork_state` |
@@ -56,8 +58,9 @@ renders real waveform data. Domain rules remain in `flux-app`.
 | Artist create/edit | Delimiter form | Structured Name/Aliases/Description/Image form; stable ID preserved | `create_artist`, `update_artist_metadata`, `set/remove_artist_image` | Complete | Artist workflow test |
 | Artist image status | Basic | Missing/inaccessible details remain in resource APIs and editor | `artist_image_resource_state` | Partial presentation; no destructive repair action | Existing app tests |
 | Album edit | Delimiter form | Structured Title/Release type/Cover form | `update_album_metadata`, `set/remove_album_cover` | Complete | Album form tests |
+| Album participants | Not represented | `Alt+p` participant list; Enter opens Artist, `a` adds, `r` confirms removal; Album view title lists participants | `album_participants`, `add/remove_album_participant` | Complete | `tui_navigates_and_edits_collaborative_album_participants` |
 | Album track order/membership | GUI-only | `Ctrl+↑/↓` reorders; `Alt+m` moves to an album or standalone | `reorder_album_track`, `plan/execute_track_move` | Complete | `tui_completes_album_order_membership_and_safe_deletion` |
-| Album delete/transfer | GUI workflow | Empty albums delete with confirmation; `Alt+t` reviews album ownership transfer with explicit artist and credit decisions | `delete_empty_album`, `plan/execute_album_transfer` | Complete | Album transfer test |
+| Album delete/transfer | GUI workflow | Empty albums delete with confirmation; `Alt+t` reviews album ownership transfer with explicit artist and credit decisions. Artist deletion separates shared participation from owned Albums (`b` confirms owned-Album removal). | `delete_empty_album`, `plan/execute_album_transfer`, `plan/execute_artist_deletion` | Complete | Album transfer and artist deletion tests |
 | Track title/artist credit/album/numbering | Delimiter form | Structured prefilled form | `edit_track_metadata`, `create_artist` | Complete | `import_edit_and_artist_keys_use_the_shared_controller` |
 | Track credits/ownership | Read-only info | Structured common fields; `Alt+e` advanced credit/owner form; ownership transfer remains GUI-only | `edit_track_metadata`, transfer plans | Limit: ownership transfer | Existing app tests |
 | Track artwork | Path form | `W` managed override set/remove from a path; `-` removes | `set/remove_track_artwork`, resource state | Complete | Artwork workflow test |

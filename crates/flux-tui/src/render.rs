@@ -79,6 +79,8 @@ impl Tui {
             Mode::TrackMovePick => "move",
             Mode::ArtistDeletion => "delete",
             Mode::ImportAlbumPick => "import",
+            Mode::AlbumParticipants | Mode::AlbumParticipantPick => "participants",
+            Mode::ConfirmAlbumParticipantRemove => "confirm",
             Mode::AlbumTransferPick | Mode::AlbumTransferReview => "transfer",
             Mode::ArtistOwnerPick | Mode::ArtistAlbumPick => "transfer",
             Mode::ConfirmTrackMove
@@ -159,6 +161,16 @@ impl Tui {
             Mode::ConfirmTrackDelete => "Confirm track deletion".to_owned(),
             Mode::ConfirmAlbumDelete => "Confirm empty-album deletion".to_owned(),
             Mode::ImportAlbumPick => "Import into an existing album · choose a target".to_owned(),
+            Mode::AlbumParticipants => self
+                .detail
+                .and_then(|detail| match detail {
+                    Detail::Album(id) => self.controller.album(id),
+                    _ => None,
+                })
+                .map(|album| format!("Album participants · {}", album.title))
+                .unwrap_or_else(|| "Album participants".to_owned()),
+            Mode::AlbumParticipantPick => "Add Album participant · choose an Artist".to_owned(),
+            Mode::ConfirmAlbumParticipantRemove => "Confirm Album participation removal".to_owned(),
             Mode::AlbumTransferPick => "Transfer album · choose a destination artist".to_owned(),
             Mode::AlbumTransferReview => self
                 .album_transfer
@@ -237,6 +249,13 @@ impl Tui {
             self.draw_import_view(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::ImportAlbumPick {
             self.draw_import_album_picker(out, list_top, detail_height, content_width)?;
+        } else if matches!(
+            self.mode,
+            Mode::AlbumParticipants | Mode::ConfirmAlbumParticipantRemove
+        ) {
+            self.draw_album_participants(out, list_top, detail_height, content_width)?;
+        } else if self.mode == Mode::AlbumParticipantPick {
+            self.draw_album_participant_picker(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::AlbumTransferPick {
             self.draw_album_transfer_picker(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::AlbumTransferReview {
@@ -300,6 +319,15 @@ impl Tui {
             Mode::ConfirmQueueClear => {
                 "Clear queue — y confirms · any other key cancels".to_owned()
             }
+            Mode::AlbumParticipants => {
+                "Album participants — ↑/↓ select · Enter opens Artist · a adds · r removes · Esc back".to_owned()
+            }
+            Mode::AlbumParticipantPick => {
+                "Add participant — ↑/↓ choose Artist · Enter adds · Esc back".to_owned()
+            }
+            Mode::ConfirmAlbumParticipantRemove => {
+                "Remove participation — y confirms · any other key cancels".to_owned()
+            }
             Mode::ImportAlbumPick => {
                 "Fixed target — ↑/↓ choose album · Enter apply to every candidate · Esc cancel".to_owned()
             }
@@ -316,7 +344,7 @@ impl Tui {
                 "Track transfer — ↑/↓ choose album or New album · Enter apply · Esc back".to_owned()
             }
             Mode::ArtistDeletion => {
-                "Artist deletion — ↑/↓ select · t transfer · r remove credit · d delete twice · u reset · a auto · y publish · Esc cancel".to_owned()
+                "Artist deletion — ↑/↓ track · t transfer · r remove credit · d delete twice · u reset · a auto · b owned albums · y publish · Esc cancel".to_owned()
             }
             Mode::TrackMovePick => {
                 "Move — ↑/↓ choose · Enter review · s standalone · Esc cancel".to_owned()
@@ -842,6 +870,37 @@ impl Tui {
         };
         let count = plan.owned_tracks.len() + plan.credited_tracks.len();
         self.artist_delete_cursor = self.artist_delete_cursor.min(count.saturating_sub(1));
+        let mut top = top;
+        let mut height = height;
+        if !plan.owned_albums.is_empty()
+            || !plan.participant_albums.is_empty()
+            || !plan.shared_owned_albums.is_empty()
+        {
+            let summary = format!(
+                "Albums: {} owned ({}) · {} shared participation · {} need ownership transfer · b toggles owned deletion",
+                plan.owned_albums.len(),
+                if plan.delete_owned_albums {
+                    "delete selected"
+                } else {
+                    "kept/blocked"
+                },
+                plan.participant_albums.len(),
+                plan.shared_owned_albums.len()
+            );
+            self.line(out, top as u16, &summary, width, false)?;
+            top += 1;
+            height = height.saturating_sub(1);
+        }
+        if count == 0 {
+            self.line(
+                out,
+                top as u16,
+                "No affected tracks. Review Album associations above; y publishes when ready.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
         for (index, track) in plan
             .owned_tracks
             .iter()
@@ -1031,6 +1090,119 @@ impl Tui {
             );
             let y = (top + index) as u16;
             if index == self.artist_owner_cursor {
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_album_participants(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let participants = self.album_participant_ids();
+        if participants.is_empty() {
+            self.line(
+                out,
+                top as u16,
+                "No Artists participate in this Album. Press a to add one.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
+        self.album_participant_cursor = self
+            .album_participant_cursor
+            .min(participants.len().saturating_sub(1));
+        let owner = self.detail.and_then(|detail| match detail {
+            Detail::Album(id) => self.controller.album(id).map(|album| album.owner_artist_id),
+            _ => None,
+        });
+        for (index, artist) in participants.iter().take(height).enumerate() {
+            let name = self
+                .controller
+                .artist(*artist)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {artist}"));
+            let text = format!(
+                "{} {}{}",
+                if index == self.album_participant_cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                name,
+                if owner == Some(*artist) {
+                    "  [physical owner]"
+                } else {
+                    ""
+                }
+            );
+            let y = (top + index) as u16;
+            if index == self.album_participant_cursor {
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_album_participant_picker(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let artists = self.album_participant_candidates();
+        if artists.is_empty() {
+            self.line(
+                out,
+                top as u16,
+                "Every Artist already participates in this Album.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
+        self.album_participant_pick_cursor = self
+            .album_participant_pick_cursor
+            .min(artists.len().saturating_sub(1));
+        for (index, artist) in artists.iter().take(height).enumerate() {
+            let name = self
+                .controller
+                .artist(*artist)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {artist}"));
+            let text = format!(
+                "{} {}",
+                if index == self.album_participant_pick_cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                name
+            );
+            let y = (top + index) as u16;
+            if index == self.album_participant_pick_cursor {
                 queue!(
                     out,
                     MoveTo(self.content_offset as u16, y),
@@ -1442,8 +1614,12 @@ impl Tui {
                                 || self.controller.track_credits(*track).contains(&id)
                         })
                         .count();
-                    let albums = self.controller.albums_owned_by(id).len()
-                        + self.controller.albums_credited_for(id).len();
+                    let mut albums = self.controller.albums_owned_by(id);
+                    albums.extend(self.controller.albums_participating_for(id));
+                    albums.extend(self.controller.albums_credited_for(id));
+                    albums.sort_by_key(|album| album.get());
+                    albums.dedup();
+                    let albums = albums.len();
                     return format!(
                         "Artist · {name} · {} · {}",
                         count_label(albums, "album"),
@@ -1457,11 +1633,25 @@ impl Tui {
                             .artist(album.owner_artist_id)
                             .map(|artist| artist.name().to_owned())
                             .unwrap_or_else(|| "Unknown artist".to_owned());
+                        let participants = album
+                            .participant_artist_ids
+                            .iter()
+                            .filter_map(|artist| {
+                                self.controller
+                                    .artist(*artist)
+                                    .map(|artist| artist.name().to_owned())
+                            })
+                            .collect::<Vec<_>>();
                         return format!(
-                            "Album · {} · {owner} · {} · {} track(s)",
+                            "Album · {} · {owner} · {} · {} track(s) · participants: {}",
                             album.title,
                             sentence_case(album.release_type.as_str()),
-                            album.track_order.len()
+                            album.track_order.len(),
+                            if participants.is_empty() {
+                                "none".to_owned()
+                            } else {
+                                participants.join(", ")
+                            }
                         );
                     }
                 }
@@ -1574,8 +1764,12 @@ impl Tui {
                             || self.controller.track_credits(*track).contains(&id)
                     })
                     .count();
-                let albums = self.controller.albums_owned_by(id).len()
-                    + self.controller.albums_credited_for(id).len();
+                let mut albums = self.controller.albums_owned_by(id);
+                albums.extend(self.controller.albums_participating_for(id));
+                albums.extend(self.controller.albums_credited_for(id));
+                albums.sort_by_key(|album| album.get());
+                albums.dedup();
+                let albums = albums.len();
                 pad_with_right(
                     &format!(
                         "{}  · {} album(s) · {} track(s)",
@@ -1597,10 +1791,11 @@ impl Tui {
                     .map(|artist| artist.name().to_owned())
                     .unwrap_or_else(|| "Unknown artist".to_owned());
                 let mut text = format!(
-                    "{}  · {owner}  · {}  · {} track(s)",
+                    "{}  · {owner}  · {}  · {} track(s)  · {} participant(s)",
                     album.title,
                     sentence_case(album.release_type.as_str()),
-                    album.track_order.len()
+                    album.track_order.len(),
+                    album.participant_artist_ids.len()
                 );
                 if album.cover.is_some() {
                     text.push_str("  [cover]");
@@ -1690,7 +1885,7 @@ impl Tui {
         if let Some(detail) = self.detail {
             return match detail {
                 Detail::Artist(_) => "↑/↓ select · Enter opens album/track · Y edit · Delete removes an empty artist · Esc back".to_owned(),
-                Detail::Album(_) => "↑/↓ select · Enter play · Z edit · Ctrl+↑/↓ reorder · Delete removes a track/empty album · Esc back".to_owned(),
+                Detail::Album(_) => "↑/↓ select · Enter play · Z edit · Alt+p participants · Ctrl+↑/↓ reorder · Delete removes a track/empty album · Esc back".to_owned(),
                 Detail::Playlist(_) => "↑/↓ select · Enter play · l play all · Alt+s shuffle · d remove · Ctrl+↑/↓ reorder · c clear · R rename · Esc back".to_owned(),
             };
         }

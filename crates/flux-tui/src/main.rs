@@ -328,6 +328,12 @@ enum Mode {
     ConfirmTrackDelete,
     /// Confirming deletion of an empty album.
     ConfirmAlbumDelete,
+    /// Browsing the participating Artists of the open Album.
+    AlbumParticipants,
+    /// Choosing an existing Artist to add to the open Album.
+    AlbumParticipantPick,
+    /// Confirming removal of one Album participation association.
+    ConfirmAlbumParticipantRemove,
     /// Reviewing decisions for deleting an artist with affected tracks.
     ArtistDeletion,
     /// Confirming deletion of an artist with no track decisions.
@@ -497,6 +503,12 @@ struct Tui {
     queue_offset: usize,
     /// Left offset reserved by the persistent destination sidebar.
     content_offset: usize,
+    /// Cursor in the Album participant association list.
+    album_participant_cursor: usize,
+    /// Cursor in the add-participant Artist picker.
+    album_participant_pick_cursor: usize,
+    /// Pending participant removal confirmation.
+    pending_participant_remove: Option<(AlbumId, ArtistId)>,
     /// Title and lines for help/import-detail info views.
     info_title: String,
     info_lines: Vec<String>,
@@ -623,6 +635,11 @@ impl Tui {
                 Detail::Artist(artist_id) => {
                     let mut rows = Vec::new();
                     let mut albums = self.controller.albums_owned_by(artist_id);
+                    for id in self.controller.albums_participating_for(artist_id) {
+                        if !albums.contains(&id) {
+                            albums.push(id);
+                        }
+                    }
                     for id in self.controller.albums_credited_for(artist_id) {
                         if !albums.contains(&id) {
                             albums.push(id);
@@ -1826,6 +1843,96 @@ impl Tui {
             Mode::FormInput => return self.handle_form_key(key, ctrl_c),
             Mode::CommandInput => return self.handle_command_key(key, ctrl_c),
             Mode::ConfirmPlaylist => return self.handle_playlist_confirm(key, ctrl_c),
+            Mode::AlbumParticipants => {
+                if ctrl_c {
+                    return true;
+                }
+                let participants = self.album_participant_ids();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.mode = Mode::Normal;
+                        self.lifecycle_msg = Some("Album participants closed.".to_owned());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.album_participant_cursor =
+                            self.album_participant_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.album_participant_cursor = (self.album_participant_cursor + 1)
+                            .min(participants.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if let Some(artist) =
+                            participants.get(self.album_participant_cursor).copied()
+                        {
+                            self.mode = Mode::Normal;
+                            self.detail = Some(Detail::Artist(artist));
+                            self.reset_selection();
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        self.album_participant_pick_cursor = 0;
+                        self.mode = Mode::AlbumParticipantPick;
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(artist) =
+                            participants.get(self.album_participant_cursor).copied()
+                            && let Some(Detail::Album(album)) = self.detail
+                        {
+                            self.pending_participant_remove = Some((album, artist));
+                            self.mode = Mode::ConfirmAlbumParticipantRemove;
+                            self.lifecycle_msg = Some(
+                                "Remove this Album participation? The Album, its tracks, audio and Track credits are unchanged. y confirms."
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                return key.code == KeyCode::Char('q');
+            }
+            Mode::AlbumParticipantPick => {
+                if ctrl_c {
+                    return true;
+                }
+                let artists = self.album_participant_candidates();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.mode = Mode::AlbumParticipants;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.album_participant_pick_cursor =
+                            self.album_participant_pick_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.album_participant_pick_cursor = (self.album_participant_pick_cursor
+                            + 1)
+                        .min(artists.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if let Some(artist) =
+                            artists.get(self.album_participant_pick_cursor).copied()
+                        {
+                            self.add_album_participant(artist);
+                        }
+                    }
+                    _ => {}
+                }
+                return key.code == KeyCode::Char('q');
+            }
+            Mode::ConfirmAlbumParticipantRemove => {
+                if ctrl_c {
+                    return true;
+                }
+                if key.code == KeyCode::Char('y') {
+                    self.remove_album_participant();
+                } else {
+                    self.pending_participant_remove = None;
+                    self.mode = Mode::AlbumParticipants;
+                    self.lifecycle_msg = Some("Participant removal cancelled.".to_owned());
+                }
+                return false;
+            }
             Mode::TrackMovePick => {
                 if ctrl_c {
                     return true;
@@ -2009,6 +2116,18 @@ impl Tui {
                     KeyCode::Char('t') => self.open_artist_owner_picker(),
                     KeyCode::Char('r') => self.resolve_artist_credit(),
                     KeyCode::Char('d') => self.resolve_artist_track_delete(),
+                    KeyCode::Char('b') => {
+                        if let Some(plan) = self.artist_deletion.as_mut() {
+                            let confirmed = !plan.delete_owned_albums;
+                            plan.set_delete_owned_albums(confirmed);
+                            self.lifecycle_msg = Some(if confirmed {
+                                "Owned Albums without other participants are selected for deletion."
+                                    .to_owned()
+                            } else {
+                                "Owned-Album deletion is no longer selected.".to_owned()
+                            });
+                        }
+                    }
                     KeyCode::Char('u') => self.reset_artist_track_decisions(),
                     KeyCode::Char('a') => self.auto_resolve_artist(),
                     KeyCode::Char('y') => {
@@ -2158,6 +2277,7 @@ impl Tui {
                         Some(format!("Visualizer sensitivity: {:.2}×.", self.viz_gain));
                 }
                 KeyCode::Char('t') => self.open_album_transfer_picker(),
+                KeyCode::Char('p') => self.open_album_participants(),
                 KeyCode::Char('m') => self.open_move_picker(),
                 KeyCode::Char('r') => {
                     if let Some(id) = self.current_track() {
@@ -2449,6 +2569,7 @@ impl Tui {
                     ];
                     for artist in artists {
                         let owned = self.controller.albums_owned_by(artist.id());
+                        let participating = self.controller.albums_participating_for(artist.id());
                         let credited = self.controller.albums_credited_for(artist.id());
                         let track_count = self
                             .controller
@@ -2470,7 +2591,7 @@ impl Tui {
                             }
                         ));
                         lines.push(format!(
-                            "  description: {} · image: {} · owned albums: {} · credited-only albums: {} · tracks: {}",
+                            "  description: {} · image: {} · owned albums: {} · participating albums: {} · track-credit-only albums: {} · tracks: {}",
                             if self
                                 .controller
                                 .artist_description(artist.id())
@@ -2490,6 +2611,7 @@ impl Tui {
                                 "no"
                             },
                             owned.len(),
+                            participating.len(),
                             credited.len(),
                             track_count,
                         ));
@@ -2753,8 +2875,18 @@ impl Tui {
                                 if album.cover.is_some() { "yes" } else { "no" },
                             ),
                             format!(
-                                "{} ordered track(s) · credited-only albums for owner: {}",
+                                "{} ordered track(s) · participating: {} · credited-only albums for owner: {}",
                                 album.track_order.len(),
+                                album
+                                    .participant_artist_ids
+                                    .iter()
+                                    .map(|artist| self
+                                        .controller
+                                        .artist(*artist)
+                                        .map(|artist| artist.name().to_owned())
+                                        .unwrap_or_else(|| format!("Artist {artist}")))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
                                 credited.len()
                             ),
                             String::new(),
@@ -3455,6 +3587,78 @@ impl Tui {
         }
     }
 
+    fn open_album_participants(&mut self) {
+        let Some(Detail::Album(_)) = self.detail else {
+            self.lifecycle_msg = Some("Open an Album to manage participants.".to_owned());
+            return;
+        };
+        self.album_participant_cursor = 0;
+        self.mode = Mode::AlbumParticipants;
+        self.lifecycle_msg = Some(
+            "Album participants — ↑/↓ select · Enter opens Artist · a adds · r removes · Esc back"
+                .to_owned(),
+        );
+    }
+
+    fn album_participant_ids(&self) -> Vec<ArtistId> {
+        let Some(Detail::Album(album)) = self.detail else {
+            return Vec::new();
+        };
+        self.controller.album_participants(album)
+    }
+
+    fn album_participant_candidates(&self) -> Vec<ArtistId> {
+        let participants = self.album_participant_ids();
+        self.controller
+            .artists()
+            .into_iter()
+            .map(|artist| artist.id())
+            .filter(|artist| !participants.contains(artist))
+            .collect()
+    }
+
+    fn add_album_participant(&mut self, artist: ArtistId) {
+        let Some(Detail::Album(album)) = self.detail else {
+            return;
+        };
+        match self.controller.add_album_participant(album, artist) {
+            Ok(()) => {
+                self.album_participant_cursor = 0;
+                self.mode = Mode::AlbumParticipants;
+                let name = self
+                    .controller
+                    .artist(artist)
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| format!("Artist {artist}"));
+                self.lifecycle_msg = Some(format!(
+                    "Added {name} to the Album participants. Track credits are unchanged."
+                ));
+            }
+            Err(error) => self.lifecycle_msg = Some(error),
+        }
+    }
+
+    fn remove_album_participant(&mut self) {
+        let Some((album, artist)) = self.pending_participant_remove.take() else {
+            self.mode = Mode::AlbumParticipants;
+            return;
+        };
+        match self.controller.remove_album_participant(album, artist) {
+            Ok(()) => {
+                self.album_participant_cursor = self.album_participant_cursor.saturating_sub(1);
+                self.mode = Mode::AlbumParticipants;
+                self.lifecycle_msg = Some(
+                    "Removed the Album participation association. The Album, audio and Track credits are unchanged."
+                        .to_owned(),
+                );
+            }
+            Err(error) => {
+                self.mode = Mode::AlbumParticipants;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
     fn open_album_deletion(&mut self) {
         let Some(Detail::Album(album)) = self.detail else {
             self.lifecycle_msg = Some("Open an album to delete it.".to_owned());
@@ -3487,18 +3691,23 @@ impl Tui {
             Ok(plan) => {
                 let name = plan.artist_name.clone();
                 let affected = plan.owned_tracks.len() + plan.credited_tracks.len();
+                let owned_albums = plan.owned_albums.len();
+                let participant_albums = plan.participant_albums.len();
+                let has_albums =
+                    !plan.owned_albums.is_empty() || !plan.participant_albums.is_empty();
                 self.artist_deletion = Some(plan);
                 self.artist_delete_cursor = 0;
                 self.artist_delete_armed = None;
-                if affected == 0 {
+                if affected == 0 && !has_albums {
                     self.mode = Mode::ConfirmArtistDelete;
                     self.lifecycle_msg = Some(format!(
-                        "Delete artist “{name}” and its empty albums? No tracks are touched. y confirms."
+                        "Delete artist “{name}”? No tracks or albums are affected. y confirms."
                     ));
                 } else {
                     self.mode = Mode::ArtistDeletion;
                     self.lifecycle_msg = Some(format!(
-                        "{affected} track(s) need transfer, credit-removal or explicit deletion decisions. a auto-resolves safe transfers/credits; y publishes when ready."
+                        "{affected} track(s) plus {} owned and {} shared Album association(s) need review. a auto-resolves safe track decisions; b toggles owned-Album deletion; y publishes when ready.",
+                        owned_albums, participant_albums
                     ));
                 }
             }
@@ -4012,7 +4221,10 @@ impl Tui {
                 self.detail = None;
                 self.mode = Mode::Normal;
                 self.reset_selection();
-                self.lifecycle_msg = Some("Deleted the artist and its empty albums.".to_owned());
+                self.lifecycle_msg = Some(
+                    "Deleted the artist and removed its Album associations; shared Albums and audio remain."
+                        .to_owned(),
+                );
             }
             Err(error) => {
                 self.mode = Mode::Normal;
@@ -4323,6 +4535,9 @@ impl Tui {
                 let text = std::mem::take(&mut self.input);
                 let mut next = Mode::Normal;
                 match self.mode {
+                    Mode::AlbumParticipants
+                    | Mode::AlbumParticipantPick
+                    | Mode::ConfirmAlbumParticipantRemove => {}
                     Mode::ScanInput => {
                         let path = text.trim();
                         if path.is_empty() {
@@ -4868,6 +5083,9 @@ fn cancel_message(mode: Mode) -> Option<&'static str> {
         Mode::CommandInput => Some("Command cancelled; nothing changed."),
         Mode::ConfirmPlaylist => Some("Playlist change cancelled."),
         Mode::ConfirmQueueClear => Some("Queue clear cancelled."),
+        Mode::AlbumParticipants => Some("Album participants closed."),
+        Mode::AlbumParticipantPick => Some("Album participant selection cancelled."),
+        Mode::ConfirmAlbumParticipantRemove => Some("Participant removal cancelled."),
         Mode::TrackMovePick => Some("Track move cancelled."),
         Mode::TrackReplacementInput => Some("Audio replacement cancelled."),
         Mode::ConfirmTrackReplacement => Some("Audio replacement cancelled."),
@@ -4942,6 +5160,9 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         queue_follow: true,
         queue_offset: 0,
         content_offset: 0,
+        album_participant_cursor: 0,
+        album_participant_pick_cursor: 0,
+        pending_participant_remove: None,
         info_title: String::new(),
         info_lines: Vec::new(),
         info_scroll: 0,
@@ -5090,6 +5311,9 @@ mod tests {
             queue_follow: true,
             queue_offset: 0,
             content_offset: 0,
+            album_participant_cursor: 0,
+            album_participant_pick_cursor: 0,
+            pending_participant_remove: None,
             info_title: String::new(),
             info_lines: Vec::new(),
             info_scroll: 0,
@@ -6910,6 +7134,75 @@ mod tests {
         tui.controller.shutdown();
     }
     #[test]
+    fn tui_navigates_and_edits_collaborative_album_participants() {
+        let dir = TempDir::new("tui-album-participants");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        let alpha = tui.controller.create_artist("Alpha").expect("alpha");
+        let beta = tui.controller.create_artist("Beta").expect("beta");
+        let gamma = tui.controller.create_artist("Gamma").expect("gamma");
+        let album = tui
+            .controller
+            .create_album(alpha, "Shared Release", flux_app::ReleaseType::Album)
+            .expect("album");
+        tui.controller
+            .set_album_participants(album, &[alpha, beta])
+            .expect("participants");
+        tui.view = View::Albums;
+        tui.detail = Some(Detail::Album(album));
+        assert!(tui.view_title().contains("Alpha"));
+        assert!(tui.view_title().contains("Beta"));
+
+        tui.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(tui.mode, Mode::AlbumParticipants);
+        key(&mut tui, KeyCode::Down);
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.detail, Some(Detail::Artist(beta)));
+        assert_eq!(tui.mode, Mode::Normal);
+
+        tui.detail = Some(Detail::Album(album));
+        tui.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        key(&mut tui, KeyCode::Char('a'));
+        assert_eq!(tui.mode, Mode::AlbumParticipantPick);
+        let candidates = tui.album_participant_candidates();
+        let gamma_index = candidates
+            .iter()
+            .position(|artist| *artist == gamma)
+            .expect("gamma candidate");
+        for _ in 0..gamma_index {
+            key(&mut tui, KeyCode::Down);
+        }
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.mode, Mode::AlbumParticipants);
+        assert_eq!(
+            tui.controller.album_participants(album),
+            vec![alpha, beta, gamma]
+        );
+
+        tui.album_participant_cursor = 2;
+        key(&mut tui, KeyCode::Char('r'));
+        assert_eq!(tui.mode, Mode::ConfirmAlbumParticipantRemove);
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.mode, Mode::AlbumParticipants);
+        assert_eq!(tui.controller.album_participants(album), vec![alpha, beta]);
+        assert!(
+            tui.controller.album(album).is_some(),
+            "participation edits never delete the Album"
+        );
+        tui.view = View::Artists;
+        tui.detail = Some(Detail::Artist(beta));
+        assert!(
+            tui.view_rows().contains(&Row::Album(album)),
+            "an Artist reaches a shared Album through participation alone"
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
     fn tui_deletes_an_empty_artist_with_explicit_confirmation() {
         let dir = TempDir::new("tui-delete-empty-artist");
         let root = dir.path().join("library");
@@ -6928,10 +7221,12 @@ mod tests {
         tui.view = View::Artists;
         tui.detail = Some(Detail::Artist(artist));
         key(&mut tui, KeyCode::Delete);
-        assert_eq!(tui.mode, Mode::ConfirmArtistDelete);
-        key(&mut tui, KeyCode::Char('n'));
+        assert_eq!(tui.mode, Mode::ArtistDeletion);
+        key(&mut tui, KeyCode::Esc);
         assert!(tui.controller.artist(artist).is_some(), "cancel is safe");
         key(&mut tui, KeyCode::Delete);
+        assert_eq!(tui.mode, Mode::ArtistDeletion);
+        key(&mut tui, KeyCode::Char('b'));
         key(&mut tui, KeyCode::Char('y'));
         assert!(tui.controller.artist(artist).is_none());
         assert!(tui.controller.albums().is_empty());
@@ -6971,6 +7266,7 @@ mod tests {
         assert_eq!(tui.mode, Mode::ArtistAlbumPick);
         key(&mut tui, KeyCode::Enter);
         assert_eq!(tui.mode, Mode::ArtistDeletion);
+        key(&mut tui, KeyCode::Char('b'));
         assert!(
             tui.artist_deletion
                 .as_ref()
