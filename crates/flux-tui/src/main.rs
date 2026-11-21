@@ -7831,7 +7831,8 @@ mod tests {
         assert!(text.contains("visualization_mode=bars"), "{text}");
 
         subject.controller.shutdown();
-        let mut restored_tui = tui(&dir);
+        let restored_dir = TempDir::new("tui-preferences-restored");
+        let mut restored_tui = tui(&restored_dir);
         restored_tui.prefs_path = Some(path);
         restored_tui.load_preferences();
         assert_eq!(restored_tui.layout, LayoutMode::Library);
