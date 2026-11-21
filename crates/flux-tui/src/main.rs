@@ -1,58 +1,24 @@
 //! Flux terminal interface (`flux-tui`).
 //!
-//! A minimal interactive player over the shared [`flux_app::Controller`]
-//! — the same controller the GUI uses, so behavior matches exactly.
-//! Rendering is hand-rolled on top of `crossterm` (no widget
-//! framework): a header, a now-playing line, a scrollable track or queue
-//! list, a status/error line, and a help/input line. Playback, scanning,
-//! import, catalogue and persistence decisions all stay in the shared
-//! Controller; this thread only draws and routes keys.
+//! A complete keyboard-first player over the shared [`flux_app::Controller`] —
+//! the same controller, canonical library, playback engine, queue, history,
+//! ratings, playlists, lyrics and import pipeline as the GUI.
+//!
+//! The interface is organized as library destinations (Tracks, Artists,
+//! Albums, Playlists, Collections, Lyrics, Settings) with contextual detail
+//! views, a first-class queue, five layout presets, a command palette and a
+//! real audio visualizer fed by the engine's post-gain waveform tap. Metadata
+//! editing uses labelled, prefilled forms. Rendering is hand-written on
+//! `crossterm`; no domain or persistence logic lives here.
 //!
 //! Usage: `flux-tui [MUSIC_DIR]` — with a directory argument, the same
-//! cancellable review-first import opens immediately. Real audio output requires
-//! a build with `--features cpal`; otherwise the app says so and playback
-//! commands report why (see the README).
+//! cancellable review-first import opens immediately. Real audio output
+//! requires a build with `--features cpal`; a no-CPAL build reports that
+//! honestly. See `docs/m16-tui-parity.md` for the full keymap and limitations.
 //!
-//! Keys:
-//! - `↑`/`k`, `↓`/`j` move; `PgUp`/`PgDn`, `g`/`G` jump
-//! - `Enter` play selected, `Space` play/pause, `s` stop
-//! - `n` next, `p` previous, `+`/`-` volume, `R` cycle repeat
-//! - `K` toggle crossfade, `[`/`]` decrease/increase its duration
-//! - `a` add selected track to the queue, `x` play it next
-//! - `Q` open the queue-entry view: `Enter` plays the selected stable
-//!   QueueEntryId, `Delete`/`d` removes it, `Ctrl+↑`/`Ctrl+↓` reorders it;
-//!   duplicate tracks remain distinct entries
-//! - `o` imports a folder, `r` refreshes scanned folders
-//! - `i`/`I` import semicolon-separated paths into the canonical library.
-//!   Both routes open a cancellable discovery/review phase: select
-//!   import/update/skip decisions, then prepare copies before the atomic
-//!   publish. The GUI retains the rich metadata/artwork editor.
-//!   Per-path issues open a scrollable result panel.
-//! - `e` edit the selected track, `Z` edit its Album metadata/cover,
-//!   `W` set/remove a Track artwork override, `S` set/remove managed
-//!   lyrics from a UTF-8 path, `P` create an artist, and `Y` edit an
-//!   artist (`artist-id|name|aliases|description|image-path`);
-//!   `V` lists artist IDs, `X` reconciles, `L` relinks a unique reported
-//!   move candidate
-//! - `/` search/filter, `Esc` clear search or cancel input, `?` opens
-//!   the full scrollable help/limitations panel
-//! - `q` or `Ctrl-C` quit (terminal state is always restored)
-//! - `U` preserve and replace an unreadable legacy app index only after
-//!   an explicit `y` confirmation
-//! - `O` open a canonical library (type its folder), `C` create one,
-//!   `M` migrate a legacy index/portable library (type source, then
-//!   destination; review the plan, `y` executes, `Esc` cancels; in the
-//!   migration-complete screen, `a` opens the migrated library), `B`
-//!   explains that legacy runtime switching is disabled, `A` acknowledges
-//!   a recovered portable library only after explicit confirmation,
-//!   `X` reconciles the portable catalogue with the filesystem
-//!   (missing records are kept and possible locations are never
-//!   auto-applied)
-//!
-//! Startup uses `Controller::open_default` (canonical by default). Opening,
-//! creating, migrating, or switching libraries only ever happens through the
-//! explicit keys above, and a failed/cancelled switch leaves the active
-//! library untouched.
+//! `Tab`/`Shift+Tab` and `F1`–`F7` switch destinations. `?` opens contextual
+//! help. `m` cycles layouts; `v` toggles the visualizer and `Alt+v` cycles its
+//! modes. The terminal is restored on normal exit, error and panic.
 
 use std::cell::RefCell;
 use std::io::{IsTerminal, Write};
@@ -71,10 +37,11 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use flux_app::{
-    AlbumId, AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller, ImportDecision,
-    ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage, PreparedImport,
-    ReconcileReport, StorageMode, TrackMetadataEdit, format_duration, is_track_playable,
-    prepare_import_files, prepare_import_plan,
+    AlbumId, AudioOutputDevice, AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller,
+    ImportDecision, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
+    OpenedAudioOutput, PlaylistId, PreparedImport, ReconcileReport, SmartCollection, StorageMode,
+    TrackMetadataEdit, WaveformScope, format_duration, is_track_playable, prepare_import_files,
+    prepare_import_plan, waveform_sample,
 };
 use flux_core::{APP_VERSION, ArtistId, PlaybackState, Track, TrackId};
 use unicode_width::UnicodeWidthChar;
@@ -151,6 +118,153 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Primary library destinations. Navigation is shared by the tab bar,
+/// keyboard shortcuts and the command palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Tracks,
+    Artists,
+    Albums,
+    Playlists,
+    Collections,
+    Lyrics,
+    Settings,
+}
+
+impl View {
+    const ALL: [Self; 7] = [
+        Self::Tracks,
+        Self::Artists,
+        Self::Albums,
+        Self::Playlists,
+        Self::Collections,
+        Self::Lyrics,
+        Self::Settings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tracks => "Tracks",
+            Self::Artists => "Artists",
+            Self::Albums => "Albums",
+            Self::Playlists => "Playlists",
+            Self::Collections => "Collections",
+            Self::Lyrics => "Lyrics",
+            Self::Settings => "Settings",
+        }
+    }
+}
+
+/// A selected entity context inside a primary view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    Artist(ArtistId),
+    Album(AlbumId),
+    Playlist(PlaylistId),
+}
+
+/// One visible, selectable row. Entity rows preserve stable identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Track(TrackId),
+    Artist(ArtistId),
+    Album(AlbumId),
+    Playlist(PlaylistId),
+    Collection(SmartCollection),
+    LyricsTrack(TrackId),
+    Setting(SettingRow),
+    AudioDevice(Option<usize>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingRow {
+    Layout,
+    Visualizer,
+    VisualizationMode,
+    FollowPlayback,
+    RefreshDevices,
+    LibrarySetup,
+}
+
+impl SettingRow {
+    const ALL: [Self; 6] = [
+        Self::Layout,
+        Self::Visualizer,
+        Self::VisualizationMode,
+        Self::FollowPlayback,
+        Self::RefreshDevices,
+        Self::LibrarySetup,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Layout => "Layout",
+            Self::Visualizer => "Visualizer",
+            Self::VisualizationMode => "Visualization mode",
+            Self::FollowPlayback => "Lyrics follow playback",
+            Self::RefreshDevices => "Refresh audio devices",
+            Self::LibrarySetup => "Library setup",
+        }
+    }
+}
+
+/// Coherent layout presets rather than arbitrary panel toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    Standard,
+    Library,
+    Player,
+    Visualizer,
+    Compact,
+}
+
+impl LayoutMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Library => "Library",
+            Self::Player => "Player",
+            Self::Visualizer => "Visualizer",
+            Self::Compact => "Compact",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Standard => Self::Library,
+            Self::Library => Self::Player,
+            Self::Player => Self::Visualizer,
+            Self::Visualizer => Self::Compact,
+            Self::Compact => Self::Standard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VizMode {
+    Waveform,
+    Bars,
+    Pulse,
+}
+
+impl VizMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Waveform => "Waveform",
+            Self::Bars => "Bars",
+            Self::Pulse => "Pulse",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Waveform => Self::Bars,
+            Self::Bars => Self::Pulse,
+            Self::Pulse => Self::Waveform,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -200,15 +314,45 @@ enum Mode {
     ConfirmPreserveIndex,
     /// Explicit confirmation before acknowledging portable recovery.
     ConfirmAcknowledgeRecovery,
+    /// A structured, labelled form. Tab moves between fields.
+    FormInput,
+    /// A small command palette (`:`), parsed into ordinary actions.
+    CommandInput,
+    /// Explicit confirmation for a destructive playlist operation.
+    ConfirmPlaylist,
+    /// Explicit confirmation before clearing the whole queue.
+    ConfirmQueueClear,
+}
+
+#[derive(Debug, Clone)]
+enum PlaylistAction {
+    Delete {
+        id: PlaylistId,
+        name: String,
+        tracks: Vec<TrackId>,
+    },
+    Clear {
+        id: PlaylistId,
+        tracks: Vec<TrackId>,
+    },
+    Remove {
+        id: PlaylistId,
+        position: usize,
+        tracks: Vec<TrackId>,
+    },
 }
 
 struct RowsCache {
     session: u64,
     revision: u64,
     generation: u64,
+    view: View,
+    detail: Option<Detail>,
+    collection: Option<SmartCollection>,
     search: String,
     favorites_only: bool,
-    ids: Rc<Vec<TrackId>>,
+    rows: Rc<Vec<Row>>,
+    track_rows: Rc<Vec<TrackId>>,
 }
 
 struct TuiImport {
@@ -241,6 +385,55 @@ fn join_worker_bounded(worker: JoinHandle<()>) {
         drop(worker);
     }
 }
+
+#[derive(Debug, Clone)]
+struct FormField {
+    label: &'static str,
+    value: String,
+    hint: &'static str,
+}
+
+#[derive(Debug, Clone)]
+enum FormKind {
+    Track {
+        id: TrackId,
+        original_credit: String,
+        original_credits: Vec<ArtistId>,
+    },
+    Artist(ArtistId),
+    Album(AlbumId),
+    PlaylistNew,
+    PlaylistRename {
+        id: PlaylistId,
+        expected_name: String,
+        expected_tracks: Vec<TrackId>,
+    },
+    ImportCandidate(usize),
+}
+
+#[derive(Debug, Clone)]
+struct FormState {
+    title: String,
+    kind: FormKind,
+    fields: Vec<FormField>,
+    focus: usize,
+    error: Option<String>,
+}
+
+impl FormState {
+    fn new(title: impl Into<String>, kind: FormKind, fields: Vec<FormField>) -> Self {
+        Self {
+            title: title.into(),
+            kind,
+            fields,
+            focus: 0,
+            error: None,
+        }
+    }
+}
+
+type AudioListReceiver = Receiver<Result<Vec<AudioOutputDevice>, String>>;
+type AudioOpenReceiver = Receiver<(Option<String>, Result<OpenedAudioOutput, String>)>;
 
 struct Tui {
     controller: Controller,
@@ -275,21 +468,59 @@ struct Tui {
     lyrics_scroll: usize,
     /// Human-readable lyrics title/status.
     lyrics_title: String,
+    /// Whether the next lyrics update should snap to the current line.
+    lyrics_follow_ready: bool,
+    /// Track and timestamps backing the open lyrics view.
+    lyrics_track: Option<TrackId>,
+    lyrics_timestamps: Vec<Option<u64>>,
     /// Cursor within the stable queue-entry list.
     queue_cursor: usize,
+    /// Whether the queue cursor follows the current playback entry.
+    queue_follow: bool,
     /// First visible queue row.
     queue_offset: usize,
     /// Title and lines for help/import-detail info views.
     info_title: String,
     info_lines: Vec<String>,
     info_scroll: usize,
+    /// Active primary library destination and optional entity detail.
+    view: View,
+    detail: Option<Detail>,
+    /// Derived collection currently filtering the Tracks view.
+    active_collection: Option<SmartCollection>,
+    /// Coherent layout preset and visualization preferences.
+    layout: LayoutMode,
+    viz_visible: bool,
+    viz_mode: VizMode,
+    viz_gain: f32,
+    scope: WaveformScope,
+    follow_lyrics: bool,
+    prefs_path: Option<PathBuf>,
+    /// Structured form shared by common metadata and playlist edits.
+    form: Option<FormState>,
+    playlist_action: Option<PlaylistAction>,
+    /// Audio-device list and asynchronous selection state.
+    audio_devices: Vec<AudioOutputDevice>,
+    audio_error: Option<String>,
+    audio_loading: bool,
+    audio_list_rx: Option<AudioListReceiver>,
+    audio_open_rx: Option<AudioOpenReceiver>,
 }
 
 impl Tui {
-    /// IDs of the visible rows. Only IDs are collected; track metadata
-    /// is looked up for the handful of rows actually drawn. Cloning every
-    /// `Track` on each redraw was unnecessary work for large libraries.
-    fn rows(&self) -> Rc<Vec<TrackId>> {
+    /// Visible rows for the active view/detail. Only stable identities are
+    /// cached; metadata is looked up for the handful of rows actually drawn.
+    fn view_rows(&self) -> Rc<Vec<Row>> {
+        if self.view == View::Settings {
+            let mut rows = SettingRow::ALL
+                .iter()
+                .copied()
+                .map(Row::Setting)
+                .collect::<Vec<_>>();
+            rows.push(Row::AudioDevice(None));
+            rows.extend((0..self.audio_devices.len()).map(|index| Row::AudioDevice(Some(index))));
+            return Rc::new(rows);
+        }
         let session = self.controller.library_session();
         let revision = self.controller.library_revision();
         let generation = self.controller.generation();
@@ -297,34 +528,303 @@ impl Tui {
             && cache.session == session
             && cache.revision == revision
             && cache.generation == generation
+            && cache.view == self.view
+            && cache.detail == self.detail
+            && cache.collection == self.active_collection
             && cache.search == self.search
             && cache.favorites_only == self.favorites_only
         {
-            return Rc::clone(&cache.ids);
+            return Rc::clone(&cache.rows);
         }
-        let ids = Rc::new(
-            self.controller
-                .search(&self.search)
-                .into_iter()
-                .filter(|(id, _)| {
-                    !self.favorites_only
-                        || self
-                            .controller
-                            .rating(*id)
-                            .is_some_and(|rating| rating.favorite)
+        let rows = Rc::new(self.build_rows());
+        let track_rows = Rc::new(
+            rows.iter()
+                .filter_map(|row| match row {
+                    Row::Track(id) | Row::LyricsTrack(id) => Some(*id),
+                    _ => None,
                 })
-                .map(|(id, _)| id)
                 .collect::<Vec<_>>(),
         );
         *self.rows_cache.borrow_mut() = Some(RowsCache {
             session,
             revision,
             generation,
+            view: self.view,
+            detail: self.detail,
+            collection: self.active_collection,
             search: self.search.clone(),
             favorites_only: self.favorites_only,
-            ids: Rc::clone(&ids),
+            rows: Rc::clone(&rows),
+            track_rows,
         });
-        ids
+        rows
+    }
+
+    fn build_rows(&self) -> Vec<Row> {
+        let query = self.search.trim().to_lowercase();
+        let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
+        let track_matches = |id: TrackId| {
+            let Some(track) = self.controller.track(id) else {
+                return false;
+            };
+            matches(track.title())
+                || matches(&credit_display(&self.controller, id))
+                || track
+                    .album()
+                    .is_some_and(|album| album.to_lowercase().contains(&query))
+        };
+        let favorite = |id: TrackId| {
+            self.controller
+                .rating(id)
+                .is_some_and(|rating| rating.favorite)
+        };
+        let filter_track =
+            |id: TrackId| track_matches(id) && (!self.favorites_only || favorite(id));
+
+        if let Some(detail) = self.detail {
+            match detail {
+                Detail::Artist(artist_id) => {
+                    let mut rows = Vec::new();
+                    let mut albums = self.controller.albums_owned_by(artist_id);
+                    for id in self.controller.albums_credited_for(artist_id) {
+                        if !albums.contains(&id) {
+                            albums.push(id);
+                        }
+                    }
+                    let mut albums = albums
+                        .into_iter()
+                        .filter_map(|id| self.controller.album(id))
+                        .filter(|album| matches(&album.title))
+                        .collect::<Vec<_>>();
+                    albums.sort_by(|left, right| {
+                        left.title
+                            .to_lowercase()
+                            .cmp(&right.title.to_lowercase())
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    rows.extend(albums.into_iter().map(|album| Row::Album(album.id)));
+                    let mut tracks = self
+                        .controller
+                        .tracks()
+                        .iter()
+                        .filter(|(id, _)| {
+                            self.controller.track_artist_id(*id) == Some(artist_id)
+                                || self.controller.track_credits(*id).contains(&artist_id)
+                        })
+                        .map(|(id, _)| *id)
+                        .filter(|id| filter_track(*id))
+                        .collect::<Vec<_>>();
+                    tracks.sort_by(|left, right| {
+                        let left_track = self.controller.track(*left);
+                        let right_track = self.controller.track(*right);
+                        left_track
+                            .map(|track| display_album(track).to_lowercase())
+                            .cmp(&right_track.map(|track| display_album(track).to_lowercase()))
+                            .then_with(|| {
+                                left_track
+                                    .and_then(Track::track_number)
+                                    .cmp(&right_track.and_then(Track::track_number))
+                            })
+                            .then_with(|| left.cmp(right))
+                    });
+                    rows.extend(tracks.into_iter().map(Row::Track));
+                    rows
+                }
+                Detail::Album(album_id) => self
+                    .controller
+                    .album_tracks(album_id)
+                    .into_iter()
+                    .filter(|id| filter_track(*id))
+                    .map(Row::Track)
+                    .collect(),
+                Detail::Playlist(playlist_id) => self
+                    .controller
+                    .playlist(playlist_id)
+                    .map(|playlist| {
+                        playlist
+                            .track_ids
+                            .iter()
+                            .copied()
+                            .filter(|id| filter_track(*id))
+                            .map(Row::Track)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        } else {
+            match self.view {
+                View::Tracks => {
+                    let mut ids = if let Some(collection) = self.active_collection {
+                        self.controller.smart_collection_tracks(collection)
+                    } else {
+                        self.controller
+                            .search(&self.search)
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect()
+                    };
+                    ids.retain(|id| {
+                        (!self.favorites_only || favorite(*id))
+                            && (self.active_collection.is_none() || filter_track(*id))
+                    });
+                    ids.into_iter().map(Row::Track).collect()
+                }
+                View::Artists => {
+                    let mut artists = self
+                        .controller
+                        .artists()
+                        .into_iter()
+                        .filter(|artist| {
+                            matches(artist.name())
+                                || artist.aliases().iter().any(|alias| matches(alias))
+                        })
+                        .collect::<Vec<_>>();
+                    artists.sort_by(|left, right| {
+                        left.name()
+                            .to_lowercase()
+                            .cmp(&right.name().to_lowercase())
+                            .then_with(|| left.id().cmp(&right.id()))
+                    });
+                    artists
+                        .into_iter()
+                        .map(|artist| Row::Artist(artist.id()))
+                        .collect()
+                }
+                View::Albums => {
+                    let mut albums = self
+                        .controller
+                        .albums()
+                        .into_iter()
+                        .filter(|album| {
+                            let owner = self
+                                .controller
+                                .artist(album.owner_artist_id)
+                                .map(|artist| artist.name().to_owned())
+                                .unwrap_or_default();
+                            matches(&album.title) || matches(&owner)
+                        })
+                        .collect::<Vec<_>>();
+                    albums.sort_by(|left, right| {
+                        left.title
+                            .to_lowercase()
+                            .cmp(&right.title.to_lowercase())
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    albums
+                        .into_iter()
+                        .map(|album| Row::Album(album.id))
+                        .collect()
+                }
+                View::Playlists => {
+                    let mut playlists = self
+                        .controller
+                        .playlists()
+                        .into_iter()
+                        .filter(|playlist| matches(&playlist.name))
+                        .collect::<Vec<_>>();
+                    playlists.sort_by(|left, right| {
+                        left.name
+                            .to_lowercase()
+                            .cmp(&right.name.to_lowercase())
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    playlists
+                        .into_iter()
+                        .map(|playlist| Row::Playlist(playlist.id))
+                        .collect()
+                }
+                View::Collections => SmartCollection::ALL
+                    .into_iter()
+                    .filter(|collection| {
+                        matches(collection.label()) || matches(collection.description())
+                    })
+                    .map(Row::Collection)
+                    .collect(),
+                View::Lyrics => {
+                    let mut ids = self
+                        .controller
+                        .tracks()
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .filter(|id| self.controller.track_has_lyrics(*id))
+                        .filter(|id| track_matches(*id))
+                        .collect::<Vec<_>>();
+                    ids.sort_by(|left, right| {
+                        self.controller
+                            .track(*left)
+                            .map(|track| display_title(track).to_lowercase())
+                            .cmp(
+                                &self
+                                    .controller
+                                    .track(*right)
+                                    .map(|track| display_title(track).to_lowercase()),
+                            )
+                            .then_with(|| left.cmp(right))
+                    });
+                    ids.into_iter().map(Row::LyricsTrack).collect()
+                }
+                View::Settings => Vec::new(),
+            }
+        }
+    }
+
+    /// Track IDs currently visible as tracks, in display order.
+    ///
+    /// The vector is shared with the row cache so large unchanged lists do not
+    /// rebuild or reallocate on every playback tick.
+    fn rows(&self) -> Rc<Vec<TrackId>> {
+        let rows = self.view_rows();
+        if let Some(cache) = self.rows_cache.borrow().as_ref()
+            && Rc::ptr_eq(&cache.rows, &rows)
+        {
+            return Rc::clone(&cache.track_rows);
+        }
+        Rc::new(
+            rows.iter()
+                .filter_map(|row| match row {
+                    Row::Track(id) | Row::LyricsTrack(id) => Some(*id),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    fn current_row(&self) -> Option<Row> {
+        self.view_rows().get(self.cursor).copied()
+    }
+
+    fn current_track(&self) -> Option<TrackId> {
+        match self.current_row()? {
+            Row::Track(id) | Row::LyricsTrack(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn selected_playlist(&self) -> Option<PlaylistId> {
+        match self.detail {
+            Some(Detail::Playlist(id)) => Some(id),
+            _ => match self.current_row() {
+                Some(Row::Playlist(id)) => Some(id),
+                _ => None,
+            },
+        }
+    }
+
+    fn reset_selection(&mut self) {
+        self.cursor = 0;
+        self.offset = 0;
+    }
+
+    fn switch_view(&mut self, view: View) {
+        if self.view != view {
+            self.view = view;
+            self.detail = None;
+            self.active_collection = None;
+            self.reset_selection();
+            if view == View::Settings && self.audio_devices.is_empty() {
+                self.refresh_audio_devices();
+            }
+        }
     }
 
     fn library_full_identity(&self) -> String {
@@ -342,6 +842,676 @@ impl Tui {
                 |root| format!("canonical {}", root.display()),
             ),
         }
+    }
+
+    fn load_preferences(&mut self) {
+        let Some(path) = self.prefs_path.as_ref() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "layout" => {
+                    self.layout = match value.trim() {
+                        "library" => LayoutMode::Library,
+                        "player" => LayoutMode::Player,
+                        "visualizer" => LayoutMode::Visualizer,
+                        "compact" => LayoutMode::Compact,
+                        _ => LayoutMode::Standard,
+                    };
+                }
+                "visualizer" => self.viz_visible = value.trim() != "hidden",
+                "visualization_mode" => {
+                    self.viz_mode = match value.trim() {
+                        "bars" => VizMode::Bars,
+                        "pulse" => VizMode::Pulse,
+                        _ => VizMode::Waveform,
+                    };
+                }
+                "visualization_gain" => {
+                    if let Ok(gain) = value.trim().parse::<f32>() {
+                        self.viz_gain = gain.clamp(0.5, 2.5);
+                    }
+                }
+                "follow_lyrics" => self.follow_lyrics = value.trim() != "off",
+                _ => {}
+            }
+        }
+    }
+
+    fn save_preferences(&self) {
+        let Some(path) = self.prefs_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return;
+        }
+        let layout = match self.layout {
+            LayoutMode::Standard => "standard",
+            LayoutMode::Library => "library",
+            LayoutMode::Player => "player",
+            LayoutMode::Visualizer => "visualizer",
+            LayoutMode::Compact => "compact",
+        };
+        let mode = match self.viz_mode {
+            VizMode::Waveform => "waveform",
+            VizMode::Bars => "bars",
+            VizMode::Pulse => "pulse",
+        };
+        let text = format!(
+            "layout={layout}\nvisualizer={}\nvisualization_mode={mode}\nvisualization_gain={:.2}\nfollow_lyrics={}\n",
+            if self.viz_visible { "shown" } else { "hidden" },
+            self.viz_gain,
+            if self.follow_lyrics { "on" } else { "off" },
+        );
+        let _ = std::fs::write(path, text);
+    }
+
+    fn refresh_audio_devices(&mut self) {
+        if self.audio_loading {
+            return;
+        }
+        self.audio_loading = true;
+        self.audio_error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(flux_app::enumerate_audio_output_devices());
+        });
+        self.audio_list_rx = Some(rx);
+    }
+
+    fn poll_audio_workers(&mut self) {
+        if let Some(rx) = self.audio_list_rx.as_ref()
+            && let Ok(result) = rx.try_recv()
+        {
+            self.audio_list_rx = None;
+            self.audio_loading = false;
+            match result {
+                Ok(devices) => {
+                    self.audio_devices = devices;
+                    self.audio_error = None;
+                }
+                Err(error) => self.audio_error = Some(error),
+            }
+            *self.rows_cache.borrow_mut() = None;
+        }
+        if let Some(rx) = self.audio_open_rx.as_ref()
+            && let Ok((target, result)) = rx.try_recv()
+        {
+            self.audio_open_rx = None;
+            match result {
+                Ok(opened) => match self.controller.install_audio_output(opened) {
+                    Ok(()) => {
+                        self.audio_error = None;
+                        self.lifecycle_msg = Some(match target {
+                            Some(id) => format!("Switched audio output to {id}."),
+                            None => "Switched to the system default output.".to_owned(),
+                        });
+                    }
+                    Err(error) => self.audio_error = Some(error),
+                },
+                Err(error) => self.audio_error = Some(error),
+            }
+        }
+    }
+
+    fn select_audio_output(&mut self, target: Option<String>) {
+        if self.audio_open_rx.is_some() {
+            self.audio_error = Some("Wait for the current output switch to finish.".to_owned());
+            return;
+        }
+        if matches!(self.controller.audio_status(), AudioStatus::Recovering(_)) {
+            self.audio_error =
+                Some("Wait for the current audio recovery attempt to finish.".to_owned());
+            return;
+        }
+        let request = target.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((request.clone(), flux_app::open_audio_output(request)));
+        });
+        self.audio_open_rx = Some(rx);
+        self.audio_error = None;
+        self.lifecycle_msg = Some("Opening the selected audio output…".to_owned());
+    }
+
+    fn toggle_setting(&mut self, setting: SettingRow) {
+        match setting {
+            SettingRow::Layout => {
+                self.layout = self.layout.next();
+                self.save_preferences();
+                self.lifecycle_msg = Some(format!("Layout: {}.", self.layout.label()));
+            }
+            SettingRow::Visualizer => {
+                self.viz_visible = !self.viz_visible;
+                self.save_preferences();
+                self.lifecycle_msg = Some(if self.viz_visible {
+                    "Visualizer shown.".to_owned()
+                } else {
+                    "Visualizer hidden; waveform sampling is paused.".to_owned()
+                });
+            }
+            SettingRow::VisualizationMode => {
+                self.viz_mode = self.viz_mode.next();
+                self.save_preferences();
+                self.lifecycle_msg = Some(format!("Visualization: {}.", self.viz_mode.label()));
+            }
+            SettingRow::FollowPlayback => {
+                self.follow_lyrics = !self.follow_lyrics;
+                self.save_preferences();
+                self.lifecycle_msg = Some(if self.follow_lyrics {
+                    "Lyrics will follow playback.".to_owned()
+                } else {
+                    "Lyrics follow is off; scroll manually.".to_owned()
+                });
+            }
+            SettingRow::RefreshDevices => self.refresh_audio_devices(),
+            SettingRow::LibrarySetup => {
+                self.mode = Mode::OpenInput;
+                self.input.clear();
+            }
+        }
+    }
+
+    fn open_track_form(&mut self, id: TrackId) {
+        let Some(track) = self.controller.track(id) else {
+            self.lifecycle_msg = Some("The selected track is no longer present.".to_owned());
+            return;
+        };
+        let owner = self.controller.track_artist_id(id);
+        let credit = self
+            .controller
+            .track_credits(id)
+            .first()
+            .copied()
+            .or(owner)
+            .and_then(|artist| self.controller.artist(artist))
+            .map(|artist| artist.name().to_owned())
+            .unwrap_or_default();
+        let fields = vec![
+            FormField {
+                label: "Title",
+                value: track.title().to_owned(),
+                hint: "Required",
+            },
+            FormField {
+                label: "Artist credit",
+                value: credit.clone(),
+                hint: "Existing name or a new artist; ownership is unchanged",
+            },
+            FormField {
+                label: "Album",
+                value: track.album().unwrap_or_default().to_owned(),
+                hint: "Empty keeps a standalone track",
+            },
+            FormField {
+                label: "Track number",
+                value: track
+                    .track_number()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                hint: "Optional whole number",
+            },
+            FormField {
+                label: "Disc number",
+                value: track
+                    .disc_number()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                hint: "Optional whole number",
+            },
+        ];
+        self.form = Some(FormState::new(
+            format!("Edit track · {}", display_title(track)),
+            FormKind::Track {
+                id,
+                original_credit: credit,
+                original_credits: self.controller.track_credits(id),
+            },
+            fields,
+        ));
+        self.mode = Mode::FormInput;
+    }
+
+    fn open_artist_form(&mut self, id: ArtistId) {
+        let Some(artist) = self.controller.artist(id) else {
+            self.lifecycle_msg = Some("The selected artist is no longer present.".to_owned());
+            return;
+        };
+        let fields = vec![
+            FormField {
+                label: "Name",
+                value: artist.name().to_owned(),
+                hint: "Required",
+            },
+            FormField {
+                label: "Aliases",
+                value: self.controller.artist_aliases(id).join("; "),
+                hint: "Separate aliases with semicolons",
+            },
+            FormField {
+                label: "Description",
+                value: self
+                    .controller
+                    .artist_description(id)
+                    .unwrap_or_default()
+                    .to_owned(),
+                hint: "Optional",
+            },
+            FormField {
+                label: "Image path",
+                value: self
+                    .controller
+                    .artist_image_path(id)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                hint: "Empty preserves; - removes",
+            },
+        ];
+        self.form = Some(FormState::new(
+            format!("Edit artist · {}", artist.name()),
+            FormKind::Artist(id),
+            fields,
+        ));
+        self.mode = Mode::FormInput;
+    }
+
+    fn open_album_form(&mut self, id: AlbumId) {
+        let Some(album) = self.controller.album(id) else {
+            self.lifecycle_msg = Some("The selected album is no longer present.".to_owned());
+            return;
+        };
+        let fields = vec![
+            FormField {
+                label: "Title",
+                value: album.title.clone(),
+                hint: "Required",
+            },
+            FormField {
+                label: "Release type",
+                value: album.release_type.as_str().to_owned(),
+                hint: "Album, EP, Single, Compilation or Other",
+            },
+            FormField {
+                label: "Cover path",
+                value: self
+                    .controller
+                    .album_cover_path(id)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                hint: "Empty preserves; - removes",
+            },
+        ];
+        self.form = Some(FormState::new(
+            format!("Edit album · {}", album.title),
+            FormKind::Album(id),
+            fields,
+        ));
+        self.mode = Mode::FormInput;
+    }
+
+    fn open_playlist_create_form(&mut self) {
+        self.form = Some(FormState::new(
+            "New playlist",
+            FormKind::PlaylistNew,
+            vec![FormField {
+                label: "Name",
+                value: String::new(),
+                hint: "Required",
+            }],
+        ));
+        self.mode = Mode::FormInput;
+    }
+
+    fn open_playlist_rename_form(&mut self, id: PlaylistId) {
+        let Some(playlist) = self.controller.playlist(id) else {
+            self.lifecycle_msg = Some("The selected playlist is no longer present.".to_owned());
+            return;
+        };
+        self.form = Some(FormState::new(
+            format!("Rename playlist · {}", playlist.name),
+            FormKind::PlaylistRename {
+                id,
+                expected_name: playlist.name.clone(),
+                expected_tracks: playlist.track_ids.clone(),
+            },
+            vec![FormField {
+                label: "Name",
+                value: playlist.name.clone(),
+                hint: "Required",
+            }],
+        ));
+        self.mode = Mode::FormInput;
+    }
+
+    fn open_import_form(&mut self, index: usize) {
+        let Some(ui) = self.import_ui.as_ref() else {
+            return;
+        };
+        let Some(plan) = ui.plan.as_ref() else {
+            return;
+        };
+        let Some(candidate) = plan.candidates.get(index) else {
+            return;
+        };
+        let fields = vec![
+            FormField {
+                label: "Title",
+                value: candidate.title().to_owned(),
+                hint: "Required",
+            },
+            FormField {
+                label: "Artist",
+                value: candidate.artist_name().unwrap_or_default().to_owned(),
+                hint: "Optional display credit",
+            },
+            FormField {
+                label: "Album",
+                value: candidate.album().unwrap_or_default().to_owned(),
+                hint: "Empty imports a standalone track",
+            },
+            FormField {
+                label: "Track number",
+                value: candidate
+                    .source_track()
+                    .track_number()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                hint: "Optional",
+            },
+            FormField {
+                label: "Disc number",
+                value: candidate
+                    .source_track()
+                    .disc_number()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                hint: "Optional",
+            },
+        ];
+        self.form = Some(FormState::new(
+            format!("Review metadata · {}", candidate.title()),
+            FormKind::ImportCandidate(index),
+            fields,
+        ));
+        self.mode = Mode::FormInput;
+    }
+
+    fn submit_form(&mut self) {
+        let Some(form) = self.form.clone() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let return_mode = if matches!(form.kind, FormKind::ImportCandidate(_)) {
+            Mode::ImportReview
+        } else {
+            Mode::Normal
+        };
+        let values = form
+            .fields
+            .iter()
+            .map(|field| field.value.trim().to_owned())
+            .collect::<Vec<_>>();
+        let number = |value: &str, label: &str| -> Result<Option<u32>, String> {
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                value
+                    .parse::<u32>()
+                    .map(Some)
+                    .map_err(|_| format!("{label} must be a whole number."))
+            }
+        };
+        let result: Result<String, String> = match form.kind {
+            FormKind::Track {
+                id,
+                original_credit,
+                original_credits,
+            } => {
+                if values[0].is_empty() {
+                    Err("Title must not be empty.".to_owned())
+                } else {
+                    let owner = self.controller.track_artist_id(id);
+                    let artist_name = values[1].clone();
+                    let credits = if artist_name == original_credit {
+                        original_credits
+                    } else {
+                        let credit_id = if artist_name.is_empty() {
+                            None
+                        } else if let Some(artist) = self
+                            .controller
+                            .artists()
+                            .into_iter()
+                            .find(|artist| artist.name().eq_ignore_ascii_case(&artist_name))
+                        {
+                            Some(artist.id())
+                        } else {
+                            self.controller.create_artist(&artist_name).ok()
+                        };
+                        let mut credits = owner.into_iter().collect::<Vec<_>>();
+                        if let Some(credit) = credit_id
+                            && !credits.contains(&credit)
+                        {
+                            credits.push(credit);
+                        }
+                        credits
+                    };
+                    if credits.is_empty() {
+                        return self.reject_form("At least one artist credit is required.");
+                    }
+                    let numbers = number(&values[3], "Track number").and_then(|track| {
+                        number(&values[4], "Disc number").map(|disc| (track, disc))
+                    });
+                    match numbers {
+                        Ok((track_number, disc_number)) => {
+                            let edit = TrackMetadataEdit {
+                                title: Some(values[0].clone()),
+                                artist_id: None,
+                                credited_artist_ids: Some(credits),
+                                album: if self.controller.track_album_id(id).is_some() {
+                                    Some(values[2].clone())
+                                } else {
+                                    None
+                                },
+                                track_number,
+                                disc_number,
+                            };
+                            self.controller
+                                .edit_track_metadata(id, edit)
+                                .map(|()| format!("Saved metadata for track {id}."))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+            FormKind::Artist(id) => {
+                if values[0].is_empty() {
+                    Err("Artist name must not be empty.".to_owned())
+                } else {
+                    let aliases = values[1]
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|alias| !alias.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                    let description = (!values[2].is_empty()).then(|| values[2].clone());
+                    let metadata = self.controller.update_artist_metadata(
+                        id,
+                        &values[0],
+                        description.as_deref(),
+                        &aliases,
+                    );
+                    let current_image = self
+                        .controller
+                        .artist_image_path(id)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default();
+                    let image = match values[3].as_str() {
+                        "" => Ok(()),
+                        "-" => self.controller.remove_artist_image(id),
+                        path if path == current_image => Ok(()),
+                        path => self.controller.set_artist_image(id, Path::new(path)),
+                    };
+                    metadata
+                        .and(image)
+                        .map(|()| format!("Updated artist {id}."))
+                }
+            }
+            FormKind::Album(id) => {
+                if values[0].is_empty() {
+                    Err("Album title must not be empty.".to_owned())
+                } else {
+                    match parse_release_type(&values[1]) {
+                        Ok(release_type) => {
+                            let metadata =
+                                self.controller
+                                    .update_album_metadata(id, &values[0], release_type);
+                            let current_cover = self
+                                .controller
+                                .album_cover_path(id)
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default();
+                            let cover = match values[2].as_str() {
+                                "" => Ok(()),
+                                "-" => self.controller.remove_album_cover(id),
+                                path if path == current_cover => Ok(()),
+                                path => self.controller.set_album_cover(id, Path::new(path)),
+                            };
+                            metadata.and(cover).map(|()| format!("Updated album {id}."))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+            FormKind::PlaylistNew => {
+                if values[0].is_empty() {
+                    Err("Playlist name must not be empty.".to_owned())
+                } else {
+                    self.controller
+                        .create_playlist(&values[0])
+                        .map(|id| format!("Created playlist {id}."))
+                }
+            }
+            FormKind::PlaylistRename {
+                id,
+                expected_name,
+                expected_tracks,
+            } => {
+                if values[0].is_empty() {
+                    Err("Playlist name must not be empty.".to_owned())
+                } else {
+                    self.controller
+                        .rename_playlist(id, &values[0], &expected_name, &expected_tracks)
+                        .map(|()| format!("Renamed playlist {id}."))
+                }
+            }
+            FormKind::ImportCandidate(index) => {
+                if values[0].is_empty() {
+                    Err("Title must not be empty.".to_owned())
+                } else {
+                    let numbers = number(&values[3], "Track number").and_then(|track| {
+                        number(&values[4], "Disc number").map(|disc| (track, disc))
+                    });
+                    match numbers {
+                        Ok((track_number, disc_number)) => {
+                            let Some(ui) = self.import_ui.as_mut() else {
+                                return self.reject_form("The import review closed.");
+                            };
+                            let Some(plan) = ui.plan.as_mut() else {
+                                return self.reject_form("The import review closed.");
+                            };
+                            let Some(candidate) = plan.candidates.get_mut(index) else {
+                                return self
+                                    .reject_form("The reviewed track is no longer present.");
+                            };
+                            candidate.set_title(&values[0]);
+                            candidate.set_artist_name(
+                                (!values[1].is_empty()).then(|| values[1].clone()),
+                            );
+                            candidate.set_album((!values[2].is_empty()).then(|| values[2].clone()));
+                            candidate.set_track_number(track_number);
+                            candidate.set_disc_number(disc_number);
+                            Ok(format!("Updated reviewed track {}.", values[0]))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(message) => {
+                self.form = None;
+                self.mode = return_mode;
+                self.lifecycle_msg = Some(message);
+            }
+            Err(error) => self.reject_form(&error),
+        }
+    }
+
+    fn reject_form(&mut self, error: &str) {
+        if let Some(form) = self.form.as_mut() {
+            form.error = Some(error.to_owned());
+        }
+    }
+
+    fn handle_form_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if ctrl_c {
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                let return_mode = self
+                    .form
+                    .as_ref()
+                    .map(|form| {
+                        if matches!(form.kind, FormKind::ImportCandidate(_)) {
+                            Mode::ImportReview
+                        } else {
+                            Mode::Normal
+                        }
+                    })
+                    .unwrap_or(Mode::Normal);
+                self.form = None;
+                self.mode = return_mode;
+                self.lifecycle_msg = Some("Edit cancelled; nothing was changed.".to_owned());
+            }
+            KeyCode::Enter => self.submit_form(),
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(form) = self.form.as_mut() {
+                    form.focus = (form.focus + 1) % form.fields.len().max(1);
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(form) = self.form.as_mut() {
+                    form.focus = form.focus.saturating_sub(1);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = self.form.as_mut()
+                    && let Some(field) = form.fields.get_mut(form.focus)
+                {
+                    field.value.pop();
+                    form.error = None;
+                }
+            }
+            KeyCode::Char(character) => {
+                if let Some(form) = self.form.as_mut()
+                    && let Some(field) = form.fields.get_mut(form.focus)
+                {
+                    field.value.push(character);
+                    form.error = None;
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     fn library_header_identity(&self, width: usize) -> String {
@@ -402,6 +1572,7 @@ impl Tui {
             .unwrap_or(0)
             .min(self.controller.queue_len().saturating_sub(1));
         self.queue_offset = self.queue_cursor;
+        self.queue_follow = true;
         self.mode = Mode::QueueView;
     }
 
@@ -810,6 +1981,9 @@ impl Tui {
                 }
             }
             KeyCode::Char(' ') => self.toggle_import_decision(),
+            KeyCode::Char('e') => {
+                self.open_import_form(self.import_ui.as_ref().map_or(0, |ui| ui.selected))
+            }
             KeyCode::Char('u') => self.toggle_import_update(),
             KeyCode::Char('a') => self.bulk_import_decision(ImportDecision::ImportNew),
             KeyCode::Char('s') => self.bulk_import_decision(ImportDecision::Skip),
@@ -923,10 +2097,10 @@ impl Tui {
         };
         let title = if issue_count > 0 {
             format!(
-                "Import review · {count} track(s) · {issue_count} unreadable · Enter import · Esc cancel"
+                "Import review · {count} track(s) · {issue_count} unreadable · e edit · Enter import · Esc cancel"
             )
         } else {
-            format!("Import review · {count} track(s) · Enter import · Esc cancel")
+            format!("Import review · {count} track(s) · e edit · Enter import · Esc cancel")
         };
         self.line(out, top as u16, &title, width, true)?;
         for (row, (selected, text)) in rows.into_iter().enumerate() {
@@ -950,11 +2124,17 @@ impl Tui {
     fn event_loop(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         loop {
             self.poll_import_worker();
+            self.poll_audio_workers();
             self.controller.poll();
             self.draw(out)?;
+            let active_visualizer = self.viz_visible
+                && self.layout != LayoutMode::Compact
+                && self.controller.player_state() == PlaybackState::Playing
+                && self.controller.audio_status().is_ready();
+            let interval = if active_visualizer { 50 } else { 120 };
             // Windows terminals report key releases too; act only on
             // presses (and repeats, for held keys).
-            if event::poll(Duration::from_millis(100))?
+            if event::poll(Duration::from_millis(interval))?
                 && let Event::Key(key) = event::read()?
                 && key.kind != KeyEventKind::Release
                 && self.handle_key(key)
@@ -1029,9 +2209,11 @@ impl Tui {
             KeyCode::Char('q') => return true,
             KeyCode::Esc | KeyCode::Char('Q') => self.mode = Mode::Normal,
             KeyCode::Up | KeyCode::Char('k') => {
+                self.queue_follow = false;
                 self.queue_cursor = self.queue_cursor.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                self.queue_follow = false;
                 self.queue_cursor = (self.queue_cursor + 1).min(len.saturating_sub(1));
             }
             KeyCode::PageUp => self.queue_cursor = self.queue_cursor.saturating_sub(10),
@@ -1095,6 +2277,29 @@ impl Tui {
             }
             KeyCode::Char('+') | KeyCode::Char('=') => self.controller.adjust_volume(0.05),
             KeyCode::Char('-') => self.controller.adjust_volume(-0.05),
+            KeyCode::Char('J') => {
+                self.queue_follow = true;
+                self.follow_current_queue();
+                self.lifecycle_msg = Some("Queue cursor follows the current entry.".to_owned());
+            }
+            KeyCode::Char('f') => {
+                self.queue_follow = !self.queue_follow;
+                self.lifecycle_msg = Some(if self.queue_follow {
+                    "Queue follows playback.".to_owned()
+                } else {
+                    "Queue follow paused.".to_owned()
+                });
+            }
+            KeyCode::Char('C') => {
+                if len == 0 {
+                    self.lifecycle_msg = Some("The queue is already empty.".to_owned());
+                } else {
+                    self.mode = Mode::ConfirmQueueClear;
+                    self.lifecycle_msg = Some(format!(
+                        "Clear all {len} queue entr(ies)? y confirms, any other key cancels."
+                    ));
+                }
+            }
             _ => {}
         }
         false
@@ -1112,13 +2317,29 @@ impl Tui {
                 KeyCode::Esc => self.mode = Mode::Normal,
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1);
+                    self.lyrics_follow_ready = false;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.lyrics_scroll = self.lyrics_scroll.saturating_add(1);
+                    self.lyrics_follow_ready = false;
                 }
-                KeyCode::PageUp => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(10),
-                KeyCode::PageDown => self.lyrics_scroll = self.lyrics_scroll.saturating_add(10),
-                KeyCode::Home | KeyCode::Char('g') => self.lyrics_scroll = 0,
+                KeyCode::PageUp => {
+                    self.lyrics_scroll = self.lyrics_scroll.saturating_sub(10);
+                    self.lyrics_follow_ready = false;
+                }
+                KeyCode::PageDown => {
+                    self.lyrics_scroll = self.lyrics_scroll.saturating_add(10);
+                    self.lyrics_follow_ready = false;
+                }
+                KeyCode::Char('f') => {
+                    self.follow_lyrics = !self.follow_lyrics;
+                    self.lyrics_follow_ready = true;
+                    self.save_preferences();
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.lyrics_scroll = 0;
+                    self.lyrics_follow_ready = false;
+                }
                 KeyCode::End | KeyCode::Char('G') => {
                     self.lyrics_scroll = self.lyrics_lines.len().saturating_sub(1);
                 }
@@ -1133,6 +2354,25 @@ impl Tui {
                 return self.handle_import_progress_key(key, ctrl_c);
             }
             Mode::ImportReview => return self.handle_import_review_key(key, ctrl_c),
+            Mode::FormInput => return self.handle_form_key(key, ctrl_c),
+            Mode::CommandInput => return self.handle_command_key(key, ctrl_c),
+            Mode::ConfirmPlaylist => return self.handle_playlist_confirm(key, ctrl_c),
+            Mode::ConfirmQueueClear => {
+                if ctrl_c {
+                    return true;
+                }
+                if key.code == KeyCode::Char('y') {
+                    let count = self.controller.clear_queue();
+                    self.queue_cursor = 0;
+                    self.queue_offset = 0;
+                    self.mode = Mode::Normal;
+                    self.lifecycle_msg = Some(format!("Cleared {count} queue entr(ies)."));
+                } else {
+                    self.mode = Mode::QueueView;
+                    self.lifecycle_msg = Some("Queue clear cancelled.".to_owned());
+                }
+                return false;
+            }
             _ => {}
         }
         if self.mode != Mode::Normal {
@@ -1147,7 +2387,28 @@ impl Tui {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Up | KeyCode::Down => {
-                    if let Some(entry) = self.controller.current_queue_entry_id() {
+                    if let Some(Detail::Playlist(id)) = self.detail {
+                        if let Some(playlist) = self.controller.playlist(id) {
+                            let tracks = playlist.track_ids.clone();
+                            let from = self.cursor;
+                            let to = if key.code == KeyCode::Up {
+                                from.saturating_sub(1)
+                            } else {
+                                (from + 1).min(tracks.len().saturating_sub(1))
+                            };
+                            match self
+                                .controller
+                                .reorder_playlist_entry(id, from, to, &tracks)
+                            {
+                                Ok(()) => {
+                                    self.cursor = to;
+                                    self.lifecycle_msg =
+                                        Some("Reordered the playlist entry.".to_owned());
+                                }
+                                Err(error) => self.lifecycle_msg = Some(error),
+                            }
+                        }
+                    } else if let Some(entry) = self.controller.current_queue_entry_id() {
                         let delta = if key.code == KeyCode::Up { -1 } else { 1 };
                         let _ = self.controller.move_queue_entry_by(entry, delta);
                     } else {
@@ -1158,7 +2419,57 @@ impl Tui {
             }
             return false;
         }
-        let len = self.rows().len();
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('v') => {
+                    self.viz_mode = self.viz_mode.next();
+                    self.save_preferences();
+                    self.lifecycle_msg = Some(format!("Visualization: {}.", self.viz_mode.label()));
+                }
+                KeyCode::Up => {
+                    self.viz_gain = (self.viz_gain + 0.25).min(2.5);
+                    self.save_preferences();
+                    self.lifecycle_msg =
+                        Some(format!("Visualizer sensitivity: {:.2}×.", self.viz_gain));
+                }
+                KeyCode::Down => {
+                    self.viz_gain = (self.viz_gain - 0.25).max(0.5);
+                    self.save_preferences();
+                    self.lifecycle_msg =
+                        Some(format!("Visualizer sensitivity: {:.2}×.", self.viz_gain));
+                }
+                KeyCode::Char('e') => {
+                    if let Some(id) = self.current_track()
+                        && let Some(track) = self.controller.track(id)
+                    {
+                        self.input = track_edit_form(&self.controller, id, track);
+                        self.mode = Mode::TrackEditInput;
+                    }
+                }
+                KeyCode::Char('y') => {
+                    if let Some(artist) = self
+                        .current_track()
+                        .and_then(|id| self.controller.track_artist_id(id))
+                    {
+                        self.input = artist_edit_form(&self.controller, artist);
+                        self.mode = Mode::ArtistRenameInput;
+                    }
+                }
+                KeyCode::Char('z') => {
+                    if let Some(album) = self
+                        .current_track()
+                        .and_then(|id| self.controller.track_album_id(id))
+                        && let Some(album) = self.controller.album(album)
+                    {
+                        self.input = album_edit_form(album.id, &album.title, album.release_type);
+                        self.mode = Mode::AlbumEditInput;
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+        let len = self.view_rows().len();
         match key.code {
             KeyCode::Char('q') => return true,
             KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
@@ -1171,20 +2482,75 @@ impl Tui {
             }
             KeyCode::Char('g') | KeyCode::Home => self.cursor = 0,
             KeyCode::Char('G') | KeyCode::End => self.cursor = len.saturating_sub(1),
-            KeyCode::Enter => {
-                if let Some(id) = self.rows().get(self.cursor).copied() {
-                    let title = self
-                        .controller
-                        .track(id)
-                        .map(display_title)
-                        .unwrap_or_else(|| format!("Track {id}"));
-                    self.controller.play_track(id);
-                    self.lifecycle_msg = Some(format!("Playing {title}."));
+            KeyCode::Tab => {
+                let index = View::ALL
+                    .iter()
+                    .position(|view| *view == self.view)
+                    .unwrap_or(0);
+                self.switch_view(View::ALL[(index + 1) % View::ALL.len()]);
+            }
+            KeyCode::BackTab => {
+                let index = View::ALL
+                    .iter()
+                    .position(|view| *view == self.view)
+                    .unwrap_or(0);
+                self.switch_view(View::ALL[(index + View::ALL.len() - 1) % View::ALL.len()]);
+            }
+            KeyCode::F(number @ 1..=7) => {
+                if let Some(view) = View::ALL.get(usize::from(number) - 1) {
+                    self.switch_view(*view);
                 }
+            }
+            KeyCode::Enter => self.activate_row(),
+            KeyCode::Left => {
+                let delta = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    30
+                } else {
+                    5
+                };
+                let position = self
+                    .controller
+                    .position()
+                    .saturating_sub(Duration::from_secs(delta));
+                if let Err(error) = self.controller.seek(position) {
+                    self.lifecycle_msg = Some(error);
+                }
+            }
+            KeyCode::Right => {
+                let delta = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    30
+                } else {
+                    5
+                };
+                let position = self.controller.position() + Duration::from_secs(delta);
+                if let Err(error) = self.controller.seek(position) {
+                    self.lifecycle_msg = Some(error);
+                }
+            }
+            KeyCode::Char('m') => {
+                self.layout = self.layout.next();
+                self.save_preferences();
+                self.lifecycle_msg = Some(format!(
+                    "Layout: {} · m cycles layouts.",
+                    self.layout.label()
+                ));
+            }
+            KeyCode::Char('v') => {
+                self.viz_visible = !self.viz_visible;
+                self.save_preferences();
+                self.lifecycle_msg = Some(if self.viz_visible {
+                    "Visualizer shown.".to_owned()
+                } else {
+                    "Visualizer hidden; waveform sampling is paused.".to_owned()
+                });
+            }
+            KeyCode::Char(':') => {
+                self.mode = Mode::CommandInput;
+                self.input.clear();
             }
             KeyCode::Char(' ') => self.controller.toggle_play_pause(),
             KeyCode::Char('a') => {
-                if let Some(id) = self.rows().get(self.cursor).copied() {
+                if let Some(id) = self.current_track() {
                     match self.controller.enqueue_track(id) {
                         Ok(entry) => {
                             self.lifecycle_msg = Some(format!("Added queue entry #{entry}."));
@@ -1196,7 +2562,22 @@ impl Tui {
                 }
             }
             KeyCode::Char('x') => {
-                if let Some(id) = self.rows().get(self.cursor).copied() {
+                if (self.view == View::Playlists
+                    || matches!(self.detail, Some(Detail::Playlist(_))))
+                    && let Some(playlist) = self.selected_playlist()
+                    && let Some(found) = self.controller.playlist(playlist)
+                {
+                    self.playlist_action = Some(PlaylistAction::Delete {
+                        id: found.id,
+                        name: found.name.clone(),
+                        tracks: found.track_ids.clone(),
+                    });
+                    self.mode = Mode::ConfirmPlaylist;
+                    self.lifecycle_msg = Some(format!(
+                        "Delete playlist “{}” without deleting tracks? y confirms.",
+                        found.name
+                    ));
+                } else if let Some(id) = self.current_track() {
                     match self.controller.play_next_track(id) {
                         Ok(entry) => {
                             self.lifecycle_msg =
@@ -1219,7 +2600,21 @@ impl Tui {
             }
             KeyCode::Char('+') | KeyCode::Char('=') => self.controller.adjust_volume(0.05),
             KeyCode::Char('-') => self.controller.adjust_volume(-0.05),
-            KeyCode::Char('R') => self.controller.cycle_repeat_mode(),
+            KeyCode::Char('R') => {
+                let playlist = match self.detail {
+                    Some(Detail::Playlist(id)) => Some(id),
+                    _ if self.view == View::Playlists => match self.current_row() {
+                        Some(Row::Playlist(id)) => Some(id),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(playlist) = playlist {
+                    self.open_playlist_rename_form(playlist);
+                } else {
+                    self.controller.cycle_repeat_mode();
+                }
+            }
             KeyCode::Char('K') => self.toggle_crossfade(),
             KeyCode::Char(']') => self.adjust_crossfade_up(),
             KeyCode::Char('[') => self.adjust_crossfade_down(),
@@ -1236,95 +2631,61 @@ impl Tui {
                 self.input.clear();
             }
             KeyCode::Char('e') => {
-                if let Some(id) = self.rows().get(self.cursor).copied()
-                    && let Some(track) = self.controller.track(id)
-                {
-                    self.input = track_edit_form(&self.controller, id, track);
-                    self.mode = Mode::TrackEditInput;
+                if let Some(id) = self.current_track() {
+                    self.open_track_form(id);
                 } else {
                     self.lifecycle_msg = Some("Select a track to edit.".to_owned());
                 }
             }
             KeyCode::Char('y') => {
                 let id = self
-                    .rows()
-                    .get(self.cursor)
-                    .copied()
+                    .current_track()
                     .or_else(|| self.controller.current_id());
                 let Some(id) = id else {
                     self.lifecycle_msg = Some("Select a track to inspect lyrics.".to_owned());
                     return false;
                 };
-                let Some(raw) = self.controller.track_lyrics(id) else {
-                    self.lifecycle_msg = Some(format!("Track {id} has no managed lyrics."));
-                    return false;
-                };
-                let document = match flux_app::LyricsDocument::parse(&raw) {
-                    Ok(document) => document,
-                    Err(error) => {
-                        self.lifecycle_msg = Some(format!("Lyrics cannot be parsed: {error}"));
-                        return false;
-                    }
-                };
-                self.lyrics_title = self
-                    .controller
-                    .track(id)
-                    .map(|track| {
-                        format!(
-                            "Lyrics · {} · {} · {}",
-                            display_title(track),
-                            credit_display(&self.controller, id),
-                            match document.kind() {
-                                flux_app::LyricsKind::Synced => "synchronized",
-                                flux_app::LyricsKind::Plain => "plain text",
-                            }
-                        )
-                    })
-                    .unwrap_or_else(|| format!("Lyrics for track {id}"));
-                self.lyrics_lines = document
-                    .lines
-                    .iter()
-                    .map(|line| match line.timestamp_ms {
-                        Some(timestamp) => {
-                            format!("{}  {}", format_lyrics_timestamp(timestamp), line.text)
-                        }
-                        None => line.text.clone(),
-                    })
-                    .collect();
-                if self.lyrics_lines.is_empty() {
-                    self.lyrics_lines.push("(empty lyrics file)".to_owned());
-                }
-                self.lyrics_scroll = 0;
-                self.mode = Mode::LyricsView;
+                self.open_lyrics_view(id);
             }
             KeyCode::Char('P') => {
                 self.mode = Mode::ArtistCreateInput;
                 self.input.clear();
             }
             KeyCode::Char('Y') => {
-                self.mode = Mode::ArtistRenameInput;
-                self.input = self
-                    .rows()
-                    .get(self.cursor)
-                    .copied()
-                    .and_then(|id| self.controller.track_artist_id(id))
-                    .map(|artist| artist_edit_form(&self.controller, artist))
-                    .unwrap_or_default();
+                let artist = match self.detail {
+                    Some(Detail::Artist(id)) => Some(id),
+                    _ => match self.current_row() {
+                        Some(Row::Artist(id)) => Some(id),
+                        _ => self
+                            .current_track()
+                            .and_then(|id| self.controller.track_artist_id(id)),
+                    },
+                };
+                if let Some(artist) = artist {
+                    self.open_artist_form(artist);
+                } else {
+                    self.lifecycle_msg = Some("Select an artist or track first.".to_owned());
+                }
             }
             KeyCode::Char('Z') => {
-                if let Some(id) = self.rows().get(self.cursor).copied()
-                    && let Some(album_id) = self.controller.track_album_id(id)
-                    && let Some(album) = self.controller.album(album_id)
-                {
-                    self.input = album_edit_form(album.id, &album.title, album.release_type);
-                    self.mode = Mode::AlbumEditInput;
+                let album = match self.detail {
+                    Some(Detail::Album(id)) => Some(id),
+                    _ => match self.current_row() {
+                        Some(Row::Album(id)) => Some(id),
+                        _ => self
+                            .current_track()
+                            .and_then(|id| self.controller.track_album_id(id)),
+                    },
+                };
+                if let Some(album) = album {
+                    self.open_album_form(album);
                 } else {
                     self.lifecycle_msg =
-                        Some("Select a track that belongs to an album first.".to_owned());
+                        Some("Select an album or a track that belongs to one.".to_owned());
                 }
             }
             KeyCode::Char('W') => {
-                if let Some(id) = self.rows().get(self.cursor).copied() {
+                if let Some(id) = self.current_track() {
                     self.input = track_asset_form(id);
                     self.mode = Mode::TrackArtworkInput;
                 } else {
@@ -1332,7 +2693,7 @@ impl Tui {
                 }
             }
             KeyCode::Char('S') => {
-                if let Some(id) = self.rows().get(self.cursor).copied() {
+                if let Some(id) = self.current_track() {
                     self.input = track_asset_form(id);
                     self.mode = Mode::TrackLyricsInput;
                 } else {
@@ -1425,12 +2786,28 @@ impl Tui {
                     self.open_info("Artists", lines);
                 }
             }
+            KeyCode::Char('d') if self.view == View::Settings && self.detail.is_none() => {
+                self.refresh_audio_devices();
+                self.lifecycle_msg = Some("Refreshing audio devices…".to_owned());
+            }
             KeyCode::Char('c') => {
-                self.controller.dismiss_notice();
-                self.lifecycle_msg = None;
+                if let Some(Detail::Playlist(id)) = self.detail
+                    && let Some(playlist) = self.controller.playlist(id)
+                {
+                    self.playlist_action = Some(PlaylistAction::Clear {
+                        id,
+                        tracks: playlist.track_ids.clone(),
+                    });
+                    self.mode = Mode::ConfirmPlaylist;
+                    self.lifecycle_msg =
+                        Some("Clear this playlist without deleting tracks? y confirms.".to_owned());
+                } else {
+                    self.controller.dismiss_notice();
+                    self.lifecycle_msg = None;
+                }
             }
             KeyCode::Char('f') => {
-                if let Some(id) = self.rows().get(self.cursor).copied() {
+                if let Some(id) = self.current_track() {
                     match self.controller.toggle_track_favorite(id) {
                         Ok(favorite) => {
                             *self.rows_cache.borrow_mut() = None;
@@ -1446,7 +2823,7 @@ impl Tui {
                 }
             }
             KeyCode::Char(digit @ '0'..='5') => {
-                if let Some(id) = self.rows().get(self.cursor).copied() {
+                if let Some(id) = self.current_track() {
                     let rating = (digit != '0').then(|| digit.to_digit(10).unwrap_or(0) as u8);
                     match self.controller.set_track_rating(id, rating) {
                         Ok(()) => {
@@ -1758,6 +3135,90 @@ impl Tui {
                     self.mode = Mode::ConfirmAcknowledgeRecovery;
                 }
             }
+            KeyCode::Char('w') => {
+                if let Some(id) = self.current_track() {
+                    let playlists = self.controller.playlists();
+                    match playlists.as_slice() {
+                        [] => {
+                            self.lifecycle_msg = Some(
+                                "No playlists yet — open Playlists (F4) and press N.".to_owned(),
+                            );
+                        }
+                        [playlist] => {
+                            match self.controller.add_tracks_to_playlist(
+                                playlist.id,
+                                &[id],
+                                &playlist.track_ids,
+                            ) {
+                                Ok(_) => {
+                                    self.lifecycle_msg =
+                                        Some(format!("Added the track to “{}”.", playlist.name));
+                                }
+                                Err(error) => self.lifecycle_msg = Some(error),
+                            }
+                        }
+                        _ => {
+                            self.lifecycle_msg =
+                                Some("Choose a playlist with :playlist <name>.".to_owned());
+                        }
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a track to add to a playlist.".to_owned());
+                }
+            }
+            KeyCode::Char('N') => {
+                if self.view == View::Playlists {
+                    self.open_playlist_create_form();
+                } else {
+                    self.lifecycle_msg =
+                        Some("Open Playlists (F4) and press N to create one.".to_owned());
+                }
+            }
+            KeyCode::Char('l') => {
+                let playlist = self.selected_playlist();
+                if let Some(playlist) = playlist {
+                    let start = self
+                        .current_track()
+                        .and_then(|track| {
+                            self.controller.playlist(playlist).and_then(|playlist| {
+                                playlist.track_ids.iter().position(|id| *id == track)
+                            })
+                        })
+                        .unwrap_or(0);
+                    match self.controller.play_playlist(playlist, start) {
+                        Ok(()) => {
+                            self.lifecycle_msg =
+                                Some("Playing playlist from the selected position.".to_owned());
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a playlist first.".to_owned());
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(Detail::Playlist(id)) = self.detail
+                    && let Some(playlist) = self.controller.playlist(id)
+                    && let Some(track) = self.current_track()
+                    && let Some(position) = playlist
+                        .track_ids
+                        .iter()
+                        .position(|candidate| *candidate == track)
+                {
+                    self.playlist_action = Some(PlaylistAction::Remove {
+                        id,
+                        position,
+                        tracks: playlist.track_ids.clone(),
+                    });
+                    self.mode = Mode::ConfirmPlaylist;
+                    self.lifecycle_msg = Some(
+                        "Remove the selected entry from this playlist? y confirms.".to_owned(),
+                    );
+                } else {
+                    self.lifecycle_msg =
+                        Some("Select a playlist-entry track to remove.".to_owned());
+                }
+            }
             KeyCode::Char('?') => {
                 let library = self.library_full_identity();
                 let lines = help_lines(&self.controller, &library);
@@ -1780,15 +3241,23 @@ impl Tui {
                 self.input.clone_from(&self.search);
             }
             KeyCode::Esc => {
-                if self.search.is_empty() {
+                if !self.search.is_empty() {
+                    self.search.clear();
+                    self.reset_selection();
+                    self.lifecycle_msg = Some("Search cleared.".to_owned());
+                } else if self.detail.is_some() {
+                    self.detail = None;
+                    self.reset_selection();
+                    self.lifecycle_msg = Some("Back to the library view.".to_owned());
+                } else if self.active_collection.is_some() {
+                    self.active_collection = None;
+                    self.reset_selection();
+                    self.lifecycle_msg = Some("Showing all tracks.".to_owned());
+                } else {
                     self.lifecycle_msg = Some(
                         "No active search. Esc cancels an input or closes a view; / starts a search."
                             .to_owned(),
                     );
-                } else {
-                    self.search.clear();
-                    self.cursor = 0;
-                    self.lifecycle_msg = Some("Search cleared.".to_owned());
                 }
             }
             KeyCode::Char(command) => {
@@ -1796,6 +3265,381 @@ impl Tui {
                     Some(format!("Unknown command '{command}'. Press ? for help."));
             }
             _ => {}
+        }
+        false
+    }
+
+    fn activate_row(&mut self) {
+        let Some(row) = self.current_row() else {
+            return;
+        };
+        match row {
+            Row::Track(id) => {
+                let title = self
+                    .controller
+                    .track(id)
+                    .map(display_title)
+                    .unwrap_or_else(|| format!("Track {id}"));
+                self.controller.play_track(id);
+                self.lifecycle_msg = Some(format!("Playing {title}."));
+            }
+            Row::LyricsTrack(id) => self.open_lyrics_view(id),
+            Row::Artist(id) => {
+                self.detail = Some(Detail::Artist(id));
+                self.reset_selection();
+            }
+            Row::Album(id) => {
+                self.detail = Some(Detail::Album(id));
+                self.reset_selection();
+            }
+            Row::Playlist(id) => {
+                self.detail = Some(Detail::Playlist(id));
+                self.reset_selection();
+            }
+            Row::Collection(collection) => {
+                self.active_collection = Some(collection);
+                self.view = View::Tracks;
+                self.detail = None;
+                self.reset_selection();
+                self.lifecycle_msg = Some(format!("Collection: {}.", collection.label()));
+            }
+            Row::Setting(setting) => self.toggle_setting(setting),
+            Row::AudioDevice(None) => self.select_audio_output(None),
+            Row::AudioDevice(Some(index)) => {
+                if let Some(device) = self.audio_devices.get(index) {
+                    self.select_audio_output(device.id.clone());
+                }
+            }
+        }
+    }
+
+    fn open_lyrics_view(&mut self, id: TrackId) {
+        let Some(raw) = self.controller.track_lyrics(id) else {
+            self.lifecycle_msg = Some("This track has no managed lyrics.".to_owned());
+            return;
+        };
+        let document = match flux_app::LyricsDocument::parse(&raw) {
+            Ok(document) => document,
+            Err(error) => {
+                self.lifecycle_msg = Some(format!("Lyrics cannot be parsed: {error}"));
+                return;
+            }
+        };
+        self.lyrics_title = self
+            .controller
+            .track(id)
+            .map(|track| {
+                format!(
+                    "Lyrics · {} · {} · {}",
+                    display_title(track),
+                    credit_display(&self.controller, id),
+                    match document.kind() {
+                        flux_app::LyricsKind::Synced => "synchronized",
+                        flux_app::LyricsKind::Plain => "plain text",
+                    }
+                )
+            })
+            .unwrap_or_else(|| format!("Lyrics for track {id}"));
+        self.lyrics_lines = document
+            .lines
+            .iter()
+            .map(|line| match line.timestamp_ms {
+                Some(timestamp) => format!("{}  {}", format_lyrics_timestamp(timestamp), line.text),
+                None => line.text.clone(),
+            })
+            .collect();
+        self.lyrics_timestamps = document
+            .lines
+            .iter()
+            .map(|line| line.timestamp_ms)
+            .collect();
+        if self.lyrics_lines.is_empty() {
+            self.lyrics_lines.push("(empty lyrics file)".to_owned());
+            self.lyrics_timestamps.push(None);
+        }
+        self.lyrics_track = Some(id);
+        self.lyrics_scroll = 0;
+        self.lyrics_follow_ready = true;
+        self.mode = Mode::LyricsView;
+    }
+
+    fn handle_command_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if ctrl_c {
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.lifecycle_msg = Some("Command cancelled; nothing changed.".to_owned());
+            }
+            KeyCode::Enter => {
+                let command = std::mem::take(&mut self.input);
+                self.mode = Mode::Normal;
+                self.run_command(&command);
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(character) => self.input.push(character),
+            _ => {}
+        }
+        false
+    }
+
+    fn run_command(&mut self, command: &str) {
+        let mut parts = command.split_whitespace();
+        let Some(name) = parts.next() else {
+            self.lifecycle_msg = Some("No command entered.".to_owned());
+            return;
+        };
+        let argument = parts.next();
+        match name.to_lowercase().as_str() {
+            "tracks" => self.switch_view(View::Tracks),
+            "artists" => self.switch_view(View::Artists),
+            "albums" => self.switch_view(View::Albums),
+            "playlists" => self.switch_view(View::Playlists),
+            "collections" => self.switch_view(View::Collections),
+            "lyrics" => self.switch_view(View::Lyrics),
+            "settings" => self.switch_view(View::Settings),
+            "queue" => self.open_queue_view(),
+            "help" => {
+                let library = self.library_full_identity();
+                let lines = help_lines(&self.controller, &library);
+                self.open_info("Flux TUI help", lines);
+            }
+            "viz" | "visualizer" => match argument.map(str::to_lowercase).as_deref() {
+                Some("on") | None => {
+                    self.viz_visible = true;
+                    self.save_preferences();
+                    self.lifecycle_msg = Some("Visualizer shown.".to_owned());
+                }
+                Some("off") => {
+                    self.viz_visible = false;
+                    self.save_preferences();
+                    self.lifecycle_msg = Some("Visualizer hidden.".to_owned());
+                }
+                Some("waveform") => {
+                    self.viz_mode = VizMode::Waveform;
+                    self.viz_visible = true;
+                    self.save_preferences();
+                    self.lifecycle_msg = Some("Visualization: Waveform.".to_owned());
+                }
+                Some("bars") => {
+                    self.viz_mode = VizMode::Bars;
+                    self.viz_visible = true;
+                    self.save_preferences();
+                    self.lifecycle_msg = Some("Visualization: Bars.".to_owned());
+                }
+                Some("pulse") => {
+                    self.viz_mode = VizMode::Pulse;
+                    self.viz_visible = true;
+                    self.save_preferences();
+                    self.lifecycle_msg = Some("Visualization: Pulse.".to_owned());
+                }
+                Some(other) => {
+                    self.lifecycle_msg = Some(format!(
+                        "Unknown visualization '{other}'. Use on/off/waveform/bars/pulse."
+                    ));
+                }
+            },
+            "layout" => {
+                let layout = match argument.map(str::to_lowercase).as_deref() {
+                    Some("standard") => Some(LayoutMode::Standard),
+                    Some("library") => Some(LayoutMode::Library),
+                    Some("player") => Some(LayoutMode::Player),
+                    Some("visualizer") => Some(LayoutMode::Visualizer),
+                    Some("compact") => Some(LayoutMode::Compact),
+                    None => {
+                        self.layout = self.layout.next();
+                        Some(self.layout)
+                    }
+                    Some(_) => None,
+                };
+                if let Some(layout) = layout {
+                    self.layout = layout;
+                    self.save_preferences();
+                    self.lifecycle_msg = Some(format!("Layout: {}.", layout.label()));
+                } else {
+                    self.lifecycle_msg = Some(
+                        "Unknown layout. Use standard, library, player, visualizer or compact."
+                            .to_owned(),
+                    );
+                }
+            }
+            "play" => self.controller.toggle_play_pause(),
+            "pause" => self.controller.toggle_play_pause(),
+            "stop" => self.controller.stop(),
+            "next" => {
+                self.controller.next();
+                self.follow_current();
+            }
+            "prev" | "previous" => {
+                self.controller.previous();
+                self.follow_current();
+            }
+            "seek" => {
+                let Some(value) = argument else {
+                    self.lifecycle_msg =
+                        Some("Usage: :seek <seconds> or :seek +10 / -10".to_owned());
+                    return;
+                };
+                let result = if let Some(relative) = value.strip_prefix('+') {
+                    relative
+                        .parse::<u64>()
+                        .map(|seconds| self.controller.position() + Duration::from_secs(seconds))
+                } else if let Some(relative) = value.strip_prefix('-') {
+                    relative.parse::<u64>().map(|seconds| {
+                        self.controller
+                            .position()
+                            .saturating_sub(Duration::from_secs(seconds))
+                    })
+                } else {
+                    value.parse::<u64>().map(Duration::from_secs)
+                };
+                match result {
+                    Ok(position) => {
+                        if let Err(error) = self.controller.seek(position) {
+                            self.lifecycle_msg = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        self.lifecycle_msg = Some("Seek expects whole seconds.".to_owned());
+                    }
+                }
+            }
+            "vol" | "volume" => {
+                if let Some(value) = argument.and_then(|value| value.parse::<f32>().ok()) {
+                    self.controller.set_volume((value / 100.0).clamp(0.0, 1.0));
+                } else {
+                    self.lifecycle_msg = Some("Usage: :vol <0-100>".to_owned());
+                }
+            }
+            "rate" => {
+                let rating = argument.and_then(|value| value.parse::<u8>().ok());
+                if let Some(id) = self.current_track() {
+                    match self
+                        .controller
+                        .set_track_rating(id, rating.filter(|value| *value <= 5))
+                    {
+                        Ok(()) => {
+                            *self.rows_cache.borrow_mut() = None;
+                            self.lifecycle_msg = Some("Rating updated.".to_owned());
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a track to rate.".to_owned());
+                }
+            }
+            "favorite" => {
+                if let Some(id) = self.current_track() {
+                    match self.controller.toggle_track_favorite(id) {
+                        Ok(favorite) => {
+                            *self.rows_cache.borrow_mut() = None;
+                            self.lifecycle_msg = Some(if favorite {
+                                "Marked as favorite.".to_owned()
+                            } else {
+                                "Removed from favorites.".to_owned()
+                            });
+                        }
+                        Err(error) => self.lifecycle_msg = Some(error),
+                    }
+                } else {
+                    self.lifecycle_msg = Some("Select a track first.".to_owned());
+                }
+            }
+            "search" => {
+                let rest = parts.collect::<Vec<_>>().join(" ");
+                self.search = match argument {
+                    Some(first) if rest.is_empty() => first.to_owned(),
+                    Some(first) => format!("{first} {rest}"),
+                    None => rest,
+                };
+                self.cursor = 0;
+                self.save_preferences();
+            }
+            "library" => {
+                self.mode = Mode::OpenInput;
+                self.input.clear();
+            }
+            "new-playlist" | "newplaylist" => self.open_playlist_create_form(),
+            "playlist" => {
+                let rest = parts.collect::<Vec<_>>().join(" ");
+                let name = match argument {
+                    Some(first) if rest.is_empty() => first.to_owned(),
+                    Some(first) => format!("{first} {rest}"),
+                    None => rest,
+                };
+                let Some(id) = self.current_track() else {
+                    self.lifecycle_msg = Some("Select a track first.".to_owned());
+                    return;
+                };
+                let Some(playlist) = self
+                    .controller
+                    .playlists()
+                    .into_iter()
+                    .find(|playlist| playlist.name.eq_ignore_ascii_case(&name))
+                else {
+                    self.lifecycle_msg = Some(format!("No playlist named '{name}'."));
+                    return;
+                };
+                match self.controller.add_tracks_to_playlist(
+                    playlist.id,
+                    &[id],
+                    &playlist.track_ids,
+                ) {
+                    Ok(_) => {
+                        self.lifecycle_msg = Some(format!("Added track to “{}”.", playlist.name));
+                    }
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
+            }
+            _ => {
+                self.lifecycle_msg = Some(format!("Unknown command '{name}'. Press ? for help."));
+            }
+        }
+    }
+
+    fn handle_playlist_confirm(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if ctrl_c {
+            return true;
+        }
+        if key.code != KeyCode::Char('y') {
+            self.playlist_action = None;
+            self.mode = Mode::Normal;
+            self.lifecycle_msg = Some("Playlist change cancelled.".to_owned());
+            return false;
+        }
+        let Some(action) = self.playlist_action.take() else {
+            self.mode = Mode::Normal;
+            return false;
+        };
+        let result = match action {
+            PlaylistAction::Delete { id, name, tracks } => self
+                .controller
+                .delete_playlist(id, &name, &tracks)
+                .map(|()| {
+                    self.detail = None;
+                    format!("Deleted playlist “{name}”; tracks were kept.")
+                }),
+            PlaylistAction::Clear { id, tracks } => self
+                .controller
+                .clear_playlist(id, &tracks)
+                .map(|()| "Cleared the playlist; tracks were kept.".to_owned()),
+            PlaylistAction::Remove {
+                id,
+                position,
+                tracks,
+            } => self
+                .controller
+                .remove_playlist_entries(id, &[position], &tracks)
+                .map(|_| "Removed the playlist entry.".to_owned()),
+        };
+        self.mode = Mode::Normal;
+        match result {
+            Ok(message) => self.lifecycle_msg = Some(message),
+            Err(error) => self.lifecycle_msg = Some(error),
         }
         false
     }
@@ -1967,6 +3811,10 @@ impl Tui {
                         self.search = text;
                         self.cursor = 0;
                     }
+                    Mode::FormInput
+                    | Mode::CommandInput
+                    | Mode::ConfirmPlaylist
+                    | Mode::ConfirmQueueClear => {}
                     Mode::ImportInput => {
                         let paths: Vec<PathBuf> = text
                             .split(';')
@@ -2438,21 +4286,6 @@ impl Tui {
         let (width, height) = clamp_terminal_size(raw_width, raw_height);
         // A fresh pty can report 0 columns; lay out for at least a
         // minimal sane width rather than dividing the void.
-        let rows = self.rows();
-        let current = self.controller.current_id();
-
-        // Clamp cursor/window against the (possibly shrunken) list.
-        let list_top = 3usize;
-        let list_height = height.saturating_sub(list_top + 2).max(1);
-        self.cursor = self.cursor.min(rows.len().saturating_sub(1));
-        if self.cursor < self.offset {
-            self.offset = self.cursor;
-        }
-        if self.cursor >= self.offset + list_height {
-            self.offset = self.cursor + 1 - list_height;
-        }
-        self.offset = self.offset.min(rows.len().saturating_sub(list_height));
-
         queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
 
         if !detail_view_fits(height)
@@ -2478,59 +4311,80 @@ impl Tui {
             return Ok(());
         }
 
-        // Header.
+        // Header, navigation tabs, playback summary and contextual title.
         let library_label = self.library_header_identity(width);
-        let view_label = match self.mode {
+        let mode_label = match self.mode {
             Mode::QueueView => "queue",
-            Mode::InfoView => "help/info",
+            Mode::InfoView => "help",
             Mode::LyricsView => "lyrics",
             Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing => "import",
-            Mode::Normal => "tracks",
+            Mode::FormInput => "edit",
+            Mode::CommandInput => "command",
+            Mode::Normal => self.view.label(),
             _ => "input",
         };
-        let mut header = format!("Flux · {library_label} · {view_label}");
+        let mut header = if width < 60 {
+            format!(
+                "Flux · {mode_label} · {}",
+                self.controller.playback_mode().label()
+            )
+        } else {
+            format!("Flux · {library_label} · {mode_label}")
+        };
         if self.controller.queue_len() > 0 {
             header.push_str(&format!(" · queue {}", self.controller.queue_len()));
         }
-        header.push_str(&format!(" · {}", self.controller.playback_mode().label()));
-        if self.favorites_only {
-            header.push_str(" · favorites");
+        if width >= 60 {
+            header.push_str(&format!(" · {}", self.controller.playback_mode().label()));
         }
         if !self.search.trim().is_empty() {
-            let search = truncate_to_width(&self.search, 24);
-            header.push_str(&format!(" · search \"{search}\""));
+            header.push_str(&format!(" · “{}”", truncate_to_width(&self.search, 20)));
         }
         if self.controller.portable_recovery().is_some() {
-            header.push_str(" · recovered (read-only, A acknowledges)");
+            header.push_str(" · recovered");
         }
         if self.controller.legacy_index_write_protected() {
-            header.push_str(" · index protected (U preserves & replaces)");
+            header.push_str(" · index protected");
         }
         if self.controller.is_scanning() {
             header.push_str(" · scanning…");
         }
         self.line(out, 0, &header, width, true)?;
 
-        // Now playing.
-        self.line(out, 1, &self.now_playing_line(width), width, false)?;
-        // Audio availability gets its own line so the reason remains
-        // readable on narrow terminals.
-        if let Some(reason) = self.controller.audio_status().reason() {
-            let label = if matches!(self.controller.audio_status(), AudioStatus::Recovering(_)) {
-                "Audio recovering"
-            } else {
-                "Audio unavailable"
-            };
-            queue!(out, SetForegroundColor(Color::DarkYellow))?;
-            self.line(out, 2, &format!("{label} — {reason}"), width, false)?;
-            queue!(out, SetForegroundColor(Color::Reset))?;
-        } else {
-            self.line(out, 2, "", width, false)?;
+        let compact_layout = width < 70 || height < 16 || self.layout == LayoutMode::Compact;
+        if !compact_layout {
+            self.draw_tabs(out, 1, width)?;
         }
+        let playing_y = if compact_layout { 1 } else { 2 };
+        let mut playing = self.now_playing_line(width);
+        if compact_layout {
+            playing = truncate_to_width(&playing, width);
+        }
+        self.line(out, playing_y, &playing, width, false)?;
 
-        let detail_height = height.saturating_sub(list_top + 4).max(1);
+        let context_y = if compact_layout { 2 } else { 3 };
+        let list_top = (context_y + 1) as usize;
+        let detail_height = height.saturating_sub(list_top + 2).max(1);
+        let context = match self.mode {
+            Mode::InfoView => self.info_title.clone(),
+            Mode::QueueView => "Queue · stable entry order".to_owned(),
+            Mode::LyricsView => self.lyrics_title.clone(),
+            Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing => {
+                "Import · Source → Destination → Verify → Import".to_owned()
+            }
+            Mode::FormInput => self
+                .form
+                .as_ref()
+                .map(|form| form.title.clone())
+                .unwrap_or_else(|| "Edit".to_owned()),
+            Mode::CommandInput => "Command palette".to_owned(),
+            _ => self.view_title(),
+        };
+        queue!(out, SetForegroundColor(self.accent()))?;
+        self.line(out, context_y, &context, width, true)?;
+        queue!(out, SetForegroundColor(Color::Reset))?;
+
         if self.mode == Mode::InfoView {
-            self.line(out, list_top as u16, &self.info_title, width, true)?;
             let max_scroll = self.info_lines.len().saturating_sub(detail_height);
             self.info_scroll = self.info_scroll.min(max_scroll);
             for (row, line) in self
@@ -2540,83 +4394,12 @@ impl Tui {
                 .take(detail_height)
                 .enumerate()
             {
-                self.line(out, (list_top + 1 + row) as u16, line, width, false)?;
+                self.line(out, (list_top + row) as u16, line, width, false)?;
             }
         } else if self.mode == Mode::QueueView {
-            let entries = self.controller.queue_entries();
-            self.queue_cursor = self.queue_cursor.min(entries.len().saturating_sub(1));
-            if self.queue_cursor < self.queue_offset {
-                self.queue_offset = self.queue_cursor;
-            }
-            if self.queue_cursor >= self.queue_offset + detail_height {
-                self.queue_offset = self.queue_cursor + 1 - detail_height;
-            }
-            self.queue_offset = self
-                .queue_offset
-                .min(entries.len().saturating_sub(detail_height));
-            let title = format!(
-                "QUEUE · {} entr{} · Enter play · Del remove · Ctrl+↑/↓ reorder · Esc back",
-                entries.len(),
-                if entries.len() == 1 { "y" } else { "ies" }
-            );
-            self.line(out, list_top as u16, &title, width, true)?;
-            if entries.is_empty() {
-                self.line(
-                    out,
-                    (list_top + 1) as u16,
-                    "Queue is empty — add a track with a or x from the track view.",
-                    width,
-                    false,
-                )?;
-            }
-            for (row, entry) in entries
-                .iter()
-                .skip(self.queue_offset)
-                .take(detail_height)
-                .enumerate()
-            {
-                let index = self.queue_offset + row;
-                let current = self.controller.current_queue_entry_id() == Some(entry.id());
-                let track = self.controller.track(entry.track());
-                let mut text = format!(
-                    "{} {}. #{} {}",
-                    if index == self.queue_cursor { ">" } else { " " },
-                    index + 1,
-                    entry.id(),
-                    track.map_or_else(
-                        || "Missing from library".to_owned(),
-                        |track| format!(
-                            "{} — {}",
-                            display_title(track),
-                            credit_display(&self.controller, entry.track())
-                        ),
-                    )
-                );
-                if current {
-                    text.push_str("  ▶ current");
-                }
-                if let Some(label) =
-                    resource_label(self.controller.track_audio_resource_state(entry.track()))
-                {
-                    text.push_str("  ");
-                    text.push_str(label);
-                }
-                let duration = track
-                    .and_then(Track::duration)
-                    .map(format_duration)
-                    .unwrap_or_default();
-                let text = pad_with_right(&text, &duration, width);
-                let y = (list_top + 1 + row) as u16;
-                if index == self.queue_cursor {
-                    queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
-                    self.line(out, y, &text, width, false)?;
-                    queue!(out, SetAttribute(Attribute::Reset))?;
-                } else {
-                    self.line(out, y, &text, width, false)?;
-                }
-            }
+            self.draw_queue_view(out, list_top, detail_height, width)?;
         } else if self.mode == Mode::LyricsView {
-            self.line(out, list_top as u16, &self.lyrics_title, width, true)?;
+            self.update_lyrics_follow();
             let max_scroll = self.lyrics_lines.len().saturating_sub(detail_height);
             self.lyrics_scroll = self.lyrics_scroll.min(max_scroll);
             for (row, line) in self
@@ -2626,64 +4409,26 @@ impl Tui {
                 .take(detail_height)
                 .enumerate()
             {
-                self.line(out, (list_top + 1 + row) as u16, line, width, false)?;
+                self.line(out, (list_top + row) as u16, line, width, false)?;
             }
         } else if matches!(
             self.mode,
             Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing
         ) {
             self.draw_import_view(out, list_top, detail_height, width)?;
+        } else if self.mode == Mode::FormInput {
+            self.draw_form(out, list_top, detail_height, width)?;
         } else {
-            // Track list.
-            if rows.is_empty() {
-                let message = self.empty_rows_message();
-                self.line(out, list_top as u16, &message, width, false)?;
-            }
-            for (row, id) in rows.iter().skip(self.offset).take(list_height).enumerate() {
-                let index = self.offset + row;
-                let Some(track) = self.controller.track(*id) else {
-                    continue;
-                };
-                let mut text = format!(
-                    "{} {} {}  · {}",
-                    if index == self.cursor { ">" } else { " " },
-                    if Some(*id) == current { "▶" } else { " " },
-                    display_title(track),
-                    credit_display(&self.controller, *id),
-                );
-                if !is_track_playable(track) {
-                    text.push_str("  [indexed — not playable yet]");
-                }
-                if let Some(label) = resource_label(self.controller.track_audio_resource_state(*id))
-                {
-                    text.push_str("  ");
-                    text.push_str(label);
-                }
-                if self.controller.track_album_id(*id).is_none() {
-                    text.push_str("  [standalone]");
-                }
-                if self.controller.track_artwork_path(*id).is_some() {
-                    text.push_str("  [art]");
-                }
-                if self.controller.track_lyrics_path(*id).is_some() {
-                    text.push_str("  [lyrics]");
-                }
-                let duration = track.duration().map(format_duration).unwrap_or_default();
-                let text = pad_with_right(&text, &duration, width);
-                let y = (list_top + row) as u16;
-                if index == self.cursor {
-                    queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
-                    self.line(out, y, &text, width, false)?;
-                    queue!(out, SetAttribute(Attribute::Reset))?;
-                } else {
-                    self.line(out, y, &text, width, false)?;
-                }
-            }
+            self.draw_workspace(out, list_top, detail_height, width)?;
         }
 
         // Status / error line.
         let status_y = (height - 2) as u16;
-        if let Some(error) = self.controller.last_error() {
+        if let Some(error) = &self.audio_error {
+            queue!(out, SetForegroundColor(Color::Red))?;
+            self.line(out, status_y, error, width, false)?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+        } else if let Some(error) = self.controller.last_error() {
             queue!(out, SetForegroundColor(Color::Red))?;
             self.line(out, status_y, error, width, false)?;
             queue!(out, SetForegroundColor(Color::Reset))?;
@@ -2696,7 +4441,7 @@ impl Tui {
         // Help / input line.
         let input_line = |prefix: &str| fit_input_line(prefix, &self.input, width);
         let help = match self.mode {
-            Mode::Normal => normal_help().to_owned(),
+            Mode::Normal => self.help_line(),
             Mode::InfoView => format!(
                 "Help/details — ↑/↓ scroll · PgUp/PgDn · Esc/Q back · {}-{} of {}",
                 self.info_scroll + 1,
@@ -2709,6 +4454,16 @@ impl Tui {
             }
             Mode::ScanInput => input_line("Scan folder (Enter scan, Esc cancel): "),
             Mode::SearchInput => input_line("Search (Enter apply, Esc cancel): "),
+            Mode::FormInput => {
+                "Form — Tab/↑/↓ field · type to edit · Enter save · Esc cancel".to_owned()
+            }
+            Mode::CommandInput => input_line("Command (:tracks :artists :albums :queue :viz :layout <name>): "),
+            Mode::ConfirmPlaylist => {
+                "Playlist change — y confirms · any other key cancels".to_owned()
+            }
+            Mode::ConfirmQueueClear => {
+                "Clear queue — y confirms · any other key cancels".to_owned()
+            }
             Mode::ImportInput => {
                 input_line("Copy import paths separated by ; (Enter import, Esc cancel): ")
             }
@@ -2754,7 +4509,7 @@ impl Tui {
                 "Import worker running — Esc cancels · q quits after the worker stops.".to_owned()
             }
             Mode::ImportReview => {
-                "Review — ↑/↓ select · Space include/skip · a all · s skip all · Enter import · Esc cancel"
+                "Review — ↑/↓ select · Space include/skip · e edit metadata · a all · s skip all · Enter import · Esc cancel"
                     .to_owned()
             }
             Mode::ConfirmPreserveIndex => {
@@ -2792,6 +4547,896 @@ impl Tui {
         }
     }
 
+    fn line_at(
+        &self,
+        out: &mut impl Write,
+        x: usize,
+        y: u16,
+        text: &str,
+        width: usize,
+        bold: bool,
+    ) -> std::io::Result<()> {
+        if width == 0 {
+            return Ok(());
+        }
+        let text = truncate_to_width(text, width);
+        queue!(out, MoveTo(x as u16, y), Clear(ClearType::UntilNewLine))?;
+        if bold {
+            queue!(
+                out,
+                SetAttribute(Attribute::Bold),
+                Print(text),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            queue!(out, Print(text))?;
+        }
+        Ok(())
+    }
+
+    fn accent(&self) -> Color {
+        Color::Rgb {
+            r: 0xff,
+            g: 0x66,
+            b: 0xcc,
+        }
+    }
+
+    fn draw_tabs(&self, out: &mut impl Write, y: u16, width: usize) -> std::io::Result<()> {
+        queue!(out, MoveTo(0, y), Clear(ClearType::UntilNewLine))?;
+        if width < 70 {
+            let label = format!("{} · Tab switches views · ? help", self.view.label());
+            self.line_at(out, 0, y, &label, width, true)?;
+            return Ok(());
+        }
+        let mut x = 0usize;
+        for view in View::ALL {
+            let active = view == self.view;
+            let label = format!(" {} ", view.label());
+            if active {
+                queue!(
+                    out,
+                    SetForegroundColor(Color::Rgb {
+                        r: 0xff,
+                        g: 0x66,
+                        b: 0xcc,
+                    }),
+                    SetAttribute(Attribute::Reverse)
+                )?;
+            } else {
+                queue!(out, SetForegroundColor(Color::Grey))?;
+            }
+            queue!(out, Print(&label))?;
+            if active {
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            }
+            x += display_width(&label);
+            if x >= width {
+                break;
+            }
+        }
+        queue!(out, SetForegroundColor(Color::Reset))?;
+        Ok(())
+    }
+
+    fn help_line(&self) -> String {
+        if let Some(detail) = self.detail {
+            return match detail {
+                Detail::Artist(_) => "↑/↓ select · Enter opens album/track · Y edit artist · Esc back · Tab views".to_owned(),
+                Detail::Album(_) => "↑/↓ select · Enter play · Z edit album · Esc back · Tab views".to_owned(),
+                Detail::Playlist(_) => "↑/↓ select · Enter play · l play all · Alt+s shuffle · d remove · Ctrl+↑/↓ reorder · c clear · R rename · Esc back".to_owned(),
+            };
+        }
+        match self.view {
+            View::Tracks => "↑/↓ move · Enter play · a queue · x next · e edit · f favorite · 0–5 rate · / search · w add to playlist".to_owned(),
+            View::Artists => "↑/↓ select · Enter opens artist · Y edit · P create · Esc back · Tab views".to_owned(),
+            View::Albums => "↑/↓ select · Enter opens album · Z edit · Esc back · Tab views".to_owned(),
+            View::Playlists => "↑/↓ select · Enter open · N new · R rename · x delete · Esc back".to_owned(),
+            View::Collections => "↑/↓ select · Enter filters Tracks · Esc back · Tab views".to_owned(),
+            View::Lyrics => "↑/↓ select · Enter reads lyrics · y current track · Esc back · Tab views".to_owned(),
+            View::Settings => "↑/↓ select · Enter toggles · d refresh devices · Tab views · ? help".to_owned(),
+        }
+    }
+
+    fn view_title(&self) -> String {
+        if let Some(collection) = self.active_collection {
+            return format!("{} · {}", collection.label(), collection.description());
+        }
+        if let Some(detail) = self.detail {
+            match detail {
+                Detail::Artist(id) => {
+                    let name = self
+                        .controller
+                        .artist(id)
+                        .map(|artist| artist.name().to_owned())
+                        .unwrap_or_else(|| "Artist".to_owned());
+                    let tracks = self
+                        .controller
+                        .tracks()
+                        .iter()
+                        .filter(|(track, _)| {
+                            self.controller.track_artist_id(*track) == Some(id)
+                                || self.controller.track_credits(*track).contains(&id)
+                        })
+                        .count();
+                    let albums = self.controller.albums_owned_by(id).len()
+                        + self.controller.albums_credited_for(id).len();
+                    return format!(
+                        "Artist · {name} · {} · {}",
+                        count_label(albums, "album"),
+                        count_label(tracks, "track")
+                    );
+                }
+                Detail::Album(id) => {
+                    if let Some(album) = self.controller.album(id) {
+                        let owner = self
+                            .controller
+                            .artist(album.owner_artist_id)
+                            .map(|artist| artist.name().to_owned())
+                            .unwrap_or_else(|| "Unknown artist".to_owned());
+                        return format!(
+                            "Album · {} · {owner} · {} · {} track(s)",
+                            album.title,
+                            sentence_case(album.release_type.as_str()),
+                            album.track_order.len()
+                        );
+                    }
+                }
+                Detail::Playlist(id) => {
+                    if let Some(playlist) = self.controller.playlist(id) {
+                        return format!(
+                            "Playlist · {} · {} track(s) · Enter play · d remove · c clear · R rename · x delete",
+                            playlist.name,
+                            playlist.track_ids.len()
+                        );
+                    }
+                }
+            }
+        }
+        match self.view {
+            View::Tracks => {
+                let count = self.view_rows().len();
+                if self.favorites_only {
+                    format!("Tracks · favorites · {}", count_label(count, "track"))
+                } else {
+                    format!("Tracks · {}", count_label(count, "track"))
+                }
+            }
+            View::Artists => format!(
+                "Artists · {} · Enter opens albums and tracks",
+                count_label(self.view_rows().len(), "artist")
+            ),
+            View::Albums => format!(
+                "Albums · {} · Enter opens the track listing",
+                count_label(self.view_rows().len(), "album")
+            ),
+            View::Playlists => "Playlists · N new · Enter open · R rename · x delete".to_owned(),
+            View::Collections => "Collections · Enter filters Tracks".to_owned(),
+            View::Lyrics => format!(
+                "Lyrics library · {} track(s) · Enter reads",
+                self.view_rows().len()
+            ),
+            View::Settings => "Settings · Enter toggles · d refreshes audio devices".to_owned(),
+        }
+    }
+
+    fn row_text(&self, row: Row, width: usize) -> String {
+        let current = self.controller.current_id();
+        match row {
+            Row::Track(id) | Row::LyricsTrack(id) => {
+                let Some(track) = self.controller.track(id) else {
+                    return "Missing track".to_owned();
+                };
+                let favorite = self
+                    .controller
+                    .rating(id)
+                    .is_some_and(|rating| rating.favorite);
+                let stars = self
+                    .controller
+                    .rating(id)
+                    .and_then(|rating| rating.rating)
+                    .map(|rating| format!("★{rating}"))
+                    .unwrap_or_default();
+                let marker = if current == Some(id) { "▶" } else { " " };
+                let favorite_marker = if favorite { "♥" } else { " " };
+                let mut text = format!(
+                    "{marker}{favorite_marker} {}{}  · {}  · {}{}",
+                    track.title(),
+                    if self.controller.track_album_id(id).is_none() {
+                        "  [standalone]"
+                    } else {
+                        ""
+                    },
+                    credit_display(&self.controller, id),
+                    display_album(track),
+                    if stars.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {stars}")
+                    }
+                );
+                if matches!(row, Row::LyricsTrack(_)) {
+                    let kind = self
+                        .controller
+                        .track_lyrics(id)
+                        .and_then(|raw| flux_app::LyricsDocument::parse(&raw).ok())
+                        .map(|document| match document.kind() {
+                            flux_app::LyricsKind::Synced => "synced",
+                            flux_app::LyricsKind::Plain => "plain",
+                        })
+                        .unwrap_or("lyrics");
+                    text.push_str(&format!("  [{kind}]"));
+                }
+                if !is_track_playable(track) {
+                    text.push_str("  [not playable]");
+                }
+                if let Some(label) = resource_label(self.controller.track_audio_resource_state(id))
+                {
+                    text.push_str("  ");
+                    text.push_str(label);
+                }
+                let duration = track.duration().map(format_duration).unwrap_or_default();
+                pad_with_right(&text, &duration, width)
+            }
+            Row::Artist(id) => {
+                let Some(artist) = self.controller.artist(id) else {
+                    return "Missing artist".to_owned();
+                };
+                let tracks = self
+                    .controller
+                    .tracks()
+                    .iter()
+                    .filter(|(track, _)| {
+                        self.controller.track_artist_id(*track) == Some(id)
+                            || self.controller.track_credits(*track).contains(&id)
+                    })
+                    .count();
+                let albums = self.controller.albums_owned_by(id).len()
+                    + self.controller.albums_credited_for(id).len();
+                pad_with_right(
+                    &format!(
+                        "{}  · {} album(s) · {} track(s)",
+                        artist.name(),
+                        albums,
+                        tracks
+                    ),
+                    "",
+                    width,
+                )
+            }
+            Row::Album(id) => {
+                let Some(album) = self.controller.album(id) else {
+                    return "Missing album".to_owned();
+                };
+                let owner = self
+                    .controller
+                    .artist(album.owner_artist_id)
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| "Unknown artist".to_owned());
+                let mut text = format!(
+                    "{}  · {owner}  · {}  · {} track(s)",
+                    album.title,
+                    sentence_case(album.release_type.as_str()),
+                    album.track_order.len()
+                );
+                if album.cover.is_some() {
+                    text.push_str("  [cover]");
+                }
+                pad_with_right(&text, "", width)
+            }
+            Row::Playlist(id) => {
+                let Some(playlist) = self.controller.playlist(id) else {
+                    return "Missing playlist".to_owned();
+                };
+                pad_with_right(
+                    &format!("{}  · {} track(s)", playlist.name, playlist.track_ids.len()),
+                    "",
+                    width,
+                )
+            }
+            Row::Collection(collection) => pad_with_right(
+                &format!("{}  · {}", collection.label(), collection.description()),
+                &format!(
+                    "{}",
+                    self.controller.smart_collection_tracks(collection).len()
+                ),
+                width,
+            ),
+            Row::Setting(setting) => {
+                let value = match setting {
+                    SettingRow::Layout => self.layout.label().to_owned(),
+                    SettingRow::Visualizer => {
+                        if self.viz_visible {
+                            "Shown".to_owned()
+                        } else {
+                            "Hidden".to_owned()
+                        }
+                    }
+                    SettingRow::VisualizationMode => self.viz_mode.label().to_owned(),
+                    SettingRow::FollowPlayback => {
+                        if self.follow_lyrics {
+                            "On".to_owned()
+                        } else {
+                            "Off".to_owned()
+                        }
+                    }
+                    SettingRow::RefreshDevices => {
+                        if self.audio_loading {
+                            "Refreshing…".to_owned()
+                        } else {
+                            format!("{} found", self.audio_devices.len())
+                        }
+                    }
+                    SettingRow::LibrarySetup => "Open".to_owned(),
+                };
+                pad_with_right(&format!("{}  · {}", setting.label(), value), "", width)
+            }
+            Row::AudioDevice(index) => {
+                let (name, id, default) = match index {
+                    None => ("System default output".to_owned(), None, true),
+                    Some(index) => match self.audio_devices.get(index) {
+                        Some(device) => (device.name.clone(), device.id.clone(), device.is_default),
+                        None => return "Missing audio device".to_owned(),
+                    },
+                };
+                let active = self.controller.selected_audio_device().map(str::to_owned) == id;
+                let duplicate_name = self
+                    .audio_devices
+                    .iter()
+                    .filter(|device| device.name == name)
+                    .count()
+                    > 1;
+                let mut text = name;
+                if default {
+                    text.push_str("  · system default");
+                }
+                if active {
+                    text.push_str("  · active");
+                }
+                if let Some(id) = id
+                    && duplicate_name
+                {
+                    text.push_str(&format!("  [{id}]"));
+                }
+                pad_with_right(&text, "", width)
+            }
+        }
+    }
+
+    fn draw_queue_view(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let entries = self.controller.queue_entries();
+        if self.queue_follow
+            && let Some(entry) = self.controller.current_queue_entry_id()
+            && let Some(index) = self.controller.queue_entry_index(entry)
+        {
+            self.queue_cursor = index;
+        }
+        self.queue_cursor = self.queue_cursor.min(entries.len().saturating_sub(1));
+        if self.queue_cursor < self.queue_offset {
+            self.queue_offset = self.queue_cursor;
+        }
+        if self.queue_cursor >= self.queue_offset + height {
+            self.queue_offset = self.queue_cursor + 1 - height;
+        }
+        self.queue_offset = self.queue_offset.min(entries.len().saturating_sub(height));
+        if entries.is_empty() {
+            self.line(
+                out,
+                top as u16,
+                "Queue is empty — press a or x on a track to add it.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
+        for (row, entry) in entries
+            .iter()
+            .skip(self.queue_offset)
+            .take(height)
+            .enumerate()
+        {
+            let index = self.queue_offset + row;
+            let current = self.controller.current_queue_entry_id() == Some(entry.id());
+            let track = self.controller.track(entry.track());
+            let mut text = format!(
+                "{} {}. {} — {}",
+                if index == self.queue_cursor { ">" } else { " " },
+                index + 1,
+                track.map_or_else(|| "Missing from library".to_owned(), display_title,),
+                track.map_or_else(
+                    || "unavailable".to_owned(),
+                    |_| credit_display(&self.controller, entry.track()),
+                ),
+            );
+            if current {
+                text.push_str("  ▶");
+            }
+            if let Some(label) =
+                resource_label(self.controller.track_audio_resource_state(entry.track()))
+            {
+                text.push_str("  ");
+                text.push_str(label);
+            }
+            let duration = track
+                .and_then(Track::duration)
+                .map(format_duration)
+                .unwrap_or_default();
+            let text = pad_with_right(&text, &duration, width);
+            let y = (top + row) as u16;
+            if index == self.queue_cursor {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn progress_text(&self, width: usize) -> String {
+        if width == 0 {
+            return String::new();
+        }
+        let position = self.controller.position();
+        let total = self.controller.current_duration();
+        let fraction = total
+            .filter(|duration| !duration.is_zero())
+            .map_or(0.0, |duration| {
+                (position.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
+            });
+        let filled = (fraction * width as f32).round() as usize;
+        format!(
+            "{}{}",
+            "█".repeat(filled.min(width)),
+            "░".repeat(width.saturating_sub(filled))
+        )
+    }
+
+    fn draw_workspace(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        if self.layout == LayoutMode::Visualizer {
+            return self.draw_visualizer(out, 0, top as u16, width, height);
+        }
+        if self.layout == LayoutMode::Player {
+            return self.draw_player_page(out, top, height, width);
+        }
+        let show_side = self.layout == LayoutMode::Standard && width >= 76 && height >= 8;
+        let side = if show_side {
+            (width / 3).clamp(22, 38)
+        } else {
+            0
+        };
+        let list_width = width.saturating_sub(side + usize::from(side > 0));
+        self.draw_list(out, top, height, list_width)?;
+        if side > 0 {
+            self.draw_side_panel(out, top, height, width - side, side)?;
+        }
+        Ok(())
+    }
+
+    fn draw_list(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let rows = self.view_rows();
+        let len = rows.len();
+        self.cursor = self.cursor.min(len.saturating_sub(1));
+        if self.cursor < self.offset {
+            self.offset = self.cursor;
+        }
+        if self.cursor >= self.offset + height {
+            self.offset = self.cursor + 1 - height;
+        }
+        self.offset = self.offset.min(len.saturating_sub(height));
+        if rows.is_empty() {
+            if self.view == View::Tracks
+                && self.detail.is_none()
+                && self.active_collection.is_none()
+            {
+                let message = self.empty_rows_message();
+                self.line(out, top as u16, &message, width, false)?;
+                return Ok(());
+            }
+            let message = if let Some(detail) = self.detail {
+                match detail {
+                    Detail::Artist(_) => "This artist has no tracks or albums in the library.",
+                    Detail::Album(_) if self.search.trim().is_empty() => {
+                        "This album has no tracks."
+                    }
+                    Detail::Album(_) => "No tracks in this album match the search.",
+                    Detail::Playlist(_) if self.search.trim().is_empty() => {
+                        "This playlist is empty. Add tracks with :playlist <name>."
+                    }
+                    Detail::Playlist(_) => "No tracks in this playlist match the search.",
+                }
+            } else {
+                match self.view {
+                    View::Tracks if self.active_collection.is_some() => {
+                        "No tracks in this collection match the current search."
+                    }
+                    View::Tracks => {
+                        "Library is empty — press o to scan a folder, i to import files, or ? for help."
+                    }
+                    View::Artists => "No artists yet. Import music or press P to create one.",
+                    View::Albums if self.favorites_only => "No albums match the current search.",
+                    View::Albums => "No albums yet. Import music or create one in Library setup.",
+                    View::Playlists => "No playlists yet — press N to create one.",
+                    View::Collections => "No collections match the search.",
+                    View::Lyrics => {
+                        "No managed lyrics yet. Open a track and press S to attach lyrics."
+                    }
+                    View::Settings => "No settings available.",
+                }
+            };
+            self.line(out, top as u16, message, width, false)?;
+            return Ok(());
+        }
+        for (row, item) in rows.iter().skip(self.offset).take(height).enumerate() {
+            let index = self.offset + row;
+            let text = format!(
+                "{} {}",
+                if index == self.cursor { ">" } else { " " },
+                self.row_text(*item, width.saturating_sub(2))
+            );
+            let text = truncate_to_width(&text, width);
+            let y = (top + row) as u16;
+            if index == self.cursor {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_side_panel(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        x: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        if width < 8 {
+            return Ok(());
+        }
+        let current = self.controller.current_track();
+        let mut y = top;
+        queue!(out, SetForegroundColor(self.accent()))?;
+        self.line_at(out, x, y as u16, "NOW PLAYING", width, true)?;
+        queue!(out, SetForegroundColor(Color::Reset))?;
+        y += 1;
+        if let Some(track) = current {
+            self.line_at(out, x, y as u16, &display_title(track), width, true)?;
+            y += 1;
+            self.line_at(
+                out,
+                x,
+                y as u16,
+                &format!(
+                    "{} · {}",
+                    self.controller
+                        .current_id()
+                        .map(|id| credit_display(&self.controller, id))
+                        .unwrap_or_default(),
+                    display_album(track)
+                ),
+                width,
+                false,
+            )?;
+            y += 1;
+            let elapsed = format_duration(self.controller.position());
+            let total = self
+                .controller
+                .current_duration()
+                .map(format_duration)
+                .unwrap_or_else(|| "--:--".to_owned());
+            let bar_width =
+                width.saturating_sub(display_width(&elapsed) + display_width(&total) + 2);
+            self.line_at(
+                out,
+                x,
+                y as u16,
+                &format!("{elapsed} {} {total}", self.progress_text(bar_width)),
+                width,
+                false,
+            )?;
+            y += 1;
+        } else {
+            self.line_at(out, x, y as u16, "Nothing playing", width, false)?;
+            y += 1;
+            self.line_at(
+                out,
+                x,
+                y as u16,
+                "Select a track and press Enter.",
+                width,
+                false,
+            )?;
+            y += 1;
+        }
+        if self.viz_visible && y + 3 < top + height {
+            queue!(out, SetForegroundColor(self.accent()))?;
+            self.line_at(
+                out,
+                x,
+                y as u16,
+                &format!("VISUALIZER · {}", self.viz_mode.label()),
+                width,
+                true,
+            )?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+            let viz_height = (top + height).saturating_sub(y + 2).clamp(2, 7);
+            self.draw_visualizer(out, x, y as u16, width, viz_height)?;
+            y += viz_height;
+        }
+        let entries = self.controller.queue_entries();
+        let current_index = self
+            .controller
+            .current_queue_entry_id()
+            .and_then(|entry| self.controller.queue_entry_index(entry))
+            .map_or(0, |index| index + 1);
+        let up_next = entries
+            .iter()
+            .skip(current_index)
+            .take((top + height).saturating_sub(y + 1))
+            .collect::<Vec<_>>();
+        if !up_next.is_empty() {
+            queue!(out, SetForegroundColor(self.accent()))?;
+            self.line_at(out, x, y as u16, "UP NEXT", width, true)?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+            for entry in up_next {
+                let label = self.controller.track(entry.track()).map_or_else(
+                    || "Missing track".to_owned(),
+                    |track| {
+                        format!(
+                            "{} — {}",
+                            display_title(track),
+                            credit_display(&self.controller, entry.track())
+                        )
+                    },
+                );
+                self.line_at(out, x, y as u16, &format!("· {label}"), width, false)?;
+                y += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_player_page(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let mut y = top;
+        let current = self.controller.current_track();
+        if let Some(track) = current {
+            queue!(out, SetForegroundColor(self.accent()))?;
+            self.line(out, y as u16, &display_title(track), width, true)?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+            self.line(
+                out,
+                y as u16,
+                &format!(
+                    "{} · {}",
+                    self.controller
+                        .current_id()
+                        .map(|id| credit_display(&self.controller, id))
+                        .unwrap_or_default(),
+                    display_album(track)
+                ),
+                width,
+                false,
+            )?;
+            y += 1;
+        } else {
+            self.line(out, y as u16, "Nothing playing", width, true)?;
+            y += 1;
+            self.line(
+                out,
+                y as u16,
+                "Select a track in Tracks and press Enter.",
+                width,
+                false,
+            )?;
+            y += 1;
+        }
+        let elapsed = format_duration(self.controller.position());
+        let total = self
+            .controller
+            .current_duration()
+            .map(format_duration)
+            .unwrap_or_else(|| "--:--".to_owned());
+        self.line(
+            out,
+            y as u16,
+            &format!(
+                "{elapsed} {} {total}",
+                self.progress_text(width.saturating_sub(14))
+            ),
+            width,
+            false,
+        )?;
+        y += 1;
+        if self.viz_visible && y + 2 < top + height {
+            queue!(out, SetForegroundColor(self.accent()))?;
+            self.line(
+                out,
+                y as u16,
+                &format!("VISUALIZER · {}", self.viz_mode.label()),
+                width,
+                true,
+            )?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+            let viz_height = (top + height).saturating_sub(y + 4).max(2);
+            self.draw_visualizer(out, 0, y as u16, width, viz_height)?;
+            y += viz_height;
+        }
+        let entries = self.controller.queue_entries();
+        let current_index = self
+            .controller
+            .current_queue_entry_id()
+            .and_then(|entry| self.controller.queue_entry_index(entry))
+            .map_or(0, |index| index + 1);
+        let up_next = entries
+            .iter()
+            .skip(current_index)
+            .take((top + height).saturating_sub(y + 1))
+            .collect::<Vec<_>>();
+        if !up_next.is_empty() {
+            queue!(out, SetForegroundColor(self.accent()))?;
+            self.line(out, y as u16, "UP NEXT", width, true)?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            y += 1;
+            for entry in up_next {
+                let label = self.controller.track(entry.track()).map_or_else(
+                    || "Missing track".to_owned(),
+                    |track| {
+                        format!(
+                            "{} — {}",
+                            display_title(track),
+                            credit_display(&self.controller, entry.track())
+                        )
+                    },
+                );
+                self.line(out, y as u16, &format!("· {label}"), width, false)?;
+                y += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_form(
+        &self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let Some(form) = self.form.as_ref() else {
+            return Ok(());
+        };
+        let visible = height.saturating_sub(2).max(1);
+        let start = form.focus.saturating_sub(visible.saturating_sub(1));
+        let mut y = top;
+        for (index, field) in form.fields.iter().enumerate().skip(start).take(visible) {
+            let marker = if index == form.focus { ">" } else { " " };
+            let line = format!(
+                "{marker} {:<18} {}",
+                format!("{}:", field.label),
+                field.value
+            );
+            if index == form.focus {
+                queue!(out, MoveTo(0, y as u16), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y as u16, &line, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y as u16, &line, width, false)?;
+            }
+            y += 1;
+        }
+        if y < top + height {
+            if let Some(error) = &form.error {
+                queue!(out, SetForegroundColor(Color::Red))?;
+                self.line(out, y as u16, error, width, false)?;
+                queue!(out, SetForegroundColor(Color::Reset))?;
+            } else if let Some(field) = form.fields.get(form.focus) {
+                self.line(out, y as u16, &format!("· {}", field.hint), width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn update_lyrics_follow(&mut self) {
+        if !self.follow_lyrics || !self.lyrics_follow_ready {
+            return;
+        }
+        let Some(id) = self.lyrics_track else {
+            return;
+        };
+        if self.controller.current_id() != Some(id) {
+            return;
+        }
+        let position = self
+            .controller
+            .position()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let mut target = None;
+        for (index, timestamp) in self.lyrics_timestamps.iter().enumerate() {
+            if let Some(timestamp) = timestamp
+                && *timestamp <= position
+            {
+                target = Some(index);
+            }
+        }
+        if let Some(index) = target {
+            self.lyrics_scroll = index.saturating_sub(2);
+        }
+    }
+
+    fn draw_visualizer(
+        &mut self,
+        out: &mut impl Write,
+        x: usize,
+        y: u16,
+        width: usize,
+        height: usize,
+    ) -> std::io::Result<()> {
+        if width < 4 || height == 0 {
+            return Ok(());
+        }
+        if self.controller.player_state() == PlaybackState::Playing
+            && self.controller.audio_status().is_ready()
+        {
+            let waveform = self.controller.waveform();
+            self.scope.update(&waveform);
+        } else {
+            self.scope.reset();
+        }
+        let canvas = visualization_canvas(
+            self.scope.samples(),
+            self.viz_mode,
+            self.viz_gain,
+            width,
+            height,
+        );
+        let accent = self.accent();
+        for (row, line) in canvas.into_iter().enumerate() {
+            queue!(
+                out,
+                MoveTo(x as u16, y + row as u16),
+                SetForegroundColor(accent),
+                Print(truncate_to_width(&line, width)),
+                SetForegroundColor(Color::Reset)
+            )?;
+        }
+        Ok(())
+    }
+
     fn now_playing_line(&self, _width: usize) -> String {
         let state_icon = match self.controller.player_state() {
             PlaybackState::Playing => "▶",
@@ -2815,9 +5460,14 @@ impl Tui {
                     .map(format_duration)
                     .unwrap_or_else(|| "--:--".to_owned());
                 format!(
-                    "{state_icon} {}    {} / {total}    Vol {volume}%    {crossfade}",
-                    display_title(track),
+                    "{state_icon} {} — {}    {} / {total}    {}    Vol {volume}%    {crossfade}",
+                    track.title(),
+                    self.controller
+                        .current_id()
+                        .map(|id| credit_display(&self.controller, id))
+                        .unwrap_or_default(),
                     format_duration(self.controller.position()),
+                    self.progress_text(12),
                 )
             }
             None if self.controller.current_queue_entry_id().is_some() => {
@@ -3111,6 +5761,121 @@ fn credit_display(controller: &Controller, id: TrackId) -> String {
         .join(" · ")
 }
 
+/// Renders the current visualization from real waveform samples.
+///
+/// This is pure display processing: no timers, random values or synthetic
+/// animation feed the canvas. Bars and Pulse use the same measured samples as
+/// the Waveform trace.
+#[allow(clippy::needless_range_loop)]
+fn visualization_canvas(
+    samples: &[f32],
+    mode: VizMode,
+    gain: f32,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let center = height / 2;
+    let mut canvas = vec![vec![' '; width]; height];
+    match mode {
+        VizMode::Waveform => {
+            let mut previous = center;
+            for column in 0..width {
+                let t = if width <= 1 {
+                    0.0
+                } else {
+                    column as f32 / (width - 1) as f32
+                };
+                let value = (waveform_sample(samples, t) * gain).clamp(-1.0, 1.0);
+                let amplitude =
+                    (value.abs() * (height.saturating_sub(1)) as f32 / 2.0).round() as usize;
+                let position = if value >= 0.0 {
+                    center.saturating_sub(amplitude)
+                } else {
+                    center + amplitude
+                }
+                .min(height - 1);
+                let low = previous.min(position);
+                let high = previous.max(position);
+                for row in low..=high {
+                    canvas[row][column] = '•';
+                }
+                previous = position;
+            }
+        }
+        VizMode::Bars => {
+            const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+            for column in 0..width {
+                let t = if width <= 1 {
+                    0.0
+                } else {
+                    column as f32 / (width - 1) as f32
+                };
+                let value = (waveform_sample(samples, t) * gain).abs().clamp(0.0, 1.0);
+                let level = ((value * 7.0).round() as usize).min(7);
+                for row in 0..height {
+                    canvas[row][column] = LEVELS[level];
+                }
+            }
+        }
+        VizMode::Pulse => {
+            for column in 0..width {
+                let t = if width <= 1 {
+                    0.0
+                } else {
+                    column as f32 / (width - 1) as f32
+                };
+                let value = (waveform_sample(samples, t) * gain).abs().clamp(0.0, 1.0);
+                let reach = (value * center as f32).round() as usize;
+                for offset in 0..=reach {
+                    if center >= offset {
+                        canvas[center - offset][column] = '█';
+                    }
+                    if center + offset < height {
+                        canvas[center + offset][column] = '█';
+                    }
+                }
+            }
+        }
+    }
+    canvas
+        .into_iter()
+        .map(|line| line.into_iter().collect::<String>())
+        .collect()
+}
+
+fn count_label(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
+}
+
+fn sentence_case(text: &str) -> String {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), characters.as_str()),
+        None => String::new(),
+    }
+}
+
+fn display_album(track: &Track) -> String {
+    track.album().unwrap_or("Standalone").to_owned()
+}
+
+fn tui_prefs_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FLUX_TUI_CONFIG") {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|root| root.join("flux").join("tui.conf"))
+}
+
 fn display_title(track: &Track) -> String {
     match track.artist() {
         Some(artist) => format!("{} — {artist}", track.title()),
@@ -3125,8 +5890,9 @@ fn format_lyrics_timestamp(timestamp_ms: u64) -> String {
     format!("{minutes:02}:{seconds:02}.{millis:03}")
 }
 
+#[cfg(test)]
 fn normal_help() -> &'static str {
-    "↑/↓ move · Enter play · e edit · / search · f favorite · Q queue · ? help · q quit"
+    "↑/↓ move · Enter open/play · Tab views · m layout · v visualizer · Q queue · ? help · q quit"
 }
 
 fn resource_label(state: Option<flux_app::ResourceState>) -> Option<&'static str> {
@@ -3205,6 +5971,10 @@ fn cancel_message(mode: Mode) -> Option<&'static str> {
         }
         Mode::ImportReview => Some("Import review closed; nothing was copied or published."),
         Mode::TrackEditInput => Some("Track edit cancelled; no changes were made."),
+        Mode::FormInput => Some("Form cancelled; no changes were made."),
+        Mode::CommandInput => Some("Command cancelled; nothing changed."),
+        Mode::ConfirmPlaylist => Some("Playlist change cancelled."),
+        Mode::ConfirmQueueClear => Some("Queue clear cancelled."),
         Mode::ArtistCreateInput => Some("Artist creation cancelled."),
         Mode::ArtistRenameInput => Some("Artist edit cancelled; no changes were made."),
         Mode::AlbumEditInput => Some("Album edit cancelled; no changes were made."),
@@ -3251,68 +6021,67 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
     };
     vec![
         "Flux TUI quick reference".to_owned(),
+        "A complete keyboard-first player: library, queue, playlists, lyrics, metadata and a real audio visualizer.".to_owned(),
         format!("Active library: {library}"),
         format!(
-            "Audio output: {audio} · {active} · policy {policy} · queue {} · playback mode {}",
+            "Audio output: {audio} · {active} · {policy} · queue {} · {}",
             controller.queue_len(),
             controller.playback_mode().label()
         ),
         String::new(),
         "NAVIGATION".to_owned(),
-        "↑/↓ or k/j move · PgUp/PgDn · g/G first/last".to_owned(),
-        "/ search · Esc clears the active search · F favorites-only filter · c clears notice"
-            .to_owned(),
-        "f toggles the selected favorite · 0 clears rating · 1–5 sets stars".to_owned(),
-        "Q queue view · ? help · q or Ctrl-C quits".to_owned(),
+        "Tab / Shift+Tab cycles Tracks, Artists, Albums, Playlists, Collections, Lyrics, Settings.".to_owned(),
+        "F1–F7 open a destination directly · ↑/↓ or k/j move · PgUp/PgDn · g/G first/last".to_owned(),
+        "Enter opens the selected entity or plays the selected track · Esc goes back.".to_owned(),
+        "/ searches the current view · Esc clears search · F filters favorites · ? opens help.".to_owned(),
+        ": opens the command palette (:tracks :queue :viz bars :layout player :seek +10).".to_owned(),
         String::new(),
         "PLAYBACK".to_owned(),
-        "Enter play · Space play/pause · s stop · n/p skip".to_owned(),
-        "+/- volume · R playback mode · K crossfade · [ ] crossfade duration".to_owned(),
-        "Output loss triggers bounded automatic recovery; after exhaustion, Play starts a fresh retry."
-            .to_owned(),
+        "Enter play · Space play/pause · s stop · n/p next/previous · ←/→ seek 5s (Shift 30s).".to_owned(),
+        "+/- volume · R cycles repeat/shuffle modes · K crossfade · [ ] crossfade duration.".to_owned(),
+        "The player remains visible in every library view; Player layout gives it the whole screen.".to_owned(),
+        "Output loss triggers bounded automatic recovery; after exhaustion, Play starts a fresh retry.".to_owned(),
+        String::new(),
+        "LAYOUT AND VISUALIZER".to_owned(),
+        "m cycles Standard, Library, Player, Visualizer and Compact layouts.".to_owned(),
+        "v shows/hides the visualizer · Alt+v cycles Waveform, Bars and Pulse.".to_owned(),
+        "Alt+↑/↓ changes visualization sensitivity. Preferences persist in the Flux config directory.".to_owned(),
+        "The visualizer reads the engine's real post-gain waveform tap; it is not a simulated animation.".to_owned(),
+        String::new(),
+        "LIBRARY".to_owned(),
+        "Artists: Enter opens albums and tracks · Y edits · P creates.".to_owned(),
+        "Albums: Enter opens the track listing · Z edits title, release type and cover.".to_owned(),
+        "Tracks: e edits title, artist credit, album and numbering · y reads lyrics.".to_owned(),
+        "W sets/removes Track artwork · S sets/removes managed lyrics · 0–5 rating · f favorite.".to_owned(),
+        "Collections: Favorites, Highly rated, Recently added/played, Most played, lyrics and artwork views.".to_owned(),
+        String::new(),
+        "PLAYLISTS".to_owned(),
+        "N creates · Enter opens · R renames · x deletes after confirmation.".to_owned(),
+        "Inside a playlist: Enter plays · l plays all · Alt+s plays shuffled · d removes an entry · Ctrl+↑/↓ reorders.".to_owned(),
+        "c clears the playlist after confirmation; canonical tracks are never deleted.".to_owned(),
+        "From Tracks: :playlist <name> appends the selected track.".to_owned(),
         String::new(),
         "QUEUE".to_owned(),
-        "a add selected · x play selected next".to_owned(),
-        "Q opens the stable queue-entry view".to_owned(),
-        "Enter play selected entry · Del/d remove selected entry".to_owned(),
-        "Ctrl+↑/↓ reorder selected entry; duplicate tracks remain distinct by #entry id".to_owned(),
+        "a adds the selected track · x plays it next · Q opens the first-class queue view.".to_owned(),
+        "Enter plays the selected entry · Del/d removes it · Ctrl+↑/↓ reorders.".to_owned(),
+        "J jumps to the current entry · f toggles follow · C clears the queue after confirmation.".to_owned(),
         String::new(),
-        "CATALOGUE".to_owned(),
-        "o import a folder · i/I import files · r refresh".to_owned(),
-        "Imports open a cancellable discovery/review phase before any copy.".to_owned(),
-        "Review: Space include · u update exact duplicate · a/s bulk · y prepare.".to_owned(),
-        "Esc cancels discovery or copy; nothing is published until preparation finishes."
-            .to_owned(),
-        "e edit selected metadata · y read managed lyrics".to_owned(),
-        "H local history · D selected Track membership · E Album/standalone relationships"
-            .to_owned(),
-        "V artist/album relationships · P create artist".to_owned(),
-        "Y edit artist name/aliases/description/image · Z edit the selected album and cover"
-            .to_owned(),
-        "W set/remove Track artwork override · S set/remove managed lyrics from a UTF-8 file"
-            .to_owned(),
-        "X refresh/reconcile · L relink a unique reported move candidate".to_owned(),
+        "IMPORT".to_owned(),
+        "o imports a folder · i/I import files · r refreshes the active library.".to_owned(),
+        "Import follows Source → Destination → Verify → Import; nothing is copied before review.".to_owned(),
+        "Review: Space include/skip · e edits metadata · u updates an exact duplicate · a/s bulk.".to_owned(),
+        "Esc cancels discovery or preparation. The final canonical transaction is never cancelled.".to_owned(),
         String::new(),
-        "LIBRARY LIFECYCLE".to_owned(),
-        "O open canonical library · C create canonical library".to_owned(),
-        "M migrate a legacy index/portable library".to_owned(),
-        "U preserve and replace a protected legacy index (confirmation required)".to_owned(),
-        "A acknowledge portable recovery from backup (confirmation required)".to_owned(),
-        "B legacy runtime switching is disabled; use M instead".to_owned(),
+        "SETTINGS AND LIBRARY".to_owned(),
+        "Settings exposes layout, visualizer, lyrics follow and audio device selection.".to_owned(),
+        "Audio devices open off the UI thread; an explicit selection never silently falls back.".to_owned(),
+        "O opens a canonical library · C creates one · M migrates an old library.".to_owned(),
+        "X refreshes/reconciles · L relinks a unique reported move candidate.".to_owned(),
         String::new(),
-        "SAFETY AND LIMITS".to_owned(),
-        "TUI import review supports decisions only; rich metadata/artwork editing is GUI-only."
-            .to_owned(),
-        "Discovery, hashing and portable copy preparation are cancellable; the final canonical transaction is not."
-            .to_owned(),
+        "SAFETY".to_owned(),
         "Missing resources are retained; inaccessible paths are not treated as missing.".to_owned(),
-        "The TUI never deletes external audio and never deletes library tracks.".to_owned(),
-        "Track deletion, missing-resource repair, membership and ownership transfer,"
-            .to_owned(),
-        "playlists, batch actions and global filters require the GUI review workflows."
-            .to_owned(),
-        "Audio-output enumeration and device selection are GUI-only; Play retries recovery here."
-            .to_owned(),
+        "The TUI never deletes external audio, library tracks, artists or albums.".to_owned(),
+        "Playlist operations validate the reviewed canonical state before writing.".to_owned(),
     ]
 }
 
@@ -3362,7 +6131,11 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         lyrics_lines: Vec::new(),
         lyrics_scroll: 0,
         lyrics_title: String::new(),
+        lyrics_follow_ready: true,
+        lyrics_track: None,
+        lyrics_timestamps: Vec::new(),
         queue_cursor: 0,
+        queue_follow: true,
         queue_offset: 0,
         info_title: String::new(),
         info_lines: Vec::new(),
@@ -3371,7 +6144,25 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         migrated_dest: None,
         lifecycle_msg: None,
         last_reconcile: None,
+        view: View::Tracks,
+        detail: None,
+        active_collection: None,
+        layout: LayoutMode::Standard,
+        viz_visible: true,
+        viz_mode: VizMode::Waveform,
+        viz_gain: 1.0,
+        scope: WaveformScope::default(),
+        follow_lyrics: true,
+        prefs_path: tui_prefs_path(),
+        form: None,
+        playlist_action: None,
+        audio_devices: Vec::new(),
+        audio_error: None,
+        audio_loading: false,
+        audio_list_rx: None,
+        audio_open_rx: None,
     };
+    tui.load_preferences();
     if created_default {
         tui.lifecycle_msg = Some(format!(
             "Created a new empty library at {}. Use i/o to import music; ? lists commands.",
@@ -3395,11 +6186,11 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageEdit, ImportWorkerMessage, Mode, StorageMode, Track, Tui, album_edit_form,
-        clamp_terminal_size, detail_view_fits, display_width, fit_input_line, help_lines,
-        normal_help, pad_with_right, parse_album_edit_form, parse_artist_edit_form,
-        parse_release_type, parse_track_asset_form, resource_label, terminal_too_small,
-        truncate_to_width,
+        Detail, ImageEdit, ImportWorkerMessage, LayoutMode, Mode, Row, StorageMode, Track, Tui,
+        View, VizMode, WaveformScope, album_edit_form, clamp_terminal_size, detail_view_fits,
+        display_width, fit_input_line, help_lines, normal_help, pad_with_right,
+        parse_album_edit_form, parse_artist_edit_form, parse_release_type, parse_track_asset_form,
+        resource_label, terminal_too_small, truncate_to_width, visualization_canvas,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use flux_app::ImportDecision;
@@ -3468,7 +6259,11 @@ mod tests {
             lyrics_lines: Vec::new(),
             lyrics_scroll: 0,
             lyrics_title: String::new(),
+            lyrics_follow_ready: true,
+            lyrics_track: None,
+            lyrics_timestamps: Vec::new(),
             queue_cursor: 0,
+            queue_follow: true,
             queue_offset: 0,
             info_title: String::new(),
             info_lines: Vec::new(),
@@ -3477,6 +6272,23 @@ mod tests {
             migrated_dest: None,
             lifecycle_msg: None,
             last_reconcile: None,
+            view: View::Tracks,
+            detail: None,
+            active_collection: None,
+            layout: LayoutMode::Standard,
+            viz_visible: false,
+            viz_mode: VizMode::Waveform,
+            viz_gain: 1.0,
+            scope: WaveformScope::default(),
+            follow_lyrics: true,
+            prefs_path: None,
+            form: None,
+            playlist_action: None,
+            audio_devices: Vec::new(),
+            audio_error: None,
+            audio_loading: false,
+            audio_list_rx: None,
+            audio_open_rx: None,
         }
     }
 
@@ -3717,6 +6529,19 @@ mod tests {
                 .map(|plan| plan.candidates.len()),
             Some(1)
         );
+        key(&mut tui, KeyCode::Char('e'));
+        assert_eq!(tui.mode, Mode::FormInput);
+        tui.form.as_mut().expect("import form").fields[0].value = "Edited Import Title".to_owned();
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.mode, Mode::ImportReview, "editing returns to review");
+        assert_eq!(
+            tui.import_ui
+                .as_ref()
+                .and_then(|ui| ui.plan.as_ref())
+                .and_then(|plan| plan.candidates.first())
+                .map(|candidate| candidate.title().to_owned()),
+            Some("Edited Import Title".to_owned())
+        );
         key(&mut tui, KeyCode::Char('y'));
         wait_for_tracks(&mut tui, 1);
         assert_eq!(tui.mode, Mode::Normal);
@@ -3761,8 +6586,13 @@ mod tests {
         );
 
         key(&mut tui, KeyCode::Char('e'));
-        assert_eq!(tui.mode, Mode::TrackEditInput);
-        tui.input = format!("Tui Title | Tui Album | 3 | 1 | {artist} | {artist}");
+        assert_eq!(tui.mode, Mode::FormInput);
+        let form = tui.form.as_mut().expect("track form");
+        form.fields[0].value = "Tui Title".to_owned();
+        form.fields[1].value = "Tui Artist".to_owned();
+        form.fields[2].value = "Tui Album".to_owned();
+        form.fields[3].value = "3".to_owned();
+        form.fields[4].value = "1".to_owned();
         key(&mut tui, KeyCode::Enter);
         let track = tui.controller.track(id).expect("edited");
         assert_eq!(track.title(), "Tui Title");
@@ -3772,17 +6602,22 @@ mod tests {
         assert_eq!(tui.controller.track_credits(id), vec![artist]);
 
         key(&mut tui, KeyCode::Char('e'));
-        let invalid = format!("Bad Title | Album | not-a-number | 1 | {artist} | {artist}");
-        tui.input.clone_from(&invalid);
+        assert_eq!(tui.mode, Mode::FormInput);
+        let form = tui.form.as_mut().expect("track form");
+        form.fields[0].value = "Bad Title".to_owned();
+        form.fields[3].value = "not-a-number".to_owned();
         key(&mut tui, KeyCode::Enter);
         assert_eq!(
             tui.mode,
-            Mode::TrackEditInput,
+            Mode::FormInput,
             "invalid input keeps the edit form open"
         );
-        assert_eq!(
-            tui.input, invalid,
-            "typed fields survive a validation error"
+        assert!(
+            tui.form
+                .as_ref()
+                .and_then(|form| form.error.as_deref())
+                .is_some_and(|error| error.contains("whole number")),
+            "validation error is shown in the form"
         );
         assert_eq!(
             tui.controller.track(id).map(Track::title),
@@ -3800,8 +6635,10 @@ mod tests {
         key(&mut tui, KeyCode::Esc);
 
         key(&mut tui, KeyCode::Char('Y'));
-        assert_eq!(tui.mode, Mode::ArtistRenameInput);
-        tui.input = format!("{artist}|Renamed Tui Artist|Tui AKA;Former Tui");
+        assert_eq!(tui.mode, Mode::FormInput);
+        let form = tui.form.as_mut().expect("artist form");
+        form.fields[0].value = "Renamed Tui Artist".to_owned();
+        form.fields[1].value = "Tui AKA;Former Tui".to_owned();
         key(&mut tui, KeyCode::Enter);
         assert_eq!(
             tui.controller.track(id).and_then(Track::artist),
@@ -3812,12 +6649,13 @@ mod tests {
             ["Tui AKA".to_owned(), "Former Tui".to_owned()]
         );
         key(&mut tui, KeyCode::Char('Y'));
-        tui.input = format!("{artist}|Tui Artist II");
+        let form = tui.form.as_mut().expect("artist form");
+        form.fields[0].value = "Tui Artist II".to_owned();
         key(&mut tui, KeyCode::Enter);
         assert_eq!(
             tui.controller.artist_aliases(artist),
             ["Tui AKA".to_owned(), "Former Tui".to_owned()],
-            "omitting the alias field preserves existing aliases"
+            "the prefilled alias field preserves existing aliases"
         );
 
         tui.controller
@@ -4397,16 +7235,23 @@ mod tests {
         assert_eq!(tui.mode, Mode::InfoView);
         assert!(tui.info_title.contains("help"));
         let help = tui.info_lines.join("\n");
-        assert!(help.contains("Q queue view"), "{help}");
+        assert!(help.contains("QUEUE"), "{help}");
         assert!(help.contains("Active library:"), "{help}");
-        assert!(help.contains("policy system default"), "{help}");
-        assert!(help.contains("bounded automatic recovery"), "{help}");
-        assert!(help.contains("SAFETY AND LIMITS"), "{help}");
-        assert!(help.contains("device selection are GUI-only"), "{help}");
-        assert!(help.contains("GUI review workflows"), "{help}");
-        assert!(help.contains("cancellable discovery/review"), "{help}");
+        assert!(help.contains("system default"), "{help}");
         assert!(
-            help.contains("final canonical transaction is not"),
+            help.contains("bounded automatic recovery") || help.contains("recovery"),
+            "{help}"
+        );
+        assert!(help.contains("SAFETY"), "{help}");
+        assert!(help.contains("audio device selection"), "{help}");
+        assert!(help.contains("F1–F7"), "{help}");
+        assert!(
+            help.contains("Source → Destination → Verify → Import"),
+            "{help}"
+        );
+        assert!(help.contains("real post-gain waveform"), "{help}");
+        assert!(
+            help.contains("final canonical transaction is never cancelled"),
             "{help}"
         );
         key(&mut tui, KeyCode::Down);
@@ -4510,14 +7355,17 @@ mod tests {
             .switch_to_canonical(&root)
             .expect("switch canonical");
         let artist = tui.controller.create_artist("Old Artist").expect("artist");
+        key(&mut tui, KeyCode::F(2));
+        assert_eq!(tui.view, View::Artists);
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.detail, Some(Detail::Artist(artist)));
         key(&mut tui, KeyCode::Char('Y'));
-        type_text(
-            &mut tui,
-            &format!(
-                "{}|New Artist|Alias;Second|Artist description|",
-                artist.get()
-            ),
-        );
+        assert_eq!(tui.mode, Mode::FormInput);
+        let form = tui.form.as_mut().expect("artist form");
+        form.fields[0].value = "New Artist".to_owned();
+        form.fields[1].value = "Alias;Second".to_owned();
+        form.fields[2].value = "Artist description".to_owned();
+        key(&mut tui, KeyCode::Enter);
         assert_eq!(tui.mode, Mode::Normal);
         let updated = tui.controller.artist(artist).expect("artist");
         assert_eq!(updated.name(), "New Artist");
@@ -4537,6 +7385,8 @@ mod tests {
             .import_files(std::slice::from_ref(&source), false)
             .expect("canonical import");
         let track = tui.controller.tracks()[0].0;
+        key(&mut tui, KeyCode::F(1));
+        assert_eq!(tui.view, View::Tracks);
 
         let artwork = dir.path().join("cover.png");
         std::fs::write(
@@ -4585,7 +7435,7 @@ mod tests {
             format!(r#"{{"version":1,"next_id":5001,"tracks":[{tracks}]}}"#),
         )
         .expect("large index");
-        let tui = tui(&dir);
+        let mut tui = tui(&dir);
         let started = std::time::Instant::now();
         let first = tui.rows();
         let first_elapsed = started.elapsed();
@@ -4596,6 +7446,13 @@ mod tests {
             "unchanged large list must reuse its cached rows"
         );
         println!("5,000-track TUI row build: {first_elapsed:?}");
+        let mut rendered = Vec::new();
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            rendered.clear();
+            tui.draw(&mut rendered).expect("large draw");
+        }
+        println!("5,000-track TUI draw: {:?}/frame", started.elapsed() / 50);
         tui.controller.shutdown();
     }
 
@@ -4649,8 +7506,8 @@ mod tests {
         let mut rendered = Vec::new();
         tui.draw(&mut rendered).expect("queue view render");
         let rendered = String::from_utf8_lossy(&rendered);
-        assert!(rendered.contains("QUEUE"), "{rendered}");
-        assert!(rendered.contains(&format!("#{selected}")), "{rendered}");
+        assert!(rendered.contains("Queue"), "{rendered}");
+        assert!(rendered.contains('▶'), "{rendered}");
 
         let len_before = tui.controller.queue_len();
         key(&mut tui, KeyCode::Delete);
@@ -4834,6 +7691,174 @@ mod tests {
         assert!(message.contains("0 track(s)"), "{message}");
         assert!(message.contains("artwork no"), "{message}");
         assert!(message.contains("Empty albums are retained"), "{message}");
+        tui.controller.shutdown();
+    }
+    #[test]
+    fn tui_navigation_opens_artists_albums_playlists_and_collections() {
+        let dir = TempDir::new("tui-view-navigation");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        let artist = tui.controller.create_artist("Alpha").expect("artist");
+        tui.controller
+            .create_album(artist, "First Light", flux_app::ReleaseType::Album)
+            .expect("album");
+
+        key(&mut tui, KeyCode::F(2));
+        assert_eq!(tui.view, View::Artists);
+        assert!(
+            tui.view_rows()
+                .iter()
+                .any(|row| matches!(row, Row::Artist(_)))
+        );
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.detail, Some(Detail::Artist(artist)));
+        assert!(
+            tui.view_rows()
+                .iter()
+                .any(|row| matches!(row, Row::Album(_))),
+            "artist detail lists owned albums"
+        );
+        key(&mut tui, KeyCode::Esc);
+        assert!(tui.detail.is_none());
+
+        key(&mut tui, KeyCode::F(3));
+        assert_eq!(tui.view, View::Albums);
+        key(&mut tui, KeyCode::Enter);
+        assert!(matches!(tui.detail, Some(Detail::Album(_))));
+        key(&mut tui, KeyCode::Esc);
+
+        key(&mut tui, KeyCode::F(4));
+        key(&mut tui, KeyCode::Char('N'));
+        assert_eq!(tui.mode, Mode::FormInput);
+        tui.form.as_mut().expect("playlist form").fields[0].value = "Night Mix".to_owned();
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.controller.playlists().len(), 1);
+        assert_eq!(tui.controller.playlists()[0].name, "Night Mix");
+
+        key(&mut tui, KeyCode::F(5));
+        assert_eq!(tui.view, View::Collections);
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.view, View::Tracks);
+        assert_eq!(
+            tui.active_collection,
+            Some(flux_app::SmartCollection::Favorites)
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn visualization_is_derived_from_real_waveform_samples() {
+        let silence = [0.0f32; 64];
+        let loud = [1.0f32; 64];
+        let quiet_bars = visualization_canvas(&silence, VizMode::Bars, 1.0, 16, 4);
+        let loud_bars = visualization_canvas(&loud, VizMode::Bars, 1.0, 16, 4);
+        assert_ne!(quiet_bars, loud_bars);
+        assert!(
+            loud_bars.iter().any(|line| line.contains('█')),
+            "measured peaks reach the top level"
+        );
+        assert!(
+            quiet_bars.iter().all(|line| !line.contains('█')),
+            "silence stays quiet"
+        );
+
+        let quiet_pulse = visualization_canvas(&silence, VizMode::Pulse, 1.0, 8, 5);
+        let loud_pulse = visualization_canvas(&loud, VizMode::Pulse, 1.0, 8, 5);
+        assert_ne!(quiet_pulse, loud_pulse);
+
+        let low_gain = visualization_canvas(&loud, VizMode::Bars, 0.5, 16, 4);
+        let high_gain = visualization_canvas(&loud, VizMode::Bars, 1.5, 16, 4);
+        assert_ne!(low_gain, high_gain, "sensitivity changes the display");
+
+        let waveform = visualization_canvas(&loud, VizMode::Waveform, 1.0, 16, 5);
+        assert!(waveform.iter().any(|line| line.contains('•')));
+    }
+
+    #[test]
+    fn queue_clear_requires_confirmation_and_preserves_the_library() {
+        let dir = TempDir::new("tui-clear-queue");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        tui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = tui.controller.tracks()[0].0;
+        tui.controller.clear_queue();
+        tui.controller.enqueue_track(id).expect("queue");
+        key(&mut tui, KeyCode::Char('Q'));
+        key(&mut tui, KeyCode::Char('C'));
+        assert_eq!(tui.mode, Mode::ConfirmQueueClear);
+        assert_eq!(tui.controller.queue_len(), 1);
+        key(&mut tui, KeyCode::Char('n'));
+        assert_eq!(
+            tui.controller.queue_len(),
+            1,
+            "cancel leaves the queue intact"
+        );
+        key(&mut tui, KeyCode::Char('C'));
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.controller.queue_len(), 0);
+        assert!(
+            tui.controller.track(id).is_some(),
+            "catalogue track remains"
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_preferences_persist_layout_and_visualizer_choices() {
+        let dir = TempDir::new("tui-preferences");
+        let mut subject = tui(&dir);
+        let path = dir.path().join("tui.conf");
+        subject.prefs_path = Some(path.clone());
+        subject.viz_visible = true;
+        key(&mut subject, KeyCode::Char('m'));
+        key(&mut subject, KeyCode::Char('v'));
+        assert!(!subject.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT)));
+        let text = std::fs::read_to_string(&path).expect("preferences");
+        assert!(text.contains("layout=library"), "{text}");
+        assert!(text.contains("visualizer=hidden"), "{text}");
+        assert!(text.contains("visualization_mode=bars"), "{text}");
+
+        subject.controller.shutdown();
+        let mut restored_tui = tui(&dir);
+        restored_tui.prefs_path = Some(path);
+        restored_tui.load_preferences();
+        assert_eq!(restored_tui.layout, LayoutMode::Library);
+        assert!(!restored_tui.viz_visible);
+        assert_eq!(restored_tui.viz_mode, VizMode::Bars);
+        restored_tui.controller.shutdown();
+    }
+    #[test]
+    fn command_palette_switches_views_and_visualizer_settings() {
+        let dir = TempDir::new("tui-command-palette");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char(':'));
+        assert_eq!(tui.mode, Mode::CommandInput);
+        type_text(&mut tui, "artists");
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.view, View::Artists);
+
+        key(&mut tui, KeyCode::Char(':'));
+        type_text(&mut tui, "layout player");
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.layout, LayoutMode::Player);
+
+        key(&mut tui, KeyCode::Char(':'));
+        type_text(&mut tui, "viz bars");
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.viz_mode, VizMode::Bars);
+        assert!(tui.viz_visible);
         tui.controller.shutdown();
     }
 }
