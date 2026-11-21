@@ -2489,6 +2489,17 @@ mod tests {
         seen
     }
 
+    fn drain_until_audible(control: &NullControl, channels: usize) {
+        for _ in 0..4_000 {
+            control.drain_frames(512);
+            if nonzero_frames(control, channels) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("no audible frames reached the null output");
+    }
+
     fn nonzero_frames(control: &NullControl, channels: usize) -> usize {
         control
             .captured()
@@ -3136,10 +3147,7 @@ mod tests {
             matches!(e, EngineEvent::Loaded { .. })
         });
         engine.play();
-        for _ in 0..6 {
-            control.drain_frames(512);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        drain_until_audible(&control, 1);
         assert!(
             nonzero_frames(&control, 1) > 0,
             "track A is audible in the capture"
@@ -5692,10 +5700,7 @@ mod tests {
         drive_until(&engine, &control, |e| {
             matches!(e, EngineEvent::Started { .. })
         });
-        for _ in 0..8 {
-            control.drain_frames(512);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        drain_until_audible(&control, 1);
         assert!(nonzero_frames(&control, 1) > 0);
 
         engine.pause();
