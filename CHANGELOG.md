@@ -6,6 +6,18 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M19 completion
+
+- TUI Artist deletion transfer now uses explicit destination selection: choose a
+  surviving owner, then an eligible existing album or a uniquely titled new
+  album and release type. Auto-resolution remains a separate convenience action.
+- TUI Album ownership transfer is available from Album detail with `Alt+t`,
+  including per-track destination-credit decisions and readiness validation.
+- Added regression coverage for interactive artist transfer and album transfer
+  with credit resolution.
+- Added `docs/release-readiness.md` with release blockers, signing state,
+  deferred manual validation and verified packaging inputs.
+
 ### M18 completion
 
 - TUI populated-artist deletion now reviews owned and credited tracks through the

@@ -221,8 +221,8 @@ image, Album title/release/cover, Track artwork, lyrics and managed audio repair
 use shared Controller operations. Album tracks reorder with `Ctrl+↑/↓`, and a
 track can move between owner Albums or to standalone state through a reviewed
 plan. Track deletion, empty-Album deletion and populated Artist deletion require
-explicit confirmation and shared decisions; ownership/Album transfer remains a
-GUI review workflow. Playlists support create, rename, delete, add,
+explicit confirmation and shared decisions. Album ownership transfer is available
+from Album detail; single-track ownership transfer remains a GUI review workflow. Playlists support create, rename, delete, add,
 remove, reorder, clear, play and shuffle-play. The TUI never bypasses deletion or
 repair safety, never deletes external audio, and does not treat an inaccessible
 path as missing.
@@ -2254,11 +2254,12 @@ cleanup.
     Album names. Approximate/fuzzy matching is deliberately not performed;
     ambiguous normalized names require explicit review.
 12. Both frontends delete artists through the shared decision plan. The TUI
-    exposes transfer, credit removal, explicit deletion, reset and safe
-    auto-resolution; ownership/Album transfer remains GUI-only.
-13. Track membership moves, album reorder and managed-audio replacement are
-    available in both frontends through shared Controller plans. Ownership/Album
-    transfer remains GUI-only.
+    exposes explicit owner/album selection, credit removal, explicit deletion,
+    reset and safe auto-resolution. Album ownership transfer is available from
+    Album detail; single-track ownership transfer remains GUI-only.
+13. Track membership moves, album reorder, album ownership transfer and
+    managed-audio replacement are available in both frontends through shared
+    Controller plans. Single-track ownership transfer remains GUI-only.
 14. Audio replacement validates file existence, non-empty content, extension
     safety and fingerprints only; it does not decode the audio or read tags.
 15. On platforms that block deleting an open file, replacing or moving the
@@ -2329,8 +2330,8 @@ cleanup.
     publish is synchronous.
 30. TUI track deletion, managed-audio replacement, artwork/lyrics management,
     album order/membership, playlists, collections, queue clear and audio-device
-    selection are implemented. Populated artist deletion, ownership/Album
-    transfer, batch actions and native pickers remain GUI-only.
+    selection are implemented. Single-track ownership transfer, batch actions
+    and native pickers remain GUI-only.
 31. TUI truncation uses Unicode display-cell width for combining marks and
     wide characters. Complex emoji ZWJ sequences may still be conservatively
     approximated; broad terminal-emulator compatibility was not exhaustively

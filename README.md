@@ -233,7 +233,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   history, import, library lifecycle and audio-device workflows remain available.
   Album tracks reorder in place and tracks can move between albums or to
   standalone state; track deletion, empty-album deletion and populated artist
-  deletion use explicit confirmation and shared decision plans. `Alt+r` reviews managed-audio repair or
+  deletion use explicit confirmation and shared decision plans. Artist transfer
+  chooses the surviving owner and destination album explicitly; Album detail
+  offers reviewed ownership transfer with per-track credit decisions. `Alt+r` reviews managed-audio repair or
   replacement. Import review can attach album art, track art and lyrics through
   typed paths, and the lyrics reader exports to a new file. `m` cycles Standard,
   Library, Player, Visualizer and Compact layouts, and `v`/`Alt+v` control a real
@@ -529,8 +531,8 @@ type of a newly created Album remain per-candidate; a featuring boolean and
 one-action metadata templates beyond that scope remain future work. The TUI
 exposes structured Artist/Album/Track metadata forms, album order/membership,
 managed audio repair, artwork/lyrics attachment, fixed-target import, populated
-artist deletion and safe deletion; native pickers, multi-selection and ownership/
-album transfer remain GUI-only.
+artist deletion/transfer, album ownership transfer and safe deletion; native
+pickers, multi-selection and single-track ownership transfer remain GUI-only.
 Lyrics must be valid UTF-8 LRC/TXT; embedded audio tags are neither read nor
 written.
 Native dialogs and file-drop are implemented; cross-platform runtime
@@ -560,6 +562,12 @@ cargo deny check licenses          # license policy (see deny.toml)
 cargo run -p flux-gui --features cpal
 cargo run -p flux-tui --features cpal -- ~/Music
 ```
+
+## Release readiness
+
+See [`docs/release-readiness.md`](docs/release-readiness.md) for the current
+blockers, signing state, deferred manual validation and verified packaging
+inputs. No public release or signing credential is implied by a green CI run.
 
 ## Supported targets and CI
 

@@ -54,7 +54,7 @@ renders real waveform data. Domain rules remain in `flux-app`.
 | Artist image status | Basic | Missing/inaccessible details remain in resource APIs and editor | `artist_image_resource_state` | Partial presentation; no destructive repair action | Existing app tests |
 | Album edit | Delimiter form | Structured Title/Release type/Cover form | `update_album_metadata`, `set/remove_album_cover` | Complete | Album form tests |
 | Album track order/membership | GUI-only | `Ctrl+↑/↓` reorders; `Alt+m` moves to an album or standalone | `reorder_album_track`, `plan/execute_track_move` | Complete | `tui_completes_album_order_membership_and_safe_deletion` |
-| Album delete/transfer | GUI workflow | Empty albums delete with confirmation; transfer remains GUI-only | `delete_empty_album`, shared transfer plans | Empty deletion complete; transfer limitation | Album deletion test |
+| Album delete/transfer | GUI workflow | Empty albums delete with confirmation; `Alt+t` reviews album ownership transfer with explicit artist and credit decisions | `delete_empty_album`, `plan/execute_album_transfer` | Complete | Album transfer test |
 | Track title/artist credit/album/numbering | Delimiter form | Structured prefilled form | `edit_track_metadata`, `create_artist` | Complete | `import_edit_and_artist_keys_use_the_shared_controller` |
 | Track credits/ownership | Read-only info | Structured common fields; `Alt+e` advanced credit/owner form; ownership transfer remains GUI-only | `edit_track_metadata`, transfer plans | Limit: ownership transfer | Existing app tests |
 | Track artwork | Path form | `W` managed override set/remove from a path; `-` removes | `set/remove_track_artwork`, resource state | Complete | Artwork workflow test |
@@ -87,7 +87,7 @@ renders real waveform data. Domain rules remain in `flux-app`.
 | Layout presets | None | `m` cycles five presets; persisted | TUI preference file | Complete | Preferences test |
 | Help and discovery | Large static help | Contextual footer, `?` help, command palette | Frontend presentation | Complete | Help test |
 | Library open/create/migrate | Complete | Preserved | Shared lifecycle APIs | Complete | Existing migration tests |
-| Track/Artist/Album deletion | GUI review | Track deletion, empty albums and populated artist deletion use shared plans and explicit confirmation | `plan/delete_track`, `delete_empty_album`, artist decision plan/execute | Complete for supported decisions; ownership/album transfer stays GUI | Album/artist deletion tests |
+| Track/Artist/Album deletion | GUI review | Track deletion, empty albums and populated artist deletion use shared plans and explicit confirmation; artist transfer chooses owner and destination album interactively | Shared deletion/transfer plans | Complete | Album/artist deletion tests |
 | Track audio replacement | GUI review | `Alt+r` plans a replacement and confirms with `y` | `plan/execute_track_audio_replacement` | Complete | `tui_reviews_managed_audio_replacement...` |
 
 ## Genuine limitations
@@ -123,6 +123,7 @@ renders real waveform data. Domain rules remain in `flux-app`.
 | `e` | Structured track edit |
 | `Alt+m` | Move selected track to an album or standalone |
 | `Alt+r` | Review managed-audio replacement or missing-file repair |
+| `Alt+t` in album detail | Review album ownership transfer |
 | `F` in import | Choose a fixed target album |
 | `1`–`5` in import | Bulk Album/EP/Single/Compilation/Other release type |
 | `Delete` | Review track, empty-album or populated artist deletion |
@@ -131,7 +132,7 @@ renders real waveform data. Domain rules remain in `flux-app`.
 | `y` | Read selected/current lyrics |
 | `x` in lyrics | Export lyrics to a new path |
 | `A`/`T`/`L` in import | Attach album artwork / track artwork / lyrics |
-| `t`/`r`/`d`/`a` in artist deletion | Transfer / remove credit / explicit delete twice / auto-resolve |
+| `t`/`r`/`d`/`a` in artist deletion | Choose owner/album / remove credit / explicit delete twice / auto-resolve |
 | `N` / `R` / `x` | New / rename / delete playlist (context) |
 | `l` / `d` / `c` | Play playlist / remove entry / clear playlist (detail context) |
 | `Ctrl+↑`/`Ctrl+↓` | Reorder queue entry or playlist entry |
