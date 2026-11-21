@@ -2159,6 +2159,7 @@ struct FluxReady {
     navigation_stack: Vec<NavigationSnapshot>,
     page: usize,
     queue_page: usize,
+    queue_clear_confirm: bool,
     queue_drag: Option<QueueDrag>,
     last_queue_current: Option<QueueEntryId>,
     scope: FlowScope,
@@ -2461,6 +2462,9 @@ enum Message {
     PageNext,
     QueuePagePrev,
     QueuePageNext,
+    QueueClearPressed,
+    QueueClearConfirm,
+    QueueClearCancel,
     PlayTrack(TrackId),
     EnqueueTrack(TrackId),
     PlayNextTrack(TrackId),
@@ -2640,6 +2644,7 @@ impl FluxReady {
             navigation_stack: Vec::new(),
             page: 0,
             queue_page,
+            queue_clear_confirm: false,
             queue_drag: None,
             last_queue_current: current,
             scope: FlowScope::default(),
@@ -7429,6 +7434,17 @@ impl FluxReady {
                     self.playlist_entry_selection.clear();
                     self.playlist_remove_confirm = false;
                 }
+            }
+            Message::QueueClearPressed => {
+                self.queue_clear_confirm = self.controller.queue_len() > 0;
+            }
+            Message::QueueClearCancel => self.queue_clear_confirm = false,
+            Message::QueueClearConfirm => {
+                let removed = self.controller.clear_queue();
+                self.queue_clear_confirm = false;
+                self.queue_page = 0;
+                self.queue_drag = None;
+                self.lifecycle_msg = Some(format!("Cleared {removed} queue entr(ies)."));
             }
             Message::QueuePagePrev => {
                 self.cancel_queue_drag();
@@ -15682,6 +15698,35 @@ impl FluxReady {
             ]
             .align_y(Alignment::Center),
         );
+        if total > 0 {
+            panel = panel.push(if self.queue_clear_confirm {
+                row![
+                    text("Clear all entries?")
+                        .size(9)
+                        .color(MUTED)
+                        .width(Length::Fill),
+                    button(text("Confirm").size(9))
+                        .style(danger_button_style)
+                        .padding([2, 6])
+                        .on_press(Message::QueueClearConfirm),
+                    button(text("Cancel").size(9))
+                        .style(ghost_style)
+                        .padding([2, 6])
+                        .on_press(Message::QueueClearCancel),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center)
+            } else {
+                row![
+                    iced::widget::Space::new().width(Length::Fill),
+                    button(text("Clear queue").size(9))
+                        .style(ghost_style)
+                        .padding([2, 6])
+                        .on_press(Message::QueueClearPressed),
+                ]
+                .align_y(Alignment::Center)
+            });
+        }
         if total == 0 {
             panel = panel.push(
                 text("Use + on any track to add it to the queue.")
@@ -16713,6 +16758,7 @@ mod tests {
             navigation_stack: Vec::new(),
             page: 0,
             queue_page: 0,
+            queue_clear_confirm: false,
             queue_drag: None,
             last_queue_current,
             scope: FlowScope::default(),
@@ -21853,6 +21899,38 @@ mod tests {
         let manager = gui.import_manager.as_ref().expect("manager");
         assert!(manager.plan.is_some());
         assert_eq!(manager.stage, ImportUiStage::Review);
+        gui.controller.shutdown();
+    }
+    #[test]
+    fn gui_clear_queue_requires_explicit_confirmation() {
+        let dir = TempDir::new("gui-clear-queue");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let source = dir.path().join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = gui.controller.tracks()[0].0;
+        gui.controller.clear_queue();
+        gui.controller.enqueue_track(id).expect("queue");
+        send(&mut gui, Message::QueueClearPressed);
+        assert!(gui.queue_clear_confirm);
+        assert_eq!(gui.controller.queue_len(), 1);
+        send(&mut gui, Message::QueueClearCancel);
+        assert!(!gui.queue_clear_confirm);
+        assert_eq!(gui.controller.queue_len(), 1);
+        send(&mut gui, Message::QueueClearPressed);
+        send(&mut gui, Message::QueueClearConfirm);
+        assert!(!gui.queue_clear_confirm);
+        assert_eq!(gui.controller.queue_len(), 0);
+        assert!(gui.controller.track(id).is_some());
         gui.controller.shutdown();
     }
 }
