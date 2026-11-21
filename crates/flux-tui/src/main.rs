@@ -20,6 +20,16 @@
 //! help. `m` cycles layouts; `v` toggles the visualizer and `Alt+v` cycles its
 //! modes. The terminal is restored on normal exit, error and panic.
 
+mod text;
+mod visualizer;
+
+use text::{
+    clamp_terminal_size, count_label, detail_view_fits, display_album, display_title,
+    display_width, fit_input_line, format_lyrics_timestamp, pad_with_right, resource_label,
+    sentence_case, terminal_too_small, truncate_to_width,
+};
+use visualizer::{VizMode, visualization_canvas};
+
 use std::cell::RefCell;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -40,11 +50,10 @@ use flux_app::{
     AlbumId, AudioOutputDevice, AudioStatus, CandidateStatus, CanonicalMigrationPlan, Controller,
     ImportDecision, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
     OpenedAudioOutput, PlaylistId, PreparedImport, ReconcileReport, SmartCollection, StorageMode,
-    TrackMetadataEdit, WaveformScope, format_duration, is_track_playable, prepare_import_files,
-    prepare_import_plan, waveform_sample,
+    TrackDeletionPlan, TrackMetadataEdit, TrackMovePlan, WaveformScope, format_duration,
+    is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{APP_VERSION, ArtistId, PlaybackState, Track, TrackId};
-use unicode_width::UnicodeWidthChar;
 
 fn handle_cli() -> bool {
     for arg in std::env::args_os().skip(1) {
@@ -241,31 +250,6 @@ impl LayoutMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VizMode {
-    Waveform,
-    Bars,
-    Pulse,
-}
-
-impl VizMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Waveform => "Waveform",
-            Self::Bars => "Bars",
-            Self::Pulse => "Pulse",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Waveform => Self::Bars,
-            Self::Bars => Self::Pulse,
-            Self::Pulse => Self::Waveform,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
     ScanInput,
@@ -322,6 +306,39 @@ enum Mode {
     ConfirmPlaylist,
     /// Explicit confirmation before clearing the whole queue.
     ConfirmQueueClear,
+    /// Choosing a destination album or standalone state for one track.
+    TrackMovePick,
+    /// Confirming a reviewed album-membership move.
+    ConfirmTrackMove,
+    /// Typing a replacement audio path for one track.
+    TrackReplacementInput,
+    /// Confirming a reviewed managed-audio replacement.
+    ConfirmTrackReplacement,
+    /// Confirming a reviewed single-track deletion.
+    ConfirmTrackDelete,
+    /// Confirming deletion of an empty album.
+    ConfirmAlbumDelete,
+    /// Confirming deletion of an artist with no track decisions.
+    ConfirmArtistDelete,
+    /// Exporting managed lyrics to a user path.
+    LyricsExportInput,
+    /// Attaching import album artwork, track artwork or lyrics.
+    ImportAssetInput,
+}
+
+#[derive(Debug, Clone)]
+struct MoveTarget {
+    album: Option<AlbumId>,
+    label: String,
+    tracks: usize,
+    current: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportAssetKind {
+    AlbumArtwork,
+    TrackArtwork,
+    Lyrics,
 }
 
 #[derive(Debug, Clone)]
@@ -499,6 +516,15 @@ struct Tui {
     /// Structured form shared by common metadata and playlist edits.
     form: Option<FormState>,
     playlist_action: Option<PlaylistAction>,
+    move_track: Option<TrackId>,
+    move_cursor: usize,
+    pending_move: Option<TrackMovePlan>,
+    pending_track_delete: Option<TrackDeletionPlan>,
+    pending_album_delete: Option<AlbumId>,
+    pending_artist_delete: Option<flux_app::ArtistDeletionPlan>,
+    import_asset: Option<ImportAssetKind>,
+    asset_track: Option<TrackId>,
+    pending_replacement: Option<flux_app::TrackAudioReplacementPlan>,
     /// Audio-device list and asynchronous selection state.
     audio_devices: Vec<AudioOutputDevice>,
     audio_error: Option<String>,
@@ -1984,6 +2010,9 @@ impl Tui {
             KeyCode::Char('e') => {
                 self.open_import_form(self.import_ui.as_ref().map_or(0, |ui| ui.selected))
             }
+            KeyCode::Char('A') => self.begin_import_asset(ImportAssetKind::AlbumArtwork),
+            KeyCode::Char('T') => self.begin_import_asset(ImportAssetKind::TrackArtwork),
+            KeyCode::Char('L') => self.begin_import_asset(ImportAssetKind::Lyrics),
             KeyCode::Char('u') => self.toggle_import_update(),
             KeyCode::Char('a') => self.bulk_import_decision(ImportDecision::ImportNew),
             KeyCode::Char('s') => self.bulk_import_decision(ImportDecision::Skip),
@@ -2097,10 +2126,12 @@ impl Tui {
         };
         let title = if issue_count > 0 {
             format!(
-                "Import review · {count} track(s) · {issue_count} unreadable · e edit · Enter import · Esc cancel"
+                "Import review · {count} track(s) · {issue_count} unreadable · e edit · A/T/L assets · Enter import · Esc cancel"
             )
         } else {
-            format!("Import review · {count} track(s) · e edit · Enter import · Esc cancel")
+            format!(
+                "Import review · {count} track(s) · e edit · A/T/L assets · Enter import · Esc cancel"
+            )
         };
         self.line(out, top as u16, &title, width, true)?;
         for (row, (selected, text)) in rows.into_iter().enumerate() {
@@ -2343,6 +2374,7 @@ impl Tui {
                 KeyCode::End | KeyCode::Char('G') => {
                     self.lyrics_scroll = self.lyrics_lines.len().saturating_sub(1);
                 }
+                KeyCode::Char('x') => self.begin_lyrics_export(),
                 _ => {}
             }
             return false;
@@ -2357,6 +2389,68 @@ impl Tui {
             Mode::FormInput => return self.handle_form_key(key, ctrl_c),
             Mode::CommandInput => return self.handle_command_key(key, ctrl_c),
             Mode::ConfirmPlaylist => return self.handle_playlist_confirm(key, ctrl_c),
+            Mode::TrackMovePick => {
+                if ctrl_c {
+                    return true;
+                }
+                let targets = self.move_targets();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.mode = Mode::Normal;
+                        self.move_track = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.move_cursor = self.move_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.move_cursor =
+                            (self.move_cursor + 1).min(targets.len().saturating_sub(1));
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => self.move_cursor = 0,
+                    KeyCode::End | KeyCode::Char('G') => {
+                        self.move_cursor = targets.len().saturating_sub(1);
+                    }
+                    KeyCode::Char('s') => {
+                        if let Some(index) =
+                            targets.iter().position(|target| target.album.is_none())
+                        {
+                            self.move_cursor = index;
+                            self.plan_move_target();
+                        }
+                    }
+                    KeyCode::Enter => self.plan_move_target(),
+                    _ => {}
+                }
+                return key.code == KeyCode::Char('q');
+            }
+            Mode::ConfirmTrackMove
+            | Mode::ConfirmTrackReplacement
+            | Mode::ConfirmTrackDelete
+            | Mode::ConfirmAlbumDelete
+            | Mode::ConfirmArtistDelete => {
+                if ctrl_c {
+                    return true;
+                }
+                if key.code == KeyCode::Char('y') {
+                    match self.mode {
+                        Mode::ConfirmTrackMove => self.confirm_track_move(),
+                        Mode::ConfirmTrackReplacement => self.confirm_track_replacement(),
+                        Mode::ConfirmTrackDelete => self.confirm_track_deletion(),
+                        Mode::ConfirmAlbumDelete => self.confirm_album_deletion(),
+                        Mode::ConfirmArtistDelete => self.confirm_artist_deletion(),
+                        _ => {}
+                    }
+                } else {
+                    self.pending_move = None;
+                    self.pending_replacement = None;
+                    self.pending_track_delete = None;
+                    self.pending_album_delete = None;
+                    self.pending_artist_delete = None;
+                    self.mode = Mode::Normal;
+                    self.lifecycle_msg = Some("Destructive action cancelled.".to_owned());
+                }
+                return false;
+            }
             Mode::ConfirmQueueClear => {
                 if ctrl_c {
                     return true;
@@ -2387,7 +2481,24 @@ impl Tui {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Up | KeyCode::Down => {
-                    if let Some(Detail::Playlist(id)) = self.detail {
+                    if let Some(Detail::Album(album)) = self.detail {
+                        if let Some(track) = self.current_track() {
+                            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                            match self.controller.reorder_album_track(album, track, delta) {
+                                Ok(()) => {
+                                    if key.code == KeyCode::Up {
+                                        self.cursor = self.cursor.saturating_sub(1);
+                                    } else {
+                                        self.cursor = (self.cursor + 1)
+                                            .min(self.view_rows().len().saturating_sub(1));
+                                    }
+                                    self.lifecycle_msg =
+                                        Some("Reordered the album track.".to_owned());
+                                }
+                                Err(error) => self.lifecycle_msg = Some(error),
+                            }
+                        }
+                    } else if let Some(Detail::Playlist(id)) = self.detail {
                         if let Some(playlist) = self.controller.playlist(id) {
                             let tracks = playlist.track_ids.clone();
                             let from = self.cursor;
@@ -2437,6 +2548,17 @@ impl Tui {
                     self.save_preferences();
                     self.lifecycle_msg =
                         Some(format!("Visualizer sensitivity: {:.2}×.", self.viz_gain));
+                }
+                KeyCode::Char('m') => self.open_move_picker(),
+                KeyCode::Char('r') => {
+                    if let Some(id) = self.current_track() {
+                        self.asset_track = Some(id);
+                        self.input.clear();
+                        self.mode = Mode::TrackReplacementInput;
+                    } else {
+                        self.lifecycle_msg =
+                            Some("Select a track to repair or replace.".to_owned());
+                    }
                 }
                 KeyCode::Char('e') => {
                     if let Some(id) = self.current_track()
@@ -2686,7 +2808,8 @@ impl Tui {
             }
             KeyCode::Char('W') => {
                 if let Some(id) = self.current_track() {
-                    self.input = track_asset_form(id);
+                    self.asset_track = Some(id);
+                    self.input.clear();
                     self.mode = Mode::TrackArtworkInput;
                 } else {
                     self.lifecycle_msg = Some("Select a track first.".to_owned());
@@ -2694,7 +2817,8 @@ impl Tui {
             }
             KeyCode::Char('S') => {
                 if let Some(id) = self.current_track() {
-                    self.input = track_asset_form(id);
+                    self.asset_track = Some(id);
+                    self.input.clear();
                     self.mode = Mode::TrackLyricsInput;
                 } else {
                     self.lifecycle_msg = Some("Select a track first.".to_owned());
@@ -3166,6 +3290,22 @@ impl Tui {
                     self.lifecycle_msg = Some("Select a track to add to a playlist.".to_owned());
                 }
             }
+            KeyCode::Delete => {
+                if matches!(self.detail, Some(Detail::Artist(_))) {
+                    self.open_artist_deletion();
+                } else if matches!(self.detail, Some(Detail::Album(_)))
+                    && self.current_track().is_none()
+                {
+                    self.open_album_deletion();
+                } else if self.current_track().is_some()
+                    && !matches!(self.detail, Some(Detail::Playlist(_)))
+                {
+                    self.open_track_deletion();
+                } else {
+                    self.lifecycle_msg =
+                        Some("Select a track, empty album or artist to delete.".to_owned());
+                }
+            }
             KeyCode::Char('N') => {
                 if self.view == View::Playlists {
                     self.open_playlist_create_form();
@@ -3601,6 +3741,418 @@ impl Tui {
         }
     }
 
+    fn move_targets(&self) -> Vec<MoveTarget> {
+        let Some(track) = self.move_track.or_else(|| self.current_track()) else {
+            return Vec::new();
+        };
+        let Some(track_value) = self.controller.track(track) else {
+            return Vec::new();
+        };
+        let owner = self.controller.track_artist_id(track);
+        let current_album = self.controller.track_album_id(track);
+        let mut targets = Vec::new();
+        if let Some(owner) = owner {
+            let mut albums = self
+                .controller
+                .albums_owned_by(owner)
+                .into_iter()
+                .filter_map(|id| self.controller.album(id))
+                .collect::<Vec<_>>();
+            albums.sort_by(|left, right| {
+                left.title
+                    .to_lowercase()
+                    .cmp(&right.title.to_lowercase())
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            for album in albums {
+                targets.push(MoveTarget {
+                    album: Some(album.id),
+                    label: format!(
+                        "{} · {}",
+                        album.title,
+                        count_label(album.track_order.len(), "track")
+                    ),
+                    tracks: album.track_order.len(),
+                    current: current_album == Some(album.id),
+                });
+            }
+        }
+        targets.push(MoveTarget {
+            album: None,
+            label: format!("Standalone · {}", display_title(track_value)),
+            tracks: 0,
+            current: current_album.is_none(),
+        });
+        targets
+    }
+
+    fn open_move_picker(&mut self) {
+        let Some(track) = self.current_track() else {
+            self.lifecycle_msg = Some("Select a track to move.".to_owned());
+            return;
+        };
+        self.move_track = Some(track);
+        self.move_cursor = 0;
+        self.mode = Mode::TrackMovePick;
+    }
+
+    fn plan_move_target(&mut self) {
+        let Some(track) = self.move_track else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let targets = self.move_targets();
+        let Some(target) = targets.get(self.move_cursor) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let insertion = target.tracks;
+        match self
+            .controller
+            .plan_track_move(track, target.album, insertion)
+        {
+            Ok(plan) => {
+                self.lifecycle_msg = Some(format!(
+                    "Review: {} → {} at position {}. Press y to confirm.",
+                    plan.from_album_title.as_deref().unwrap_or("Standalone"),
+                    plan.to_album_title.as_deref().unwrap_or("Standalone"),
+                    plan.insertion_index + 1
+                ));
+                self.pending_move = Some(plan);
+                self.mode = Mode::ConfirmTrackMove;
+            }
+            Err(error) => {
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
+    fn open_track_deletion(&mut self) {
+        let Some(track) = self.current_track() else {
+            self.lifecycle_msg = Some("Select a track to delete.".to_owned());
+            return;
+        };
+        match self.controller.plan_track_deletion(track) {
+            Ok(plan) => {
+                self.lifecycle_msg = Some(format!(
+                    "Delete “{}”? Managed audio, lyrics, artwork, rating and queue entries will be removed; the album and artist remain. y confirms.",
+                    plan.inner.title
+                ));
+                self.pending_track_delete = Some(plan);
+                self.mode = Mode::ConfirmTrackDelete;
+            }
+            Err(error) => self.lifecycle_msg = Some(error),
+        }
+    }
+
+    fn open_album_deletion(&mut self) {
+        let Some(Detail::Album(album)) = self.detail else {
+            self.lifecycle_msg = Some("Open an album to delete it.".to_owned());
+            return;
+        };
+        let Some(value) = self.controller.album(album) else {
+            self.lifecycle_msg = Some("The album is no longer present.".to_owned());
+            return;
+        };
+        if !value.track_order.is_empty() {
+            self.lifecycle_msg = Some(
+                "Only empty albums can be deleted. Move or delete their tracks first.".to_owned(),
+            );
+            return;
+        }
+        self.pending_album_delete = Some(album);
+        self.mode = Mode::ConfirmAlbumDelete;
+        self.lifecycle_msg = Some(format!(
+            "Delete the empty album “{}”? AlbumId is retired; no tracks or files are touched. y confirms.",
+            value.title
+        ));
+    }
+
+    fn open_artist_deletion(&mut self) {
+        let Some(Detail::Artist(artist)) = self.detail else {
+            self.lifecycle_msg = Some("Open an artist to delete it.".to_owned());
+            return;
+        };
+        match self.controller.plan_artist_deletion(artist) {
+            Ok(plan) => {
+                if !plan.owned_tracks.is_empty() || !plan.credited_tracks.is_empty() {
+                    self.lifecycle_msg = Some(
+                        "This artist still owns or credits tracks. Use the GUI deletion review to resolve transfers, credits and track deletions."
+                            .to_owned(),
+                    );
+                } else if !plan.is_ready() {
+                    self.lifecycle_msg = Some(format!(
+                        "Artist deletion is blocked: {}",
+                        plan.blocking_reason().unwrap_or("review required")
+                    ));
+                } else {
+                    let name = plan.artist_name.clone();
+                    self.pending_artist_delete = Some(plan);
+                    self.mode = Mode::ConfirmArtistDelete;
+                    self.lifecycle_msg = Some(format!(
+                        "Delete artist “{name}” and its empty albums? No tracks are touched. y confirms."
+                    ));
+                }
+            }
+            Err(error) => self.lifecycle_msg = Some(error),
+        }
+    }
+
+    fn confirm_track_move(&mut self) {
+        let Some(plan) = self.pending_move.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match self.controller.execute_track_move(&plan) {
+            Ok(report) => {
+                self.detail = report.to_album_id.map(Detail::Album);
+                self.mode = Mode::Normal;
+                self.reset_selection();
+                self.lifecycle_msg = Some("Moved the track and preserved its identity.".to_owned());
+            }
+            Err(error) => {
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
+    fn plan_track_replacement(&mut self, path_text: &str) {
+        let Some(id) = self.asset_track else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let path = PathBuf::from(path_text.trim());
+        if path.as_os_str().is_empty() {
+            self.lifecycle_msg = Some("Enter a replacement audio path.".to_owned());
+            self.mode = Mode::TrackReplacementInput;
+            return;
+        }
+        match self.controller.plan_track_audio_replacement(id, &path) {
+            Ok(plan) => {
+                let title = self
+                    .controller
+                    .track(id)
+                    .map(display_title)
+                    .unwrap_or_else(|| format!("Track {id}"));
+                self.lifecycle_msg = Some(format!(
+                    "Review: replace managed audio for “{title}” from {}. TrackId and references are preserved. y confirms.",
+                    path.display()
+                ));
+                self.pending_replacement = Some(plan);
+                self.mode = Mode::ConfirmTrackReplacement;
+            }
+            Err(error) => {
+                self.lifecycle_msg = Some(error);
+                self.mode = Mode::TrackReplacementInput;
+            }
+        }
+    }
+
+    fn confirm_track_replacement(&mut self) {
+        let Some(plan) = self.pending_replacement.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match self.controller.execute_track_audio_replacement(&plan) {
+            Ok(report) => {
+                self.mode = Mode::Normal;
+                self.asset_track = None;
+                self.reset_selection();
+                self.lifecycle_msg = Some(if report.restored_missing_audio {
+                    "Repaired the missing managed audio; the track kept its identity.".to_owned()
+                } else {
+                    "Replaced the managed audio; the track kept its identity.".to_owned()
+                });
+            }
+            Err(error) => {
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
+    fn confirm_track_deletion(&mut self) {
+        let Some(plan) = self.pending_track_delete.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match self.controller.delete_track(&plan) {
+            Ok(report) => {
+                self.mode = Mode::Normal;
+                self.reset_selection();
+                self.lifecycle_msg = Some(if report.cleanup_errors.is_empty() {
+                    format!("Deleted track {}.", report.track_id)
+                } else {
+                    format!(
+                        "Track {} was deleted; managed-resource cleanup needs attention: {}",
+                        report.track_id,
+                        report.cleanup_errors.join("; ")
+                    )
+                });
+            }
+            Err(error) => {
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
+    fn confirm_album_deletion(&mut self) {
+        let Some(album) = self.pending_album_delete.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match self.controller.delete_empty_album(album) {
+            Ok(()) => {
+                self.detail = None;
+                self.mode = Mode::Normal;
+                self.reset_selection();
+                self.lifecycle_msg = Some("Deleted the empty album.".to_owned());
+            }
+            Err(error) => {
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
+    fn confirm_artist_deletion(&mut self) {
+        let Some(plan) = self.pending_artist_delete.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match self.controller.execute_artist_deletion(&plan) {
+            Ok(_) => {
+                self.detail = None;
+                self.mode = Mode::Normal;
+                self.reset_selection();
+                self.lifecycle_msg = Some("Deleted the artist and its empty albums.".to_owned());
+            }
+            Err(error) => {
+                self.mode = Mode::Normal;
+                self.lifecycle_msg = Some(error);
+            }
+        }
+    }
+
+    fn begin_lyrics_export(&mut self) {
+        if self.lyrics_track.is_none() {
+            self.lifecycle_msg = Some("Open managed lyrics first.".to_owned());
+            return;
+        }
+        self.input.clear();
+        self.mode = Mode::LyricsExportInput;
+    }
+
+    fn export_lyrics(&mut self, path_text: &str) {
+        let Some(track) = self.lyrics_track else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let Some(lyrics) = self.controller.track_lyrics(track) else {
+            self.mode = Mode::Normal;
+            self.lifecycle_msg = Some("This track has no managed lyrics.".to_owned());
+            return;
+        };
+        let path = PathBuf::from(path_text.trim());
+        if path.as_os_str().is_empty() {
+            self.lifecycle_msg = Some("Enter an export path.".to_owned());
+            self.mode = Mode::LyricsExportInput;
+            return;
+        }
+        if path.exists() {
+            self.lifecycle_msg =
+                Some("That file already exists; choose a new export path.".to_owned());
+            self.mode = Mode::LyricsExportInput;
+            return;
+        }
+        match std::fs::write(&path, lyrics) {
+            Ok(()) => {
+                self.mode = Mode::LyricsView;
+                self.lifecycle_msg = Some(format!("Exported lyrics to {}.", path.display()));
+            }
+            Err(error) => {
+                self.lifecycle_msg = Some(format!(
+                    "Could not export lyrics to {}: {error}",
+                    path.display()
+                ));
+                self.mode = Mode::LyricsExportInput;
+            }
+        }
+    }
+
+    fn begin_import_asset(&mut self, kind: ImportAssetKind) {
+        self.import_asset = Some(kind);
+        self.input.clear();
+        self.mode = Mode::ImportAssetInput;
+    }
+
+    fn apply_import_asset(&mut self, path_text: &str) {
+        let Some(kind) = self.import_asset.take() else {
+            self.mode = Mode::ImportReview;
+            return;
+        };
+        let path = PathBuf::from(path_text.trim());
+        if path.as_os_str().is_empty() {
+            self.lifecycle_msg = Some("Enter an asset path, or - to clear.".to_owned());
+            self.import_asset = Some(kind);
+            self.mode = Mode::ImportAssetInput;
+            return;
+        }
+        let Some(ui) = self.import_ui.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let Some(plan) = ui.plan.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let index = ui.selected;
+        let Some(candidate) = plan.candidates.get_mut(index) else {
+            self.mode = Mode::ImportReview;
+            return;
+        };
+        let result = match kind {
+            ImportAssetKind::AlbumArtwork => {
+                if path.as_os_str() == "-" {
+                    candidate.clear_album_artwork();
+                    Ok(())
+                } else if candidate.album().is_none() {
+                    Err("Album artwork requires an album title for this track.".to_owned())
+                } else {
+                    candidate.set_album_artwork(&path)
+                }
+            }
+            ImportAssetKind::TrackArtwork => {
+                if path.as_os_str() == "-" {
+                    candidate.clear_artwork();
+                    Ok(())
+                } else {
+                    candidate.set_artwork(&path)
+                }
+            }
+            ImportAssetKind::Lyrics => {
+                if path.as_os_str() == "-" {
+                    candidate.set_lyrics_text(None);
+                    Ok(())
+                } else {
+                    plan.apply_lyrics_from_path(&[index], &path)
+                }
+            }
+        };
+        self.mode = Mode::ImportReview;
+        self.lifecycle_msg = Some(match result {
+            Ok(()) => match kind {
+                ImportAssetKind::AlbumArtwork => "Updated album artwork for the review.".to_owned(),
+                ImportAssetKind::TrackArtwork => "Updated track artwork for the review.".to_owned(),
+                ImportAssetKind::Lyrics => "Attached lyrics to the review.".to_owned(),
+            },
+            Err(error) => error,
+        });
+    }
+
     fn handle_playlist_confirm(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
         if ctrl_c {
             return true;
@@ -3706,6 +4258,71 @@ impl Tui {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, ctrl_c: bool) -> bool {
+        if self.mode == Mode::LyricsExportInput {
+            if ctrl_c {
+                return true;
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::LyricsView;
+                    self.lifecycle_msg = Some("Lyrics export cancelled.".to_owned());
+                }
+                KeyCode::Enter => {
+                    let text = std::mem::take(&mut self.input);
+                    self.export_lyrics(&text);
+                }
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) => self.input.push(character),
+                _ => {}
+            }
+            return false;
+        }
+        if self.mode == Mode::TrackReplacementInput {
+            if ctrl_c {
+                return true;
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    self.asset_track = None;
+                    self.mode = Mode::Normal;
+                    self.lifecycle_msg = Some("Audio replacement cancelled.".to_owned());
+                }
+                KeyCode::Enter => {
+                    let text = std::mem::take(&mut self.input);
+                    self.plan_track_replacement(&text);
+                }
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) => self.input.push(character),
+                _ => {}
+            }
+            return false;
+        }
+        if self.mode == Mode::ImportAssetInput {
+            if ctrl_c {
+                return true;
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    self.import_asset = None;
+                    self.mode = Mode::ImportReview;
+                    self.lifecycle_msg = Some("Asset attachment cancelled.".to_owned());
+                }
+                KeyCode::Enter => {
+                    let text = std::mem::take(&mut self.input);
+                    self.apply_import_asset(&text);
+                }
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                KeyCode::Char(character) => self.input.push(character),
+                _ => {}
+            }
+            return false;
+        }
         // The two migration decision modes are single-key, not text.
         match self.mode {
             Mode::MigrateConfirm => {
@@ -3814,7 +4431,12 @@ impl Tui {
                     Mode::FormInput
                     | Mode::CommandInput
                     | Mode::ConfirmPlaylist
-                    | Mode::ConfirmQueueClear => {}
+                    | Mode::ConfirmQueueClear
+                    | Mode::TrackMovePick
+                    | Mode::ConfirmTrackMove
+                    | Mode::ConfirmTrackDelete
+                    | Mode::ConfirmAlbumDelete
+                    | Mode::ConfirmArtistDelete => {}
                     Mode::ImportInput => {
                         let paths: Vec<PathBuf> = text
                             .split(';')
@@ -3955,69 +4577,77 @@ impl Tui {
                             next = Mode::AlbumEditInput;
                         }
                     },
-                    Mode::TrackArtworkInput => match parse_track_asset_form(&text, "artwork") {
-                        Ok((id, path)) => {
-                            let result = match path {
-                                Some(path) => self.controller.set_track_artwork(id, &path),
-                                None => self.controller.remove_track_artwork(id),
-                            };
-                            match result {
-                                Ok(()) => {
-                                    self.lifecycle_msg =
-                                        Some(format!("Updated artwork override for track {id}."));
-                                }
-                                Err(error) => self.lifecycle_msg = Some(error),
+                    Mode::TrackArtworkInput => {
+                        let Some(id) = self.asset_track else {
+                            self.lifecycle_msg = Some("Select a track first.".to_owned());
+                            return false;
+                        };
+                        let path = text.trim();
+                        let result = if path == "-" {
+                            self.controller.remove_track_artwork(id)
+                        } else if path.is_empty() {
+                            Err("Enter an image path, or - to remove the override.".to_owned())
+                        } else {
+                            self.controller.set_track_artwork(id, Path::new(path))
+                        };
+                        match result {
+                            Ok(()) => {
+                                self.asset_track = None;
+                                self.lifecycle_msg =
+                                    Some(format!("Updated artwork override for track {id}."));
+                            }
+                            Err(error) => {
+                                self.lifecycle_msg = Some(error);
+                                self.input = text;
+                                next = Mode::TrackArtworkInput;
                             }
                         }
-                        Err(err) => {
-                            self.lifecycle_msg = Some(format!(
-                                "{err} The form remains open so you can correct it."
-                            ));
-                            self.input = text;
-                            next = Mode::TrackArtworkInput;
-                        }
-                    },
-                    Mode::TrackLyricsInput => match parse_track_asset_form(&text, "lyrics") {
-                        Ok((id, path)) => {
-                            let result = match path {
-                                Some(path) => match std::fs::read_to_string(&path) {
-                                    Ok(text) if text.len() <= 1024 * 1024 => self
-                                        .controller
-                                        .set_lyrics(id, Some(text.as_str()))
-                                        .map(|()| Some(text)),
-                                    Ok(_) => Err(
-                                        "Lyrics file is larger than 1 MiB; nothing was changed."
-                                            .to_owned(),
-                                    ),
-                                    Err(error) => Err(format!(
-                                        "Could not read lyrics file {}: {error}",
-                                        path.display()
-                                    )),
-                                },
-                                None => self.controller.set_lyrics(id, None).map(|()| None),
-                            };
-                            match result {
-                                Ok(Some(text)) => {
-                                    self.lifecycle_msg = Some(format!(
-                                        "Replaced managed lyrics for track {id} ({} line(s)).",
-                                        text.lines().count()
-                                    ));
+                    }
+                    Mode::TrackLyricsInput => {
+                        let Some(id) = self.asset_track else {
+                            self.lifecycle_msg = Some("Select a track first.".to_owned());
+                            return false;
+                        };
+                        let path = text.trim();
+                        let result = if path == "-" {
+                            self.controller.set_lyrics(id, None).map(|()| None)
+                        } else if path.is_empty() {
+                            Err("Enter a UTF-8 LRC/TXT path, or - to remove lyrics.".to_owned())
+                        } else {
+                            match std::fs::read_to_string(path) {
+                                Ok(text) if text.len() <= 1024 * 1024 => self
+                                    .controller
+                                    .set_lyrics(id, Some(text.as_str()))
+                                    .map(|()| Some(text)),
+                                Ok(_) => {
+                                    Err("Lyrics file is larger than 1 MiB; nothing was changed."
+                                        .to_owned())
                                 }
-                                Ok(None) => {
-                                    self.lifecycle_msg =
-                                        Some(format!("Removed managed lyrics for track {id}."));
+                                Err(error) => {
+                                    Err(format!("Could not read lyrics file {path}: {error}"))
                                 }
-                                Err(error) => self.lifecycle_msg = Some(error),
+                            }
+                        };
+                        match result {
+                            Ok(Some(text)) => {
+                                self.asset_track = None;
+                                self.lifecycle_msg = Some(format!(
+                                    "Replaced managed lyrics for track {id} ({} line(s)).",
+                                    text.lines().count()
+                                ));
+                            }
+                            Ok(None) => {
+                                self.asset_track = None;
+                                self.lifecycle_msg =
+                                    Some(format!("Removed managed lyrics for track {id}."));
+                            }
+                            Err(error) => {
+                                self.lifecycle_msg = Some(error);
+                                self.input = text;
+                                next = Mode::TrackLyricsInput;
                             }
                         }
-                        Err(err) => {
-                            self.lifecycle_msg = Some(format!(
-                                "{err} The form remains open so you can correct it."
-                            ));
-                            self.input = text;
-                            next = Mode::TrackLyricsInput;
-                        }
-                    },
+                    }
                     Mode::OpenInput => {
                         if text.trim().is_empty() {
                             self.lifecycle_msg = Some(
@@ -4097,7 +4727,11 @@ impl Tui {
                     | Mode::ImportReview
                     | Mode::ImportPreparing
                     | Mode::ConfirmPreserveIndex
-                    | Mode::ConfirmAcknowledgeRecovery => {}
+                    | Mode::ConfirmAcknowledgeRecovery
+                    | Mode::LyricsExportInput
+                    | Mode::ImportAssetInput
+                    | Mode::TrackReplacementInput
+                    | Mode::ConfirmTrackReplacement => {}
                 }
                 self.mode = next;
             }
@@ -4320,6 +4954,14 @@ impl Tui {
             Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing => "import",
             Mode::FormInput => "edit",
             Mode::CommandInput => "command",
+            Mode::TrackMovePick => "move",
+            Mode::ConfirmTrackMove
+            | Mode::ConfirmTrackReplacement
+            | Mode::ConfirmTrackDelete
+            | Mode::ConfirmAlbumDelete
+            | Mode::ConfirmArtistDelete
+            | Mode::ConfirmPlaylist
+            | Mode::ConfirmQueueClear => "confirm",
             Mode::Normal => self.view.label(),
             _ => "input",
         };
@@ -4378,6 +5020,15 @@ impl Tui {
                 .map(|form| form.title.clone())
                 .unwrap_or_else(|| "Edit".to_owned()),
             Mode::CommandInput => "Command palette".to_owned(),
+            Mode::TrackMovePick => "Move track · choose an album or standalone".to_owned(),
+            Mode::TrackReplacementInput => "Replace or repair managed audio".to_owned(),
+            Mode::ConfirmTrackMove => "Confirm track move".to_owned(),
+            Mode::ConfirmTrackReplacement => "Confirm audio replacement".to_owned(),
+            Mode::ConfirmTrackDelete => "Confirm track deletion".to_owned(),
+            Mode::ConfirmAlbumDelete => "Confirm empty-album deletion".to_owned(),
+            Mode::ConfirmArtistDelete => "Confirm artist deletion".to_owned(),
+            Mode::LyricsExportInput => "Export managed lyrics".to_owned(),
+            Mode::ImportAssetInput => "Attach import asset".to_owned(),
             _ => self.view_title(),
         };
         queue!(out, SetForegroundColor(self.accent()))?;
@@ -4416,6 +5067,8 @@ impl Tui {
             Mode::ImportScanning | Mode::ImportReview | Mode::ImportPreparing
         ) {
             self.draw_import_view(out, list_top, detail_height, width)?;
+        } else if self.mode == Mode::TrackMovePick {
+            self.draw_move_picker(out, list_top, detail_height, width)?;
         } else if self.mode == Mode::FormInput {
             self.draw_form(out, list_top, detail_height, width)?;
         } else {
@@ -4464,6 +5117,19 @@ impl Tui {
             Mode::ConfirmQueueClear => {
                 "Clear queue — y confirms · any other key cancels".to_owned()
             }
+            Mode::TrackMovePick => {
+                "Move — ↑/↓ choose · Enter review · s standalone · Esc cancel".to_owned()
+            }
+            Mode::TrackReplacementInput => input_line("Replacement audio path (Enter review, Esc cancel): "),
+            Mode::ConfirmTrackMove
+            | Mode::ConfirmTrackReplacement
+            | Mode::ConfirmTrackDelete
+            | Mode::ConfirmAlbumDelete
+            | Mode::ConfirmArtistDelete => {
+                "Review the status line — y confirms · any other key cancels".to_owned()
+            }
+            Mode::LyricsExportInput => input_line("Export lyrics path (Enter write, Esc cancel): "),
+            Mode::ImportAssetInput => input_line("Asset path (Enter apply, - clears, Esc cancel): "),
             Mode::ImportInput => {
                 input_line("Copy import paths separated by ; (Enter import, Esc cancel): ")
             }
@@ -4503,13 +5169,13 @@ impl Tui {
                     .to_owned()
             }
             Mode::LyricsView => {
-                "Lyrics read-only — ↑/↓ scroll · PgUp/PgDn · Esc back · q quits.".to_owned()
+                "Lyrics — ↑/↓ scroll · f follow · x export · Esc back · q quits.".to_owned()
             }
             Mode::ImportScanning | Mode::ImportPreparing => {
                 "Import worker running — Esc cancels · q quits after the worker stops.".to_owned()
             }
             Mode::ImportReview => {
-                "Review — ↑/↓ select · Space include/skip · e edit metadata · a all · s skip all · Enter import · Esc cancel"
+                "Review — ↑/↓ select · Space include/skip · e edit · A/T/L artwork/lyrics · a all · s skip all · Enter import · Esc cancel"
                     .to_owned()
             }
             Mode::ConfirmPreserveIndex => {
@@ -4622,13 +5288,13 @@ impl Tui {
     fn help_line(&self) -> String {
         if let Some(detail) = self.detail {
             return match detail {
-                Detail::Artist(_) => "↑/↓ select · Enter opens album/track · Y edit artist · Esc back · Tab views".to_owned(),
-                Detail::Album(_) => "↑/↓ select · Enter play · Z edit album · Esc back · Tab views".to_owned(),
+                Detail::Artist(_) => "↑/↓ select · Enter opens album/track · Y edit · Delete removes an empty artist · Esc back".to_owned(),
+                Detail::Album(_) => "↑/↓ select · Enter play · Z edit · Ctrl+↑/↓ reorder · Delete removes a track/empty album · Esc back".to_owned(),
                 Detail::Playlist(_) => "↑/↓ select · Enter play · l play all · Alt+s shuffle · d remove · Ctrl+↑/↓ reorder · c clear · R rename · Esc back".to_owned(),
             };
         }
         match self.view {
-            View::Tracks => "↑/↓ move · Enter play · a queue · x next · e edit · f favorite · 0–5 rate · / search · w add to playlist".to_owned(),
+            View::Tracks => "↑/↓ move · Enter play · a queue · x next · e edit · Alt+m move · Delete delete · f favorite · 0–5 rate · / search".to_owned(),
             View::Artists => "↑/↓ select · Enter opens artist · Y edit · P create · Esc back · Tab views".to_owned(),
             View::Albums => "↑/↓ select · Enter opens album · Z edit · Esc back · Tab views".to_owned(),
             View::Playlists => "↑/↓ select · Enter open · N new · R rename · x delete · Esc back".to_owned(),
@@ -5329,6 +5995,44 @@ impl Tui {
         Ok(())
     }
 
+    fn draw_move_picker(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let targets = self.move_targets();
+        if targets.is_empty() {
+            self.line(
+                out,
+                top as u16,
+                "No destination albums are available.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
+        self.move_cursor = self.move_cursor.min(targets.len().saturating_sub(1));
+        for (index, target) in targets.iter().take(height).enumerate() {
+            let text = format!(
+                "{} {}{}",
+                if index == self.move_cursor { ">" } else { " " },
+                target.label,
+                if target.current { "  [current]" } else { "" }
+            );
+            let y = (top + index) as u16;
+            if index == self.move_cursor {
+                queue!(out, MoveTo(0, y), SetAttribute(Attribute::Reverse))?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
     fn draw_form(
         &self,
         out: &mut impl Write,
@@ -5666,29 +6370,6 @@ fn parse_album_edit_form(input: &str) -> Result<AlbumEditForm, String> {
     })
 }
 
-fn track_asset_form(id: TrackId) -> String {
-    format!("{id}|")
-}
-
-fn parse_track_asset_form(input: &str, label: &str) -> Result<(TrackId, Option<PathBuf>), String> {
-    let fields: Vec<&str> = input.split('|').map(str::trim).collect();
-    if fields.len() != 2 {
-        return Err(format!(
-            "Track {label} format: track-id|path or track-id|- to remove."
-        ));
-    }
-    let id = fields[0]
-        .parse::<u64>()
-        .map(TrackId::new)
-        .map_err(|_| "Track ID must be a whole number.".to_owned())?;
-    let path = match fields[1] {
-        "" => return Err(format!("Enter a {label} path or - to remove it.")),
-        "-" => None,
-        value => Some(PathBuf::from(value)),
-    };
-    Ok((id, path))
-}
-
 fn parse_track_edit_form(input: &str) -> Result<TrackMetadataEdit, String> {
     let fields: Vec<&str> = input.split('|').map(str::trim).collect();
     if !(5..=6).contains(&fields.len()) {
@@ -5761,111 +6442,6 @@ fn credit_display(controller: &Controller, id: TrackId) -> String {
         .join(" · ")
 }
 
-/// Renders the current visualization from real waveform samples.
-///
-/// This is pure display processing: no timers, random values or synthetic
-/// animation feed the canvas. Bars and Pulse use the same measured samples as
-/// the Waveform trace.
-#[allow(clippy::needless_range_loop)]
-fn visualization_canvas(
-    samples: &[f32],
-    mode: VizMode,
-    gain: f32,
-    width: usize,
-    height: usize,
-) -> Vec<String> {
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-    let center = height / 2;
-    let mut canvas = vec![vec![' '; width]; height];
-    match mode {
-        VizMode::Waveform => {
-            let mut previous = center;
-            for column in 0..width {
-                let t = if width <= 1 {
-                    0.0
-                } else {
-                    column as f32 / (width - 1) as f32
-                };
-                let value = (waveform_sample(samples, t) * gain).clamp(-1.0, 1.0);
-                let amplitude =
-                    (value.abs() * (height.saturating_sub(1)) as f32 / 2.0).round() as usize;
-                let position = if value >= 0.0 {
-                    center.saturating_sub(amplitude)
-                } else {
-                    center + amplitude
-                }
-                .min(height - 1);
-                let low = previous.min(position);
-                let high = previous.max(position);
-                for row in low..=high {
-                    canvas[row][column] = '•';
-                }
-                previous = position;
-            }
-        }
-        VizMode::Bars => {
-            const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-            for column in 0..width {
-                let t = if width <= 1 {
-                    0.0
-                } else {
-                    column as f32 / (width - 1) as f32
-                };
-                let value = (waveform_sample(samples, t) * gain).abs().clamp(0.0, 1.0);
-                let level = ((value * 7.0).round() as usize).min(7);
-                for row in 0..height {
-                    canvas[row][column] = LEVELS[level];
-                }
-            }
-        }
-        VizMode::Pulse => {
-            for column in 0..width {
-                let t = if width <= 1 {
-                    0.0
-                } else {
-                    column as f32 / (width - 1) as f32
-                };
-                let value = (waveform_sample(samples, t) * gain).abs().clamp(0.0, 1.0);
-                let reach = (value * center as f32).round() as usize;
-                for offset in 0..=reach {
-                    if center >= offset {
-                        canvas[center - offset][column] = '█';
-                    }
-                    if center + offset < height {
-                        canvas[center + offset][column] = '█';
-                    }
-                }
-            }
-        }
-    }
-    canvas
-        .into_iter()
-        .map(|line| line.into_iter().collect::<String>())
-        .collect()
-}
-
-fn count_label(count: usize, singular: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {singular}s")
-    }
-}
-
-fn sentence_case(text: &str) -> String {
-    let mut characters = text.chars();
-    match characters.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), characters.as_str()),
-        None => String::new(),
-    }
-}
-
-fn display_album(track: &Track) -> String {
-    track.album().unwrap_or("Standalone").to_owned()
-}
-
 fn tui_prefs_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("FLUX_TUI_CONFIG") {
         return Some(PathBuf::from(path));
@@ -5876,89 +6452,9 @@ fn tui_prefs_path() -> Option<PathBuf> {
         .map(|root| root.join("flux").join("tui.conf"))
 }
 
-fn display_title(track: &Track) -> String {
-    match track.artist() {
-        Some(artist) => format!("{} — {artist}", track.title()),
-        None => track.title().to_owned(),
-    }
-}
-
-fn format_lyrics_timestamp(timestamp_ms: u64) -> String {
-    let minutes = timestamp_ms / 60_000;
-    let seconds = (timestamp_ms / 1000) % 60;
-    let millis = timestamp_ms % 1000;
-    format!("{minutes:02}:{seconds:02}.{millis:03}")
-}
-
 #[cfg(test)]
 fn normal_help() -> &'static str {
     "↑/↓ move · Enter open/play · Tab views · m layout · v visualizer · Q queue · ? help · q quit"
-}
-
-fn resource_label(state: Option<flux_app::ResourceState>) -> Option<&'static str> {
-    match state {
-        Some(flux_app::ResourceState::Missing) => Some("[missing]"),
-        Some(flux_app::ResourceState::Unavailable(_)) => Some("[inaccessible]"),
-        Some(flux_app::ResourceState::Present) | None => None,
-    }
-}
-
-fn terminal_too_small(width: u16, height: u16) -> bool {
-    width < 20 || height < 6
-}
-
-fn clamp_terminal_size(width: u16, height: u16) -> (usize, usize) {
-    (usize::from(width.max(20)), usize::from(height.max(6)))
-}
-
-fn detail_view_fits(height: usize) -> bool {
-    height >= 8
-}
-
-fn char_width(character: char) -> usize {
-    character.width().unwrap_or(0)
-}
-
-fn display_width(text: &str) -> usize {
-    text.chars().map(char_width).sum()
-}
-
-fn truncate_to_width(text: &str, width: usize) -> String {
-    let mut output = String::new();
-    let mut used = 0usize;
-    for character in text.chars() {
-        let next = char_width(character);
-        if used.saturating_add(next) > width {
-            break;
-        }
-        output.push(character);
-        used = used.saturating_add(next);
-    }
-    output
-}
-
-fn fit_input_line(prefix: &str, input: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let line = format!("{prefix}{input}_");
-    if display_width(&line) <= width {
-        return line;
-    }
-    let keep = width.saturating_sub(1);
-    let mut used = 0usize;
-    let mut tail = Vec::new();
-    for character in line.chars().rev() {
-        let next = char_width(character);
-        if used.saturating_add(next) > keep {
-            break;
-        }
-        used = used.saturating_add(next);
-        tail.push(character);
-    }
-    let mut tail = tail.into_iter().rev().collect::<String>();
-    tail.insert(0, '…');
-    tail
 }
 
 fn cancel_message(mode: Mode) -> Option<&'static str> {
@@ -5975,6 +6471,15 @@ fn cancel_message(mode: Mode) -> Option<&'static str> {
         Mode::CommandInput => Some("Command cancelled; nothing changed."),
         Mode::ConfirmPlaylist => Some("Playlist change cancelled."),
         Mode::ConfirmQueueClear => Some("Queue clear cancelled."),
+        Mode::TrackMovePick => Some("Track move cancelled."),
+        Mode::TrackReplacementInput => Some("Audio replacement cancelled."),
+        Mode::ConfirmTrackReplacement => Some("Audio replacement cancelled."),
+        Mode::ConfirmTrackMove => Some("Track move cancelled."),
+        Mode::ConfirmTrackDelete => Some("Track deletion cancelled."),
+        Mode::ConfirmAlbumDelete => Some("Album deletion cancelled."),
+        Mode::ConfirmArtistDelete => Some("Artist deletion cancelled."),
+        Mode::LyricsExportInput => Some("Lyrics export cancelled."),
+        Mode::ImportAssetInput => Some("Asset attachment cancelled."),
         Mode::ArtistCreateInput => Some("Artist creation cancelled."),
         Mode::ArtistRenameInput => Some("Artist edit cancelled; no changes were made."),
         Mode::AlbumEditInput => Some("Album edit cancelled; no changes were made."),
@@ -6052,6 +6557,8 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "Artists: Enter opens albums and tracks · Y edits · P creates.".to_owned(),
         "Albums: Enter opens the track listing · Z edits title, release type and cover.".to_owned(),
         "Tracks: e edits title, artist credit, album and numbering · y reads lyrics.".to_owned(),
+        "Alt+m moves a track to an album or standalone state · Delete reviews track deletion.".to_owned(),
+        "Album detail: Ctrl+↑/↓ reorders tracks · Delete removes an empty album.".to_owned(),
         "W sets/removes Track artwork · S sets/removes managed lyrics · 0–5 rating · f favorite.".to_owned(),
         "Collections: Favorites, Highly rated, Recently added/played, Most played, lyrics and artwork views.".to_owned(),
         String::new(),
@@ -6069,10 +6576,11 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "IMPORT".to_owned(),
         "o imports a folder · i/I import files · r refreshes the active library.".to_owned(),
         "Import follows Source → Destination → Verify → Import; nothing is copied before review.".to_owned(),
-        "Review: Space include/skip · e edits metadata · u updates an exact duplicate · a/s bulk.".to_owned(),
+        "Review: Space include/skip · e edits metadata · A/T/L attach album art, track art or lyrics · u updates an exact duplicate · a/s bulk.".to_owned(),
         "Esc cancels discovery or preparation. The final canonical transaction is never cancelled.".to_owned(),
         String::new(),
         "SETTINGS AND LIBRARY".to_owned(),
+        "Lyrics: f toggles playback follow · x exports managed lyrics to a new file.".to_owned(),
         "Settings exposes layout, visualizer, lyrics follow and audio device selection.".to_owned(),
         "Audio devices open off the UI thread; an explicit selection never silently falls back.".to_owned(),
         "O opens a canonical library · C creates one · M migrates an old library.".to_owned(),
@@ -6083,22 +6591,6 @@ fn help_lines(controller: &Controller, library: &str) -> Vec<String> {
         "The TUI never deletes external audio, library tracks, artists or albums.".to_owned(),
         "Playlist operations validate the reviewed canonical state before writing.".to_owned(),
     ]
-}
-
-/// Left text plus right-aligned `right`, space-padded to `width`.
-/// Degenerate widths (a 0-column pty, `right` wider than the line)
-/// degrade to just the truncated left text instead of panicking.
-fn pad_with_right(left: &str, right: &str, width: usize) -> String {
-    let right_width = display_width(right);
-    if right.is_empty() || right_width >= width {
-        return truncate_to_width(left, width);
-    }
-    let room = width.saturating_sub(right_width).saturating_sub(1);
-    let left = truncate_to_width(left, room);
-    let pad = width
-        .saturating_sub(display_width(&left))
-        .saturating_sub(right_width);
-    format!("{left}{}{right}", " ".repeat(pad.max(1)))
 }
 
 fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
@@ -6156,6 +6648,15 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         prefs_path: tui_prefs_path(),
         form: None,
         playlist_action: None,
+        move_track: None,
+        move_cursor: 0,
+        pending_move: None,
+        pending_track_delete: None,
+        pending_album_delete: None,
+        pending_artist_delete: None,
+        import_asset: None,
+        asset_track: None,
+        pending_replacement: None,
         audio_devices: Vec::new(),
         audio_error: None,
         audio_loading: false,
@@ -6189,12 +6690,11 @@ mod tests {
         Detail, ImageEdit, ImportWorkerMessage, LayoutMode, Mode, Row, StorageMode, Track, Tui,
         View, VizMode, WaveformScope, album_edit_form, clamp_terminal_size, detail_view_fits,
         display_width, fit_input_line, help_lines, normal_help, pad_with_right,
-        parse_album_edit_form, parse_artist_edit_form, parse_release_type, parse_track_asset_form,
-        resource_label, terminal_too_small, truncate_to_width, visualization_canvas,
+        parse_album_edit_form, parse_artist_edit_form, parse_release_type, resource_label,
+        terminal_too_small, truncate_to_width, visualization_canvas,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use flux_app::ImportDecision;
-    use flux_core::TrackId;
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -6284,6 +6784,15 @@ mod tests {
             prefs_path: None,
             form: None,
             playlist_action: None,
+            move_track: None,
+            move_cursor: 0,
+            pending_move: None,
+            pending_track_delete: None,
+            pending_album_delete: None,
+            pending_artist_delete: None,
+            import_asset: None,
+            asset_track: None,
+            pending_replacement: None,
             audio_devices: Vec::new(),
             audio_error: None,
             audio_loading: false,
@@ -6295,6 +6804,13 @@ mod tests {
     fn key(tui: &mut Tui, code: KeyCode) {
         assert!(
             !tui.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+            "test keys must not quit"
+        );
+    }
+
+    fn key_mod(tui: &mut Tui, code: KeyCode, mods: KeyModifiers) {
+        assert!(
+            !tui.handle_key(KeyEvent::new(code, mods)),
             "test keys must not quit"
         );
     }
@@ -7024,6 +7540,14 @@ mod tests {
 
     /// The smallest valid PCM WAV header (no samples); nothing here
     /// plays it.
+    fn wav_with_sample(sample: u8) -> Vec<u8> {
+        let mut wav = minimal_wav();
+        wav[4..8].copy_from_slice(&38u32.to_le_bytes());
+        wav[40..44].copy_from_slice(&2u32.to_le_bytes());
+        wav.extend_from_slice(&[sample, 0]);
+        wav
+    }
+
     fn minimal_wav() -> Vec<u8> {
         let mut wav = Vec::with_capacity(44);
         wav.extend_from_slice(b"RIFF");
@@ -7332,17 +7856,6 @@ mod tests {
             album_edit_form(album.id, &album.title, album.release_type),
             "3|Title|ep|"
         );
-
-        assert_eq!(
-            parse_track_asset_form("4|/tmp/art.png", "artwork").expect("asset"),
-            (TrackId::new(4), Some(PathBuf::from("/tmp/art.png")))
-        );
-        assert_eq!(
-            parse_track_asset_form("4|-", "lyrics").expect("remove"),
-            (TrackId::new(4), None)
-        );
-        assert!(parse_track_asset_form("4|", "artwork").is_err());
-        assert!(parse_track_asset_form("x|path", "artwork").is_err());
     }
 
     #[test]
@@ -7860,6 +8373,193 @@ mod tests {
         key(&mut tui, KeyCode::Enter);
         assert_eq!(tui.viz_mode, VizMode::Bars);
         assert!(tui.viz_visible);
+        tui.controller.shutdown();
+    }
+    #[test]
+    fn tui_completes_album_order_membership_and_safe_deletion() {
+        let dir = TempDir::new("tui-album-completion");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source_dir = dir.path().join("source/Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let mut sources = Vec::new();
+        for (name, sample) in [("01 - One.wav", 1u8), ("02 - Two.wav", 2u8)] {
+            let path = source_dir.join(name);
+            std::fs::write(&path, wav_with_sample(sample)).expect("wav");
+            sources.push(path);
+        }
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        tui.controller
+            .import_files(&sources, false)
+            .expect("import");
+        let album = tui
+            .controller
+            .tracks()
+            .iter()
+            .find_map(|(id, _)| tui.controller.track_album_id(*id))
+            .expect("album");
+        let owner = tui.controller.album_owner(album).expect("owner");
+        let second = tui
+            .controller
+            .create_album(owner, "Second Album", flux_app::ReleaseType::Album)
+            .expect("second album");
+
+        tui.detail = Some(Detail::Album(album));
+        tui.cursor = 0;
+        let before = tui.controller.album_tracks(album);
+        key_mod(&mut tui, KeyCode::Down, KeyModifiers::CONTROL);
+        let after = tui.controller.album_tracks(album);
+        assert_ne!(before, after, "album order changed");
+        assert_eq!(after.len(), 2);
+
+        let track = after[0];
+        tui.cursor = 0;
+        key_mod(&mut tui, KeyCode::Char('m'), KeyModifiers::ALT);
+        assert_eq!(tui.mode, Mode::TrackMovePick);
+        let target = tui
+            .move_targets()
+            .iter()
+            .position(|target| target.album == Some(second))
+            .expect("destination album");
+        tui.move_cursor = target;
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.mode, Mode::ConfirmTrackMove);
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.controller.track_album_id(track), Some(second));
+
+        tui.detail = Some(Detail::Album(second));
+        tui.cursor = 0;
+        key(&mut tui, KeyCode::Delete);
+        assert_eq!(tui.mode, Mode::ConfirmTrackDelete);
+        assert_eq!(tui.controller.album_tracks(second), vec![track]);
+        key(&mut tui, KeyCode::Char('y'));
+        assert!(tui.controller.track(track).is_none());
+        assert!(tui.controller.album(second).is_some());
+
+        key(&mut tui, KeyCode::Delete);
+        assert_eq!(tui.mode, Mode::ConfirmAlbumDelete);
+        key(&mut tui, KeyCode::Char('y'));
+        assert!(tui.controller.album(second).is_none());
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_exports_lyrics_and_attaches_import_assets() {
+        let dir = TempDir::new("tui-lyrics-export");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source_dir = dir.path().join("source/Artist/Album");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join("01 - Song.wav");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        tui.controller
+            .import_files(&[source], false)
+            .expect("import");
+        let id = tui.controller.tracks()[0].0;
+        tui.controller
+            .set_lyrics(id, Some("[00:01.000]line"))
+            .expect("lyrics");
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.mode, Mode::LyricsView);
+        key(&mut tui, KeyCode::Char('x'));
+        assert_eq!(tui.mode, Mode::LyricsExportInput);
+        type_path(&mut tui, &dir.path().join("export.lrc"));
+        assert_eq!(tui.mode, Mode::LyricsView);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("export.lrc")).expect("export"),
+            "[00:01.000]line"
+        );
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::Normal);
+
+        // Import asset attachment uses the shared import candidate assets.
+        let import_source = source_dir.join("02 - Art.wav");
+        std::fs::write(&import_source, minimal_wav()).expect("wav");
+        tui.controller.switch_to_canonical(&root).expect("reopen");
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &import_source);
+        wait_for_mode(&mut tui, Mode::ImportReview);
+        let png = dir.path().join("cover.png");
+        std::fs::write(
+            &png,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .expect("png");
+        key(&mut tui, KeyCode::Char('A'));
+        assert_eq!(tui.mode, Mode::ImportAssetInput);
+        type_path(&mut tui, &png);
+        assert_eq!(tui.mode, Mode::ImportReview);
+        assert!(
+            tui.import_ui
+                .as_ref()
+                .and_then(|ui| ui.plan.as_ref())
+                .and_then(|plan| plan.candidates.first())
+                .and_then(|candidate| candidate.album_artwork_path())
+                .is_some(),
+            "album artwork attached to review"
+        );
+        tui.controller.shutdown();
+    }
+    #[test]
+    fn tui_reviews_managed_audio_replacement_through_the_shared_plan() {
+        let dir = TempDir::new("tui-replace-audio");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("source/Artist/Album/01 - Song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, wav_with_sample(1)).expect("wav");
+        let replacement = dir.path().join("replacement.wav");
+        std::fs::write(&replacement, wav_with_sample(7)).expect("replacement");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        tui.controller
+            .import_files(&[source], false)
+            .expect("import");
+        let id = tui.controller.tracks()[0].0;
+        key_mod(&mut tui, KeyCode::Char('r'), KeyModifiers::ALT);
+        assert_eq!(tui.mode, Mode::TrackReplacementInput);
+        type_path(&mut tui, &replacement);
+        assert_eq!(tui.mode, Mode::ConfirmTrackReplacement);
+        key(&mut tui, KeyCode::Char('y'));
+        assert_eq!(tui.mode, Mode::Normal);
+        assert!(tui.controller.track(id).is_some());
+        tui.controller.shutdown();
+    }
+    #[test]
+    fn tui_deletes_an_empty_artist_with_explicit_confirmation() {
+        let dir = TempDir::new("tui-delete-empty-artist");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        let artist = tui
+            .controller
+            .create_artist("Temporary Artist")
+            .expect("artist");
+        tui.controller
+            .create_album(artist, "Empty Album", flux_app::ReleaseType::Album)
+            .expect("album");
+        tui.view = View::Artists;
+        tui.detail = Some(Detail::Artist(artist));
+        key(&mut tui, KeyCode::Delete);
+        assert_eq!(tui.mode, Mode::ConfirmArtistDelete);
+        key(&mut tui, KeyCode::Char('n'));
+        assert!(tui.controller.artist(artist).is_some(), "cancel is safe");
+        key(&mut tui, KeyCode::Delete);
+        key(&mut tui, KeyCode::Char('y'));
+        assert!(tui.controller.artist(artist).is_none());
+        assert!(tui.controller.albums().is_empty());
         tui.controller.shutdown();
     }
 }
