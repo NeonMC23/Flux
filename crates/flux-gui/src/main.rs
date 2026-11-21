@@ -13,6 +13,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod inert;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -42,8 +44,8 @@ use iced::advanced::widget::Tree;
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::image::Handle as ImageHandle;
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, slider, stack,
-    text, text_input, toggler, tooltip,
+    button, column, container, mouse_area, opaque, pick_list, progress_bar, row, scrollable,
+    slider, stack, text, text_input, toggler, tooltip,
 };
 use iced::{
     Alignment, Border, Color, Element, Length, Rectangle, Shadow, Subscription, Task, Theme, mouse,
@@ -142,6 +144,38 @@ fn rule_style(_: &Theme) -> container::Style {
 
 fn modal_backdrop_style(_: &Theme) -> container::Style {
     container::Style::default().background(Color::from_rgba8(0, 0, 0, 0.70))
+}
+
+fn menu_pick_style(
+    _: &Theme,
+    status: iced::widget::pick_list::Status,
+) -> iced::widget::pick_list::Style {
+    let (background, border, text_color) = match status {
+        iced::widget::pick_list::Status::Hovered
+        | iced::widget::pick_list::Status::Opened { .. } => (SURFACE_HI, ACCENT_BORDER, TEXT),
+        iced::widget::pick_list::Status::Active => (Color::TRANSPARENT, Color::TRANSPARENT, MUTED),
+    };
+    iced::widget::pick_list::Style {
+        text_color,
+        placeholder_color: text_color,
+        handle_color: text_color,
+        background: background.into(),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+    }
+}
+
+fn control_bar_style(_: &Theme) -> container::Style {
+    container::Style::default()
+        .background(Color::from_rgba8(0x18, 0x15, 0x20, 0.72))
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 9.0.into(),
+        })
 }
 
 fn import_panel_style(_: &Theme) -> container::Style {
@@ -1663,7 +1697,6 @@ struct DashboardSummary {
     recently_added: Vec<TrackId>,
     recently_played: Vec<TrackId>,
     most_played: Vec<TrackId>,
-    highly_rated: Vec<TrackId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2271,6 +2304,8 @@ enum Message {
     RelinkTrack(TrackId, RelPath),
     ImportOpen,
     ImportOpenSetup,
+    ImportOpenExistingAlbum(AlbumId),
+    ImportOpenExistingArtist(ArtistId),
     ImportClose,
     ImportReset,
     ImportNoop,
@@ -2468,6 +2503,7 @@ enum Message {
     PlayTrack(TrackId),
     EnqueueTrack(TrackId),
     PlayNextTrack(TrackId),
+    TrackMenu(TrackId, TrackMenuAction),
     RemoveQueueEntry(QueueEntryId),
     QueueDragStart(QueueEntryId),
     QueueDragHover(usize),
@@ -2909,6 +2945,29 @@ impl FluxReady {
             .collect()
     }
 
+    fn artist_choice_by_id(&self, id: ArtistId) -> Option<ArtistChoice> {
+        self.artist_choices()
+            .into_iter()
+            .find(|choice| choice.id == Some(id))
+    }
+
+    fn album_choice_label(&self, id: AlbumId, title: &str, owner: ArtistId) -> String {
+        let duplicate = self
+            .controller
+            .albums()
+            .into_iter()
+            .filter(|candidate| {
+                candidate.owner_artist_id == owner && candidate.title.eq_ignore_ascii_case(title)
+            })
+            .count()
+            > 1;
+        if duplicate {
+            format!("{title} · ID {id}")
+        } else {
+            title.to_owned()
+        }
+    }
+
     fn editor_artist_choices(&self) -> Vec<ArtistChoice> {
         let mut choices = vec![ArtistChoice {
             id: None,
@@ -3006,6 +3065,11 @@ impl FluxReady {
     }
 
     fn sync_deletion_defaults(&mut self) {
+        let artist_labels = self
+            .artist_choices()
+            .into_iter()
+            .filter_map(|choice| choice.id.map(|id| (id, choice.label)))
+            .collect::<BTreeMap<_, _>>();
         let Some(manager) = self.deletion_manager.as_mut() else {
             return;
         };
@@ -3037,10 +3101,9 @@ impl FluxReady {
         };
         manager.destination_artist = wanted_owner.map(|owner| ArtistChoice {
             id: Some(owner),
-            label: self
-                .controller
-                .artist(owner)
-                .map(|artist| artist.name().to_owned())
+            label: artist_labels
+                .get(&owner)
+                .cloned()
                 .unwrap_or_else(|| format!("Artist {owner}")),
         });
         manager.destination_album = None;
@@ -3138,7 +3201,7 @@ impl FluxReady {
             .filter(|album| album.owner_artist_id == owner)
             .map(|album| AlbumChoice {
                 id: album.id,
-                label: format!("{} · AlbumId {}", album.title, album.id),
+                label: self.album_choice_label(album.id, &album.title, album.owner_artist_id),
             })
             .collect()
     }
@@ -3154,7 +3217,7 @@ impl FluxReady {
             .filter(|album| album.owner_artist_id == owner && Some(album.id) != current)
             .map(|album| AlbumChoice {
                 id: album.id,
-                label: format!("{} · {}", album.title, album.id),
+                label: self.album_choice_label(album.id, &album.title, album.owner_artist_id),
             })
             .collect()
     }
@@ -5218,6 +5281,14 @@ impl FluxReady {
             Message::ImportOpenSetup => {
                 self.close_import_manager();
                 self.show_setup = true;
+            }
+            Message::ImportOpenExistingAlbum(album) => {
+                self.close_import_manager();
+                return self.update(Message::OpenAlbum(album));
+            }
+            Message::ImportOpenExistingArtist(artist) => {
+                self.close_import_manager();
+                return self.update(Message::OpenArtist(artist));
             }
             Message::ImportClose => self.close_import_manager(),
             Message::ImportReset => {
@@ -7461,6 +7532,41 @@ impl FluxReady {
                 let _ = self.controller.enqueue_track(id);
                 self.follow_queue_current();
             }
+            Message::TrackMenu(id, action) => {
+                return self.update(match action {
+                    TrackMenuAction::PlayNext => Message::PlayNextTrack(id),
+                    TrackMenuAction::AddToQueue => Message::EnqueueTrack(id),
+                    TrackMenuAction::Edit => Message::EditTrack(id),
+                    TrackMenuAction::FavoriteToggle => Message::TrackFavoriteToggle(id),
+                    TrackMenuAction::RateUp => {
+                        let next = match self.controller.rating(id).and_then(|rating| rating.rating)
+                        {
+                            None => Some(1),
+                            Some(rating) if rating < 5 => Some(rating + 1),
+                            Some(_) => None,
+                        };
+                        Message::TrackRatingSet(id, next)
+                    }
+                    TrackMenuAction::ClearRating => Message::TrackRatingSet(id, None),
+                    TrackMenuAction::OpenArtist => {
+                        return self
+                            .controller
+                            .track_artist_id(id)
+                            .map_or(Task::none(), |artist| {
+                                self.update(Message::SearchNavigateArtist(artist))
+                            });
+                    }
+                    TrackMenuAction::OpenAlbum => {
+                        return self
+                            .controller
+                            .track_album_id(id)
+                            .map_or(Task::none(), |album| {
+                                self.update(Message::SearchNavigateAlbum(album))
+                            });
+                    }
+                    TrackMenuAction::OpenLyrics => Message::LyricsSelect(id),
+                });
+            }
             Message::PlayNextTrack(id) => {
                 let _ = self.controller.play_next_track(id);
                 self.follow_queue_current();
@@ -7863,38 +7969,24 @@ impl FluxReady {
 
         let body: Element<'_, Message> = body.into();
         let base: Element<'_, Message> = if queue_placement == QueuePlacement::Overlay {
-            stack([body, self.queue_overlay()])
-                .height(Length::Fill)
-                .into()
+            modal_stack(body, self.queue_overlay())
         } else {
             body
         };
         let body: Element<'_, Message> = if self.lyrics_import.is_some() {
-            stack([base, self.lyrics_import_overlay()])
-                .height(Length::Fill)
-                .into()
+            modal_stack(base, self.lyrics_import_overlay())
         } else if self.playlist_create_open {
-            stack([base, self.playlist_create_overlay()])
-                .height(Length::Fill)
-                .into()
+            modal_stack(base, self.playlist_create_overlay())
         } else if self.batch_review.is_some() {
-            stack([base, self.batch_overlay()])
-                .height(Length::Fill)
-                .into()
+            modal_stack(base, self.batch_overlay())
         } else if self.album_transfer.is_some() {
-            stack([base, self.album_transfer_overlay()])
-                .height(Length::Fill)
-                .into()
+            modal_stack(base, self.album_transfer_overlay())
         } else if self.deletion_manager.is_some() {
-            stack([base, self.deletion_overlay()])
-                .height(Length::Fill)
-                .into()
+            modal_stack(base, self.deletion_overlay())
         } else if self.import_manager.is_some() {
-            stack([base, self.import_overlay()])
-                .height(Length::Fill)
-                .into()
+            modal_stack(base, self.import_overlay())
         } else if self.external_drag_hover {
-            stack([base, self.drop_hint()]).height(Length::Fill).into()
+            modal_stack(base, self.drop_hint())
         } else {
             base
         };
@@ -7926,10 +8018,7 @@ impl FluxReady {
             .artists()
             .into_iter()
             .filter(|artist| artist.id() != plan.from_owner)
-            .map(|artist| ArtistChoice {
-                id: Some(artist.id()),
-                label: artist.name().to_owned(),
-            })
+            .filter_map(|artist| self.artist_choice_by_id(artist.id()))
             .collect::<Vec<_>>();
         let selected_artist = manager.destination_artist.clone().filter(|choice| {
             artist_choices
@@ -8407,14 +8496,7 @@ impl FluxReady {
                 let artist_choices = track
                     .eligible_owners
                     .iter()
-                    .map(|artist| ArtistChoice {
-                        id: Some(*artist),
-                        label: self
-                            .controller
-                            .artist(*artist)
-                            .map(|artist| artist.name().to_owned())
-                            .unwrap_or_else(|| format!("Artist {artist}")),
-                    })
+                    .filter_map(|artist| self.artist_choice_by_id(*artist))
                     .collect::<Vec<_>>();
                 let selected_artist = manager.destination_artist.clone().filter(|choice| {
                     artist_choices
@@ -9448,13 +9530,43 @@ impl FluxReady {
         if let Some(existing) = candidate.existing_match() {
             body = body.push(
                 text(format!(
-                    "Already in your library: {} · {}",
+                    "Already in your library: {} · {}{}",
                     existing.title,
-                    existing.artist_name.as_deref().unwrap_or("Unknown artist")
+                    existing.artist_name.as_deref().unwrap_or("Unknown artist"),
+                    existing
+                        .album_title
+                        .as_deref()
+                        .map(|album| format!(" · {album}"))
+                        .unwrap_or_default()
                 ))
                 .size(9)
                 .color(MUTED),
             );
+            let mut existing_actions = row![].spacing(6);
+            if let Some(album) = existing.album_id {
+                existing_actions = existing_actions.push(
+                    button(text("Open album").size(10))
+                        .style(ghost_style)
+                        .padding([5, 9])
+                        .on_press(Message::ImportOpenExistingAlbum(album)),
+                );
+            }
+            if let Some(artist) = existing.owner_artist_id {
+                existing_actions = existing_actions.push(
+                    button(text("Open artist").size(10))
+                        .style(ghost_style)
+                        .padding([5, 9])
+                        .on_press(Message::ImportOpenExistingArtist(artist)),
+                );
+            }
+            body = body.push(existing_actions);
+        }
+        let provenance = candidate.provenance().summary();
+        if !provenance.is_empty() {
+            body = body.push(text(format!("Detected: {provenance}")).size(8).color(MUTED));
+        }
+        for note in candidate.sidecar_notes().iter().take(3) {
+            body = body.push(text(note).size(8).color(MUTED));
         }
 
         let mut decisions = row![].spacing(6);
@@ -9549,9 +9661,48 @@ impl FluxReady {
                 ]
                 .spacing(6),
             );
+            let album_choices = self.import_album_choices(candidate);
+            if !album_choices.is_empty() {
+                body = body.push(
+                    pick_list(album_choices, None::<AlbumChoice>, |choice| {
+                        Message::ImportAlbumPicked(Some(choice))
+                    })
+                    .placeholder("Or choose an existing album…")
+                    .text_size(10)
+                    .padding([5, 7])
+                    .width(Length::Fill),
+                );
+            }
         }
 
         body = body.push(text("ARTWORK").size(8).color(MUTED));
+        let album_art = candidate.album_artwork_path().map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        });
+        let track_art = candidate.artwork_path().map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        });
+        body = body.push(
+            text(match (&album_art, &track_art) {
+                (Some(album), Some(track)) => format!("Album: {album} · Track override: {track}"),
+                (Some(album), None) => format!("Album artwork ready: {album}"),
+                (None, Some(track)) => format!("Track artwork override ready: {track}"),
+                (None, None) if candidate.album().is_some() => {
+                    "No album artwork detected.".to_owned()
+                }
+                (None, None) => "No track artwork detected.".to_owned(),
+            })
+            .size(9)
+            .color(if album_art.is_some() || track_art.is_some() {
+                TEXT
+            } else {
+                MUTED
+            }),
+        );
         body = body.push(
             text_input(
                 "Album artwork path (optional)…",
@@ -9762,25 +9913,12 @@ impl FluxReady {
                 .width(Length::Fill),
             );
 
-            if !targeted {
-                let album_choices = self.import_album_choices(candidate);
-                body = body.push(text("EXISTING ALBUM").size(8).color(MUTED));
-                body = body.push(
-                    pick_list(album_choices, None::<AlbumChoice>, |choice| {
-                        Message::ImportAlbumPicked(Some(choice))
-                    })
-                    .placeholder("Use an existing album…")
-                    .text_size(10)
-                    .padding([5, 7])
-                    .width(Length::Fill),
-                );
-                if candidate.album().is_some() {
-                    body = body.push(text("RELEASE TYPE FOR NEW ALBUM").size(8).color(MUTED));
-                    body = body.push(release_type_buttons(
-                        candidate.release_type(),
-                        Message::ImportReleaseTypeChanged,
-                    ));
-                }
+            if !targeted && candidate.album().is_some() {
+                body = body.push(text("RELEASE TYPE FOR NEW ALBUM").size(8).color(MUTED));
+                body = body.push(release_type_buttons(
+                    candidate.release_type(),
+                    Message::ImportReleaseTypeChanged,
+                ));
             }
 
             body = body.push(
@@ -10204,73 +10342,110 @@ impl FluxReady {
 
     fn sidebar(&self) -> Element<'_, Message> {
         let brand = row![
-            container(iced::widget::Space::new().width(4).height(28))
+            container(iced::widget::Space::new().width(4).height(30))
                 .style(|_| container::Style::default().background(ACCENT)),
-            text("Flux").size(22).color(TEXT),
+            column![
+                text("Flux").size(21).color(TEXT),
+                text("local music").size(8).color(MUTED),
+            ]
+            .spacing(0),
         ]
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let mut nav_items = column![].spacing(2);
-        nav_items = nav_items.push(container(text("LIBRARY").size(8).color(MUTED)).padding([3, 8]));
+        let mut nav_items = column![].spacing(1);
+        nav_items = nav_items.push(sidebar_section("LIBRARY"));
         for view in [
             LibraryView::Tracks,
             LibraryView::Artists,
             LibraryView::Albums,
             LibraryView::Playlists,
         ] {
-            nav_items = nav_items.push(
-                button(text(view.label()).size(12))
-                    .width(Length::Fill)
-                    .padding([6, 8])
-                    .style(nav_style(self.view == view && !self.show_setup))
-                    .on_press(Message::SelectView(view)),
-            );
+            nav_items = nav_items.push(sidebar_destination(
+                view_glyph(view),
+                view.label(),
+                self.view == view && !self.show_setup,
+                Message::SelectView(view),
+            ));
         }
-        nav_items = nav_items.push(iced::widget::Space::new().height(6));
-        nav_items = nav_items.push(container(text("BROWSE").size(8).color(MUTED)).padding([3, 8]));
+        nav_items = nav_items.push(iced::widget::Space::new().height(10));
+        nav_items = nav_items.push(sidebar_section("BROWSE"));
         for view in [
             LibraryView::Folders,
             LibraryView::Lyrics,
             LibraryView::Collections,
             LibraryView::Dashboard,
         ] {
-            nav_items = nav_items.push(
-                button(text(view.label()).size(12))
-                    .width(Length::Fill)
-                    .padding([6, 8])
-                    .style(nav_style(self.view == view && !self.show_setup))
-                    .on_press(Message::SelectView(view)),
-            );
+            nav_items = nav_items.push(sidebar_destination(
+                view_glyph(view),
+                view.label(),
+                self.view == view && !self.show_setup,
+                Message::SelectView(view),
+            ));
         }
 
         let mut nav = column![
             brand,
-            iced::widget::Space::new().height(14),
-            button(text("Import music").size(12))
-                .width(Length::Fill)
-                .padding([8, 10])
-                .style(accent_button_style)
-                .on_press(Message::ImportOpen),
-            iced::widget::Space::new().height(8),
+            iced::widget::Space::new().height(16),
+            button(
+                row![
+                    text("+").size(13).color(BG),
+                    text("Import music").size(11).color(BG),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([8, 10])
+            .style(accent_button_style)
+            .on_press(Message::ImportOpen),
+            iced::widget::Space::new().height(10),
         ]
         .spacing(0);
         nav = nav.push(scrollable(nav_items).height(Length::Fill));
-        nav = nav.push(iced::widget::Space::new().height(8));
-        nav = nav.push(
-            button(text("Settings").size(11))
+        if self.queue_placement() != QueuePlacement::Inline
+            && let Some(track) = self.controller.current_track()
+        {
+            let title = truncate_label(track.title(), 22);
+            let subtitle = truncate_label(&display_artist(track), 24);
+            let current = self.controller.current_id();
+            nav = nav.push(
+                container(
+                    column![
+                        text("NOW PLAYING").size(8).color(ACCENT),
+                        button(text(title).size(11).color(TEXT))
+                            .style(ghost_style)
+                            .padding([0, 0])
+                            .on_press_maybe(current.map(Message::SearchNavigateTrack)),
+                        row![
+                            text(subtitle).size(9).color(MUTED).width(Length::Fill),
+                            button(text("Lyrics").size(9))
+                                .style(ghost_style)
+                                .padding([3, 5])
+                                .on_press(Message::LyricsOpenCurrent),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    ]
+                    .spacing(3),
+                )
                 .width(Length::Fill)
-                .padding([6, 8])
-                .style(nav_style(
-                    self.view == LibraryView::Settings && !self.show_setup,
-                ))
-                .on_press(Message::SelectView(LibraryView::Settings)),
-        );
+                .padding(9)
+                .style(card_style),
+            );
+            nav = nav.push(iced::widget::Space::new().height(6));
+        }
+        nav = nav.push(sidebar_destination(
+            view_glyph(LibraryView::Settings),
+            "Settings",
+            self.view == LibraryView::Settings && !self.show_setup,
+            Message::SelectView(LibraryView::Settings),
+        ));
 
         container(nav)
-            .width(Length::Fixed(184.0))
+            .width(Length::Fixed(208.0))
             .height(Length::Fill)
-            .padding(14)
+            .padding([16, 12])
             .style(sidebar_style)
             .into()
     }
@@ -10510,14 +10685,6 @@ impl FluxReady {
                         .on_press(Message::ClearSearch),
                 );
             }
-        }
-        if self.controller.current_id().is_some() && self.track_editor.is_none() {
-            bar = bar.push(
-                button(text("Lyrics").size(11))
-                    .style(nav_style(self.view == LibraryView::Lyrics))
-                    .padding([6, 10])
-                    .on_press(Message::LyricsOpenCurrent),
-            );
         }
         if self.track_editor.is_none() {
             bar = bar.push(
@@ -12237,78 +12404,58 @@ impl FluxReady {
     fn library_controls(&self) -> Element<'_, Message> {
         let album_mode = self.selected_album_id().is_some();
         let active = self.filters_active();
-        let mut controls = row![
+        let active_filters = self.filter_count();
+        let mut header = row![
             button(
-                text(if active {
-                    "Filters · active"
-                } else {
-                    "Filters"
-                })
-                .size(10)
+                row![
+                    text(if self.filters_open { "⌃" } else { "⌄" }).size(10),
+                    text("Filters").size(10),
+                    if active_filters > 0 {
+                        text(active_filters.to_string()).size(8).color(BG)
+                    } else {
+                        text("").size(8)
+                    },
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
             )
-            .style(nav_style(self.filters_open || active))
-            .padding([5, 8])
+            .style(nav_style(self.filters_open || active_filters > 0))
+            .padding([4, 7])
             .on_press(Message::ToggleFilters),
-            iced::widget::Space::new().width(Length::Fill),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
-        if self.filters_open {
-            controls = controls.push(
-                button(text("Favorites").size(10))
-                    .style(nav_style(self.filter_favorites))
+
+        if !self.filters_open {
+            if self.filter_favorites {
+                header = header.push(filter_chip("Favorites"));
+            }
+            if self.filter_lyrics != TriFilter::Any {
+                header = header.push(filter_chip(format!("Lyrics {}", self.filter_lyrics)));
+            }
+            if self.filter_artwork != TriFilter::Any {
+                header = header.push(filter_chip(format!("Artwork {}", self.filter_artwork)));
+            }
+            if self.filter_release != ReleaseFilter::Any {
+                header = header.push(filter_chip(self.filter_release.to_string()));
+            }
+            if self.filter_rating != RatingFilter::Any {
+                header = header.push(filter_chip(self.filter_rating.to_string()));
+            }
+        }
+        header = header.push(iced::widget::Space::new().width(Length::Fill));
+        if active {
+            header = header.push(
+                button(text("Reset").size(9))
+                    .style(ghost_style)
                     .padding([4, 7])
-                    .on_press(Message::FilterFavoritesToggled),
-            );
-            controls = controls.push(
-                button(text(format!("Lyrics: {}", self.filter_lyrics)).size(10))
-                    .style(nav_style(self.filter_lyrics != TriFilter::Any))
-                    .padding([4, 7])
-                    .on_press(Message::FilterLyricsCycle),
-            );
-            controls = controls.push(
-                button(text(format!("Artwork: {}", self.filter_artwork)).size(10))
-                    .style(nav_style(self.filter_artwork != TriFilter::Any))
-                    .padding([4, 7])
-                    .on_press(Message::FilterArtworkCycle),
-            );
-            controls = controls.push(
-                pick_list(
-                    vec![
-                        ReleaseFilter::Any,
-                        ReleaseFilter::Album,
-                        ReleaseFilter::Ep,
-                        ReleaseFilter::Single,
-                        ReleaseFilter::Compilation,
-                        ReleaseFilter::Other,
-                    ],
-                    Some(self.filter_release),
-                    Message::FilterReleaseChanged,
-                )
-                .text_size(9)
-                .padding([4, 6]),
-            );
-            controls = controls.push(
-                pick_list(
-                    vec![
-                        RatingFilter::Any,
-                        RatingFilter::One,
-                        RatingFilter::Two,
-                        RatingFilter::Three,
-                        RatingFilter::Four,
-                        RatingFilter::Five,
-                    ],
-                    Some(self.filter_rating),
-                    Message::FilterRatingChanged,
-                )
-                .text_size(9)
-                .padding([4, 6]),
+                    .on_press(Message::ResetLibraryFilters),
             );
         }
         if album_mode {
-            controls = controls.push(text("Album order").size(9).color(MUTED));
+            header = header.push(text("Album order").size(9).color(MUTED));
         } else {
-            controls = controls.push(
+            header = header.push(
                 pick_list(
                     vec![
                         TrackSort::Default,
@@ -12327,28 +12474,78 @@ impl FluxReady {
                     Message::SortTracksChanged,
                 )
                 .text_size(9)
-                .padding([4, 6]),
+                .padding([3, 6])
+                .width(Length::Fixed(122.0)),
             );
-            controls = controls.push(
-                button(text(if self.sort_descending { "Desc" } else { "Asc" }).size(9))
+            header = header.push(
+                button(text(if self.sort_descending { "↓" } else { "↑" }).size(10))
                     .style(nav_style(self.sort_descending))
                     .padding([4, 7])
                     .on_press(Message::SortDirectionToggled),
             );
         }
-        if active {
-            controls = controls.push(
-                button(text("Reset").size(9))
-                    .style(ghost_style)
+
+        let mut bar = column![header.wrap()].spacing(6);
+        if self.filters_open {
+            let filters = row![
+                button(text("Favorites").size(10))
+                    .style(nav_style(self.filter_favorites))
                     .padding([4, 7])
-                    .on_press(Message::ResetLibraryFilters),
-            );
+                    .on_press(Message::FilterFavoritesToggled),
+                button(text(format!("Lyrics: {}", self.filter_lyrics)).size(10))
+                    .style(nav_style(self.filter_lyrics != TriFilter::Any))
+                    .padding([4, 7])
+                    .on_press(Message::FilterLyricsCycle),
+                button(text(format!("Artwork: {}", self.filter_artwork)).size(10))
+                    .style(nav_style(self.filter_artwork != TriFilter::Any))
+                    .padding([4, 7])
+                    .on_press(Message::FilterArtworkCycle),
+                pick_list(
+                    vec![
+                        ReleaseFilter::Any,
+                        ReleaseFilter::Album,
+                        ReleaseFilter::Ep,
+                        ReleaseFilter::Single,
+                        ReleaseFilter::Compilation,
+                        ReleaseFilter::Other,
+                    ],
+                    Some(self.filter_release),
+                    Message::FilterReleaseChanged,
+                )
+                .text_size(9)
+                .padding([3, 6]),
+                pick_list(
+                    vec![
+                        RatingFilter::Any,
+                        RatingFilter::One,
+                        RatingFilter::Two,
+                        RatingFilter::Three,
+                        RatingFilter::Four,
+                        RatingFilter::Five,
+                    ],
+                    Some(self.filter_rating),
+                    Message::FilterRatingChanged,
+                )
+                .text_size(9)
+                .padding([3, 6]),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center);
+            bar = bar.push(filters.wrap());
         }
-        container(controls.wrap())
-            .padding([5, 8])
+        container(bar)
+            .padding([5, 9])
             .width(Length::Fill)
-            .style(card_style)
+            .style(control_bar_style)
             .into()
+    }
+
+    fn filter_count(&self) -> usize {
+        usize::from(self.filter_favorites)
+            + usize::from(self.filter_lyrics != TriFilter::Any)
+            + usize::from(self.filter_artwork != TriFilter::Any)
+            + usize::from(self.filter_release != ReleaseFilter::Any)
+            + usize::from(self.filter_rating != RatingFilter::Any)
     }
 
     fn search_results_view(&self) -> Element<'_, Message> {
@@ -12497,6 +12694,8 @@ impl FluxReady {
                                     .controller
                                     .rating(*id)
                                     .is_some_and(|rating| rating.favorite),
+                                has_artist: self.controller.track_artist_id(*id).is_some(),
+                                has_album: self.controller.track_album_id(*id).is_some(),
                             },
                         ),
                         button(text("Locate").size(9))
@@ -14150,11 +14349,6 @@ impl FluxReady {
                 .into_iter()
                 .take(6)
                 .collect(),
-            highly_rated: self
-                .smart_collection_ids(SmartCollection::HighlyRated)
-                .into_iter()
-                .take(6)
-                .collect(),
         };
         *self.dashboard_cache.borrow_mut() = Some(summary.clone());
         summary
@@ -14225,6 +14419,118 @@ impl FluxReady {
         rows.into()
     }
 
+    fn dashboard_top_artists(&self, limit: usize) -> Vec<(ArtistId, String, u64)> {
+        let mut totals: BTreeMap<ArtistId, u64> = BTreeMap::new();
+        for (track_id, entry) in self.controller.playback_history().entries() {
+            if let Some(artist) = self.controller.track_artist_id(track_id) {
+                *totals.entry(artist).or_default() += entry.play_count;
+            }
+        }
+        let mut ranked = totals
+            .into_iter()
+            .filter(|&(_, plays)| plays > 0)
+            .filter_map(|(id, plays)| {
+                self.controller
+                    .artist(id)
+                    .map(|artist| (id, artist.name().to_owned(), plays))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+        ranked.truncate(limit);
+        ranked
+    }
+
+    fn dashboard_top_albums(&self, limit: usize) -> Vec<(AlbumId, String, u64)> {
+        let mut totals: BTreeMap<AlbumId, u64> = BTreeMap::new();
+        for (track_id, entry) in self.controller.playback_history().entries() {
+            if let Some(album) = self.controller.track_album_id(track_id) {
+                *totals.entry(album).or_default() += entry.play_count;
+            }
+        }
+        let mut ranked = totals
+            .into_iter()
+            .filter(|&(_, plays)| plays > 0)
+            .filter_map(|(id, plays)| {
+                self.controller
+                    .album(id)
+                    .map(|album| (id, album.title.clone(), plays))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+        ranked.truncate(limit);
+        ranked
+    }
+
+    fn dashboard_ranked_row(
+        &self,
+        rank: usize,
+        label: String,
+        value: u64,
+        maximum: u64,
+        message: Option<Message>,
+    ) -> Element<'_, Message> {
+        let bar = progress_bar(0.0..=maximum.max(1) as f32, value as f32)
+            .girth(4)
+            .length(Length::Fill)
+            .style(progress_style);
+        let content = row![
+            text(format!("{}", rank + 1))
+                .size(9)
+                .color(MUTED)
+                .width(Length::Fixed(14.0)),
+            text(label)
+                .size(10)
+                .color(TEXT)
+                .width(Length::FillPortion(3)),
+            container(bar).width(Length::FillPortion(3)),
+            text(format!("{value}"))
+                .size(9)
+                .color(MUTED)
+                .width(Length::Fixed(34.0)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        match message {
+            Some(message) => button(content)
+                .width(Length::Fill)
+                .padding([3, 4])
+                .style(ghost_style)
+                .on_press(message)
+                .into(),
+            None => container(content).padding([3, 4]).into(),
+        }
+    }
+
+    fn dashboard_coverage_row(
+        &self,
+        label: &'static str,
+        count: usize,
+        total: usize,
+    ) -> Element<'_, Message> {
+        let percent = if total == 0 {
+            0.0
+        } else {
+            (count as f32 / total as f32) * 100.0
+        };
+        row![
+            text(label).size(9).color(MUTED).width(Length::Fixed(82.0)),
+            container(
+                progress_bar(0.0..=100.0, percent)
+                    .girth(5)
+                    .length(Length::Fill)
+                    .style(progress_style),
+            )
+            .width(Length::Fill),
+            text(format!("{count}"))
+                .size(9)
+                .color(TEXT)
+                .width(Length::Fixed(42.0)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
     fn dashboard_view(&self) -> Element<'_, Message> {
         let summary = self.dashboard_summary();
         if summary.total_tracks == 0 {
@@ -14247,79 +14553,198 @@ impl FluxReady {
             .center(Length::Fill)
             .into();
         }
-        let stat = |label: &'static str, value: String, hint: &str| -> Element<'_, Message> {
-            container(
-                column![
-                    text(value).size(22).color(ACCENT),
-                    text(label).size(10).color(TEXT),
-                    text(hint.to_owned()).size(8).color(MUTED),
-                ]
-                .spacing(2),
-            )
-            .padding(10)
-            .width(Length::FillPortion(1))
-            .style(card_style)
-            .into()
-        };
+        let top_artists = self.dashboard_top_artists(5);
+        let top_albums = self.dashboard_top_albums(5);
+        let artist_max = top_artists.first().map_or(0, |(_, _, plays)| *plays);
+        let album_max = top_albums.first().map_or(0, |(_, _, plays)| *plays);
+        let total_plays = self.controller.playback_history().total_plays();
+        let history_tracks = self.controller.playback_history().len();
+        let summary_stat =
+            |label: &'static str, value: String, hint: &str| -> Element<'_, Message> {
+                container(
+                    column![
+                        text(value).size(20).color(ACCENT),
+                        text(label).size(10).color(TEXT),
+                        text(hint.to_owned()).size(8).color(MUTED),
+                    ]
+                    .spacing(2),
+                )
+                .padding(10)
+                .width(Length::FillPortion(1))
+                .style(card_style)
+                .into()
+            };
+
+        let mut artist_rows = column![].spacing(1);
+        if top_artists.is_empty() {
+            artist_rows = artist_rows.push(
+                text("No plays recorded yet. Top artists appear after meaningful plays.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        } else {
+            for (index, (id, name, plays)) in top_artists.into_iter().enumerate() {
+                artist_rows = artist_rows.push(self.dashboard_ranked_row(
+                    index,
+                    name,
+                    plays,
+                    artist_max,
+                    Some(Message::SearchNavigateArtist(id)),
+                ));
+            }
+        }
+        let mut album_rows = column![].spacing(1);
+        if top_albums.is_empty() {
+            album_rows = album_rows.push(text("No album plays recorded yet.").size(9).color(MUTED));
+        } else {
+            for (index, (id, title, plays)) in top_albums.into_iter().enumerate() {
+                album_rows = album_rows.push(self.dashboard_ranked_row(
+                    index,
+                    title,
+                    plays,
+                    album_max,
+                    Some(Message::SearchNavigateAlbum(id)),
+                ));
+            }
+        }
+
         let mut body = column![
-            text("Library dashboard").size(22).color(TEXT),
-            text("Canonical library totals and locally collected listening history. History begins when this feature is first used; no past plays are fabricated.")
-                .size(9)
-                .color(MUTED),
             row![
-                stat("Tracks", summary.total_tracks.to_string(), "catalogue entries"),
-                stat("Artists", summary.total_artists.to_string(), "stable identities"),
-                stat("Albums", summary.total_albums.to_string(), "releases"),
+                column![
+                    text("Library dashboard").size(21).color(TEXT),
+                    text("Local listening data only. History starts when plays are first recorded; past listening is never invented.")
+                        .size(9)
+                        .color(MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                text(format!("{total_plays} play(s) · {history_tracks} tracked"))
+                    .size(9)
+                    .color(MUTED),
+            ]
+            .align_y(Alignment::Center),
+            row![
+                summary_stat("Tracks", summary.total_tracks.to_string(), "catalogue entries"),
+                summary_stat("Artists", summary.total_artists.to_string(), "stable identities"),
+                summary_stat("Albums", summary.total_albums.to_string(), "releases"),
+                summary_stat("Favorites", summary.favorites.to_string(), "marked favorite"),
             ]
             .spacing(7),
             row![
-                stat("Favorites", summary.favorites.to_string(), "marked favorite"),
-                stat("Rated", summary.rated.to_string(), "have a rating"),
-                stat("With lyrics", summary.with_lyrics.to_string(), &format!("{} synchronized", summary.synced_lyrics)),
+                container(
+                    column![
+                        text("TOP ARTISTS").size(9).color(ACCENT),
+                        text("Play count by each track's primary artist.")
+                            .size(8)
+                            .color(MUTED),
+                        iced::widget::Space::new().height(4),
+                        artist_rows,
+                    ]
+                    .spacing(2),
+                )
+                .padding(11)
+                .width(Length::FillPortion(1))
+                .style(card_style),
+                container(
+                    column![
+                        text("TOP ALBUMS").size(9).color(ACCENT),
+                        text("Album plays are the sum of their tracks' recorded plays.")
+                            .size(8)
+                            .color(MUTED),
+                        iced::widget::Space::new().height(4),
+                        album_rows,
+                    ]
+                    .spacing(2),
+                )
+                .padding(11)
+                .width(Length::FillPortion(1))
+                .style(card_style),
             ]
             .spacing(7),
             row![
-                stat("With artwork", summary.with_artwork.to_string(), "album cover reference"),
-                stat("Plays recorded", self.controller.playback_history().total_plays().to_string(), "meaningful plays"),
-                stat("History tracks", self.controller.playback_history().len().to_string(), "distinct TrackIds"),
+                container(
+                    column![
+                        text("LIBRARY COMPOSITION").size(9).color(ACCENT),
+                        text("Coverage across managed metadata and artwork.")
+                            .size(8)
+                            .color(MUTED),
+                        iced::widget::Space::new().height(4),
+                        self.dashboard_coverage_row("Rated", summary.rated, summary.total_tracks),
+                        self.dashboard_coverage_row("Favorites", summary.favorites, summary.total_tracks),
+                        self.dashboard_coverage_row("Lyrics", summary.with_lyrics, summary.total_tracks),
+                        self.dashboard_coverage_row("Album art", summary.with_artwork, summary.total_tracks),
+                        text(format!(
+                            "{} synchronized lyric file(s) · {} rated · {} favorite",
+                            summary.synced_lyrics, summary.rated, summary.favorites
+                        ))
+                        .size(8)
+                        .color(MUTED),
+                    ]
+                    .spacing(3),
+                )
+                .padding(11)
+                .width(Length::FillPortion(1))
+                .style(card_style),
+                container(
+                    self.dashboard_track_list(
+                        "RECENT ACTIVITY",
+                        &summary.recently_played,
+                        SmartCollection::RecentlyPlayed,
+                    ),
+                )
+                .padding(11)
+                .width(Length::FillPortion(1))
+                .style(card_style),
             ]
             .spacing(7),
             row![
                 container(
-                    self.dashboard_track_list("RECENTLY ADDED", &summary.recently_added, SmartCollection::RecentlyAdded)
-                ).padding(10).width(Length::FillPortion(1)).style(card_style),
+                    self.dashboard_track_list(
+                        "RECENTLY ADDED",
+                        &summary.recently_added,
+                        SmartCollection::RecentlyAdded,
+                    ),
+                )
+                .padding(11)
+                .width(Length::FillPortion(1))
+                .style(card_style),
                 container(
-                    self.dashboard_track_list("RECENTLY PLAYED", &summary.recently_played, SmartCollection::RecentlyPlayed)
-                ).padding(10).width(Length::FillPortion(1)).style(card_style),
-            ].spacing(7),
+                    column![
+                        text("MOST PLAYED").size(9).color(ACCENT),
+                        iced::widget::Space::new().height(4),
+                        self.dashboard_track_list(
+                            "",
+                            &summary.most_played,
+                            SmartCollection::MostPlayed,
+                        ),
+                    ]
+                    .spacing(2),
+                )
+                .padding(11)
+                .width(Length::FillPortion(1))
+                .style(card_style),
+            ]
+            .spacing(7),
             row![
-                container(
-                    self.dashboard_track_list("MOST PLAYED", &summary.most_played, SmartCollection::MostPlayed)
-                ).padding(10).width(Length::FillPortion(1)).style(card_style),
-                container(
-                    self.dashboard_track_list("HIGHLY RATED", &summary.highly_rated, SmartCollection::HighlyRated)
-                ).padding(10).width(Length::FillPortion(1)).style(card_style),
-            ].spacing(7),
-            row![
-                button(text("Browse smart collections").size(11))
+                button(text("Browse smart collections").size(10))
                     .style(accent_button_style)
-                    .padding([7, 10])
+                    .padding([6, 9])
                     .on_press(Message::SelectView(LibraryView::Collections)),
-                button(text("Recently played").size(10))
+                button(text("Recently played").size(9))
                     .style(ghost_style)
-                    .padding([7, 10])
+                    .padding([6, 9])
                     .on_press(Message::SelectView(LibraryView::RecentlyPlayed)),
-                button(text("Most played").size(10))
+                button(text("Most played").size(9))
                     .style(ghost_style)
-                    .padding([7, 10])
+                    .padding([6, 9])
                     .on_press(Message::SelectView(LibraryView::MostPlayed)),
             ]
-            .spacing(7),
+            .spacing(6),
         ]
         .spacing(10);
         if self.controller.playback_history().is_empty() {
             body = body.push(
-                text("Play a track for at least 5 seconds or half its duration (up to 30 seconds) to record a meaningful play. Seeking, pausing and restart notifications alone do not count.")
+                text("Play a track for at least 5 seconds or half its duration (up to 30 seconds) to record a meaningful play. Seeking and pausing alone do not count.")
                     .size(9)
                     .color(MUTED),
             );
@@ -15006,13 +15431,12 @@ impl FluxReady {
                 .size(9)
                 .color(MUTED)
                 .width(Length::FillPortion(4)),
-            text("RATE").size(8).color(MUTED).width(Length::Fixed(58.0)),
+            text("RATE").size(8).color(MUTED).width(Length::Fixed(26.0)),
             text("TIME").size(9).color(MUTED).width(Length::Fixed(48.0)),
-            text("+").size(9).color(MUTED).width(Length::Fixed(26.0)),
-            text("NEXT").size(9).color(MUTED).width(Length::Fixed(34.0)),
-            text("EDIT").size(9).color(MUTED).width(Length::Fixed(36.0)),
+            text("♥").size(9).color(MUTED).width(Length::Fixed(28.0)),
+            text("").size(9).width(Length::Fixed(44.0)),
         ]
-        .spacing(8)
+        .spacing(10)
         .padding([2, 10]);
 
         let mut list = column![].spacing(1);
@@ -15037,6 +15461,8 @@ impl FluxReady {
                         .controller
                         .rating(*id)
                         .is_some_and(|rating| rating.favorite),
+                    has_artist: self.controller.track_artist_id(*id).is_some(),
+                    has_album: self.controller.track_album_id(*id).is_some(),
                 },
             ));
         }
@@ -15667,6 +16093,31 @@ impl FluxReady {
             || self.album_artwork(current_album, 176.0, ContentFit::Cover),
             |entry| self.track_artwork(entry.track(), current_album, 176.0, ContentFit::Cover),
         );
+        let now_actions: Element<'_, Message> = if let Some(entry) = current_entry {
+            let track_id = entry.track();
+            let mut actions = row![
+                button(text("Lyrics").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::LyricsSelect(track_id)),
+                button(text("Edit").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::EditTrack(track_id)),
+            ]
+            .spacing(5);
+            if let Some(album) = current_album {
+                actions = actions.push(
+                    button(text("Album").size(9))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::SearchNavigateAlbum(album)),
+                );
+            }
+            actions.into()
+        } else {
+            iced::widget::Space::new().height(0).into()
+        };
         let mut panel = column![
             heading,
             container(now_art)
@@ -15674,6 +16125,7 @@ impl FluxReady {
                 .center_x(Length::Fill),
             text(title).size(16).color(TEXT),
             text(subtitle).size(11).color(MUTED),
+            now_actions,
             horizontal_rule(),
         ]
         .spacing(9);
@@ -16044,6 +16496,17 @@ impl Flux {
     }
 }
 
+/// Stacks a modal above `base`, freezing the covered layer so pointer
+/// movement cannot change hover state behind the overlay.
+fn modal_stack<'a>(
+    base: Element<'a, Message>,
+    overlay: Element<'a, Message>,
+) -> Element<'a, Message> {
+    stack([inert::inert(base), opaque(overlay)])
+        .height(Length::Fill)
+        .into()
+}
+
 fn blocked_library_view(message: &str) -> Element<'_, Message> {
     let card = column![
         text("Flux").size(28).color(ACCENT),
@@ -16091,7 +16554,35 @@ fn setup_card<'a>(
     .into()
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackMenuAction {
+    PlayNext,
+    AddToQueue,
+    Edit,
+    FavoriteToggle,
+    RateUp,
+    ClearRating,
+    OpenArtist,
+    OpenAlbum,
+    OpenLyrics,
+}
+
+impl std::fmt::Display for TrackMenuAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::PlayNext => "Play next",
+            Self::AddToQueue => "Add to queue",
+            Self::Edit => "Edit track…",
+            Self::FavoriteToggle => "Favorite",
+            Self::RateUp => "Rate +1",
+            Self::ClearRating => "Clear rating",
+            Self::OpenArtist => "Open artist",
+            Self::OpenAlbum => "Open album",
+            Self::OpenLyrics => "Open lyrics",
+        })
+    }
+}
+
 struct TrackRowState {
     current: Option<TrackId>,
     resource: Option<TrackResourceBadge>,
@@ -16100,6 +16591,72 @@ struct TrackRowState {
     focused: bool,
     rating: Option<u8>,
     favorite: bool,
+    has_artist: bool,
+    has_album: bool,
+}
+
+fn filter_chip(label: impl Into<String>) -> Element<'static, Message> {
+    container(text(label.into()).size(8).color(MUTED))
+        .padding([2, 6])
+        .style(|_| {
+            container::Style::default()
+                .background(SURFACE)
+                .border(Border {
+                    color: BORDER,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                })
+        })
+        .into()
+}
+
+fn sidebar_section(label: &'static str) -> Element<'static, Message> {
+    container(text(label).size(8).color(MUTED))
+        .padding([6, 8])
+        .into()
+}
+
+fn view_glyph(view: LibraryView) -> &'static str {
+    match view {
+        LibraryView::Tracks => "♪",
+        LibraryView::Artists => "◎",
+        LibraryView::Albums => "▣",
+        LibraryView::Playlists => "☰",
+        LibraryView::Folders => "▤",
+        LibraryView::Lyrics => "¶",
+        LibraryView::Collections => "✦",
+        LibraryView::Dashboard => "◫",
+        LibraryView::Settings => "⚙",
+        LibraryView::RecentlyAdded | LibraryView::RecentlyPlayed | LibraryView::MostPlayed => "◷",
+    }
+}
+
+fn sidebar_destination<'a>(
+    glyph: &'static str,
+    label: &'static str,
+    active: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    let color = if active { ACCENT } else { MUTED };
+    button(
+        row![
+            text(glyph)
+                .size(12)
+                .color(color)
+                .width(Length::Fixed(18.0))
+                .align_x(Alignment::Center),
+            text(label)
+                .size(11)
+                .color(if active { TEXT } else { MUTED }),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([7, 8])
+    .style(nav_style(active))
+    .on_press(message)
+    .into()
 }
 
 fn track_row<'a>(
@@ -16147,34 +16704,20 @@ fn track_row<'a>(
             .size(10)
             .color(MUTED)
             .width(Length::FillPortion(4)),
-        button(text(if state.favorite { "♥" } else { "♡" }).size(12))
-            .style(ghost_style)
-            .padding([4, 5])
-            .on_press(Message::TrackFavoriteToggle(id)),
-        button(
-            text(
-                state
-                    .rating
-                    .map_or_else(|| "☆".to_owned(), |rating| format!("{rating}★")),
-            )
-            .size(10),
+        text(
+            state
+                .rating
+                .map_or_else(String::new, |rating| format!("★{rating}")),
         )
-        .style(ghost_style)
-        .padding([4, 5])
-        .on_press(Message::TrackRatingSet(
-            id,
-            match state.rating {
-                None => Some(1),
-                Some(rating) if rating < 5 => Some(rating + 1),
-                Some(_) => None,
-            },
-        )),
+        .size(9)
+        .color(ACCENT)
+        .width(Length::Fixed(26.0)),
         text(duration)
             .size(10)
             .color(MUTED)
             .width(Length::Fixed(48.0)),
     ]
-    .spacing(12)
+    .spacing(10)
     .align_y(Alignment::Center);
 
     let check = button(text(if state.checked { "✓" } else { "○" }).size(11))
@@ -16186,25 +16729,17 @@ fn track_row<'a>(
         .padding([7, 10])
         .style(track_row_style(selected || state.checked))
         .on_press(Message::PlayTrack(id));
-    let add = button(text("+").size(12))
+    let favorite = button(text(if state.favorite { "♥" } else { "♡" }).size(12))
         .style(ghost_style)
         .padding([5, 7])
-        .on_press(Message::EnqueueTrack(id));
-    let next = button(text("→").size(12))
-        .style(ghost_style)
-        .padding([5, 7])
-        .on_press(Message::PlayNextTrack(id));
-    let edit = button(text("✎").size(11))
-        .style(ghost_style)
-        .padding([5, 7])
-        .on_press_maybe(state.editable.then_some(Message::EditTrack(id)));
-    let edit = tooltip(
-        edit,
+        .on_press(Message::TrackFavoriteToggle(id));
+    let favorite = tooltip(
+        favorite,
         container(
-            text(if state.editable {
-                "Edit metadata"
+            text(if state.favorite {
+                "Remove favorite"
             } else {
-                "Open a library to edit"
+                "Mark favorite"
             })
             .size(10)
             .color(TEXT),
@@ -16216,7 +16751,36 @@ fn track_row<'a>(
     .gap(6)
     .delay(Duration::from_millis(350));
 
-    row![check, main, add, next, edit]
+    let mut actions = vec![
+        TrackMenuAction::PlayNext,
+        TrackMenuAction::AddToQueue,
+        TrackMenuAction::FavoriteToggle,
+        TrackMenuAction::RateUp,
+        TrackMenuAction::OpenLyrics,
+    ];
+    if state.editable {
+        actions.insert(2, TrackMenuAction::Edit);
+    }
+    if state.rating.is_some() {
+        actions.insert(4, TrackMenuAction::ClearRating);
+    }
+    if state.has_artist {
+        actions.push(TrackMenuAction::OpenArtist);
+    }
+    if state.has_album {
+        actions.push(TrackMenuAction::OpenAlbum);
+    }
+    let menu = pick_list(actions, None::<TrackMenuAction>, move |action| {
+        Message::TrackMenu(id, action)
+    })
+    .placeholder("⋯")
+    .text_size(10)
+    .padding([4, 7])
+    .width(Length::Fixed(44.0))
+    .handle(iced::widget::pick_list::Handle::None)
+    .style(menu_pick_style);
+
+    row![check, main, favorite, menu]
         .spacing(2)
         .align_y(Alignment::Center)
         .into()
@@ -18133,6 +18697,258 @@ mod tests {
         let manager = gui.import_manager.as_ref().expect("manager");
         assert_eq!(manager.stage, ImportUiStage::Scanning);
         assert_eq!(manager.sources, vec![source]);
+        gui.controller.shutdown();
+    }
+
+    fn open_canonical_gui(dir: &TempDir, root: &std::path::Path) -> FluxReady {
+        std::fs::create_dir_all(root).expect("library root");
+        flux_app::create_canonical_library(root).expect("create canonical library");
+        let mut gui = gui(dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        assert_eq!(gui.controller.storage_mode(), StorageMode::Canonical);
+        gui
+    }
+
+    fn gui_import_request(gui: &FluxReady, sources: Vec<PathBuf>) -> ImportRequest {
+        ImportRequest {
+            sources,
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: gui
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| {
+                    gui.controller
+                        .track_artist_id(*id)
+                        .map(|artist| (*id, artist))
+                })
+                .collect(),
+            existing_credits: gui
+                .controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, gui.controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: gui
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| gui.controller.track_album_id(*id).map(|album| (*id, album)))
+                .collect(),
+            target_album: None,
+            generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
+        }
+    }
+
+    fn open_gui_import_review(gui: &mut FluxReady, sources: Vec<PathBuf>) -> ImportPlan {
+        let request = gui_import_request(gui, sources);
+        let plan = prepare_import_plan(
+            request,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(gui, Message::ImportOpen);
+        send(gui, Message::ImportPlanReady(0, 0, Box::new(plan.clone())));
+        assert_eq!(
+            gui.import_manager.as_ref().map(|manager| manager.stage),
+            Some(ImportUiStage::Review)
+        );
+        plan
+    }
+
+    #[test]
+    fn embedded_artwork_appears_in_gui_review_with_provenance() {
+        let dir = TempDir::new("gui-embedded-artwork");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("Nirvana/Nevermind");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("Lithium.flac");
+        std::fs::write(
+            &source,
+            include_bytes!("../../flux-library/tests/fixtures/tagged.flac"),
+        )
+        .expect("flac fixture");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let plan = open_gui_import_review(&mut gui, vec![source]);
+        let candidate = plan.candidates.first().expect("candidate");
+        assert_eq!(
+            candidate.provenance().album_artwork,
+            Some(flux_app::MetadataSource::EmbeddedArtwork)
+        );
+        assert!(
+            candidate
+                .album_artwork_path()
+                .is_some_and(|path| path.is_file())
+        );
+        assert!(
+            candidate
+                .sidecar_notes()
+                .iter()
+                .any(|note| note.contains("Embedded artwork"))
+        );
+        let _ = gui.view();
+        let review = gui.import_review_body(gui.import_manager.as_ref().expect("manager"));
+        drop(review);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn duplicate_review_opens_existing_album_and_artist() {
+        let dir = TempDir::new("gui-duplicate-navigation");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("Nirvana/Nevermind");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("Lithium.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = open_canonical_gui(&dir, &root);
+        gui.controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("base import");
+        let track_id = gui.controller.tracks()[0].0;
+        let album = gui.controller.track_album_id(track_id).expect("album");
+        let artist = gui.controller.album_owner(album).expect("album owner");
+        open_gui_import_review(&mut gui, vec![source]);
+        let candidate = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.as_ref())
+            .and_then(|plan| plan.candidates.first())
+            .expect("candidate");
+        assert!(candidate.existing_match().is_some());
+        assert_eq!(
+            candidate.existing_match().and_then(|m| m.album_id),
+            Some(album)
+        );
+
+        send(&mut gui, Message::ImportOpenExistingAlbum(album));
+        assert!(gui.import_manager.is_none());
+        assert_eq!(gui.selected_album_id(), Some(album));
+
+        send(&mut gui, Message::ImportOpen);
+        send(&mut gui, Message::ImportOpenExistingArtist(artist));
+        assert!(gui.import_manager.is_none());
+        assert_eq!(gui.selected_artist_id(), Some(artist));
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn same_named_entity_choices_are_disambiguated_by_stable_id() {
+        let dir = TempDir::new("gui-entity-disambiguation");
+        let root = dir.path().join("library");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let first = gui.controller.create_artist("Nirvana").expect("first");
+        let second = gui.controller.create_artist("Nirvana").expect("second");
+        let album_a = gui
+            .controller
+            .create_album(first, "Nevermind", ReleaseType::Album)
+            .expect("album a");
+        gui.controller
+            .create_album(second, "Nevermind", ReleaseType::Album)
+            .expect("album b");
+        let artists = gui.artist_choices();
+        let nirvanas = artists
+            .iter()
+            .filter(|choice| choice.label.starts_with("Nirvana"))
+            .collect::<Vec<_>>();
+        assert_eq!(nirvanas.len(), 2);
+        assert_eq!(
+            nirvanas
+                .iter()
+                .filter(|choice| choice.label.contains(&first.get().to_string()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            nirvanas
+                .iter()
+                .filter(|choice| choice.label.contains(&second.get().to_string()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            gui.album_choice_label(album_a, "Nevermind", first),
+            "Nevermind",
+            "an owner-scoped unique album title stays uncluttered"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn track_menu_routes_related_entities_and_playback_actions() {
+        let dir = TempDir::new("gui-track-menu");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("Nirvana/Nevermind");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("Lithium.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = open_canonical_gui(&dir, &root);
+        gui.controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("import");
+        let id = gui.controller.tracks()[0].0;
+        let album = gui.controller.track_album_id(id).expect("album");
+        let artist = gui.controller.track_artist_id(id).expect("artist");
+
+        send(
+            &mut gui,
+            Message::TrackMenu(id, TrackMenuAction::AddToQueue),
+        );
+        assert!(
+            gui.controller
+                .queue_entries()
+                .iter()
+                .any(|entry| entry.track() == id),
+            "context menu adds the track to the queue"
+        );
+        send(&mut gui, Message::TrackMenu(id, TrackMenuAction::PlayNext));
+        assert!(
+            gui.controller
+                .queue_entries()
+                .iter()
+                .any(|entry| entry.track() == id),
+            "context menu inserts the track next"
+        );
+        send(&mut gui, Message::TrackMenu(id, TrackMenuAction::OpenAlbum));
+        assert_eq!(gui.selected_album_id(), Some(album));
+        send(
+            &mut gui,
+            Message::TrackMenu(id, TrackMenuAction::OpenArtist),
+        );
+        assert_eq!(gui.selected_artist_id(), Some(artist));
+        send(&mut gui, Message::TrackMenu(id, TrackMenuAction::Edit));
+        assert!(gui.track_editor.is_some());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn filters_collapse_to_active_summary_without_a_large_panel() {
+        let dir = TempDir::new("gui-collapsible-filters");
+        let mut gui = gui(&dir);
+        assert!(!gui.filters_open);
+        assert_eq!(gui.filter_count(), 0);
+        send(&mut gui, Message::ToggleFilters);
+        assert!(gui.filters_open);
+        send(&mut gui, Message::FilterFavoritesToggled);
+        assert!(gui.filter_favorites);
+        assert_eq!(gui.filter_count(), 1);
+        send(&mut gui, Message::ToggleFilters);
+        assert!(!gui.filters_open);
+        assert_eq!(gui.filter_count(), 1);
+        let _ = gui.library_controls();
+        send(&mut gui, Message::ResetLibraryFilters);
+        assert_eq!(gui.filter_count(), 0);
         gui.controller.shutdown();
     }
 
@@ -21699,6 +22515,13 @@ mod tests {
             refreshed.history_generation,
             gui.controller.history_generation()
         );
+        let top_artists = gui.dashboard_top_artists(5);
+        assert_eq!(top_artists[0].1, "Artist One");
+        assert_eq!(top_artists[0].2, 2);
+        let top_albums = gui.dashboard_top_albums(5);
+        assert_eq!(top_albums[0].1, "Album One");
+        assert_eq!(top_albums[0].2, 2);
+        let _ = gui.dashboard_view();
         gui.controller.shutdown();
     }
 
