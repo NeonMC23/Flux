@@ -567,7 +567,8 @@ cargo run -p flux-tui --features cpal -- ~/Music
 
 See [`docs/release-readiness.md`](docs/release-readiness.md) for the current
 blockers, signing state, deferred manual validation and verified packaging
-inputs. No public release or signing credential is implied by a green CI run.
+inputs, and [`docs/signing-and-notarization.md`](docs/signing-and-notarization.md)
+for the authorized Windows/macOS signing procedure. No public release or signing credential is implied by a green CI run.
 
 ## Supported targets and CI
 
@@ -580,11 +581,11 @@ workflow artifacts only.
 
 | Platform | Native CI result | Packaging/runtime evidence |
 |---|---|---|
-| Linux x86_64 | Tests/build pass on Ubuntu 24.04 | `.tar.gz`, `.deb`, `.rpm`; verified, packaged GUI started under Xvfb with first-run library creation |
+| Linux x86_64 | Tests/build pass on Ubuntu 24.04 | Actual CI `.tar.gz`/`.deb`/`.rpm` checksum-verified; Debian/Fedora package-manager lifecycle, first-run GUI, upgrade/reinstall and removal passed in disposable containers |
 | Linux ARM64 | Native ARM64 tests/build pass | `.tar.gz`, `.deb`, `.rpm`; verified, packaged GUI started under Xvfb on the native ARM64 runner |
-| Windows x86_64 | Native tests/build pass | Portable ZIP and Inno Setup installer; PE identity/resources, Unicode path, GUI first-run/reopen, install, reinstall and uninstall sentinel lifecycle verified |
+| Windows x86_64 | Native tests/build pass | Actual CI ZIP/installer checksum-verified; PE identity/resources, Unicode path, GUI first-run/reopen, installer install/reinstall/uninstall and user-data sentinels verified natively on CI |
 | Windows ARM64 | Native ARM64 tests/build pass | Portable ZIP; PE identity/resources, Unicode path and GUI first-run/reopen verified; no installer |
-| macOS ARM64 | Native tests/build pass | `Flux.app`, ZIP and DMG; plist/icons/arch/signature, GUI first-run/reopen and Unicode home verified |
+| macOS ARM64 | Native tests/build pass | Actual CI app ZIP/DMG checksum-verified; plist/icons/arm64/ad-hoc signature, DMG mount, GUI first-run/reopen and Unicode home verified natively; not notarized |
 | macOS x86_64 | Compile-only cross-check | Not packaged or executed |
 
 All CI runners lack a usable audio endpoint, so native tests and packaging are

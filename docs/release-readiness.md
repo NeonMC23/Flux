@@ -1,7 +1,9 @@
 # Flux release-readiness audit
 
 This audit is evidence-backed and does not authorize publication. No tag,
-release, store listing, signing credential or public binary was created.
+release, store listing, signing credential or public binary was created. The
+authorized signing/notarization procedure is in
+[`signing-and-notarization.md`](signing-and-notarization.md).
 
 ## Release blockers
 
@@ -46,6 +48,95 @@ for a **public signed release**, not for development validation:
 - TUI native-independent file browser/multi-selection.
 - Further splitting entity actions out of `main.rs`.
 - Word-level synchronized lyrics and karaoke parity.
+
+
+## M20.1 actual CI artifact verification
+
+Source revision: `1aacbbfd35f1220bff75f648889d375389870fd4`.
+
+The original push run `44901144010` had the packaging jobs intentionally skipped
+because packaging requires `workflow_dispatch`. A private packaging run was
+therefore dispatched on the same SHA:
+
+- Run: `44902493899`
+- Event: `workflow_dispatch`
+- Result: success
+- Packaging jobs: Linux x86_64/ARM64, Windows x86_64/ARM64, macOS ARM64
+
+Artifacts were downloaded outside the repository and their published checksums
+verified:
+
+| Artifact | SHA-256 verified |
+|---|---|
+| `Flux-0.1.0-linux-x86_64.tar.gz` | `530f41ec8a339e4011ca8500d5d8fc3176cdcf923228617da2dfb9afa6247f2d` |
+| `Flux-0.1.0-linux-x86_64.deb` | `4fe04b324837e44f140d0037334a5dd1eed1cfca7de92ae4786f1ad766c4ff98` |
+| `Flux-0.1.0-linux-x86_64.rpm` | `7dcd66ba3e288d36b01d1dbf2652be13a9be3a6f1567f8c1496b40238fc3ff81` |
+| `Flux-0.1.0-linux-aarch64.tar.gz` | `c43381e09591904df2b808952ced21ea23191dbc3607b9f1a6e1aed642a817aa` |
+| `Flux-0.1.0-linux-aarch64.deb` | `1301c361af916790ab7da9a7f21a12de103688d31b4a61b8f67a1e1963a28520` |
+| `Flux-0.1.0-linux-aarch64.rpm` | `d8e0c3bc63b50e0adbda7bb2109d8bb5c0d2a83e94e17cbf2d1979308ea7e703` |
+| `Flux-0.1.0-windows-x86_64.zip` | `769ef82ee5503c39a30e0ace947e2ee4de693ef9b3256fc11ecd1f024b917035` |
+| `Flux-0.1.0-windows-x86_64-setup.exe` | `4196b9d22b355fbd57cda1b60cae8745b62cc3ec696ad0e502acbf3e92adaff5` |
+| `Flux-0.1.0-windows-arm64.zip` | `ea69f0f90f13c61e983ebab2bf848a8cf57d39060fed6af30334b278ab8c671d` |
+| `Flux-0.1.0-macos-arm64.app.zip` | `09b3bdb3944e27f7f731e8d240f0e8a6bf493b408c8a9b2d87dac95c3ed1b9de` |
+| `Flux-0.1.0-macos-arm64.dmg` | `f16f68cff209023b22a9cf921a3b52a738925e3d6ddbbf3a0cf02c1bd9c1d7fb` |
+
+### Linux actual artifacts
+
+- x86_64 and AArch64 `.deb` metadata report version `0.1.0`, correct
+  architecture and `libc6 (>= 2.39)`.
+- AArch64 and x86_64 binaries report `Flux 0.1.0 (io.github.neonmc23.flux)`.
+- The actual x86_64 CI `.deb`/`.rpm` passed the disposable package-manager
+  lifecycle in Ubuntu 24.04 and Fedora 44 containers: install, synthetic
+  upgrade/reinstall, sentinel preservation, removal and package-database state.
+- The portable archive extracted with expected permissions and version identity.
+- CI itself ran packaged GUI first-run validation under Xvfb.
+- The AArch64 artifacts were inspected for metadata/architecture but not
+  executed on this x86_64 host.
+
+### Windows actual artifacts
+
+- x86_64 ZIP/installer and ARM64 ZIP downloaded and checksum-verified.
+- PE inspection: x86_64 GUI is PE32+ x86-64 GUI subsystem; TUI is console
+  subsystem; ARM64 ZIP contains ARM64 PE executables.
+- Embedded version resources report `Flux`, `0.1.0` and `NeonMC23`.
+- CI native x86_64 verifier passed portable GUI/TUI identity, Unicode path,
+  icon, GUI first-run/reopen, installer install/reinstall/uninstall and
+  user-data sentinels.
+- Windows artifacts are unsigned; Authenticode status is `NotSigned`.
+- ARM64 native CI verifier passed the portable GUI launch path.
+
+### macOS actual artifacts
+
+- ARM64 app ZIP and DMG downloaded; checksums verified.
+- Bundle identifier `io.github.neonmc23.flux`, version `0.1.0`, executable
+  `flux`, icon `flux.icns`, minimum macOS 11.0.
+- Both Mach-O executables are arm64 with PIE.
+- CI native verifier passed `--version`, ZIP expansion, DMG mount, and packaged
+  GUI first-run/reopen with a non-ASCII home.
+- Signature state is ad-hoc only. Gatekeeper assessment does not pass and
+  notarization was not performed.
+
+### CI publication safety
+
+- The packaging workflow is manual-dispatch only.
+- Repository permission is `contents: read`.
+- Only private workflow artifacts are uploaded (14-day retention).
+- No workflow creates a tag, GitHub release or public binary.
+- Signing secrets are not present or printed.
+
+## Verification status matrix
+
+| Status | Evidence |
+|---|---|
+| Source validated | All six gates on `1aacbbf` |
+| CI build validated | Run `44902493899` success |
+| Actual CI artifacts inspected | All five platform artifact sets downloaded; checksums verified |
+| Linux package lifecycle validated | Actual x86_64 `.deb`/`.rpm` installed/upgraded/removed in Ubuntu 24.04/Fedora 44 containers |
+| Windows native lifecycle validated | x86_64 CI verifier install/reinstall/uninstall and GUI first-run/reopen |
+| macOS native startup validated | ARM64 CI verifier first-run/reopen and ZIP/DMG mount |
+| Signing verified | No: Windows unsigned, macOS ad-hoc only |
+| Notarization verified | No |
+| Human usability/acoustic validation | Deferred |
 
 ## M20 packaging audit finding
 
@@ -99,8 +190,13 @@ package-manager validation remain the authoritative lifecycle evidence.
 
 ## Current release classification
 
-Flux is ready for final human/platform validation and CI-produced release
-candidates. A public signed release still requires external signing/notarization
-credentials, native-platform/manual lifecycle validation and acoustic/usability
-validation. The host glibc mismatch is guarded and must not be bypassed for a
-published package.
+The actual private CI artifacts for source `1aacbbf` have been downloaded,
+checksum-verified and inspected. Linux x86_64 package-manager lifecycle passed
+on disposable Ubuntu 24.04 and Fedora 44 containers. Windows x86_64 native
+installer lifecycle and GUI first-run/reopen passed in CI; macOS ARM64 native
+first-run/reopen and ZIP/DMG inspection passed in CI.
+
+Verdict: **CI artifacts verified and ready for native validation.** A public
+release still requires authorized Windows signing and macOS Developer ID signing
+plus notarization, plus the deferred human/acoustic validation. No artifact is
+claimed signed or notarized when it is not.

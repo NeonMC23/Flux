@@ -6,6 +6,20 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M20.1 CI artifact verification
+
+- Dispatched private packaging run `44902493899` on the exact M20 source revision
+  and downloaded the actual Linux, Windows and macOS workflow artifacts.
+- Verified every published SHA-256 checksum and inspected payload identity,
+  version, architecture, resources and signing state.
+- Installed, upgraded/reinstalled and removed the actual x86_64 CI `.deb` and
+  `.rpm` in disposable Ubuntu 24.04 and Fedora 44 containers, confirming
+  glibc 2.39 compatibility and user-data sentinel preservation.
+- Confirmed CI-native Windows installer/portable lifecycle and macOS first-run,
+  ZIP/DMG mount and ad-hoc signature state.
+- Added an exact Windows Authenticode and macOS Developer ID/notarization
+  procedure in `docs/signing-and-notarization.md`.
+
 ### M20 release-candidate consolidation
 
 - Added a glibc compatibility guard to Linux packaging. Host-local packages that

@@ -303,8 +303,9 @@ is made for platforms that were not built twice.
 
 ## Signing readiness
 
-No credential is present in this environment; the prepared paths remain
-optional and fail closed when signing is explicitly required.
+See [`signing-and-notarization.md`](signing-and-notarization.md) for the exact
+operator procedure. No credential is present in this environment; the prepared
+paths remain optional and fail closed when signing is explicitly required.
 
 **Windows Authenticode**
 
@@ -342,6 +343,27 @@ suppressed.
   are unsigned; M13 macOS artifacts are ad-hoc signed and not notarized.
 - The six standard quality gates remain mandatory; packaging is additional
   validation, not a replacement.
+
+## M20.1 actual CI artifact verification
+
+Private packaging run `44902493899` was dispatched on source
+`1aacbbfd35f1220bff75f648889d375389870fd4` and completed successfully. All
+platform artifacts were downloaded and their published checksums verified.
+
+The actual x86_64 CI `.deb` and `.rpm` were installed, upgraded/reinstalled and
+removed in disposable Ubuntu 24.04 and Fedora 44 containers. Both declare the
+expected `0.1.0` identity, glibc 2.39 baseline and runtime dependencies; the
+library/configuration sentinels survived the lifecycle. The portable archive
+extracted with expected permissions and version output. AArch64 packages were
+metadata/ELF-inspected but not executed on this x86_64 host.
+
+The actual Windows x86_64 installer passed the native CI install/reinstall/
+uninstall and GUI first-run/reopen verifier. Windows ARM64 portable verification
+also passed. Windows artifacts remain unsigned.
+
+The actual macOS ARM64 app and DMG passed the native CI first-run/reopen, ZIP
+expansion and DMG-mount checks. The bundle is ad-hoc signed only; Gatekeeper does
+not accept it and no notarization occurred.
 
 ## Known distribution limits
 
