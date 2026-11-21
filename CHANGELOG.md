@@ -8,8 +8,9 @@ authorized release.
 
 ### M20.1 CI artifact verification
 
-- Dispatched private packaging run `44902493899` on the exact M20 source revision
-  and downloaded the actual Linux, Windows and macOS workflow artifacts.
+- Dispatched private packaging runs on the M20 source and, after documentation
+  updates, on final candidate `2cb94ab`; downloaded the actual Linux, Windows
+  and macOS workflow artifacts from run `44904831642`.
 - Verified every published SHA-256 checksum and inspected payload identity,
   version, architecture, resources and signing state.
 - Installed, upgraded/reinstalled and removed the actual x86_64 CI `.deb` and

@@ -52,13 +52,14 @@ for a **public signed release**, not for development validation:
 
 ## M20.1 actual CI artifact verification
 
-Source revision: `1aacbbfd35f1220bff75f648889d375389870fd4`.
+Source revision: `2cb94ab75352ad6a32ae8f439a269e2501c911f6`.
 
 The original push run `44901144010` had the packaging jobs intentionally skipped
-because packaging requires `workflow_dispatch`. A private packaging run was
-therefore dispatched on the same SHA:
+because packaging requires `workflow_dispatch`. Private packaging runs were
+dispatched on the exact candidate SHAs; the final artifact set was produced from
+the docs-complete HEAD:
 
-- Run: `44902493899`
+- Run: `44904831642`
 - Event: `workflow_dispatch`
 - Result: success
 - Packaging jobs: Linux x86_64/ARM64, Windows x86_64/ARM64, macOS ARM64
@@ -68,17 +69,17 @@ verified:
 
 | Artifact | SHA-256 verified |
 |---|---|
-| `Flux-0.1.0-linux-x86_64.tar.gz` | `530f41ec8a339e4011ca8500d5d8fc3176cdcf923228617da2dfb9afa6247f2d` |
-| `Flux-0.1.0-linux-x86_64.deb` | `4fe04b324837e44f140d0037334a5dd1eed1cfca7de92ae4786f1ad766c4ff98` |
-| `Flux-0.1.0-linux-x86_64.rpm` | `7dcd66ba3e288d36b01d1dbf2652be13a9be3a6f1567f8c1496b40238fc3ff81` |
-| `Flux-0.1.0-linux-aarch64.tar.gz` | `c43381e09591904df2b808952ced21ea23191dbc3607b9f1a6e1aed642a817aa` |
-| `Flux-0.1.0-linux-aarch64.deb` | `1301c361af916790ab7da9a7f21a12de103688d31b4a61b8f67a1e1963a28520` |
-| `Flux-0.1.0-linux-aarch64.rpm` | `d8e0c3bc63b50e0adbda7bb2109d8bb5c0d2a83e94e17cbf2d1979308ea7e703` |
-| `Flux-0.1.0-windows-x86_64.zip` | `769ef82ee5503c39a30e0ace947e2ee4de693ef9b3256fc11ecd1f024b917035` |
-| `Flux-0.1.0-windows-x86_64-setup.exe` | `4196b9d22b355fbd57cda1b60cae8745b62cc3ec696ad0e502acbf3e92adaff5` |
-| `Flux-0.1.0-windows-arm64.zip` | `ea69f0f90f13c61e983ebab2bf848a8cf57d39060fed6af30334b278ab8c671d` |
-| `Flux-0.1.0-macos-arm64.app.zip` | `09b3bdb3944e27f7f731e8d240f0e8a6bf493b408c8a9b2d87dac95c3ed1b9de` |
-| `Flux-0.1.0-macos-arm64.dmg` | `f16f68cff209023b22a9cf921a3b52a738925e3d6ddbbf3a0cf02c1bd9c1d7fb` |
+| `Flux-0.1.0-linux-x86_64.tar.gz` | `cd9e3f6069cdc3e57368256b8526e84487902e9a660a12ad23b5243509e43727` |
+| `Flux-0.1.0-linux-x86_64.deb` | `28d0c309bf8a4dd8925a9b582feaf2462bda5932e5e3cacefcb0be7a8ca2255a` |
+| `Flux-0.1.0-linux-x86_64.rpm` | `b57f9afe5025847b316decf07a84781578b7a086496bb0668152b8e32d7a4623` |
+| `Flux-0.1.0-linux-aarch64.tar.gz` | `4c8b48843c2bc0a2f6ed6f9e3274bf7d6703b114664b359074e202a37e923aa0` |
+| `Flux-0.1.0-linux-aarch64.deb` | `5739888d3c84332a958bb8f256f9f0cb6175de7d9d0ed6eea76ceb16ccaf31a9` |
+| `Flux-0.1.0-linux-aarch64.rpm` | `cb9725cb8894a3961467e668f7d89da67c0f1492cb37e058882ef7b53e2b557d` |
+| `Flux-0.1.0-windows-x86_64.zip` | `c0be0371e1424ab2c23c95aae2009c0ab219aed5e86ba82c0bf5f13f9f5bf9cf` |
+| `Flux-0.1.0-windows-x86_64-setup.exe` | `63735c7b84aa00b6882a2f70f47e3bfdddf3bd83ea14e518fc9991fd77afe001` |
+| `Flux-0.1.0-windows-arm64.zip` | `8eca67ada8bc3a168c615402f31040b971e91997a2731e25fec38199223c320c` |
+| `Flux-0.1.0-macos-arm64.app.zip` | `56c57cd002ae3808bc7c068f4237dd13a406f86c7399eca99edeede4b7e4a191` |
+| `Flux-0.1.0-macos-arm64.dmg` | `69f78b76632b1f1c8359483dd6f62436b23fc850bc6f266accefaf484965efab` |
 
 ### Linux actual artifacts
 

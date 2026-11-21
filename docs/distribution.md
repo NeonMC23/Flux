@@ -346,8 +346,8 @@ suppressed.
 
 ## M20.1 actual CI artifact verification
 
-Private packaging run `44902493899` was dispatched on source
-`1aacbbfd35f1220bff75f648889d375389870fd4` and completed successfully. All
+Private packaging run `44904831642` was dispatched on source
+`2cb94ab75352ad6a32ae8f439a269e2501c911f6` and completed successfully. All
 platform artifacts were downloaded and their published checksums verified.
 
 The actual x86_64 CI `.deb` and `.rpm` were installed, upgraded/reinstalled and
