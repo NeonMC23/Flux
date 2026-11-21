@@ -1,0 +1,36 @@
+Flux · canonical /tmp/opencode/m15-ui-w/data/flux/FluxLibrary · delete · queue 1 · normal
+ Tracks  Artists  Albums  Playlists  Collections  Lyrics  Settings
+⏸ First Song — Artist    0:00 / --:--    ░░░░░░░░░░░░    Vol 100%    Xfade off
+Delete artist · Artist · 2 owned · 0 credited · 2 issue(s)
+> First Song · owned · Album · unresolved
+  Second Song · owned · Album · unresolved
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+2 track(s) need transfer, credit-removal or explicit deletion decisions. a auto-resolves safe transfers/credits; y publi
+Artist deletion — ↑/↓ select · t transfer · r remove credit · d delete twice · u reset · a auto · y publish · Esc cancel

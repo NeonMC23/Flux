@@ -220,9 +220,9 @@ and ordered Track membership. Track metadata, Artist name/aliases/description/
 image, Album title/release/cover, Track artwork, lyrics and managed audio repair
 use shared Controller operations. Album tracks reorder with `Ctrl+↑/↓`, and a
 track can move between owner Albums or to standalone state through a reviewed
-plan. Track deletion, empty-Album deletion and track-free Artist deletion require
-explicit confirmation; populated Artist deletion and ownership/Album transfer
-remain GUI review workflows. Playlists support create, rename, delete, add,
+plan. Track deletion, empty-Album deletion and populated Artist deletion require
+explicit confirmation and shared decisions; ownership/Album transfer remains a
+GUI review workflow. Playlists support create, rename, delete, add,
 remove, reorder, clear, play and shuffle-play. The TUI never bypasses deletion or
 repair safety, never deletes external audio, and does not treat an inaccessible
 path as missing.
@@ -2246,15 +2246,16 @@ cleanup.
    exercised on native runners. Windows file dialogs, Explorer integration,
    case-sensitive volumes, Linux privileged package installation, and audio
    output on Windows/macOS remain unverified.
-10. The TUI import review supports decisions, structured metadata correction and
-    per-candidate album/track artwork and lyrics attachment from typed paths.
-    Fixed-target Album selection and native pickers remain GUI-only.
+10. The TUI import review supports decisions, structured metadata correction,
+    per-candidate album/track artwork and lyrics attachment from typed paths,
+    fixed-target existing Albums and bulk release types. Native pickers remain
+    GUI-only.
 11. Atomic import reuses exact and unique case/whitespace-normalized Artist and
     Album names. Approximate/fuzzy matching is deliberately not performed;
     ambiguous normalized names require explicit review.
-12. The TUI deletes track-free artists and empty Albums through the shared
-    plans. Populated artist deletion, credit/transfer decisions and ownership/
-    Album transfer remain GUI review workflows.
+12. Both frontends delete artists through the shared decision plan. The TUI
+    exposes transfer, credit removal, explicit deletion, reset and safe
+    auto-resolution; ownership/Album transfer remains GUI-only.
 13. Track membership moves, album reorder and managed-audio replacement are
     available in both frontends through shared Controller plans. Ownership/Album
     transfer remains GUI-only.
@@ -2321,9 +2322,9 @@ cleanup.
     to follow, but a path that disappears before enumeration cannot be named;
     refresh and the authoritative H1 planning/preparation checks remain the
     safety boundary.
-29. The TUI import review does not expose fixed-target Album selection,
-    bulk release-type controls or native pickers. It does expose structured
-    metadata correction and album/track artwork and lyrics attachment. Discovery,
+29. The TUI import review exposes fixed-target existing Albums and bulk
+    release types but not native pickers. It also exposes structured metadata
+    correction and album/track artwork and lyrics attachment. Discovery,
     hashing and copy preparation are cancellable; the final atomic catalogue
     publish is synchronous.
 30. TUI track deletion, managed-audio replacement, artwork/lyrics management,

@@ -232,8 +232,8 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   forms rather than delimiter syntax. Queue, playlist, lyrics, favorite, rating,
   history, import, library lifecycle and audio-device workflows remain available.
   Album tracks reorder in place and tracks can move between albums or to
-  standalone state; track deletion, empty-album deletion and track-free artist
-  deletion use explicit confirmation. `Alt+r` reviews managed-audio repair or
+  standalone state; track deletion, empty-album deletion and populated artist
+  deletion use explicit confirmation and shared decision plans. `Alt+r` reviews managed-audio repair or
   replacement. Import review can attach album art, track art and lyrics through
   typed paths, and the lyrics reader exports to a new file. `m` cycles Standard,
   Library, Player, Visualizer and Compact layouts, and `v`/`Alt+v` control a real
@@ -528,8 +528,9 @@ Album artwork to checked candidates, while Track artwork, lyrics and the release
 type of a newly created Album remain per-candidate; a featuring boolean and
 one-action metadata templates beyond that scope remain future work. The TUI
 exposes structured Artist/Album/Track metadata forms, album order/membership,
-managed audio repair, artwork/lyrics attachment and safe deletion; native
-pickers and ownership/album transfer remain GUI-only.
+managed audio repair, artwork/lyrics attachment, fixed-target import, populated
+artist deletion and safe deletion; native pickers, multi-selection and ownership/
+album transfer remain GUI-only.
 Lyrics must be valid UTF-8 LRC/TXT; embedded audio tags are neither read nor
 written.
 Native dialogs and file-drop are implemented; cross-platform runtime

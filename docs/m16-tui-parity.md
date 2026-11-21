@@ -32,6 +32,12 @@ Five layout presets replace arbitrary panel configuration:
 layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
 `tui.conf` under the Flux config directory. User data never moves there.
 
+The TUI is split into focused modules: `main.rs` owns application state,
+dispatch and lifecycle; `render.rs` composes views; `import.rs` owns the import
+worker and review; `forms.rs` owns structured form parsing; `help.rs` owns help
+text and summaries; `text.rs` owns width-aware helpers; and `visualizer.rs`
+renders real waveform data. Domain rules remain in `flux-app`.
+
 ## Parity matrix
 
 | Capability | Pre-M16 TUI | M16 TUI equivalent | Shared API / boundary | Status | Tests |
@@ -60,7 +66,8 @@ layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
 | Folder/file import | Delimiter/path input | Source → Destination → Verify → Import, same pipeline | `prepare_import_plan`, `prepare_import_files` | Complete for normal path | Existing import lifecycle tests |
 | Import metadata editing | None | `e` opens a structured form for title/artist/album/numbers | `ImportCandidate` setters | Complete | Import edit test |
 | Import artwork/lyrics attachment | GUI-only | `A`/`T`/`L` attach album art, track art or lyrics; `-` clears | `ImportCandidate` asset APIs, `apply_lyrics_from_path` | Complete (typed paths, no native picker) | Import asset test |
-| Import destination | Active library | Explicit review of active canonical destination | Shared import request | Complete | Existing destination tests |
+| Import destination | Active library | Explicit review of active canonical destination; `F` applies an existing fixed-target album | Shared import request and `ImportAlbumTarget` | Complete | Fixed-target test |
+| Bulk import release type | GUI-only | `1`–`5` apply Album/EP/Single/Compilation/Other to reviewed new albums | `ImportPlan::apply_release_type_to` | Complete | Fixed-target/bulk test |
 | Duplicate decisions | Complete | Include/skip/update and bulk actions | `ImportDecision`, plan bulk helpers | Complete | Duplicate import tests |
 | Import cancellation | Complete | Esc cancels discovery/preparation; final commit honest | Shared worker/cancel flag | Complete | Cancellation tests |
 | Create/rename/delete playlist | None | `N`, `R`, `x` with confirmation | `create/rename/delete_playlist` | Complete | Navigation and confirmation tests |
@@ -80,16 +87,17 @@ layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
 | Layout presets | None | `m` cycles five presets; persisted | TUI preference file | Complete | Preferences test |
 | Help and discovery | Large static help | Contextual footer, `?` help, command palette | Frontend presentation | Complete | Help test |
 | Library open/create/migrate | Complete | Preserved | Shared lifecycle APIs | Complete | Existing migration tests |
-| Track/Artist/Album deletion | GUI review | Track deletion and empty album/artist deletion use shared plans and explicit confirmation | `plan/delete_track`, `delete_empty_album`, artist plan/execute | Complete for supported cases; populated artist deletion stays GUI | Album/artist deletion tests |
+| Track/Artist/Album deletion | GUI review | Track deletion, empty albums and populated artist deletion use shared plans and explicit confirmation | `plan/delete_track`, `delete_empty_album`, artist decision plan/execute | Complete for supported decisions; ownership/album transfer stays GUI | Album/artist deletion tests |
 | Track audio replacement | GUI review | `Alt+r` plans a replacement and confirms with `y` | `plan/execute_track_audio_replacement` | Complete | `tui_reviews_managed_audio_replacement...` |
 
 ## Genuine limitations
 
 - Terminal cells cannot display embedded artwork. Track/Album artwork is
   represented by presence badges and state messages, never by a fake image.
-- Populated artist deletion and ownership/album transfer still require the
-  GUI's multi-item decision screen. The TUI deletes only track-free artists and
-  empty albums, and never duplicates those transaction rules.
+- Populated artist deletion is available through the shared decision plan
+  (`t` transfer, `r` remove credit, `d` twice for explicit deletion, `a`
+  auto-resolve, `y` publish). Ownership/album transfer remains GUI-only because
+  it needs a destination-review UI that the terminal does not approximate well.
 - Import asset attachment uses typed paths in the TUI; native graphical pickers
   remain GUI-only. The ordinary Source → Destination → Verify → Import path and
   structured metadata correction are available in both frontends.
@@ -115,12 +123,15 @@ layouts, and `v`/`Alt+v` control the visualizer. UI preferences are stored in
 | `e` | Structured track edit |
 | `Alt+m` | Move selected track to an album or standalone |
 | `Alt+r` | Review managed-audio replacement or missing-file repair |
-| `Delete` | Review track, empty-album or track-free artist deletion |
+| `F` in import | Choose a fixed target album |
+| `1`–`5` in import | Bulk Album/EP/Single/Compilation/Other release type |
+| `Delete` | Review track, empty-album or populated artist deletion |
 | `Y` / `Z` | Structured artist / album edit |
 | `W` / `S` | Track artwork / managed lyrics |
 | `y` | Read selected/current lyrics |
 | `x` in lyrics | Export lyrics to a new path |
 | `A`/`T`/`L` in import | Attach album artwork / track artwork / lyrics |
+| `t`/`r`/`d`/`a` in artist deletion | Transfer / remove credit / explicit delete twice / auto-resolve |
 | `N` / `R` / `x` | New / rename / delete playlist (context) |
 | `l` / `d` / `c` | Play playlist / remove entry / clear playlist (detail context) |
 | `Ctrl+↑`/`Ctrl+↓` | Reorder queue entry or playlist entry |

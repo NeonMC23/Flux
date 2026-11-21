@@ -6,6 +6,20 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M18 completion
+
+- TUI populated-artist deletion now reviews owned and credited tracks through the
+  shared `ArtistDeletionPlan`: transfer to a surviving owner, remove a credit,
+  explicitly delete twice, reset, or auto-resolve safe decisions. Publication is
+  refused until the plan is ready.
+- TUI import review supports fixed-target existing albums (`F`) and bulk release
+  types (`1`–`5`) while preserving the review-first canonical transaction.
+- The TUI was split into `render`, `import`, `forms`, `help`, `text` and
+  `visualizer` modules, reducing `main.rs` by roughly a quarter without moving
+  domain rules out of `flux-app`.
+- Regression tests cover populated-artist transfer deletion, fixed-target import
+  and bulk release type application.
+
 ### Feature completion
 
 - TUI album order and membership now use shared reviewed plans: `Ctrl+↑/↓`
