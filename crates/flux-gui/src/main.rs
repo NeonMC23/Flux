@@ -54,13 +54,13 @@ use iced::{
 
 // ------------------------------------------------------------------ look ---
 
-const BG: Color = Color::from_rgb8(0x0d, 0x0b, 0x12);
-const SIDEBAR: Color = Color::from_rgb8(0x12, 0x10, 0x18);
-const SURFACE: Color = Color::from_rgb8(0x18, 0x15, 0x20);
-const SURFACE_HI: Color = Color::from_rgb8(0x22, 0x1d, 0x2b);
-const BORDER: Color = Color::from_rgb8(0x2c, 0x25, 0x38);
-const TEXT: Color = Color::from_rgb8(0xf5, 0xef, 0xf8);
-const MUTED: Color = Color::from_rgb8(0x99, 0x8f, 0xa6);
+const BG: Color = Color::from_rgb8(0x0c, 0x0a, 0x10);
+const SIDEBAR: Color = Color::from_rgb8(0x12, 0x10, 0x16);
+const SURFACE: Color = Color::from_rgb8(0x18, 0x15, 0x1e);
+const SURFACE_HI: Color = Color::from_rgb8(0x22, 0x1e, 0x2a);
+const BORDER: Color = Color::from_rgb8(0x2e, 0x28, 0x38);
+const TEXT: Color = Color::from_rgb8(0xf6, 0xf1, 0xf8);
+const MUTED: Color = Color::from_rgb8(0x9c, 0x93, 0xa8);
 const ACCENT: Color = Color::from_rgb8(0xff, 0x66, 0xcc);
 const ACCENT_SOFT: Color = Color::from_rgba8(0xff, 0x66, 0xcc, 0.13);
 const ACCENT_BORDER: Color = Color::from_rgba8(0xff, 0x66, 0xcc, 0.38);
@@ -68,12 +68,28 @@ const DANGER: Color = Color::from_rgb8(0xff, 0x78, 0x8c);
 const DANGER_BG: Color = Color::from_rgba8(0x5a, 0x1c, 0x2a, 0.42);
 const SUCCESS: Color = Color::from_rgb8(0x7d, 0xe2, 0xb4);
 
+// Typography and spacing scale shared by the main product surfaces.
+const FONT_HERO: f32 = 28.0;
+const FONT_SECTION: f32 = 18.0;
+const FONT_TITLE: f32 = 15.0;
+const FONT_BODY: f32 = 12.0;
+const FONT_META: f32 = 10.0;
+const FONT_LABEL: f32 = 9.0;
+const GAP_XS: f32 = 4.0;
+const GAP_SM: f32 = 8.0;
+const GAP_MD: f32 = 12.0;
+const GAP_LG: f32 = 18.0;
+const SIDEBAR_WIDE: f32 = 232.0;
+const SIDEBAR_MEDIUM: f32 = 204.0;
+const SIDEBAR_COMPACT: f32 = 184.0;
+
 const TRACK_PAGE_SIZE: usize = 150;
 const GROUP_PAGE_SIZE: usize = 100;
 const SEARCH_RESULT_LIMIT: usize = 20;
 const PLAYLIST_PAGE_SIZE: usize = 150;
 const QUEUE_PAGE_SIZE: usize = 8;
-const QUEUE_INLINE_MIN_WIDTH: f32 = 1_080.0;
+const QUEUE_INLINE_MIN_WIDTH: f32 = 1_240.0;
+const COMPACT_SHELL_WIDTH: f32 = 1_080.0;
 const QUEUE_ROW_HEIGHT: f32 = 38.0;
 const PLAYLIST_ROW_HEIGHT: f32 = 40.0;
 const WAVE_TICK: Duration = Duration::from_millis(16);
@@ -1338,7 +1354,7 @@ impl LibraryView {
             Self::Folders => "Folders",
             Self::Playlists => "Playlists",
             Self::Lyrics => "Lyrics",
-            Self::Dashboard => "Dashboard",
+            Self::Dashboard => "Home",
             Self::Collections => "Smart Collections",
             Self::RecentlyAdded => "Recently Added",
             Self::RecentlyPlayed => "Recently Played",
@@ -1380,6 +1396,14 @@ fn resource_badge(state: Option<ResourceState>) -> Option<TrackResourceBadge> {
         Some(ResourceState::Missing) => Some(TrackResourceBadge::Missing),
         Some(ResourceState::Unavailable(_)) => Some(TrackResourceBadge::Inaccessible),
         Some(ResourceState::Present) | None => None,
+    }
+}
+
+fn pluralize(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
     }
 }
 
@@ -2220,6 +2244,7 @@ struct FluxReady {
     queue_visible: bool,
     queue_overlay_open: bool,
     window_width: f32,
+    window_height: f32,
     close_confirm: bool,
     setup_advanced_open: bool,
     closed: bool,
@@ -2557,7 +2582,7 @@ enum Message {
     KeyPressed(Key, Modifiers),
     Tick,
     WaveTick,
-    WindowResized(f32),
+    WindowResized(f32, f32),
     WindowCloseRequested(window::Id),
 }
 
@@ -2700,7 +2725,7 @@ impl FluxReady {
             pending_plan: None,
             migrated_dest: None,
             lifecycle_msg: None,
-            view: LibraryView::Tracks,
+            view: LibraryView::Dashboard,
             selected_group: None,
             navigation_stack: Vec::new(),
             page: 0,
@@ -2721,6 +2746,7 @@ impl FluxReady {
             queue_visible: true,
             queue_overlay_open: false,
             window_width: 1_180.0,
+            window_height: 760.0,
             close_confirm: false,
             setup_advanced_open: false,
             closed: false,
@@ -2731,7 +2757,8 @@ impl FluxReady {
         let mut subscriptions = vec![
             iced::time::every(Duration::from_millis(150)).map(|_| Message::Tick),
             window::close_requests().map(Message::WindowCloseRequested),
-            window::resize_events().map(|(_, size)| Message::WindowResized(size.width)),
+            window::resize_events()
+                .map(|(_, size)| Message::WindowResized(size.width, size.height)),
             iced::keyboard::listen().filter_map(|event| match event {
                 iced::keyboard::Event::KeyPressed { key, modifiers, .. } => {
                     Some(Message::KeyPressed(key, modifiers))
@@ -8088,10 +8115,11 @@ impl FluxReady {
                     self.scope.update(&waveform);
                 }
             }
-            Message::WindowResized(width) => {
+            Message::WindowResized(width, height) => {
                 self.cancel_queue_drag();
                 self.seek_preview = None;
                 self.window_width = width;
+                self.window_height = height;
                 if width >= QUEUE_INLINE_MIN_WIDTH {
                     self.queue_overlay_open = false;
                 }
@@ -9045,14 +9073,22 @@ impl FluxReady {
 
         let compact_panel = matches!(
             manager.stage,
-            ImportUiStage::Completed | ImportUiStage::Cancelled | ImportUiStage::Failed
+            ImportUiStage::Choose
+                | ImportUiStage::Scanning
+                | ImportUiStage::Completed
+                | ImportUiStage::Cancelled
+                | ImportUiStage::Failed
         ) && manager.browser.is_none();
         let panel = container(panel)
             .padding(16)
             .width(Length::Fill)
-            .max_width(1_040.0)
+            .max_width(if compact_panel { 720.0 } else { 1_040.0 })
             .height(if compact_panel {
-                Length::Fixed(360.0)
+                Length::Fixed(if manager.stage == ImportUiStage::Choose {
+                    470.0
+                } else {
+                    360.0
+                })
             } else {
                 Length::Fill
             })
@@ -10719,24 +10755,31 @@ impl FluxReady {
 
     fn sidebar(&self) -> Element<'_, Message> {
         let brand = row![
-            container(iced::widget::Space::new().width(4).height(30))
+            container(iced::widget::Space::new().width(4).height(32))
                 .style(|_| container::Style::default().background(ACCENT)),
             column![
-                text("Flux").size(21).color(TEXT),
-                text("local music").size(8).color(MUTED),
+                text("Flux").size(22).color(TEXT),
+                text("local music").size(FONT_LABEL).color(MUTED),
             ]
-            .spacing(0),
+            .spacing(1),
         ]
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let mut nav_items = column![].spacing(1);
+        let mut nav_items = column![].spacing(2);
+        nav_items = nav_items.push(sidebar_destination(
+            view_glyph(LibraryView::Dashboard),
+            LibraryView::Dashboard.label(),
+            self.view == LibraryView::Dashboard && !self.show_setup,
+            Message::SelectView(LibraryView::Dashboard),
+        ));
+        nav_items = nav_items.push(iced::widget::Space::new().height(Length::Fixed(GAP_MD)));
         nav_items = nav_items.push(sidebar_section("LIBRARY"));
         for view in [
             LibraryView::Tracks,
             LibraryView::Artists,
             LibraryView::Albums,
-            LibraryView::Playlists,
+            LibraryView::Folders,
         ] {
             nav_items = nav_items.push(sidebar_destination(
                 view_glyph(view),
@@ -10745,13 +10788,12 @@ impl FluxReady {
                 Message::SelectView(view),
             ));
         }
-        nav_items = nav_items.push(iced::widget::Space::new().height(10));
-        nav_items = nav_items.push(sidebar_section("BROWSE"));
+        nav_items = nav_items.push(iced::widget::Space::new().height(Length::Fixed(GAP_MD)));
+        nav_items = nav_items.push(sidebar_section("COLLECTIONS"));
         for view in [
-            LibraryView::Folders,
-            LibraryView::Lyrics,
+            LibraryView::Playlists,
             LibraryView::Collections,
-            LibraryView::Dashboard,
+            LibraryView::Lyrics,
         ] {
             nav_items = nav_items.push(sidebar_destination(
                 view_glyph(view),
@@ -10763,54 +10805,58 @@ impl FluxReady {
 
         let mut nav = column![
             brand,
-            iced::widget::Space::new().height(16),
+            iced::widget::Space::new().height(Length::Fixed(GAP_LG)),
             button(
                 row![
-                    text("+").size(13).color(BG),
-                    text("Import music").size(11).color(BG),
+                    text("+").size(FONT_TITLE).color(BG),
+                    text("Import music").size(FONT_BODY).color(BG),
                 ]
                 .spacing(7)
                 .align_y(Alignment::Center),
             )
             .width(Length::Fill)
-            .padding([8, 10])
+            .padding([9, 11])
             .style(accent_button_style)
             .on_press(Message::ImportOpen),
-            iced::widget::Space::new().height(10),
+            iced::widget::Space::new().height(Length::Fixed(GAP_MD)),
         ]
         .spacing(0);
         nav = nav.push(scrollable(nav_items).height(Length::Fill));
         if self.queue_placement() != QueuePlacement::Inline
+            && self.window_height >= 720.0
             && let Some(track) = self.controller.current_track()
         {
-            let title = truncate_label(track.title(), 22);
-            let subtitle = truncate_label(&display_artist(track), 24);
+            let title = truncate_label(track.title(), 24);
+            let subtitle = truncate_label(&display_artist(track), 26);
             let current = self.controller.current_id();
             nav = nav.push(
                 container(
                     column![
-                        text("NOW PLAYING").size(8).color(ACCENT),
-                        button(text(title).size(11).color(TEXT))
+                        text("NOW PLAYING").size(FONT_LABEL).color(ACCENT),
+                        button(text(title).size(FONT_BODY).color(TEXT))
                             .style(ghost_style)
                             .padding([0, 0])
                             .on_press_maybe(current.map(Message::SearchNavigateTrack)),
                         row![
-                            text(subtitle).size(9).color(MUTED).width(Length::Fill),
-                            button(text("Lyrics").size(9))
+                            text(subtitle)
+                                .size(FONT_LABEL)
+                                .color(MUTED)
+                                .width(Length::Fill),
+                            button(text("Lyrics").size(FONT_LABEL))
                                 .style(ghost_style)
                                 .padding([3, 5])
                                 .on_press(Message::LyricsOpenCurrent),
                         ]
-                        .spacing(4)
+                        .spacing(GAP_XS)
                         .align_y(Alignment::Center),
                     ]
                     .spacing(3),
                 )
                 .width(Length::Fill)
-                .padding(9)
+                .padding(10)
                 .style(card_style),
             );
-            nav = nav.push(iced::widget::Space::new().height(6));
+            nav = nav.push(iced::widget::Space::new().height(Length::Fixed(GAP_SM)));
         }
         nav = nav.push(sidebar_destination(
             view_glyph(LibraryView::Settings),
@@ -10820,15 +10866,25 @@ impl FluxReady {
         ));
 
         container(nav)
-            .width(Length::Fixed(208.0))
+            .width(Length::Fixed(self.sidebar_width()))
             .height(Length::Fill)
-            .padding([16, 12])
+            .padding([GAP_LG, GAP_MD])
             .style(sidebar_style)
             .into()
     }
 
+    fn sidebar_width(&self) -> f32 {
+        if self.window_width >= 1_150.0 {
+            SIDEBAR_WIDE
+        } else if self.window_width >= 940.0 {
+            SIDEBAR_MEDIUM
+        } else {
+            SIDEBAR_COMPACT
+        }
+    }
+
     fn central(&self) -> Element<'_, Message> {
-        let mut content = column![self.top_bar()].spacing(14).padding(20);
+        let mut content = column![self.top_bar()].spacing(GAP_LG).padding(24);
         if let Some(banner) = self.error_banner() {
             content = content.push(banner);
         }
@@ -10836,8 +10892,11 @@ impl FluxReady {
             && self.track_editor.is_none()
             && self.search.trim().is_empty()
             && !self.controller.tracks().is_empty()
+            && self.selected_artist_id().is_none()
+            && self.selected_album_id().is_none()
+            && self.selected_playlist.is_none()
+            && self.selected_lyrics.is_none()
             && (self.view == LibraryView::Tracks
-                || self.selected_group.is_some()
                 || self.collection.is_some()
                 || matches!(
                     self.view,
@@ -10913,8 +10972,8 @@ impl FluxReady {
             )
         } else if self.view == LibraryView::Dashboard {
             (
-                "Dashboard".to_owned(),
-                "Library totals and listening history.".to_owned(),
+                "Home".to_owned(),
+                "Listening overview, recent activity and library health.".to_owned(),
             )
         } else if let Some(collection) = self.collection {
             (
@@ -10953,17 +11012,17 @@ impl FluxReady {
                     .playlist(playlist_id)
                     .map(|playlist| playlist.name.clone())
                     .unwrap_or_else(|| "Playlist".to_owned()),
-                format!(
-                    "{} track(s)",
+                pluralize(
                     self.controller
                         .playlist(playlist_id)
-                        .map_or(0, |playlist| playlist.track_ids.len())
+                        .map_or(0, |playlist| playlist.track_ids.len()),
+                    "track",
                 ),
             )
         } else if self.view == LibraryView::Playlists {
             (
                 "Playlists".to_owned(),
-                format!("{} playlist(s)", self.controller.playlists().len()),
+                pluralize(self.controller.playlists().len(), "playlist"),
             )
         } else if let Some(artist_id) = self.selected_artist_id() {
             let name = self
@@ -10979,15 +11038,18 @@ impl FluxReady {
             let albums = associated.len();
             (
                 name,
-                format!("Artist detail · {albums} album association(s) · artist {artist_id}"),
+                format!(
+                    "Artist detail · {} · artist {artist_id}",
+                    pluralize(albums, "album association")
+                ),
             )
         } else if let Some(group) = &self.selected_group {
             let rows = self.filtered_track_ids();
             (
                 group_title(self.view, group),
                 format!(
-                    "{} track(s) · {}",
-                    rows.len(),
+                    "{} · {}",
+                    pluralize(rows.len(), "track"),
                     self.view.label().to_lowercase()
                 ),
             )
@@ -10995,12 +11057,12 @@ impl FluxReady {
             (
                 "Tracks".to_owned(),
                 format!(
-                    "{} track(s){}",
-                    self.controller.tracks().len(),
+                    "{}{}",
+                    pluralize(self.controller.tracks().len(), "track"),
                     if self.search.trim().is_empty() {
                         String::new()
                     } else {
-                        format!(" · {} match(es)", self.filtered_track_ids().len())
+                        format!(" · {}", pluralize(self.filtered_track_ids().len(), "match"))
                     }
                 ),
             )
@@ -11014,7 +11076,7 @@ impl FluxReady {
                 ),
             )
         };
-        let compact = self.window_width < QUEUE_INLINE_MIN_WIDTH;
+        let compact = self.window_width < COMPACT_SHELL_WIDTH;
         let title = truncate_label(&title, if compact { 46 } else { 80 });
         let subtitle = truncate_label(&subtitle, if compact { 72 } else { 120 });
 
@@ -11043,8 +11105,8 @@ impl FluxReady {
         }
         bar = bar.push(
             column![
-                text(title).size(24).color(TEXT),
-                text(subtitle).size(11).color(MUTED)
+                text(title).size(FONT_HERO).color(TEXT),
+                text(subtitle).size(FONT_META).color(MUTED)
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -11056,7 +11118,7 @@ impl FluxReady {
                     .id(iced::widget::Id::new("flux-search"))
                     .on_input(Message::SearchChanged)
                     .style(input_style)
-                    .width(Length::Fixed(if compact { 190.0 } else { 250.0 })),
+                    .width(Length::Fixed(if compact { 220.0 } else { 288.0 })),
             );
             if !self.search.trim().is_empty() {
                 bar = bar.push(
@@ -12332,18 +12394,21 @@ impl FluxReady {
         for (key, count) in &groups[start..end] {
             let title = group_title(self.view, key);
             let subtitle = if self.view == LibraryView::Folders {
-                format!("{count} track(s) · {key}")
+                format!("{} · {key}", pluralize(*count, "track"))
             } else if self.view == LibraryView::Artists {
                 let (_, artist_id) = artist_key_parts(key);
                 if artist_id == "none" {
-                    format!("{count} track(s) · no stable artist")
+                    format!("{} · no stable artist", pluralize(*count, "track"))
                 } else {
-                    format!("{count} track(s) · artist {artist_id}")
+                    format!("{} · artist {artist_id}", pluralize(*count, "track"))
                 }
             } else if self.view == LibraryView::Albums {
                 let (_, album_id) = album_key_parts(key);
                 if album_id == "none" {
-                    format!("{count} standalone track(s) · no Album membership")
+                    format!(
+                        "{} · no Album membership",
+                        pluralize(*count, "standalone track")
+                    )
                 } else {
                     let album = album_id
                         .parse::<u64>()
@@ -12351,46 +12416,55 @@ impl FluxReady {
                         .and_then(|id| self.controller.album(AlbumId::new(id)));
                     match album {
                         Some(album) => format!(
-                            "{count} track(s) · {} participant(s) · owner {}",
-                            album.participant_artist_ids.len(),
+                            "{} · {} · owner {}",
+                            pluralize(*count, "track"),
+                            pluralize(album.participant_artist_ids.len(), "participant"),
                             self.controller
                                 .artist(album.owner_artist_id)
                                 .map(|artist| artist.name().to_owned())
                                 .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id))
                         ),
-                        None => format!("{count} track(s) · album {album_id}"),
+                        None => format!("{} · album {album_id}", pluralize(*count, "track")),
                     }
                 }
             } else {
-                format!("{count} track(s)")
+                pluralize(*count, "track")
             };
             let initial = title
                 .chars()
                 .find(|value| value.is_alphanumeric())
                 .map(|value| value.to_uppercase().collect::<String>())
                 .unwrap_or_else(|| "•".to_owned());
-            let leading = if self.view == LibraryView::Albums {
-                let (_, raw) = album_key_parts(key);
-                raw.parse::<u64>().ok().map_or_else(
-                    || fallback_artwork(Some(key), 38.0),
-                    |id| self.album_artwork(Some(AlbumId::new(id)), 38.0, ContentFit::Cover),
-                )
-            } else {
-                container(text(initial).size(15).color(TEXT))
-                    .width(38)
-                    .height(38)
-                    .center(38)
+            let leading = match self.view {
+                LibraryView::Albums => {
+                    let (_, raw) = album_key_parts(key);
+                    raw.parse::<u64>().ok().map_or_else(
+                        || fallback_artwork(Some(key), 44.0),
+                        |id| self.album_artwork(Some(AlbumId::new(id)), 44.0, ContentFit::Cover),
+                    )
+                }
+                LibraryView::Artists => {
+                    let (_, raw) = artist_key_parts(key);
+                    raw.parse::<u64>().ok().map_or_else(
+                        || fallback_artwork(Some(key), 44.0),
+                        |id| self.artist_artwork(ArtistId::new(id), 44.0),
+                    )
+                }
+                _ => container(text(initial).size(16).color(TEXT))
+                    .width(44)
+                    .height(44)
+                    .center(44)
                     .style(artwork_style(artwork_color(key)))
-                    .into()
+                    .into(),
             };
 
             let row = row![
                 leading,
                 column![
-                    text(title.clone()).size(14).color(TEXT),
-                    text(subtitle).size(10).color(MUTED),
+                    text(title.clone()).size(FONT_TITLE).color(TEXT),
+                    text(subtitle).size(FONT_META).color(MUTED),
                 ]
-                .spacing(2)
+                .spacing(3)
                 .width(Length::Fill),
                 text("›").size(20).color(MUTED),
             ]
@@ -12400,7 +12474,7 @@ impl FluxReady {
             list = list.push(
                 button(row)
                     .width(Length::Fill)
-                    .padding(9)
+                    .padding(10)
                     .style(group_style)
                     .on_press(Message::SelectGroup(Some(key.clone()))),
             );
@@ -13092,6 +13166,7 @@ impl FluxReady {
                                 has_artist: self.controller.track_artist_id(*id).is_some(),
                                 has_album: self.controller.track_album_id(*id).is_some(),
                             },
+                            self.window_width < 1_020.0,
                         ),
                         button(text("Locate").size(9))
                             .style(ghost_style)
@@ -14926,21 +15001,78 @@ impl FluxReady {
         .into()
     }
 
+    fn dashboard_media_card(&self, id: TrackId) -> Element<'_, Message> {
+        let Some(track) = self.controller.track(id) else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        let album = self.controller.track_album_id(id);
+        button(
+            column![
+                self.track_artwork(id, album, 62.0, ContentFit::Cover),
+                text(track.title())
+                    .size(FONT_BODY)
+                    .color(TEXT)
+                    .width(Length::Fill),
+                text(display_artist(track))
+                    .size(FONT_LABEL)
+                    .color(MUTED)
+                    .width(Length::Fill),
+            ]
+            .spacing(GAP_XS)
+            .width(Length::Fill),
+        )
+        .width(Length::Fixed(if self.window_width < 1_120.0 {
+            148.0
+        } else {
+            166.0
+        }))
+        .padding(9)
+        .style(group_style)
+        .on_press(Message::PlayTrack(id))
+        .into()
+    }
+
+    fn dashboard_section<'a>(
+        title: &'a str,
+        subtitle: &'a str,
+        content: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        container(
+            column![
+                text(title).size(FONT_LABEL).color(ACCENT),
+                text(subtitle).size(FONT_LABEL).color(MUTED),
+                iced::widget::Space::new().height(Length::Fixed(GAP_XS)),
+                content,
+            ]
+            .spacing(2),
+        )
+        .padding(GAP_MD)
+        .style(card_style)
+        .into()
+    }
+
     fn dashboard_view(&self) -> Element<'_, Message> {
         let summary = self.dashboard_summary();
         if summary.total_tracks == 0 {
             return container(
                 column![
-                    text("Your library is empty").size(20).color(TEXT),
-                    text("Import music to populate the dashboard and smart collections.")
-                        .size(11)
+                    text("Your library is empty").size(FONT_HERO).color(TEXT),
+                    text("Import music to build your library, artwork and listening history.")
+                        .size(FONT_BODY)
                         .color(MUTED),
-                    button(text("Import music").size(11))
-                        .style(accent_button_style)
-                        .padding([7, 11])
-                        .on_press(Message::ImportOpen),
+                    row![
+                        button(text("Import music").size(FONT_BODY))
+                            .style(accent_button_style)
+                            .padding([8, 13])
+                            .on_press(Message::ImportOpen),
+                        button(text("Library setup").size(FONT_BODY))
+                            .style(ghost_style)
+                            .padding([8, 13])
+                            .on_press(Message::ToggleSetup),
+                    ]
+                    .spacing(GAP_SM),
                 ]
-                .spacing(8)
+                .spacing(GAP_SM)
                 .align_x(Alignment::Center),
             )
             .width(Length::Fill)
@@ -14954,27 +15086,21 @@ impl FluxReady {
         let album_max = top_albums.first().map_or(0, |(_, _, plays)| *plays);
         let total_plays = self.controller.playback_history().total_plays();
         let history_tracks = self.controller.playback_history().len();
-        let summary_stat =
-            |label: &'static str, value: String, hint: &str| -> Element<'_, Message> {
-                container(
-                    column![
-                        text(value).size(20).color(ACCENT),
-                        text(label).size(10).color(TEXT),
-                        text(hint.to_owned()).size(8).color(MUTED),
-                    ]
-                    .spacing(2),
-                )
-                .padding(10)
-                .width(Length::FillPortion(1))
-                .style(card_style)
-                .into()
-            };
+        let compact = self.window_width < 1_120.0;
+        let stacked_hero = self.window_width < 980.0;
+        let recent_limit = if self.window_width < 760.0 {
+            2
+        } else if compact {
+            3
+        } else {
+            4
+        };
 
-        let mut artist_rows = column![].spacing(1);
+        let mut artist_rows = column![].spacing(2);
         if top_artists.is_empty() {
             artist_rows = artist_rows.push(
-                text("No plays recorded yet. Top artists appear after meaningful plays.")
-                    .size(9)
+                text("Top Artists appear after meaningful plays are recorded.")
+                    .size(FONT_LABEL)
                     .color(MUTED),
             );
         } else {
@@ -14988,9 +15114,13 @@ impl FluxReady {
                 ));
             }
         }
-        let mut album_rows = column![].spacing(1);
+        let mut album_rows = column![].spacing(2);
         if top_albums.is_empty() {
-            album_rows = album_rows.push(text("No album plays recorded yet.").size(9).color(MUTED));
+            album_rows = album_rows.push(
+                text("Album plays appear after meaningful plays are recorded.")
+                    .size(FONT_LABEL)
+                    .color(MUTED),
+            );
         } else {
             for (index, (id, title, plays)) in top_albums.into_iter().enumerate() {
                 album_rows = album_rows.push(self.dashboard_ranked_row(
@@ -15003,144 +15133,279 @@ impl FluxReady {
             }
         }
 
-        let mut body = column![
-            row![
-                column![
-                    text("Library dashboard").size(21).color(TEXT),
-                    text("Local listening data only. History starts when plays are first recorded; past listening is never invented.")
-                        .size(9)
+        let metric =
+            |value: usize, singular: &'static str, plural: &'static str| -> Element<'_, Message> {
+                row![
+                    text(value.to_string()).size(FONT_SECTION).color(TEXT),
+                    text(if value == 1 { singular } else { plural })
+                        .size(FONT_LABEL)
                         .color(MUTED),
                 ]
-                .spacing(2)
-                .width(Length::Fill),
-                text(format!("{total_plays} play(s) · {history_tracks} tracked"))
-                    .size(9)
-                    .color(MUTED),
-            ]
-            .align_y(Alignment::Center),
-            row![
-                summary_stat("Tracks", summary.total_tracks.to_string(), "catalogue entries"),
-                summary_stat("Artists", summary.total_artists.to_string(), "stable identities"),
-                summary_stat("Albums", summary.total_albums.to_string(), "releases"),
-                summary_stat("Favorites", summary.favorites.to_string(), "marked favorite"),
-            ]
-            .spacing(7),
-            row![
-                container(
+                .spacing(5)
+                .align_y(Alignment::Center)
+                .into()
+            };
+        let continue_card: Element<'_, Message> = if let Some(track) =
+            self.controller.current_track()
+        {
+            let id = self.controller.current_id().unwrap_or(TrackId::new(0));
+            let album = self.controller.track_album_id(id);
+            container(
+                row![
+                    self.track_artwork(id, album, 72.0, ContentFit::Cover),
                     column![
-                        text("TOP ARTISTS").size(9).color(ACCENT),
-                        text("Play count by each track's primary artist.")
-                            .size(8)
-                            .color(MUTED),
-                        iced::widget::Space::new().height(4),
-                        artist_rows,
-                    ]
-                    .spacing(2),
-                )
-                .padding(11)
-                .width(Length::FillPortion(1))
-                .style(card_style),
-                container(
-                    column![
-                        text("TOP ALBUMS").size(9).color(ACCENT),
-                        text("Album plays are the sum of their tracks' recorded plays.")
-                            .size(8)
-                            .color(MUTED),
-                        iced::widget::Space::new().height(4),
-                        album_rows,
-                    ]
-                    .spacing(2),
-                )
-                .padding(11)
-                .width(Length::FillPortion(1))
-                .style(card_style),
-            ]
-            .spacing(7),
-            row![
-                container(
-                    column![
-                        text("LIBRARY COMPOSITION").size(9).color(ACCENT),
-                        text("Coverage across managed metadata and artwork.")
-                            .size(8)
-                            .color(MUTED),
-                        iced::widget::Space::new().height(4),
-                        self.dashboard_coverage_row("Rated", summary.rated, summary.total_tracks),
-                        self.dashboard_coverage_row("Favorites", summary.favorites, summary.total_tracks),
-                        self.dashboard_coverage_row("Lyrics", summary.with_lyrics, summary.total_tracks),
-                        self.dashboard_coverage_row("Album art", summary.with_artwork, summary.total_tracks),
+                        text("CONTINUE LISTENING").size(FONT_LABEL).color(ACCENT),
+                        text(track.title()).size(FONT_TITLE).color(TEXT),
                         text(format!(
-                            "{} synchronized lyric file(s) · {} rated · {} favorite",
-                            summary.synced_lyrics, summary.rated, summary.favorites
+                            "{} · {}",
+                            display_artist(track),
+                            display_album(track)
                         ))
-                        .size(8)
+                        .size(FONT_LABEL)
                         .color(MUTED),
+                        row![
+                            button(
+                                text(match self.controller.player_state() {
+                                    PlaybackState::Playing => "Pause",
+                                    _ => "Play",
+                                })
+                                .size(FONT_LABEL)
+                            )
+                            .style(accent_button_style)
+                            .padding([5, 9])
+                            .on_press(Message::TogglePlayPause),
+                            button(text("Lyrics").size(FONT_LABEL))
+                                .style(ghost_style)
+                                .padding([5, 8])
+                                .on_press(Message::LyricsOpenCurrent),
+                            button(text("Queue").size(FONT_LABEL))
+                                .style(ghost_style)
+                                .padding([5, 8])
+                                .on_press(Message::ToggleQueue),
+                        ]
+                        .spacing(GAP_XS),
                     ]
-                    .spacing(3),
-                )
-                .padding(11)
-                .width(Length::FillPortion(1))
-                .style(card_style),
-                container(
-                    self.dashboard_track_list(
-                        "RECENT ACTIVITY",
-                        &summary.recently_played,
-                        SmartCollection::RecentlyPlayed,
+                    .spacing(3)
+                    .width(Length::Fill),
+                ]
+                .spacing(GAP_MD)
+                .align_y(Alignment::Center),
+            )
+            .padding(GAP_MD)
+            .width(if stacked_hero {
+                Length::Fill
+            } else {
+                Length::Fixed(if compact { 320.0 } else { 380.0 })
+            })
+            .style(card_style)
+            .into()
+        } else {
+            container(
+                column![
+                    text("READY TO LISTEN").size(FONT_LABEL).color(ACCENT),
+                    text("Choose a track to begin").size(FONT_TITLE).color(TEXT),
+                    text("Your queue, lyrics and playback controls stay in sync across both interfaces.")
+                        .size(FONT_LABEL)
+                        .color(MUTED),
+                    row![
+                        button(text("Browse tracks").size(FONT_LABEL))
+                            .style(accent_button_style)
+                            .padding([5, 9])
+                            .on_press(Message::SelectView(LibraryView::Tracks)),
+                        button(text("Import music").size(FONT_LABEL))
+                            .style(ghost_style)
+                            .padding([5, 8])
+                            .on_press(Message::ImportOpen),
+                    ]
+                    .spacing(GAP_XS),
+                ]
+                .spacing(4),
+            )
+            .padding(GAP_MD)
+            .width(if stacked_hero {
+                Length::Fill
+            } else {
+                Length::Fixed(if compact { 320.0 } else { 380.0 })
+            })
+            .style(card_style)
+            .into()
+        };
+
+        let hero_left = column![
+                    text("Your library").size(FONT_SECTION).color(TEXT),
+                    text("A local-first collection with canonical Artists, collaborative Albums and independent Track credits.")
+                        .size(FONT_META)
+                        .color(MUTED),
+                    row![
+                        metric(summary.total_tracks, "track", "tracks"),
+                        metric(summary.total_artists, "artist", "artists"),
+                        metric(summary.total_albums, "album", "albums"),
+                    ]
+                    .spacing(GAP_LG)
+                    .align_y(Alignment::Center),
+                    row![
+                        button(text("Browse library").size(FONT_BODY))
+                            .style(accent_button_style)
+                            .padding([7, 11])
+                            .on_press(Message::SelectView(LibraryView::Tracks)),
+                        button(text("Import music").size(FONT_BODY))
+                            .style(ghost_style)
+                            .padding([7, 11])
+                            .on_press(Message::ImportOpen),
+                    ]
+                    .spacing(GAP_SM),
+                ]
+                .spacing(GAP_SM)
+                .width(Length::Fill);
+        let hero_body: Element<'_, Message> = if stacked_hero {
+            column![hero_left, continue_card].spacing(GAP_MD).into()
+        } else {
+            row![hero_left, continue_card]
+                .spacing(GAP_LG)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let hero = container(hero_body).padding(GAP_LG).style(card_style);
+
+        let recent_ids = summary
+            .recently_played
+            .iter()
+            .copied()
+            .take(recent_limit)
+            .collect::<Vec<_>>();
+        let mut recent_cards = row![].spacing(GAP_SM);
+        if recent_ids.is_empty() {
+            recent_cards = recent_cards.push(
+                text("Play something to build a recent-listening shelf.")
+                    .size(FONT_LABEL)
+                    .color(MUTED),
+            );
+        } else {
+            for id in recent_ids {
+                recent_cards = recent_cards.push(self.dashboard_media_card(id));
+            }
+        }
+
+        let recent_added_ids = summary
+            .recently_added
+            .iter()
+            .copied()
+            .take(recent_limit)
+            .collect::<Vec<_>>();
+        let mut added_cards = row![].spacing(GAP_SM);
+        if recent_added_ids.is_empty() {
+            added_cards = added_cards.push(
+                text("Recently added tracks will appear here.")
+                    .size(FONT_LABEL)
+                    .color(MUTED),
+            );
+        } else {
+            for id in recent_added_ids {
+                added_cards = added_cards.push(self.dashboard_media_card(id));
+            }
+        }
+
+        let coverage = column![
+            self.dashboard_coverage_row("Rated", summary.rated, summary.total_tracks),
+            self.dashboard_coverage_row("Favorites", summary.favorites, summary.total_tracks),
+            self.dashboard_coverage_row("Lyrics", summary.with_lyrics, summary.total_tracks),
+            self.dashboard_coverage_row("Album art", summary.with_artwork, summary.total_tracks),
+            text(format!(
+                "{} · {} · {} in history",
+                pluralize(summary.synced_lyrics, "synchronized lyric"),
+                pluralize(total_plays as usize, "recorded play"),
+                pluralize(history_tracks, "track"),
+            ))
+            .size(FONT_LABEL)
+            .color(MUTED),
+        ]
+        .spacing(4);
+
+        let lower: Element<'_, Message> = if compact {
+            column![
+                row![
+                    Self::dashboard_section(
+                        "TOP ARTISTS",
+                        "Plays attributed to each Track's primary artist.",
+                        Element::from(artist_rows),
                     ),
-                )
-                .padding(11)
-                .width(Length::FillPortion(1))
-                .style(card_style),
-            ]
-            .spacing(7),
-            row![
-                container(
-                    self.dashboard_track_list(
-                        "RECENTLY ADDED",
-                        &summary.recently_added,
-                        SmartCollection::RecentlyAdded,
+                    Self::dashboard_section(
+                        "TOP ALBUMS",
+                        "Album plays are the sum of their Tracks' recorded plays.",
+                        Element::from(album_rows),
                     ),
-                )
-                .padding(11)
-                .width(Length::FillPortion(1))
-                .style(card_style),
-                container(
-                    column![
-                        text("MOST PLAYED").size(9).color(ACCENT),
-                        iced::widget::Space::new().height(4),
-                        self.dashboard_track_list(
+                ]
+                .spacing(GAP_SM),
+                row![
+                    Self::dashboard_section(
+                        "LIBRARY COVERAGE",
+                        "Metadata and managed-artwork completeness.",
+                        Element::from(coverage),
+                    ),
+                    Self::dashboard_section(
+                        "MOST PLAYED",
+                        "The Tracks with the highest recorded play counts.",
+                        Element::from(self.dashboard_track_list(
                             "",
                             &summary.most_played,
                             SmartCollection::MostPlayed,
-                        ),
-                    ]
-                    .spacing(2),
-                )
-                .padding(11)
-                .width(Length::FillPortion(1))
-                .style(card_style),
+                        )),
+                    ),
+                ]
+                .spacing(GAP_SM),
             ]
-            .spacing(7),
+            .spacing(GAP_SM)
+            .into()
+        } else {
             row![
-                button(text("Browse smart collections").size(10))
+                Self::dashboard_section(
+                    "TOP ARTISTS",
+                    "Plays attributed to each Track's primary artist.",
+                    Element::from(artist_rows),
+                ),
+                Self::dashboard_section(
+                    "TOP ALBUMS",
+                    "Album plays are the sum of their Tracks' recorded plays.",
+                    Element::from(album_rows),
+                ),
+                Self::dashboard_section(
+                    "LIBRARY COVERAGE",
+                    "Metadata and managed-artwork completeness.",
+                    Element::from(coverage),
+                ),
+            ]
+            .spacing(GAP_SM)
+            .into()
+        };
+
+        let mut body = column![
+            hero,
+            text("RECENTLY PLAYED").size(FONT_LABEL).color(ACCENT),
+            recent_cards,
+            text("RECENTLY ADDED").size(FONT_LABEL).color(ACCENT),
+            added_cards,
+            lower,
+            row![
+                button(text("Open Smart Collections").size(FONT_BODY))
                     .style(accent_button_style)
-                    .padding([6, 9])
+                    .padding([7, 11])
                     .on_press(Message::SelectView(LibraryView::Collections)),
-                button(text("Recently played").size(9))
+                button(text("Recently played").size(FONT_LABEL))
                     .style(ghost_style)
-                    .padding([6, 9])
+                    .padding([7, 11])
                     .on_press(Message::SelectView(LibraryView::RecentlyPlayed)),
-                button(text("Most played").size(9))
+                button(text("Most played").size(FONT_LABEL))
                     .style(ghost_style)
-                    .padding([6, 9])
+                    .padding([7, 11])
                     .on_press(Message::SelectView(LibraryView::MostPlayed)),
             ]
-            .spacing(6),
+            .spacing(GAP_SM),
         ]
-        .spacing(10);
+        .spacing(GAP_MD);
         if self.controller.playback_history().is_empty() {
             body = body.push(
-                text("Play a track for at least 5 seconds or half its duration (up to 30 seconds) to record a meaningful play. Seeking and pausing alone do not count.")
-                    .size(9)
+                text("Listening history begins after a meaningful play: five seconds or half the Track duration, capped at thirty seconds. Seeking and pausing alone do not count.")
+                    .size(FONT_LABEL)
                     .color(MUTED),
             );
         }
@@ -15219,22 +15484,23 @@ impl FluxReady {
             .collect::<Vec<_>>();
 
         let mut body = column![
-            row![
-                self.artist_artwork(artist_id, 112.0),
+            container(
+                row![
+                self.artist_artwork(artist_id, 128.0),
                 column![
-                    text(artist.name().to_owned()).size(22).color(TEXT),
+                    text(artist.name().to_owned()).size(FONT_SECTION).color(TEXT),
                     text(format!(
-                        "ArtistId {} · {} album(s) · {} track(s) · image {}",
+                        "ArtistId {} · {} · {} · image {}",
                         artist.id(),
-                        album_ids.len(),
-                        tracks.len(),
+                        pluralize(album_ids.len(), "album"),
+                        pluralize(tracks.len(), "track"),
                         if self.controller.artist_image_path(artist_id).is_some() {
                             "managed"
                         } else {
                             "none"
                         }
                     ))
-                    .size(10)
+                    .size(FONT_META)
                     .color(MUTED),
                     text(
                         self.controller
@@ -15242,7 +15508,7 @@ impl FluxReady {
                             .filter(|description| !description.is_empty())
                             .unwrap_or("No description yet.")
                     )
-                    .size(10)
+                    .size(FONT_META)
                     .color(MUTED),
                     text(if self.controller.artist_aliases(artist_id).is_empty() {
                         "No aliases.".to_owned()
@@ -15252,17 +15518,20 @@ impl FluxReady {
                             self.controller.artist_aliases(artist_id).join(", ")
                         )
                     })
-                    .size(10)
+                    .size(FONT_META)
                     .color(MUTED),
                 ]
-                .spacing(3)
+                .spacing(4)
                 .width(Length::Fill),
             ]
-            .spacing(12)
+            .spacing(GAP_MD)
             .align_y(Alignment::Center),
+            )
+            .padding(GAP_LG)
+            .style(card_style),
             container(
                 column![
-                    text("ARTIST METADATA").size(9).color(ACCENT),
+                    text("ARTIST METADATA").size(FONT_LABEL).color(ACCENT),
                     text_input("Artist display name…", &self.artist_detail_name_input)
                         .on_input(Message::ArtistDetailNameChanged)
                         .on_submit(Message::ArtistMetadataSave)
@@ -15505,43 +15774,47 @@ impl FluxReady {
             .map(|artist| artist.name().to_owned())
             .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
         let mut body = column![
-            row![
-                self.album_artwork(Some(album_id), 112.0, ContentFit::Contain),
-                column![
-                    text(album.title.clone()).size(22).color(TEXT),
-                    text(format!(
-                        "AlbumId {} · owner {} · {} participant(s) · {} · {} track(s) · cover {}",
-                        album.id,
-                        owner,
-                        album.participant_artist_ids.len(),
-                        release_type_label(album.release_type),
-                        album.track_order.len(),
-                        if album.cover.is_some() {
-                            "managed"
-                        } else {
-                            "none"
-                        }
-                    ))
-                    .size(10)
-                    .color(MUTED),
+            container(
+                row![
+                    self.album_artwork(Some(album_id), 128.0, ContentFit::Contain),
+                    column![
+                        text(album.title.clone()).size(FONT_SECTION).color(TEXT),
+                        text(format!(
+                            "AlbumId {} · owner {} · {} · {} · {} · cover {}",
+                            album.id,
+                            owner,
+                            pluralize(album.participant_artist_ids.len(), "participant"),
+                            release_type_label(album.release_type),
+                            pluralize(album.track_order.len(), "track"),
+                            if album.cover.is_some() {
+                                "managed"
+                            } else {
+                                "none"
+                            }
+                        ))
+                        .size(FONT_META)
+                        .color(MUTED),
+                    ]
+                    .spacing(4)
+                    .width(Length::Fill),
+                    button(text("Open owner").size(FONT_LABEL))
+                        .style(ghost_style)
+                        .padding([7, 10])
+                        .on_press(Message::OpenArtist(album.owner_artist_id)),
+                    button(text("Add tracks…").size(FONT_LABEL))
+                        .style(accent_button_style)
+                        .padding([7, 10])
+                        .on_press(Message::AlbumAddTracks),
+                    button(text("Transfer album…").size(FONT_LABEL))
+                        .style(ghost_style)
+                        .padding([7, 10])
+                        .on_press(Message::AlbumTransferOpen),
                 ]
-                .spacing(3)
-                .width(Length::Fill),
-                button(text("Open artist").size(10))
-                    .style(ghost_style)
-                    .padding([7, 10])
-                    .on_press(Message::OpenArtist(album.owner_artist_id)),
-                button(text("Add tracks…").size(10))
-                    .style(accent_button_style)
-                    .padding([7, 10])
-                    .on_press(Message::AlbumAddTracks),
-                button(text("Transfer album…").size(10))
-                    .style(ghost_style)
-                    .padding([7, 10])
-                    .on_press(Message::AlbumTransferOpen),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+                .spacing(GAP_MD)
+                .align_y(Alignment::Center),
+            )
+            .padding(GAP_LG)
+            .style(card_style),
         ];
         if let Some(error) = self.album_artwork_error(album_id) {
             body = body.push(
@@ -15561,7 +15834,7 @@ impl FluxReady {
         body = body.push(
             container(
                 column![
-                    text("METADATA").size(9).color(ACCENT),
+                    text("METADATA").size(FONT_LABEL).color(ACCENT),
                     row![
                         text_input("Album title…", &self.album_title_input)
                             .on_input(Message::AlbumTitleChanged)
@@ -15637,7 +15910,7 @@ impl FluxReady {
         body = body.push(
             container(
                 column![
-                    text("ALBUM PARTICIPANTS").size(9).color(ACCENT),
+                    text("ALBUM PARTICIPANTS").size(FONT_LABEL).color(ACCENT),
                     text("Album participation is independent of track-level credits. Removing an Artist never deletes the Album or its audio.")
                         .size(9)
                         .color(MUTED),
@@ -15667,7 +15940,7 @@ impl FluxReady {
         body = body.push(
             container(
                 column![
-                    text("COVER ARTWORK").size(9).color(ACCENT),
+                    text("COVER ARTWORK").size(FONT_LABEL).color(ACCENT),
                     text("Local image path; PNG/JPEG/WebP bytes are preserved. No online fetch or tag extraction.")
                         .size(9)
                         .color(MUTED),
@@ -15903,24 +16176,54 @@ impl FluxReady {
             StorageMode::Portable | StorageMode::Canonical
         );
 
-        let header = row![
-            text("SEL").size(8).color(MUTED).width(Length::Fixed(22.0)),
-            text("#").size(9).color(MUTED).width(Length::Fixed(28.0)),
+        let compact_rows = self.window_width < 1_020.0;
+        let mut header = row![
+            text("SEL")
+                .size(FONT_LABEL)
+                .color(MUTED)
+                .width(Length::Fixed(22.0)),
+            text("#")
+                .size(FONT_LABEL)
+                .color(MUTED)
+                .width(Length::Fixed(28.0)),
             text("TITLE")
-                .size(9)
+                .size(FONT_LABEL)
                 .color(MUTED)
-                .width(Length::FillPortion(5)),
-            text("ALBUM")
-                .size(9)
+                .width(Length::FillPortion(if compact_rows { 8 } else { 5 })),
+        ];
+        if !compact_rows {
+            header = header
+                .push(
+                    text("ALBUM")
+                        .size(FONT_LABEL)
+                        .color(MUTED)
+                        .width(Length::FillPortion(4)),
+                )
+                .push(
+                    text("RATE")
+                        .size(FONT_LABEL)
+                        .color(MUTED)
+                        .width(Length::Fixed(26.0)),
+                );
+        }
+        header = header.push(
+            text("TIME")
+                .size(FONT_LABEL)
                 .color(MUTED)
-                .width(Length::FillPortion(4)),
-            text("RATE").size(8).color(MUTED).width(Length::Fixed(26.0)),
-            text("TIME").size(9).color(MUTED).width(Length::Fixed(48.0)),
-            text("♥").size(9).color(MUTED).width(Length::Fixed(28.0)),
-            text("").size(9).width(Length::Fixed(44.0)),
-        ]
-        .spacing(10)
-        .padding([2, 10]);
+                .width(Length::Fixed(48.0)),
+        );
+        if !compact_rows {
+            header = header.push(
+                text("♥")
+                    .size(FONT_LABEL)
+                    .color(MUTED)
+                    .width(Length::Fixed(28.0)),
+            );
+        }
+        let header = header
+            .push(text("").size(FONT_LABEL).width(Length::Fixed(44.0)))
+            .spacing(10)
+            .padding([3, 10]);
 
         let mut list = column![].spacing(1);
         for (offset, id) in rows[start..end].iter().enumerate() {
@@ -15947,6 +16250,7 @@ impl FluxReady {
                     has_artist: self.controller.track_artist_id(*id).is_some(),
                     has_album: self.controller.track_album_id(*id).is_some(),
                 },
+                self.window_width < 1_020.0,
             ));
         }
 
@@ -17094,7 +17398,7 @@ fn filter_chip(label: impl Into<String>) -> Element<'static, Message> {
 }
 
 fn sidebar_section(label: &'static str) -> Element<'static, Message> {
-    container(text(label).size(8).color(MUTED))
+    container(text(label).size(FONT_LABEL).color(MUTED))
         .padding([6, 8])
         .into()
 }
@@ -17108,7 +17412,7 @@ fn view_glyph(view: LibraryView) -> &'static str {
         LibraryView::Folders => "▤",
         LibraryView::Lyrics => "¶",
         LibraryView::Collections => "✦",
-        LibraryView::Dashboard => "◫",
+        LibraryView::Dashboard => "⌂",
         LibraryView::Settings => "⚙",
         LibraryView::RecentlyAdded | LibraryView::RecentlyPlayed | LibraryView::MostPlayed => "◷",
     }
@@ -17124,12 +17428,12 @@ fn sidebar_destination<'a>(
     button(
         row![
             text(glyph)
-                .size(12)
+                .size(13)
                 .color(color)
-                .width(Length::Fixed(18.0))
+                .width(Length::Fixed(20.0))
                 .align_x(Alignment::Center),
             text(label)
-                .size(11)
+                .size(FONT_BODY)
                 .color(if active { TEXT } else { MUTED }),
         ]
         .spacing(8)
@@ -17148,6 +17452,7 @@ fn track_row<'a>(
     track: &'a Track,
     credits: &str,
     state: TrackRowState,
+    compact: bool,
 ) -> Element<'a, Message> {
     let selected = state.current == Some(id) || state.focused;
     let marker = if selected {
@@ -17159,7 +17464,7 @@ fn track_row<'a>(
     let duration = track.duration().map(format_duration).unwrap_or_default();
     let playable = is_track_playable(track);
 
-    let mut title = row![text(track.title()).size(13).color(title_color)]
+    let mut title = row![text(track.title()).size(FONT_TITLE).color(title_color)]
         .spacing(8)
         .align_y(Alignment::Center);
     match state.resource {
@@ -17180,28 +17485,37 @@ fn track_row<'a>(
             .size(10)
             .color(if selected { ACCENT } else { MUTED })
             .width(Length::Fixed(28.0)),
-        column![title, text(credits.to_owned()).size(10).color(MUTED),]
+        column![title, text(credits.to_owned()).size(FONT_META).color(MUTED),]
             .spacing(2)
-            .width(Length::FillPortion(5)),
-        text(display_album(track))
-            .size(10)
-            .color(MUTED)
-            .width(Length::FillPortion(4)),
-        text(
-            state
-                .rating
-                .map_or_else(String::new, |rating| format!("★{rating}")),
-        )
-        .size(9)
-        .color(ACCENT)
-        .width(Length::Fixed(26.0)),
-        text(duration)
-            .size(10)
-            .color(MUTED)
-            .width(Length::Fixed(48.0)),
+            .width(Length::FillPortion(if compact { 8 } else { 5 })),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
+    let mut content = content;
+    if !compact {
+        content = content.push(
+            text(display_album(track))
+                .size(FONT_META)
+                .color(MUTED)
+                .width(Length::FillPortion(4)),
+        );
+        content = content.push(
+            text(
+                state
+                    .rating
+                    .map_or_else(String::new, |rating| format!("★{rating}")),
+            )
+            .size(FONT_LABEL)
+            .color(ACCENT)
+            .width(Length::Fixed(26.0)),
+        );
+    }
+    content = content.push(
+        text(duration)
+            .size(FONT_META)
+            .color(MUTED)
+            .width(Length::Fixed(48.0)),
+    );
 
     let check = button(text(if state.checked { "✓" } else { "○" }).size(11))
         .style(ghost_style)
@@ -17209,7 +17523,7 @@ fn track_row<'a>(
         .on_press(Message::TrackSelectionToggle(id));
     let main = button(content)
         .width(Length::Fill)
-        .padding([7, 10])
+        .padding([9, 10])
         .style(track_row_style(selected || state.checked))
         .on_press(Message::PlayTrack(id));
     let favorite = button(text(if state.favorite { "♥" } else { "♡" }).size(12))
@@ -17263,10 +17577,12 @@ fn track_row<'a>(
     .handle(iced::widget::pick_list::Handle::None)
     .style(menu_pick_style);
 
-    row![check, main, favorite, menu]
-        .spacing(2)
-        .align_y(Alignment::Center)
-        .into()
+    let mut row = row![check, main];
+    if !compact {
+        row = row.push(favorite);
+    }
+    row = row.push(menu);
+    row.spacing(2).align_y(Alignment::Center).into()
 }
 
 fn playlist_entry_row<'a>(
@@ -17822,6 +18138,7 @@ mod tests {
             queue_visible: true,
             queue_overlay_open: false,
             window_width: 1_180.0,
+            window_height: 760.0,
             close_confirm: false,
             setup_advanced_open: false,
             closed: false,
@@ -18260,9 +18577,32 @@ mod tests {
     }
 
     #[test]
+    fn shell_sidebar_and_home_render_at_responsive_widths() {
+        let dir = TempDir::new("gui-responsive-shell");
+        let mut gui = gui(&dir);
+        gui.view = LibraryView::Dashboard;
+        gui.window_width = 1_200.0;
+        assert_eq!(gui.sidebar_width(), SIDEBAR_WIDE);
+        let _ = gui.view();
+        gui.window_width = 1_000.0;
+        assert_eq!(gui.sidebar_width(), SIDEBAR_MEDIUM);
+        let _ = gui.view();
+        gui.window_width = 800.0;
+        assert_eq!(gui.sidebar_width(), SIDEBAR_COMPACT);
+        let _ = gui.view();
+        gui.library_view();
+        gui.window_width = 640.0;
+        assert_eq!(gui.sidebar_width(), SIDEBAR_COMPACT);
+        let _ = gui.library_view();
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn navigation_labels_queue_placement_and_resource_badges_are_responsive() {
         let dir = TempDir::new("gui-responsive-navigation");
         let mut gui = gui(&dir);
+        assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
+        gui.window_width = QUEUE_INLINE_MIN_WIDTH;
         assert_eq!(gui.queue_placement(), QueuePlacement::Inline);
         gui.window_width = 920.0;
         assert_eq!(gui.queue_placement(), QueuePlacement::Hidden);
@@ -18291,7 +18631,11 @@ mod tests {
         let _ = gui.view();
         send(&mut gui, Message::ToggleQueue);
         assert_eq!(gui.queue_placement(), QueuePlacement::Overlay);
-        send(&mut gui, Message::WindowResized(1_080.0));
+        let window_height = gui.window_height;
+        send(
+            &mut gui,
+            Message::WindowResized(QUEUE_INLINE_MIN_WIDTH, window_height),
+        );
         assert_eq!(gui.queue_placement(), QueuePlacement::Inline);
         assert!(!gui.queue_overlay_open);
         gui.window_width = 920.0;
