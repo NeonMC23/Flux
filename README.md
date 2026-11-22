@@ -24,7 +24,7 @@ and the real-time oscilloscope continue to use the same engine. Managed album
 and artist artwork plus optional per-Track artwork overrides are decoded and
 displayed throughout the library. Artists and Albums are first-class editable
 entities with detail pages, relationships and navigation to their Tracks.
-The GUI and TUI follow a shared product design language documented in
+Both interfaces open on Home and follow a shared product design language documented in
 [`docs/design-system.md`](docs/design-system.md): Home-first navigation, dark
 surface hierarchy, restrained pink selection and primary actions, readable type,
 one playback timeline, and explicit Artist/Album collaborative relationships.

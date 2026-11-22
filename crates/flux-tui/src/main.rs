@@ -5176,7 +5176,7 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         migrated_dest: None,
         lifecycle_msg: None,
         last_reconcile: None,
-        view: View::Tracks,
+        view: View::Home,
         detail: None,
         active_collection: None,
         layout: LayoutMode::Standard,

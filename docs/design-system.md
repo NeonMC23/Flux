@@ -86,7 +86,7 @@ GUI destinations:
 - **Lyrics** — Tracks with managed lyrics.
 - **Settings** — playback and library preferences.
 
-Home is the default destination. The keyboard shortcuts `1`–`0` and `K` remain
+Both interfaces open on Home. The GUI keyboard shortcuts `1`–`0` and `K` remain
 available. The sidebar width adapts at approximately 1150 and 940 logical
 pixels; labels are never removed, so destinations remain understandable.
 
