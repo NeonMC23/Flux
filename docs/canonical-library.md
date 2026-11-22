@@ -114,7 +114,7 @@ root may leave its documented temporary leftovers there after the switch.
 The GUI remains a presentation layer over the shared Controller. Its sidebar is
 grouped into primary library destinations (**Tracks**, **Artists**, **Albums**,
 **Playlists**), a small **Browse** group (**Folders**, **Lyrics**, **Smart
-Collections**, **Dashboard**) and **Settings** at the bottom. **Import music** is the single
+Collections**, **Home**) and **Settings** at the bottom. **Import music** is the single
 primary action. The item list scrolls independently at the minimum window
 height, while Import, Settings and the transport remain reachable. The active
 library's identity lives in Library setup rather than in a permanent sidebar
@@ -1392,7 +1392,7 @@ track lists reuse normal playback/queue/search/filter/selection actions. Album
 detail retains canonical album order. The dashboard shows track/artist/album
 totals, favorites/rated counts, lyrics/synchronized/artwork counts, recent and
 most-played previews, and highly-rated tracks, with direct collection links.
-Dashboard summaries are cached by catalogue generation plus history generation.
+Home summaries are cached by catalogue generation plus history generation.
 
 New canonical imports persist `created_unix_ms` in `track.flux`. Existing or
 migrated records lacking a reliable timestamp keep zero and are excluded from
@@ -1426,7 +1426,7 @@ A failed history save leaves the previous file intact, reports the error, keeps
 the single in-memory aggregate for the session, and retries the full aggregate
 on the next save/shutdown without counting again. Shutdown and library switch
 finalize the latest legitimate evidence into the outgoing library before
-replacing or releasing it. Dashboard artist/album play breakdowns aggregate by
+replacing or releasing it. Home artist/album play breakdowns aggregate by
 stable entity identity but display current names; orphaned history TrackIds are
 ignored. No historical plays are fabricated. The history
 `entries` collection is required in the current schema; missing or wrong-typed

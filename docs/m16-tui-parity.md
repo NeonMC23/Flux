@@ -13,7 +13,8 @@ persistence or domain rules.
 
 The visual hierarchy is:
 
-1. Library destinations: a persistent sidebar on wide terminals, otherwise
+1. Library destinations: Home, Tracks, Artists, Albums, Playlists, Collections,
+   Lyrics and Settings in a persistent sidebar on wide terminals, otherwise
    compact tabs.
 2. Transport status and contextual title for the current view/detail.
 3. Main content, with an optional now-playing/visualizer/up-next side panel.
@@ -24,6 +25,10 @@ M21 added the persistent sidebar and removed duplicate progress displays from
 the header, side panel and player page. M22 adds explicit Album participation:
 `Alt+p` opens the participant list from Album detail, and Artist/Album views
 distinguish physical ownership, participation and Track-credit reachability.
+M23 tightens the composition: the sidebar now-playing block defers to the
+content side panel when that panel is visible, sidebar playback duplication is
+removed, elapsed/total time appears only on the primary timeline, and rendering
+is regression-tested at 120×36, 92×24, 80×24 and 40×12.
 
 Five layout presets replace arbitrary panel configuration:
 
@@ -47,6 +52,7 @@ renders real waveform data. Domain rules remain in `flux-app`.
 
 | Capability | Pre-M16 TUI | M16 TUI equivalent | Shared API / boundary | Status | Tests |
 |---|---|---|---|---|---|
+| Home overview | Not available | Home destination exposes Recently Played, Recently Added, Most Played, Favorites and Highly Rated; Enter opens the shared collection | `smart_collection_tracks` | Complete | `tui_home_destination_opens_shared_collections` |
 | Browse tracks | Flat list | Tracks destination, search, favorites, collection filter | `Controller::search`, `tracks` | Complete | Existing TUI tests, large-list test |
 | Browse artists | Info panel only | Artists list and artist detail with albums and tracks | `artists`, `artist`, `albums_owned_by`, `albums_participating_for`, `albums_credited_for`, credits | Complete | `tui_navigation_opens_artists_albums_playlists_and_collections` |
 | Browse albums | Info panel only | Albums list and album track listing | `albums`, `album`, `album_tracks` | Complete | Same navigation test |

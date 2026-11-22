@@ -6,6 +6,35 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M23 product UX/UI redesign
+
+- Added a shared product design language (`docs/design-system.md`) covering
+  color roles, typography, spacing, surfaces, navigation, selection/focus, one
+  playback timeline, context actions and GUI/TUI responsive rules.
+- GUI shell redesigned around a Home-first sidebar with Library and Collections
+  groups, adaptive 232/204/184 px navigation widths and a single Import action.
+  Home is now the default destination.
+- Home rebuilt around a library overview, real continue-listening context,
+  recent artwork shelves, Top Artists/Albums and metadata/artwork coverage. No
+  listening data is invented.
+- Artist and Album index rows now use managed artwork with deterministic
+  fallbacks. Artist/Album details gained hero surfaces, clearer relationship
+  labels, participant presentation and responsive actions.
+- Track lists now hide secondary columns and favorite actions before compressing
+  primary text, retain one overflow menu, and preserve selected/current/focused
+  states. Fixed-order detail views no longer show irrelevant filter controls.
+- Inline queue now appears only at genuinely wide window sizes; narrower windows
+  use the queue overlay so content does not become cramped. Player and page
+  compact thresholds are independent of queue placement.
+- TUI gained a Home destination with the shared Recently Played, Recently
+  Added, Most Played, Favorites and Highly Rated collections (`F1`–`F8`), plus
+  explicit-size rendering tests and evidence at 120×36, 92×24, 80×24 and 40×12.
+  Duplicated now-playing metadata was removed: the sidebar rail defers to the
+  content side panel when that panel is present, playback time appears only on
+  the primary timeline, and redundant sidebar playback details were removed.
+- Added responsive GUI/TUI regression tests for shell widths, Home rendering and
+  required terminal dimensions.
+
 ### M22 canonical multi-artist Albums and schema migration
 
 - Canonical schema 2 adds an explicit, ordered, many-to-many Album participant

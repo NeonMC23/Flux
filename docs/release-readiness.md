@@ -7,9 +7,10 @@ authorized signing/notarization procedure is in
 
 ## Release blockers
 
-M21 suspended the public release pending renewed product validation. M22 adds
+M21 suspended the public release pending renewed product validation. M22 added
 canonical schema 2 with explicit Album participation and an automatic schema-1
-upgrade. Synthetic migration, rollback and commit-recovery tests pass, but
+upgrade. M23 completes a Home-first GUI/TUI visual redesign with responsive
+layout evidence; human usability validation remains pending. Synthetic migration, rollback and commit-recovery tests pass, but
 human validation of collaborative Album workflows and real user libraries is
 still required before any public artifact is authorized.
 
