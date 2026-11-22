@@ -13,6 +13,17 @@ use crate::*;
 impl Tui {
     pub(crate) fn draw(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         let (raw_width, raw_height) = terminal::size().unwrap_or((80, 24));
+        self.draw_sized(out, raw_width, raw_height)
+    }
+
+    /// Renders for an explicit terminal size. Kept separate from [`draw`] so
+    /// layout behavior can be regression-tested at fixed dimensions.
+    pub(crate) fn draw_sized(
+        &mut self,
+        out: &mut impl Write,
+        raw_width: u16,
+        raw_height: u16,
+    ) -> std::io::Result<()> {
         if terminal_too_small(raw_width, raw_height) {
             queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
             if raw_width > 0 {
@@ -94,18 +105,16 @@ impl Tui {
             _ => "input",
         };
         let mut header = if width < 60 {
-            format!(
-                "Flux · {mode_label} · {}",
-                self.controller.playback_mode().label()
-            )
+            format!("Flux · {mode_label}")
         } else {
             format!("Flux · {library_label} · {mode_label}")
         };
         if self.controller.queue_len() > 0 {
             header.push_str(&format!(" · queue {}", self.controller.queue_len()));
         }
-        if width >= 60 {
-            header.push_str(&format!(" · {}", self.controller.playback_mode().label()));
+        let repeat = self.controller.playback_mode().label();
+        if width >= 72 && repeat != "normal" {
+            header.push_str(&format!(" · {repeat}"));
         }
         if !self.search.trim().is_empty() {
             header.push_str(&format!(" · “{}”", truncate_to_width(&self.search, 20)));
@@ -296,6 +305,13 @@ impl Tui {
         // Help / input line.
         let input_line = |prefix: &str| fit_input_line(prefix, &self.input, width);
         let help = match self.mode {
+            Mode::Normal if width < 60 => {
+                "↑/↓ select · Enter open · Esc back · ? help · q quit".to_owned()
+            }
+            Mode::Normal if width < 100 => {
+                "↑/↓ select · Enter open/play · Esc back · / search · ? help · q quit"
+                    .to_owned()
+            }
             Mode::Normal => self.help_line(),
             Mode::InfoView => format!(
                 "Help/details — ↑/↓ scroll · PgUp/PgDn · Esc/Q back · {}-{} of {}",
@@ -514,18 +530,30 @@ impl Tui {
         if self.layout == LayoutMode::Player {
             return self.draw_player_page(out, top, height, width);
         }
-        let show_side = self.layout == LayoutMode::Standard && width >= 76 && height >= 8;
-        let side = if show_side {
-            (width / 3).clamp(22, 38)
-        } else {
-            0
-        };
+        let side = self.side_panel_width(width, height);
         let list_width = width.saturating_sub(side + usize::from(side > 0));
         self.draw_list(out, top, height, list_width)?;
         if side > 0 {
+            queue!(out, SetForegroundColor(Color::DarkGrey))?;
+            for row in top..(top + height) {
+                queue!(
+                    out,
+                    MoveTo((self.content_offset + list_width) as u16, row as u16),
+                    Print("│")
+                )?;
+            }
+            queue!(out, SetForegroundColor(Color::Reset))?;
             self.draw_side_panel(out, top, height, width - side, side)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn side_panel_width(&self, width: usize, height: usize) -> usize {
+        if self.layout == LayoutMode::Standard && width >= 86 && height >= 10 {
+            (width / 3).clamp(22, 38)
+        } else {
+            0
+        }
     }
 
     pub(crate) fn draw_list(
@@ -568,6 +596,9 @@ impl Tui {
                 }
             } else {
                 match self.view {
+                    View::Home => {
+                        "Library overview. Enter opens a collection; import music to fill it."
+                    }
                     View::Tracks if self.active_collection.is_some() => {
                         "No tracks in this collection match the current search."
                     }
@@ -644,21 +675,6 @@ impl Tui {
                         .unwrap_or_default(),
                     display_album(track)
                 ),
-                width,
-                false,
-            )?;
-            y += 1;
-            let elapsed = format_duration(self.controller.position());
-            let total = self
-                .controller
-                .current_duration()
-                .map(format_duration)
-                .unwrap_or_else(|| "--:--".to_owned());
-            self.line_at(
-                out,
-                x,
-                y as u16,
-                &format!("{elapsed} / {total} · timeline below"),
                 width,
                 false,
             )?;
@@ -1667,6 +1683,11 @@ impl Tui {
             }
         }
         match self.view {
+            View::Home => format!(
+                "Home · {} · {} · Enter opens a collection",
+                count_label(self.controller.tracks().len(), "track"),
+                count_label(self.controller.artists().len(), "artist")
+            ),
             View::Tracks => {
                 let count = self.view_rows().len();
                 if self.favorites_only {
@@ -1813,7 +1834,11 @@ impl Tui {
                 )
             }
             Row::Collection(collection) => pad_with_right(
-                &format!("{}  · {}", collection.label(), collection.description()),
+                &if self.view == View::Home {
+                    collection.label().to_owned()
+                } else {
+                    format!("{}  · {}", collection.label(), collection.description())
+                },
                 &format!(
                     "{}",
                     self.controller.smart_collection_tracks(collection).len()
@@ -1890,6 +1915,7 @@ impl Tui {
             };
         }
         match self.view {
+            View::Home => "↑/↓ select · Enter opens a collection · Tab views · / search · ? help".to_owned(),
             View::Tracks => "↑/↓ move · Enter play · a queue · x next · e edit · Alt+m move · Delete delete · f favorite · 0–5 rate · / search".to_owned(),
             View::Artists => "↑/↓ select · Enter opens artist · Y edit · P create · Esc back · Tab views".to_owned(),
             View::Albums => "↑/↓ select · Enter opens album · Z edit · Esc back · Tab views".to_owned(),
@@ -1916,22 +1942,14 @@ impl Tui {
             "Xfade off".to_owned()
         };
         match self.controller.current_track() {
-            Some(track) => {
-                let total = track
-                    .duration()
-                    .or_else(|| self.controller.stream_info().and_then(|i| i.duration))
-                    .map(format_duration)
-                    .unwrap_or_else(|| "--:--".to_owned());
-                format!(
-                    "{state_icon} {} — {}    {} / {total}    Vol {volume}%    {crossfade}",
-                    track.title(),
-                    self.controller
-                        .current_id()
-                        .map(|id| credit_display(&self.controller, id))
-                        .unwrap_or_default(),
-                    format_duration(self.controller.position()),
-                )
-            }
+            Some(track) => format!(
+                "{state_icon} {} — {}    Vol {volume}%    {crossfade}",
+                track.title(),
+                self.controller
+                    .current_id()
+                    .map(|id| credit_display(&self.controller, id))
+                    .unwrap_or_default(),
+            ),
             None if self.controller.current_queue_entry_id().is_some() => {
                 format!(
                     "{state_icon} Queue entry missing from the library    Vol {volume}%    {crossfade}"
@@ -1987,7 +2005,7 @@ impl Tui {
             if y >= top + height {
                 break;
             }
-            let active = view == self.view && self.detail.is_none();
+            let active = view == self.view;
             if active {
                 queue!(out, SetForegroundColor(self.accent()))?;
             } else {
@@ -1998,29 +2016,14 @@ impl Tui {
             queue!(out, SetForegroundColor(Color::Reset))?;
             y += 1;
         }
-        if y + 2 < top + height {
-            queue!(out, SetForegroundColor(Color::DarkGrey))?;
-            self.line_raw(out, 1, y as u16, "PLAYBACK", width.saturating_sub(1), false)?;
-            queue!(out, SetForegroundColor(Color::Reset))?;
-            y += 1;
-            let layout = format!("· {} layout", self.layout.label());
-            self.line_raw(out, 1, y as u16, &layout, width.saturating_sub(1), false)?;
-            y += 1;
-            let queue = format!("· {} queued", self.controller.queue_len());
-            self.line_raw(out, 1, y as u16, &queue, width.saturating_sub(1), false)?;
-        }
-
-        // Now-playing block anchored to the bottom of the rail, without a
-        // second progress bar: the single timeline lives above the status line.
-        if let Some(track) = self.controller.current_track() {
+        // Now-playing block anchored to the bottom of the rail. When the
+        // content side panel already owns now-playing context, keep the rail
+        // quieter and avoid duplicating the same metadata in two corners.
+        if self.side_panel_width(content_width, height) == 0
+            && let Some(track) = self.controller.current_track()
+        {
             let block_top = (top + height).saturating_sub(4);
             if block_top > y {
-                let elapsed = format_duration(self.controller.position());
-                let total = self
-                    .controller
-                    .current_duration()
-                    .map(format_duration)
-                    .unwrap_or_else(|| "--:--".to_owned());
                 queue!(out, SetForegroundColor(self.accent()))?;
                 self.line_raw(
                     out,
@@ -2058,7 +2061,7 @@ impl Tui {
                     out,
                     1,
                     (block_top + 3) as u16,
-                    &format!("{elapsed} / {total}"),
+                    &truncate_to_width(&display_album(track), width.saturating_sub(2)),
                     width.saturating_sub(1),
                     false,
                 )?;
@@ -2098,8 +2101,7 @@ impl Tui {
             "Xfade off".to_owned()
         };
         let line = format!(
-            "{state} · Vol {volume}% · {crossfade} · {} queued · {} layout",
-            self.controller.queue_len(),
+            "{state} · Vol {volume}% · {crossfade} · {} layout",
             self.layout.label()
         );
         self.line(out, y as u16, &line, width, false)

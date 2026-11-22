@@ -16,7 +16,7 @@
 //! requires a build with `--features cpal`; a no-CPAL build reports that
 //! honestly. See `docs/m16-tui-parity.md` for the full keymap and limitations.
 //!
-//! `Tab`/`Shift+Tab` and `F1`–`F7` switch destinations. `?` opens contextual
+//! `Tab`/`Shift+Tab` and `F1`–`F8` switch destinations. `?` opens contextual
 //! help. `m` cycles layouts; `v` toggles the visualizer and `Alt+v` cycles its
 //! modes. The terminal is restored on normal exit, error and panic.
 
@@ -141,6 +141,7 @@ impl Drop for TerminalGuard {
 /// keyboard shortcuts and the command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
+    Home,
     Tracks,
     Artists,
     Albums,
@@ -151,7 +152,8 @@ enum View {
 }
 
 impl View {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
+        Self::Home,
         Self::Tracks,
         Self::Artists,
         Self::Albums,
@@ -163,6 +165,7 @@ impl View {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Home => "Home",
             Self::Tracks => "Tracks",
             Self::Artists => "Artists",
             Self::Albums => "Albums",
@@ -707,6 +710,13 @@ impl Tui {
             }
         } else {
             match self.view {
+                View::Home => vec![
+                    Row::Collection(SmartCollection::RecentlyPlayed),
+                    Row::Collection(SmartCollection::RecentlyAdded),
+                    Row::Collection(SmartCollection::MostPlayed),
+                    Row::Collection(SmartCollection::Favorites),
+                    Row::Collection(SmartCollection::HighlyRated),
+                ],
                 View::Tracks => {
                     let mut ids = if let Some(collection) = self.active_collection {
                         self.controller.smart_collection_tracks(collection)
@@ -1544,18 +1554,14 @@ impl Tui {
         false
     }
 
-    fn library_header_identity(&self, width: usize) -> String {
-        let full = self.library_full_identity();
-        if width >= 96 {
-            return full;
-        }
+    fn library_header_identity(&self, _width: usize) -> String {
         let path = self
             .controller
             .canonical_root()
             .or_else(|| self.controller.portable_root())
             .or_else(|| self.controller.legacy_index_path());
         let Some(path) = path else {
-            return full;
+            return self.library_full_identity();
         };
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
@@ -1564,7 +1570,7 @@ impl Tui {
         match self.controller.storage_mode() {
             StorageMode::Legacy => format!("legacy {name}"),
             StorageMode::Portable => format!("portable {name}"),
-            StorageMode::Canonical => format!("canonical {name}"),
+            StorageMode::Canonical => name,
         }
     }
 
@@ -2347,7 +2353,7 @@ impl Tui {
                     .unwrap_or(0);
                 self.switch_view(View::ALL[(index + View::ALL.len() - 1) % View::ALL.len()]);
             }
-            KeyCode::F(number @ 1..=7) => {
+            KeyCode::F(number @ 1..=8) => {
                 if let Some(view) = View::ALL.get(usize::from(number) - 1) {
                     self.switch_view(*view);
                 }
@@ -6327,7 +6333,7 @@ mod tests {
         );
         assert!(help.contains("SAFETY"), "{help}");
         assert!(help.contains("audio device selection"), "{help}");
-        assert!(help.contains("F1–F7"), "{help}");
+        assert!(help.contains("F1–F8"), "{help}");
         assert!(
             help.contains("Source → Destination → Verify → Import"),
             "{help}"
@@ -6427,7 +6433,7 @@ mod tests {
             .switch_to_canonical(&root)
             .expect("switch canonical");
         let artist = tui.controller.create_artist("Old Artist").expect("artist");
-        key(&mut tui, KeyCode::F(2));
+        key(&mut tui, KeyCode::F(3));
         assert_eq!(tui.view, View::Artists);
         key(&mut tui, KeyCode::Enter);
         assert_eq!(tui.detail, Some(Detail::Artist(artist)));
@@ -6457,7 +6463,7 @@ mod tests {
             .import_files(std::slice::from_ref(&source), false)
             .expect("canonical import");
         let track = tui.controller.tracks()[0].0;
-        key(&mut tui, KeyCode::F(1));
+        key(&mut tui, KeyCode::F(2));
         assert_eq!(tui.view, View::Tracks);
 
         let artwork = dir.path().join("cover.png");
@@ -6779,7 +6785,7 @@ mod tests {
             .create_album(artist, "First Light", flux_app::ReleaseType::Album)
             .expect("album");
 
-        key(&mut tui, KeyCode::F(2));
+        key(&mut tui, KeyCode::F(3));
         assert_eq!(tui.view, View::Artists);
         assert!(
             tui.view_rows()
@@ -6797,13 +6803,13 @@ mod tests {
         key(&mut tui, KeyCode::Esc);
         assert!(tui.detail.is_none());
 
-        key(&mut tui, KeyCode::F(3));
+        key(&mut tui, KeyCode::F(4));
         assert_eq!(tui.view, View::Albums);
         key(&mut tui, KeyCode::Enter);
         assert!(matches!(tui.detail, Some(Detail::Album(_))));
         key(&mut tui, KeyCode::Esc);
 
-        key(&mut tui, KeyCode::F(4));
+        key(&mut tui, KeyCode::F(5));
         key(&mut tui, KeyCode::Char('N'));
         assert_eq!(tui.mode, Mode::FormInput);
         tui.form.as_mut().expect("playlist form").fields[0].value = "Night Mix".to_owned();
@@ -6811,7 +6817,7 @@ mod tests {
         assert_eq!(tui.controller.playlists().len(), 1);
         assert_eq!(tui.controller.playlists()[0].name, "Night Mix");
 
-        key(&mut tui, KeyCode::F(5));
+        key(&mut tui, KeyCode::F(6));
         assert_eq!(tui.view, View::Collections);
         key(&mut tui, KeyCode::Enter);
         assert_eq!(tui.view, View::Tracks);
@@ -6883,6 +6889,92 @@ mod tests {
         assert!(
             tui.controller.track(id).is_some(),
             "catalogue track remains"
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_home_destination_opens_shared_collections() {
+        let dir = TempDir::new("tui-home");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::F(1));
+        assert_eq!(tui.view, View::Home);
+        let rows = tui.view_rows();
+        assert_eq!(rows.len(), 5, "Home exposes the five shared collections");
+        assert!(rows.iter().all(|row| matches!(row, Row::Collection(_))));
+        assert!(tui.view_title().starts_with("Home"));
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.view, View::Tracks);
+        assert!(tui.active_collection.is_some());
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn required_terminal_sizes_render_with_one_primary_timeline() {
+        let dir = TempDir::new("tui-required-sizes");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let source = dir.path().join("Artist/Album/01 - Song.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, wav_with_sample(3)).expect("wav");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        tui.controller
+            .import_files(&[source], false)
+            .expect("import");
+        let track = tui.controller.tracks()[0].0;
+        tui.controller.play_track(track);
+
+        for (width, height) in [(120usize, 36usize), (92, 24), (80, 24), (40, 12)] {
+            let mut output = Vec::new();
+            tui.draw_sized(&mut output, width as u16, height as u16)
+                .unwrap_or_else(|error| panic!("{width}x{height}: {error}"));
+            let rendered = String::from_utf8_lossy(&output);
+            assert!(!rendered.is_empty(), "{width}x{height} rendered nothing");
+            assert!(
+                rendered.contains("Flux"),
+                "{width}x{height} lost the product identity"
+            );
+            assert!(
+                rendered.contains('░'),
+                "{width}x{height} renders the primary timeline"
+            );
+            assert!(
+                !rendered.contains(" / --:--"),
+                "{width}x{height} duplicates duration outside the timeline"
+            );
+            let content_width = width.saturating_sub(tui.content_offset);
+            let expected_side =
+                if tui.layout == LayoutMode::Standard && content_width >= 86 && height >= 10 {
+                    content_width / 3
+                } else {
+                    0
+                };
+            assert_eq!(
+                tui.side_panel_width(content_width, height),
+                expected_side,
+                "{width}x{height} side-panel threshold"
+            );
+        }
+
+        let album = tui
+            .controller
+            .track_album_id(track)
+            .expect("album membership");
+        tui.view = View::Albums;
+        tui.detail = Some(Detail::Album(album));
+        let mut output = Vec::new();
+        tui.draw_sized(&mut output, 120, 36).expect("album layout");
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(
+            rendered.contains("▸ Albums"),
+            "the active destination remains marked in detail views"
+        );
+        assert!(
+            !rendered.contains("Playback timeline below"),
+            "the side panel does not repeat playback placement copy"
         );
         tui.controller.shutdown();
     }

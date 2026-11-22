@@ -36,7 +36,7 @@ pub(crate) fn help_lines(controller: &Controller, library: &str) -> Vec<String> 
         String::new(),
         "NAVIGATION".to_owned(),
         "Tab / Shift+Tab cycles Tracks, Artists, Albums, Playlists, Collections, Lyrics, Settings.".to_owned(),
-        "F1–F7 open a destination directly · ↑/↓ or k/j move · PgUp/PgDn · g/G first/last".to_owned(),
+        "F1–F8 open a destination directly · ↑/↓ or k/j move · PgUp/PgDn · g/G first/last".to_owned(),
         "Enter opens the selected entity or plays the selected track · Esc goes back.".to_owned(),
         "/ searches the current view · Esc clears search · F filters favorites · ? opens help.".to_owned(),
         ": opens the command palette (:tracks :queue :viz bars :layout player :seek +10).".to_owned(),
