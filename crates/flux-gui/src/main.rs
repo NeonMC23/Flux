@@ -162,28 +162,6 @@ fn modal_backdrop_style(_: &Theme) -> container::Style {
     container::Style::default().background(Color::from_rgba8(0, 0, 0, 0.70))
 }
 
-fn menu_pick_style(
-    _: &Theme,
-    status: iced::widget::pick_list::Status,
-) -> iced::widget::pick_list::Style {
-    let (background, border, text_color) = match status {
-        iced::widget::pick_list::Status::Hovered
-        | iced::widget::pick_list::Status::Opened { .. } => (SURFACE_HI, ACCENT_BORDER, TEXT),
-        iced::widget::pick_list::Status::Active => (Color::TRANSPARENT, Color::TRANSPARENT, MUTED),
-    };
-    iced::widget::pick_list::Style {
-        text_color,
-        placeholder_color: text_color,
-        handle_color: text_color,
-        background: background.into(),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-    }
-}
-
 fn control_bar_style(_: &Theme) -> container::Style {
     container::Style::default()
         .background(Color::from_rgba8(0x18, 0x15, 0x20, 0.72))
@@ -493,32 +471,6 @@ fn track_row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button:
             shadow: Shadow::default(),
             snap: true,
         }
-    }
-}
-
-fn queue_row_style(selected: bool, dragging: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_theme| {
-        let background = if dragging {
-            SURFACE_HI
-        } else if selected {
-            ACCENT_SOFT
-        } else {
-            Color::TRANSPARENT
-        };
-        let border = if dragging {
-            ACCENT
-        } else if selected {
-            ACCENT_BORDER
-        } else {
-            Color::TRANSPARENT
-        };
-        container::Style::default()
-            .background(background)
-            .border(Border {
-                color: border,
-                width: if dragging || selected { 1.0 } else { 0.0 },
-                radius: 8.0.into(),
-            })
     }
 }
 
@@ -1458,6 +1410,17 @@ fn track_list_empty_copy(
     }
 }
 
+fn import_outcome_heading(report: &ImportApplyReport) -> &'static str {
+    let committed = report.imported + report.updated;
+    if report.failed > 0 && committed == 0 {
+        "Import needs attention"
+    } else if report.failed > 0 {
+        "Import completed with issues"
+    } else {
+        "Import complete"
+    }
+}
+
 fn import_has_committed_success(report: &ImportApplyReport) -> bool {
     report.imported > 0 || report.updated > 0
 }
@@ -2201,6 +2164,7 @@ struct FluxReady {
     album_participants: Vec<ArtistId>,
     album_participant_filter: String,
     album_participant_choice: Option<ArtistChoice>,
+    album_participant_remove_confirm: Option<ArtistId>,
     album_cover_input: String,
     album_cover_picked: Option<PathBuf>,
     album_cover_preview: Option<ImageHandle>,
@@ -2243,6 +2207,7 @@ struct FluxReady {
     show_setup: bool,
     queue_visible: bool,
     queue_overlay_open: bool,
+    track_menu: Option<TrackId>,
     window_width: f32,
     window_height: f32,
     close_confirm: bool,
@@ -2550,7 +2515,10 @@ enum Message {
     PlayTrack(TrackId),
     EnqueueTrack(TrackId),
     PlayNextTrack(TrackId),
+    TrackMenuOpen(TrackId),
+    TrackMenuClose,
     TrackMenu(TrackId, TrackMenuAction),
+    PlayQueueEntry(QueueEntryId),
     RemoveQueueEntry(QueueEntryId),
     QueueDragStart(QueueEntryId),
     QueueDragHover(usize),
@@ -2703,6 +2671,7 @@ impl FluxReady {
             album_participants: Vec::new(),
             album_participant_filter: String::new(),
             album_participant_choice: None,
+            album_participant_remove_confirm: None,
             album_cover_input: String::new(),
             album_cover_picked: None,
             album_cover_preview: None,
@@ -2745,6 +2714,7 @@ impl FluxReady {
             show_setup,
             queue_visible: true,
             queue_overlay_open: false,
+            track_menu: None,
             window_width: 1_180.0,
             window_height: 760.0,
             close_confirm: false,
@@ -2788,6 +2758,7 @@ impl FluxReady {
         self.migrated_dest = None;
         self.lifecycle_msg = None;
         self.queue_drag = None;
+        self.track_menu = None;
         self.seek_preview = None;
         self.track_editor = None;
         self.selected_lyrics = None;
@@ -2806,6 +2777,7 @@ impl FluxReady {
         self.album_participants.clear();
         self.album_participant_filter.clear();
         self.album_participant_choice = None;
+        self.album_participant_remove_confirm = None;
         self.album_cover_input.clear();
         self.album_cover_picked = None;
         self.album_cover_preview = None;
@@ -2975,6 +2947,23 @@ impl FluxReady {
         let target = Duration::from_secs_f32(preview.max(0.0)).min(total);
         if self.controller.seek(target).is_ok() {
             self.scope.reset();
+        }
+    }
+
+    fn artist_label(&self, id: ArtistId) -> String {
+        let Some(artist) = self.controller.artist(id) else {
+            return format!("Artist {id}");
+        };
+        let duplicates = self
+            .controller
+            .artists()
+            .into_iter()
+            .filter(|candidate| candidate.name() == artist.name())
+            .count();
+        if duplicates > 1 {
+            format!("{} · ID {}", artist.name(), id)
+        } else {
+            artist.name().to_owned()
         }
     }
 
@@ -4274,13 +4263,15 @@ impl FluxReady {
         }
     }
 
-    fn toggle_queue(&mut self) {
+    fn toggle_queue(&mut self) -> bool {
         self.cancel_queue_drag();
         if self.window_width >= QUEUE_INLINE_MIN_WIDTH {
             self.queue_visible = !self.queue_visible;
             self.queue_overlay_open = false;
+            false
         } else {
             self.queue_overlay_open = !self.queue_overlay_open;
+            self.queue_overlay_open
         }
     }
 
@@ -4914,11 +4905,24 @@ impl FluxReady {
                 let Some(album_id) = self.selected_album_id() else {
                     return Task::none();
                 };
+                if self.album_participant_remove_confirm != Some(artist) {
+                    self.album_participant_remove_confirm = Some(artist);
+                    let name = self
+                        .controller
+                        .artist(artist)
+                        .map(|artist| artist.name().to_owned())
+                        .unwrap_or_else(|| format!("Artist {artist}"));
+                    self.lifecycle_msg = Some(format!(
+                        "Confirm removing {name} from the Album participants. The Album, Tracks, audio and Track credits remain; click Confirm remove to continue."
+                    ));
+                    return Task::none();
+                }
+                self.album_participant_remove_confirm = None;
                 match self.controller.remove_album_participant(album_id, artist) {
                     Ok(()) => {
                         self.sync_album_editor();
                         self.lifecycle_msg = Some(
-                            "Removed the Album participant. The Album, its tracks and Track credits are unchanged."
+                            "Removed the Album participation association. The Album, Tracks, audio and Track credits are unchanged."
                                 .to_owned(),
                         );
                     }
@@ -7688,7 +7692,12 @@ impl FluxReady {
             Message::ToggleSetupAdvanced => {
                 self.setup_advanced_open = !self.setup_advanced_open;
             }
-            Message::ToggleQueue => self.toggle_queue(),
+            Message::ToggleQueue => {
+                let opened = self.toggle_queue();
+                if !opened && !self.search.trim().is_empty() {
+                    return iced::widget::operation::focus(iced::widget::Id::new("flux-search"));
+                }
+            }
             Message::PagePrev => {
                 self.page = self.page.saturating_sub(1);
                 if self.selected_playlist.is_some() {
@@ -7731,7 +7740,17 @@ impl FluxReady {
                 let _ = self.controller.enqueue_track(id);
                 self.follow_queue_current();
             }
+            Message::TrackMenuOpen(id) => {
+                if self.controller.track(id).is_some() {
+                    self.track_menu = Some(id);
+                }
+            }
+            Message::TrackMenuClose => {
+                self.track_menu = None;
+                return iced::widget::operation::focus(iced::widget::Id::new("flux-search"));
+            }
             Message::TrackMenu(id, action) => {
+                self.track_menu = None;
                 return self.update(match action {
                     TrackMenuAction::PlayNext => Message::PlayNextTrack(id),
                     TrackMenuAction::AddToQueue => Message::EnqueueTrack(id),
@@ -7769,6 +7788,13 @@ impl FluxReady {
             Message::PlayNextTrack(id) => {
                 let _ = self.controller.play_next_track(id);
                 self.follow_queue_current();
+            }
+            Message::PlayQueueEntry(entry) => {
+                self.seek_preview = None;
+                match self.controller.play_queue_entry(entry) {
+                    Ok(()) => self.follow_queue_current(),
+                    Err(error) => self.lifecycle_msg = Some(error),
+                }
             }
             Message::RemoveQueueEntry(entry) => {
                 if self.queue_drag.is_some() {
@@ -7954,6 +7980,24 @@ impl FluxReady {
                 if self.import_manager.is_some() {
                     return self.handle_import_key(&key, &modifiers);
                 }
+                if self.track_menu.is_some() {
+                    if matches!(key, Key::Named(Named::Escape)) {
+                        self.track_menu = None;
+                        return iced::widget::operation::focus(iced::widget::Id::new(
+                            "flux-search",
+                        ));
+                    }
+                    return Task::none();
+                }
+                if (self.show_setup
+                    || self.track_editor.is_some()
+                    || self.lyrics_editor.is_some()
+                    || self.playlist_create_open
+                    || self.lyrics_import.is_some())
+                    && !matches!(key, Key::Named(Named::Escape))
+                {
+                    return Task::none();
+                }
                 if modifiers.contains(Modifiers::CTRL) {
                     match key.as_ref() {
                         Key::Named(Named::ArrowUp) => {
@@ -7968,6 +8012,39 @@ impl FluxReady {
                     }
                     return Task::none();
                 }
+                if !self.show_setup && self.track_editor.is_none() {
+                    match key.as_ref() {
+                        Key::Named(Named::Tab) => {
+                            let delta = if modifiers.contains(Modifiers::SHIFT) {
+                                -1
+                            } else {
+                                1
+                            };
+                            self.cycle_view(delta);
+                            return Task::none();
+                        }
+                        Key::Named(Named::ArrowDown) => {
+                            if !self.modals_visible() {
+                                self.focus_relative_track(1);
+                            }
+                            return Task::none();
+                        }
+                        Key::Named(Named::ArrowUp) => {
+                            if !self.modals_visible() {
+                                self.focus_relative_track(-1);
+                            }
+                            return Task::none();
+                        }
+                        Key::Named(Named::Enter) => {
+                            if !self.modals_visible()
+                                && let Some(id) = self.keyboard_track()
+                            {
+                                return self.update(Message::PlayTrack(id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 match key.as_ref() {
                     Key::Named(Named::Space) => self.controller.toggle_play_pause(),
                     Key::Character("n") => return self.update(Message::Next),
@@ -7976,11 +8053,40 @@ impl FluxReady {
                         self.seek_preview = None;
                         self.controller.stop();
                     }
-                    Key::Character("q") => self.toggle_queue(),
+                    Key::Character("q") => {
+                        self.toggle_queue();
+                    }
                     Key::Character("e") => {
-                        if let Some(id) = self.controller.current_id() {
+                        if let Some(id) = self.keyboard_track() {
                             self.start_track_editor(id);
                         }
+                    }
+                    Key::Character("a") => {
+                        if let Some(id) = self.keyboard_track() {
+                            let _ = self.controller.enqueue_track(id);
+                            self.follow_queue_current();
+                        }
+                    }
+                    Key::Character("f") => {
+                        if let Some(id) = self.keyboard_track() {
+                            let favorite = !self
+                                .controller
+                                .rating(id)
+                                .is_some_and(|rating| rating.favorite);
+                            let _ = self.controller.set_rating(
+                                id,
+                                self.controller.rating(id).and_then(|rating| rating.rating),
+                                favorite,
+                            );
+                        }
+                    }
+                    Key::Character("y") => {
+                        if let Some(id) = self.keyboard_track() {
+                            return self.update(Message::LyricsSelect(id));
+                        }
+                    }
+                    Key::Character("i") => {
+                        return self.update(Message::ImportOpen);
                     }
                     Key::Named(Named::ArrowLeft) => {
                         let step = if modifiers.contains(Modifiers::SHIFT) {
@@ -8036,7 +8142,9 @@ impl FluxReady {
                         }
                         if self.queue_overlay_open {
                             self.queue_overlay_open = false;
-                            return Task::none();
+                            return iced::widget::operation::focus(iced::widget::Id::new(
+                                "flux-search",
+                            ));
                         }
                         if self.selected_playlist.is_some() {
                             self.selected_playlist = None;
@@ -8183,6 +8291,8 @@ impl FluxReady {
             modal_stack(base, self.album_transfer_overlay())
         } else if self.deletion_manager.is_some() {
             modal_stack(base, self.deletion_overlay())
+        } else if self.track_menu.is_some() {
+            modal_stack(base, self.track_menu_overlay())
         } else if self.import_manager.is_some() {
             modal_stack(base, self.import_overlay())
         } else if self.external_drag_hover {
@@ -9050,6 +9160,139 @@ impl FluxReady {
         .into()
     }
 
+    fn track_menu_overlay(&self) -> Element<'_, Message> {
+        let Some(id) = self.track_menu else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        let Some(track) = self.controller.track(id) else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        let editable = matches!(
+            self.controller.storage_mode(),
+            StorageMode::Portable | StorageMode::Canonical
+        );
+        let favorite = self
+            .controller
+            .rating(id)
+            .is_some_and(|rating| rating.favorite);
+        let rating = self.controller.rating(id).and_then(|rating| rating.rating);
+        let has_artist = self.controller.track_artist_id(id).is_some();
+        let has_album = self.controller.track_album_id(id).is_some();
+        let mut actions = vec![
+            (TrackMenuAction::PlayNext, "Play next".to_owned()),
+            (TrackMenuAction::AddToQueue, "Add to queue".to_owned()),
+        ];
+        if editable {
+            actions.push((TrackMenuAction::Edit, "Edit Track details…".to_owned()));
+        }
+        actions.push((
+            TrackMenuAction::FavoriteToggle,
+            if favorite {
+                "Remove favorite".to_owned()
+            } else {
+                "Mark favorite".to_owned()
+            },
+        ));
+        actions.push((
+            TrackMenuAction::RateUp,
+            match rating {
+                Some(value) if value < 5 => format!("Increase rating (current ★{value})"),
+                Some(_) => "Rating is already ★5".to_owned(),
+                None => "Rate ★1".to_owned(),
+            },
+        ));
+        if rating.is_some() {
+            actions.push((TrackMenuAction::ClearRating, "Clear rating".to_owned()));
+        }
+        actions.push((TrackMenuAction::OpenLyrics, "Open lyrics".to_owned()));
+        if has_artist {
+            actions.push((TrackMenuAction::OpenArtist, "Open Artist".to_owned()));
+        }
+        if has_album {
+            actions.push((TrackMenuAction::OpenAlbum, "Open Album".to_owned()));
+        }
+        let mut list = column![].spacing(3);
+        for (action, label) in actions {
+            let enabled =
+                !(action == TrackMenuAction::RateUp && rating.is_some_and(|value| value >= 5));
+            list = list.push(
+                button(
+                    row![
+                        text(label)
+                            .size(FONT_BODY)
+                            .color(if enabled { TEXT } else { MUTED }),
+                        if enabled {
+                            Element::from(iced::widget::Space::new().width(0))
+                        } else {
+                            Element::from(text("complete").size(FONT_LABEL).color(MUTED))
+                        },
+                    ]
+                    .spacing(6)
+                    .width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .padding([8, 10])
+                .style(ghost_style)
+                .on_press_maybe(enabled.then_some(Message::TrackMenu(id, action))),
+            );
+        }
+        let panel = container(
+            column![
+                row![
+                    column![
+                        text("TRACK ACTIONS").size(FONT_LABEL).color(ACCENT),
+                        text(track.title()).size(FONT_TITLE).color(TEXT),
+                        text(format!(
+                            "{} · {}",
+                            self.credit_display(id),
+                            display_album(track)
+                        ))
+                        .size(FONT_LABEL)
+                        .color(MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text("Close").size(FONT_LABEL))
+                        .style(ghost_style)
+                        .padding([4, 7])
+                        .on_press(Message::TrackMenuClose),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Start),
+                horizontal_rule(),
+                scrollable(list).height(Length::Fixed(360.0)),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .width(Length::Fixed(310.0))
+        .max_height(520.0)
+        .style(import_panel_style);
+        let backdrop = mouse_area(
+            container(
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(modal_backdrop_style),
+        )
+        .on_press(Message::TrackMenuClose);
+        stack([
+            backdrop.into(),
+            container(
+                row![iced::widget::Space::new().width(Length::Fill), panel,].height(Length::Fill),
+            )
+            .padding(24)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        ])
+        .height(Length::Fill)
+        .into()
+    }
+
     fn import_overlay(&self) -> Element<'_, Message> {
         let Some(manager) = self.import_manager.as_ref() else {
             return iced::widget::Space::new().into();
@@ -9665,23 +9908,18 @@ impl FluxReady {
     }
 
     fn import_status_label(candidate: &flux_app::ImportCandidate) -> (&'static str, Color) {
+        let review = Color::from_rgb8(0xff, 0xc2, 0x66);
         match candidate.status() {
             CandidateStatus::New => ("Ready", SUCCESS),
-            CandidateStatus::ExistingPath(_) => {
-                ("Already in library", Color::from_rgb8(0xff, 0xc2, 0x66))
-            }
+            CandidateStatus::ExistingPath(_) => ("Same managed file", review),
             CandidateStatus::SameContent {
                 track_id: Some(_), ..
-            } => ("Already in library", Color::from_rgb8(0xff, 0xc2, 0x66)),
-            CandidateStatus::SameContent { track_id: None, .. } => {
-                ("Duplicate file", Color::from_rgb8(0xff, 0xc2, 0x66))
-            }
-            CandidateStatus::SimilarMetadata(_)
-            | CandidateStatus::SameTitleDifferentAudio(_)
-            | CandidateStatus::ProbableAudio(_)
-            | CandidateStatus::AmbiguousAudio(_) => {
-                ("Check details", Color::from_rgb8(0xff, 0xc2, 0x66))
-            }
+            } => ("Same managed audio", review),
+            CandidateStatus::SameContent { track_id: None, .. } => ("Duplicate in batch", review),
+            CandidateStatus::SimilarMetadata(_) => ("Metadata-only match", review),
+            CandidateStatus::SameTitleDifferentAudio(_) => ("Title/audio conflict", review),
+            CandidateStatus::ProbableAudio(_) => ("Probable duplicate", review),
+            CandidateStatus::AmbiguousAudio(_) => ("Ambiguous match", review),
         }
     }
 
@@ -9746,7 +9984,7 @@ impl FluxReady {
                 text(decision).size(8).color(MUTED),
             ]
             .spacing(1)
-            .width(Length::Fixed(112.0)),
+            .width(Length::Fixed(150.0)),
         );
         button(row)
             .width(Length::Fill)
@@ -10247,11 +10485,7 @@ impl FluxReady {
                     );
                 } else {
                     for participant in &participant_ids {
-                        let name = self
-                            .controller
-                            .artist(*participant)
-                            .map(|artist| artist.name().to_owned())
-                            .unwrap_or_else(|| format!("Artist {participant}"));
+                        let name = self.artist_label(*participant);
                         let added = candidate.album_participants().contains(participant);
                         participant_rows = participant_rows.push(
                             row![
@@ -10552,9 +10786,13 @@ impl FluxReady {
                 |plan| {
                     let ready = plan.new_count() + plan.update_count();
                     if plan.skip_count() > 0 {
-                        format!("{ready} track(s) ready · {} skipped", plan.skip_count())
+                        format!(
+                            "{} ready · {} skipped",
+                            pluralize(ready, "Track"),
+                            plan.skip_count()
+                        )
                     } else {
-                        format!("{ready} track(s) ready")
+                        format!("{} ready", pluralize(ready, "Track"))
                     }
                 },
             ),
@@ -10563,7 +10801,7 @@ impl FluxReady {
                 || "Complete".to_owned(),
                 |report| {
                     format!(
-                        "{} imported · {} updated · {} skipped · {} failed",
+                        "{} new · {} updated · {} skipped · {} failed",
                         report.imported, report.updated, report.skipped, report.failed
                     )
                 },
@@ -10586,11 +10824,14 @@ impl FluxReady {
                 footer = footer.push(
                     button(
                         text(format!(
-                            "Import {} track(s)",
-                            manager
-                                .plan
-                                .as_ref()
-                                .map_or(0, |plan| { plan.new_count() + plan.update_count() })
+                            "Import {}",
+                            pluralize(
+                                manager
+                                    .plan
+                                    .as_ref()
+                                    .map_or(0, |plan| { plan.new_count() + plan.update_count() }),
+                                "Track"
+                            )
                         ))
                         .size(11),
                     )
@@ -10652,35 +10893,44 @@ impl FluxReady {
             );
         }
         if let Some(report) = &manager.report {
-            body = body.push(
-                text(format!("{} track(s) imported", report.imported))
-                    .size(18)
-                    .color(TEXT),
-            );
-            let mut summary = Vec::new();
-            if report.updated > 0 {
-                summary.push(format!("{} updated", report.updated));
-            }
+            let committed = report.imported + report.updated;
+            body = body.push(text(import_outcome_heading(report)).size(18).color(TEXT));
+            let mut summary = vec![
+                pluralize(report.imported, "new Track"),
+                pluralize(report.updated, "updated Track"),
+            ];
             if report.skipped > 0 {
-                summary.push(format!("{} skipped", report.skipped));
+                summary.push(pluralize(report.skipped, "skipped file"));
             }
             if report.failed > 0 {
-                summary.push(format!("{} need attention", report.failed));
+                summary.push(pluralize(report.failed, "file needing attention"));
             }
-            if !summary.is_empty() {
-                body = body.push(text(summary.join(" · ")).size(10).color(MUTED));
-            }
+            body = body.push(text(summary.join(" · ")).size(10).color(MUTED));
             body = body.push(
-                text("Find the music in Tracks or Albums.")
-                    .size(10)
-                    .color(MUTED),
+                text(if committed > 0 {
+                    "Published Tracks are already available in Tracks and Albums; failed files were not partially catalogue-registered."
+                } else {
+                    "No Track was published. Choose again to select sources or resolve the issues below."
+                })
+                .size(10)
+                .color(MUTED),
             );
             for item in report
                 .items
                 .iter()
                 .filter(|item| item.state == ImportItemState::Failed)
             {
-                body = body.push(text(item.message.clone()).size(9).color(DANGER));
+                let label = manager
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.candidates.get(item.index))
+                    .map(|candidate| candidate.title().to_owned())
+                    .unwrap_or_else(|| format!("Candidate {}", item.index + 1));
+                body = body.push(
+                    text(format!("{label}: {}", item.message))
+                        .size(9)
+                        .color(DANGER),
+                );
             }
         }
         if let Some(plan) = &manager.plan
@@ -11352,7 +11602,17 @@ impl FluxReady {
                     .size(10)
                     .color(TEXT),
                 text(
-                    "E · edit current track    Esc · cancel/clear    Ctrl+↑/↓ · reorder queue entry"
+                    "Tab/Shift+Tab · next/previous destination    ↑/↓ · move Track focus    Enter · play focused Track"
+                )
+                .size(10)
+                .color(TEXT),
+                text(
+                    "E · edit    Y · lyrics    A · add to queue    F · favorite    I · import"
+                )
+                .size(10)
+                .color(TEXT),
+                text(
+                    "Esc · cancel/clear    Ctrl+↑/↓ · reorder queue entry"
                 )
                 .size(10)
                 .color(TEXT),
@@ -12392,7 +12652,24 @@ impl FluxReady {
 
         let mut list = column![].spacing(7);
         for (key, count) in &groups[start..end] {
-            let title = group_title(self.view, key);
+            let mut title = group_title(self.view, key);
+            if self.view == LibraryView::Artists {
+                let (_, raw) = artist_key_parts(key);
+                if let Ok(raw_id) = raw.parse::<u64>() {
+                    let id = ArtistId::new(raw_id);
+                    if let Some(artist) = self.controller.artist(id) {
+                        let duplicates = self
+                            .controller
+                            .artists()
+                            .into_iter()
+                            .filter(|candidate| candidate.name() == artist.name())
+                            .count();
+                        if duplicates > 1 {
+                            title = format!("{} · ID {}", artist.name(), id);
+                        }
+                    }
+                }
+            }
             let subtitle = if self.view == LibraryView::Folders {
                 format!("{} · {key}", pluralize(*count, "track"))
             } else if self.view == LibraryView::Artists {
@@ -13009,6 +13286,76 @@ impl FluxReady {
             .into()
     }
 
+    fn modals_visible(&self) -> bool {
+        self.import_manager.is_some()
+            || self.batch_review.is_some()
+            || self.album_transfer.is_some()
+            || self.deletion_manager.is_some()
+            || self.playlist_create_open
+            || self.lyrics_import.is_some()
+            || self.queue_overlay_open
+    }
+
+    fn keyboard_track(&self) -> Option<TrackId> {
+        self.focused_track
+            .filter(|id| self.controller.track(*id).is_some())
+            .or_else(|| self.controller.current_id())
+    }
+
+    fn focus_relative_track(&mut self, delta: isize) {
+        if !matches!(
+            self.view,
+            LibraryView::Tracks
+                | LibraryView::RecentlyAdded
+                | LibraryView::RecentlyPlayed
+                | LibraryView::MostPlayed
+        ) && self.selected_album_id().is_none()
+            && self.collection.is_none()
+        {
+            return;
+        }
+        let rows = self.filtered_track_ids();
+        if rows.is_empty() {
+            self.focused_track = None;
+            return;
+        }
+        let current_index = self
+            .focused_track
+            .and_then(|id| rows.iter().position(|candidate| *candidate == id))
+            .unwrap_or_else(|| if delta < 0 { rows.len() - 1 } else { 0 });
+        let next = if delta < 0 {
+            current_index.saturating_sub(1)
+        } else {
+            (current_index + 1).min(rows.len() - 1)
+        };
+        self.focused_track = Some(rows[next]);
+        self.page = next / TRACK_PAGE_SIZE;
+    }
+
+    fn cycle_view(&mut self, delta: isize) {
+        let destinations = [
+            LibraryView::Dashboard,
+            LibraryView::Tracks,
+            LibraryView::Artists,
+            LibraryView::Albums,
+            LibraryView::Folders,
+            LibraryView::Playlists,
+            LibraryView::Collections,
+            LibraryView::Lyrics,
+            LibraryView::Settings,
+        ];
+        let index = destinations
+            .iter()
+            .position(|view| *view == self.view)
+            .unwrap_or(1);
+        let next = if delta < 0 {
+            (index + destinations.len() - 1) % destinations.len()
+        } else {
+            (index + 1) % destinations.len()
+        };
+        self.select_view(destinations[next]);
+    }
+
     fn filter_count(&self) -> usize {
         usize::from(self.filter_favorites)
             + usize::from(self.filter_lyrics != TriFilter::Any)
@@ -13133,10 +13480,6 @@ impl FluxReady {
             body = body.push(text("TRACKS").size(9).color(ACCENT));
             let mut list = column![].spacing(2);
             let current = self.controller.current_id();
-            let editable = matches!(
-                self.controller.storage_mode(),
-                StorageMode::Portable | StorageMode::Canonical
-            );
             for (index, id) in cache.track_ids.iter().take(SEARCH_RESULT_LIMIT).enumerate() {
                 let Some(track) = self.controller.track(*id) else {
                     continue;
@@ -13152,7 +13495,6 @@ impl FluxReady {
                             TrackRowState {
                                 current,
                                 resource,
-                                editable,
                                 checked: self.selected_tracks.contains(id),
                                 focused: self.focused_track == Some(*id),
                                 rating: self
@@ -13163,8 +13505,6 @@ impl FluxReady {
                                     .controller
                                     .rating(*id)
                                     .is_some_and(|rating| rating.favorite),
-                                has_artist: self.controller.track_artist_id(*id).is_some(),
-                                has_album: self.controller.track_album_id(*id).is_some(),
                             },
                             self.window_width < 1_020.0,
                         ),
@@ -15870,11 +16210,7 @@ impl FluxReady {
             );
         } else {
             for participant in &self.album_participants {
-                let name = self
-                    .controller
-                    .artist(*participant)
-                    .map(|artist| artist.name().to_owned())
-                    .unwrap_or_else(|| format!("Artist {participant}"));
+                let name = self.artist_label(*participant);
                 participant_rows = participant_rows.push(
                     row![
                         button(text(name).size(10))
@@ -15887,10 +16223,25 @@ impl FluxReady {
                             text("").size(8)
                         },
                         iced::widget::Space::new().width(Length::Fill),
-                        button(text("Remove").size(9))
-                            .style(ghost_style)
-                            .padding([3, 6])
-                            .on_press(Message::AlbumParticipantRemove(*participant)),
+                        button(
+                            text(
+                                if self.album_participant_remove_confirm == Some(*participant) {
+                                    "Confirm remove"
+                                } else {
+                                    "Remove"
+                                }
+                            )
+                            .size(9),
+                        )
+                        .style(
+                            if self.album_participant_remove_confirm == Some(*participant) {
+                                danger_button_style
+                            } else {
+                                ghost_style
+                            }
+                        )
+                        .padding([3, 6])
+                        .on_press(Message::AlbumParticipantRemove(*participant)),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -16171,10 +16522,6 @@ impl FluxReady {
         let start = page * TRACK_PAGE_SIZE;
         let end = (start + TRACK_PAGE_SIZE).min(total);
         let current = self.controller.current_id();
-        let editable = matches!(
-            self.controller.storage_mode(),
-            StorageMode::Portable | StorageMode::Canonical
-        );
 
         let compact_rows = self.window_width < 1_020.0;
         let mut header = row![
@@ -16239,7 +16586,6 @@ impl FluxReady {
                 TrackRowState {
                     current,
                     resource,
-                    editable,
                     checked: self.selected_tracks.contains(id),
                     focused: self.focused_track == Some(*id),
                     rating: self.controller.rating(*id).and_then(|rating| rating.rating),
@@ -16247,8 +16593,6 @@ impl FluxReady {
                         .controller
                         .rating(*id)
                         .is_some_and(|rating| rating.favorite),
-                    has_artist: self.controller.track_artist_id(*id).is_some(),
-                    has_album: self.controller.track_album_id(*id).is_some(),
                 },
                 self.window_width < 1_020.0,
             ));
@@ -16910,8 +17254,8 @@ impl FluxReady {
             container(now_art)
                 .width(Length::Fill)
                 .center_x(Length::Fill),
-            text(title).size(16).color(TEXT),
-            text(subtitle).size(11).color(MUTED),
+            text(truncate_label(&title, 36)).size(16).color(TEXT),
+            text(truncate_label(&subtitle, 44)).size(11).color(MUTED),
             now_actions,
             horizontal_rule(),
         ]
@@ -16966,7 +17310,7 @@ impl FluxReady {
         }
         if total == 0 {
             panel = panel.push(
-                text("Use + on any track to add it to the queue.")
+                text("Open a Track's action menu and choose “Add to queue”.")
                     .size(10)
                     .color(MUTED),
             );
@@ -17373,13 +17717,10 @@ impl std::fmt::Display for TrackMenuAction {
 struct TrackRowState {
     current: Option<TrackId>,
     resource: Option<TrackResourceBadge>,
-    editable: bool,
     checked: bool,
     focused: bool,
     rating: Option<u8>,
     favorite: bool,
-    has_artist: bool,
-    has_album: bool,
 }
 
 fn filter_chip(label: impl Into<String>) -> Element<'static, Message> {
@@ -17454,13 +17795,16 @@ fn track_row<'a>(
     state: TrackRowState,
     compact: bool,
 ) -> Element<'a, Message> {
-    let selected = state.current == Some(id) || state.focused;
-    let marker = if selected {
+    let is_current = state.current == Some(id);
+    let selected = is_current || state.focused;
+    let marker = if is_current {
         "▶".to_owned()
+    } else if state.focused {
+        "›".to_owned()
     } else {
         index.to_string()
     };
-    let title_color = if selected { ACCENT } else { TEXT };
+    let title_color = if is_current { ACCENT } else { TEXT };
     let duration = track.duration().map(format_duration).unwrap_or_default();
     let playable = is_track_playable(track);
 
@@ -17483,7 +17827,13 @@ fn track_row<'a>(
     let content = row![
         text(marker)
             .size(10)
-            .color(if selected { ACCENT } else { MUTED })
+            .color(if is_current {
+                ACCENT
+            } else if state.focused {
+                TEXT
+            } else {
+                MUTED
+            })
             .width(Length::Fixed(28.0)),
         column![title, text(credits.to_owned()).size(FONT_META).color(MUTED),]
             .spacing(2)
@@ -17521,6 +17871,15 @@ fn track_row<'a>(
         .style(ghost_style)
         .padding([5, 7])
         .on_press(Message::TrackSelectionToggle(id));
+    let check = tooltip(
+        check,
+        container(text("Select Track").size(9).color(TEXT))
+            .padding([4, 7])
+            .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(5)
+    .delay(Duration::from_millis(300));
     let main = button(content)
         .width(Length::Fill)
         .padding([9, 10])
@@ -17548,34 +17907,19 @@ fn track_row<'a>(
     .gap(6)
     .delay(Duration::from_millis(350));
 
-    let mut actions = vec![
-        TrackMenuAction::PlayNext,
-        TrackMenuAction::AddToQueue,
-        TrackMenuAction::FavoriteToggle,
-        TrackMenuAction::RateUp,
-        TrackMenuAction::OpenLyrics,
-    ];
-    if state.editable {
-        actions.insert(2, TrackMenuAction::Edit);
-    }
-    if state.rating.is_some() {
-        actions.insert(4, TrackMenuAction::ClearRating);
-    }
-    if state.has_artist {
-        actions.push(TrackMenuAction::OpenArtist);
-    }
-    if state.has_album {
-        actions.push(TrackMenuAction::OpenAlbum);
-    }
-    let menu = pick_list(actions, None::<TrackMenuAction>, move |action| {
-        Message::TrackMenu(id, action)
-    })
-    .placeholder("⋯")
-    .text_size(10)
-    .padding([4, 7])
-    .width(Length::Fixed(44.0))
-    .handle(iced::widget::pick_list::Handle::None)
-    .style(menu_pick_style);
+    let menu = button(text("⋯").size(14))
+        .style(ghost_style)
+        .padding([5, 7])
+        .on_press(Message::TrackMenuOpen(id));
+    let menu = tooltip(
+        menu,
+        container(text("Track actions").size(9).color(TEXT))
+            .padding([4, 7])
+            .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(5)
+    .delay(Duration::from_millis(300));
 
     let mut row = row![check, main];
     if !compact {
@@ -17716,30 +18060,37 @@ fn queue_row<'a>(
             .color(if is_current { ACCENT } else { MUTED })
             .width(Length::Fixed(20.0)),
         column![
-            text(title)
+            text(truncate_label(&title, 34))
                 .size(11)
                 .color(if is_current || dragging { ACCENT } else { TEXT }),
-            text(subtitle).size(9).color(MUTED),
+            text(truncate_label(&subtitle, 42)).size(9).color(MUTED),
         ]
         .spacing(1)
         .width(Length::Fill),
         text(duration).size(9).color(MUTED),
-        text("⠿")
-            .size(12)
-            .color(if dragging { ACCENT } else { MUTED }),
     ]
     .spacing(5)
     .align_y(Alignment::Center);
 
-    let main = container(content)
+    let main = button(content)
         .width(Length::Fill)
         .height(Length::Fixed(QUEUE_ROW_HEIGHT))
         .padding([3, 5])
-        .style(queue_row_style(is_current, dragging));
+        .style(track_row_style(is_current || dragging))
+        .on_press(Message::PlayQueueEntry(entry.id()));
     let remove = button(text("×").size(11))
         .style(ghost_style)
         .padding([3, 4])
         .on_press(Message::RemoveQueueEntry(entry.id()));
+    let remove = tooltip(
+        remove,
+        container(text("Remove from queue").size(9).color(TEXT))
+            .padding([4, 7])
+            .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(5)
+    .delay(Duration::from_millis(300));
 
     let on_move = move |point: iced::Point| {
         Message::QueueDragHover(if point.y < QUEUE_ROW_HEIGHT / 2.0 {
@@ -17748,12 +18099,15 @@ fn queue_row<'a>(
             index + 1
         })
     };
-
-    mouse_area(
-        row![main, remove]
-            .spacing(1)
-            .height(Length::Fixed(QUEUE_ROW_HEIGHT))
-            .align_y(Alignment::Center),
+    let drag = mouse_area(
+        container(
+            text("⠿")
+                .size(12)
+                .color(if dragging { ACCENT } else { MUTED }),
+        )
+        .height(Length::Fixed(QUEUE_ROW_HEIGHT))
+        .padding([0, 5])
+        .center_y(Length::Fixed(QUEUE_ROW_HEIGHT)),
     )
     .on_press(Message::QueueDragStart(entry.id()))
     .on_move(on_move)
@@ -17761,8 +18115,22 @@ fn queue_row<'a>(
         mouse::Interaction::Grabbing
     } else {
         mouse::Interaction::Grab
-    })
-    .into()
+    });
+    let drag = tooltip(
+        drag,
+        container(text("Drag to reorder").size(9).color(TEXT))
+            .padding([4, 7])
+            .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(5)
+    .delay(Duration::from_millis(300));
+
+    row![main, drag, remove]
+        .spacing(1)
+        .height(Length::Fixed(QUEUE_ROW_HEIGHT))
+        .align_y(Alignment::Center)
+        .into()
 }
 
 fn transport_button<'a>(
@@ -18095,6 +18463,7 @@ mod tests {
             album_participants: Vec::new(),
             album_participant_filter: String::new(),
             album_participant_choice: None,
+            album_participant_remove_confirm: None,
             album_cover_input: String::new(),
             album_cover_picked: None,
             album_cover_preview: None,
@@ -18137,6 +18506,7 @@ mod tests {
             show_setup: false,
             queue_visible: true,
             queue_overlay_open: false,
+            track_menu: None,
             window_width: 1_180.0,
             window_height: 760.0,
             close_confirm: false,
@@ -18713,6 +19083,10 @@ mod tests {
             items: Vec::new(),
         };
         assert!(import_has_committed_success(&partial));
+        assert_eq!(
+            import_outcome_heading(&partial),
+            "Import completed with issues"
+        );
         let failed = ImportApplyReport {
             imported: 0,
             updated: 0,
@@ -18721,6 +19095,15 @@ mod tests {
             items: Vec::new(),
         };
         assert!(!import_has_committed_success(&failed));
+        assert_eq!(import_outcome_heading(&failed), "Import needs attention");
+        let clean = ImportApplyReport {
+            imported: 2,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            items: Vec::new(),
+        };
+        assert_eq!(import_outcome_heading(&clean), "Import complete");
 
         let notice = browser_omission_notice(1, 1).expect("notice");
         assert!(notice.contains("1 entry disappeared"), "{notice}");
@@ -19368,6 +19751,176 @@ mod tests {
     }
 
     #[test]
+    fn import_status_labels_distinguish_exact_file_audio_and_ambiguous_cases() {
+        let dir = TempDir::new("import-status-labels");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let first = source_dir.join("one.wav");
+        std::fs::write(&first, minimal_wav()).expect("first");
+        let second = source_dir.join("two.wav");
+        std::fs::write(&second, minimal_wav()).expect("second");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let plan = open_gui_import_review(&mut gui, vec![first.clone()]);
+        assert!(matches!(plan.candidates[0].status(), CandidateStatus::New));
+        assert_eq!(
+            FluxReady::import_status_label(&plan.candidates[0]).0,
+            "Ready"
+        );
+        gui.controller
+            .import_files(std::slice::from_ref(&first), true)
+            .expect("base import");
+        let managed = gui
+            .controller
+            .tracks()
+            .first()
+            .expect("imported")
+            .1
+            .source()
+            .path()
+            .to_path_buf();
+        let plan = open_gui_import_review(&mut gui, vec![managed]);
+        assert!(matches!(
+            plan.candidates[0].status(),
+            CandidateStatus::ExistingPath(_)
+        ));
+        assert_eq!(
+            FluxReady::import_status_label(&plan.candidates[0]).0,
+            "Same managed file"
+        );
+        assert_eq!(
+            plan.candidates[0].decision(),
+            ImportDecision::Skip,
+            "an exact-path duplicate defaults to a safe no-op"
+        );
+        let before = gui.controller.tracks().len();
+        let prepared = prepare_import_files(
+            &plan,
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        send(&mut gui, Message::ImportPrepared(0, 0, Box::new(prepared)));
+        assert_eq!(
+            gui.controller.tracks().len(),
+            before,
+            "re-reviewing an exact duplicate does not create another Track"
+        );
+        let plan = open_gui_import_review(&mut gui, vec![second]);
+        assert!(matches!(
+            plan.candidates[0].status(),
+            CandidateStatus::SameContent {
+                track_id: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            FluxReady::import_status_label(&plan.candidates[0]).0,
+            "Same managed audio"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn keyboard_navigation_moves_track_focus_cycles_views_and_plays_focused_track() {
+        let dir = TempDir::new("gui-keyboard-navigation");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let first = source_dir.join("one.wav");
+        let second = source_dir.join("two.wav");
+        std::fs::write(&first, minimal_wav()).expect("first");
+        let mut bytes = minimal_wav();
+        bytes.extend_from_slice(&[0, 1]);
+        std::fs::write(&second, bytes).expect("second");
+        let mut gui = open_canonical_gui(&dir, &root);
+        gui.controller
+            .import_files(&[first, second], false)
+            .expect("import");
+        gui.view = LibraryView::Tracks;
+        gui.focused_track = Some(gui.controller.tracks()[0].0);
+        let expected = gui.controller.tracks()[1].0;
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::ArrowDown), Modifiers::default()),
+        );
+        assert_eq!(gui.focused_track, Some(expected));
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Enter), Modifiers::default()),
+        );
+        assert_eq!(gui.controller.current_id(), Some(expected));
+
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Tab), Modifiers::default()),
+        );
+        assert_eq!(gui.view, LibraryView::Artists);
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Tab), Modifiers::SHIFT),
+        );
+        assert_eq!(gui.view, LibraryView::Tracks);
+        send(&mut gui, Message::EditTrack(expected));
+        assert!(gui.track_editor.is_some());
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("3".into()), Modifiers::default()),
+        );
+        assert_eq!(
+            gui.view,
+            LibraryView::Tracks,
+            "global navigation shortcuts do not fire inside an editor"
+        );
+        assert!(gui.track_editor.is_some());
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(gui.track_editor.is_none());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn queue_entry_activation_uses_stable_queue_identity() {
+        let dir = TempDir::new("queue-entry-activation");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let one = source_dir.join("one.wav");
+        let two = source_dir.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        let mut second = minimal_wav();
+        second.extend_from_slice(&[0, 0]);
+        std::fs::write(&two, second).expect("two");
+        let mut gui = open_canonical_gui(&dir, &root);
+        gui.controller
+            .import_files(&[one, two], false)
+            .expect("import");
+        let entries = gui.controller.queue_entries();
+        assert!(entries.len() >= 2);
+        let current = gui.controller.current_queue_entry_id();
+        let other = entries
+            .iter()
+            .find(|entry| Some(entry.id()) != current)
+            .map(|entry| entry.id())
+            .expect("other entry");
+        send(&mut gui, Message::PlayQueueEntry(other));
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(other));
+
+        gui.window_width = 920.0;
+        send(&mut gui, Message::ToggleQueue);
+        assert_eq!(gui.queue_placement(), QueuePlacement::Overlay);
+        let _ = gui.view();
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(!gui.queue_overlay_open);
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(other));
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn queue_drag_messages_reorder_without_changing_the_current_entry() {
         let dir = TempDir::new("queue-drag");
         let root = dir.path().join("music");
@@ -19687,6 +20240,8 @@ mod tests {
         gui.controller
             .create_album(second, "Nevermind", ReleaseType::Album)
             .expect("album b");
+        assert_ne!(gui.artist_label(first), gui.artist_label(second));
+        assert!(gui.artist_label(first).contains("ID"));
         let artists = gui.artist_choices();
         let nirvanas = artists
             .iter()
@@ -19814,7 +20369,15 @@ mod tests {
         let _ = gui.album_detail_view(album);
 
         send(&mut gui, Message::AlbumParticipantRemove(beta));
+        assert_eq!(
+            gui.controller.album_participants(album),
+            vec![alpha, beta],
+            "the first activation only requests confirmation"
+        );
+        assert_eq!(gui.album_participant_remove_confirm, Some(beta));
+        send(&mut gui, Message::AlbumParticipantRemove(beta));
         assert_eq!(gui.controller.album_participants(album), vec![alpha]);
+        assert_eq!(gui.album_participant_remove_confirm, None);
         assert!(
             gui.controller.album(album).is_some(),
             "removing a participant never deletes the Album"
