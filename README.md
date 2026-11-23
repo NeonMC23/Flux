@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: public release suspended pending M23 product validation.** Signing and native/manual validation remain external.
+**Status: public release suspended pending M24 workflow/accessibility validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -144,7 +144,11 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   caches and pending playback are cleared while global preferences remain. The
   sidebar keeps the primary **Home**, **Tracks**, **Artists**, **Albums**,
   **Folders**, **Playlists**, **Smart Collections** and **Lyrics** destinations,
-  with **Settings** at the bottom. **Import music** is the single primary action. Use it for the review-first copy-only Import
+  with **Settings** at the bottom. **Import music** is the single primary action.
+  Normal library browsing supports Tab/Shift+Tab destination cycling, ↑/↓ Track
+  focus, Enter play, E edit, Y lyrics, A queue, F favorite, I import and Q queue.
+  Queue rows play on activation; the drag handle reorders and the remove control
+  is explicit. Track actions open a modal action sheet with full labels. Use it for the review-first copy-only Import
   Manager: native file or folder picker, Flux Browser, drag-and-drop,
   name-inferred review, duplicate decisions, and real progress/cancel. Final
   result rows retain per-item failure details; Flux Browser warns when entries
@@ -242,6 +246,10 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   general import, album-target import, audio replacement, Album/Artist/Track
   artwork and lyrics selection; every selection still enters the existing
   review/confirmation flow. Cancellation leaves the workflow unchanged.
+  Import review distinguishes exact managed-file, exact-audio, metadata-only,
+  title-collision and ambiguous matches; exact duplicates default to Skip and
+  metadata/artwork repair requires **Update details**. Partial results identify
+  failed reviewed Tracks without claiming they were registered.
 - **TUI:** a complete keyboard-first frontend over the same Controller. A
   persistent sidebar appears at 92×18 and larger; smaller terminals use compact
   tabs. `F1`–`F7` and Tab open Tracks, Artists, Albums, Playlists, Collections,

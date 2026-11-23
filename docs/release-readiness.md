@@ -9,8 +9,10 @@ authorized signing/notarization procedure is in
 
 M21 suspended the public release pending renewed product validation. M22 added
 canonical schema 2 with explicit Album participation and an automatic schema-1
-upgrade. M23 completes a Home-first GUI/TUI visual redesign with responsive
-layout evidence; human usability validation remains pending. Synthetic migration, rollback and commit-recovery tests pass, but
+upgrade. M23 completed a Home-first GUI/TUI visual redesign. M24 hardened import
+duplicate review, queue/context interaction, collaborative participant changes
+and keyboard operation; human usability and full accessibility audits remain
+pending. Synthetic migration, rollback and commit-recovery tests pass, but
 human validation of collaborative Album workflows and real user libraries is
 still required before any public artifact is authorized.
 

@@ -181,6 +181,15 @@ honor OS reduced-motion settings for the waveform without replacing the audio
 visualization contract, so the visualizer is opt-in in the TUI and reflects real
 audio only.
 
-Known accessibility gaps: no screen-reader audit, no full GUI focus-order audit,
-and no native high-contrast theme audit. TUI selection/focus is visible via
-reverse video and markers. This document does not claim those audits occurred.
+Keyboard operation: Tab/Shift+Tab cycle primary GUI destinations; ↑/↓ move
+Track focus; Enter plays; E edits; Y opens lyrics; A queues; F favorites; I
+imports; / focuses Search; Q toggles queue. Global shortcuts are suppressed
+while editors, Setup, import and other modal workflows own input. Queue close and
+Track-action close restore focus to Search where available.
+
+Known accessibility gaps: no screen-reader audit, no complete GUI button
+focus-ring/tab-order audit, no native high-contrast theme audit, and tooltips are
+not equivalent to assistive-technology labels. Iced buttons are not the focus
+target used by the app-level focus operations, so complete keyboard traversal of
+every button is not implemented. TUI selection/focus is visible via reverse video
+and markers. This document does not claim those audits occurred.

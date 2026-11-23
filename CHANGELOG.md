@@ -6,6 +6,41 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M24 workflow hardening and accessibility foundations
+
+- Import review now distinguishes same managed file, same managed audio,
+  duplicate-in-batch, metadata-only match, title collision, probable duplicate
+  and ambiguous match. Exact duplicates default to Skip; explicit Update details
+  is required for metadata/artwork repair and no duplicate Track is created by
+  re-review.
+- Import completion reports complete/partial/no-commit outcomes, identifies
+  failed reviewed Tracks and explains that failed files were not partially
+  catalogue-registered. Cancellation and atomic publication behavior are
+  unchanged.
+- GUI Track actions were moved from a clipped narrow pick list to a frozen-base
+  modal action sheet with full labels, Track context, Escape dismissal and only
+  working actions. Queue rows now play by stable QueueEntryId; drag and remove
+  are separate labelled controls.
+- The queue overlay now uses frozen covered-layer composition; closing it
+  restores Search focus. Empty-queue guidance no longer references removed "+"
+  row buttons.
+- Collaborative Album participant removal in the GUI is now two-step and
+  consequence-aware. Same-name Artists are disambiguated in GUI labels and TUI
+  Artist rows/detail/owner/participant pickers.
+- Added GUI keyboard navigation: Tab/Shift+Tab destinations, ↑/↓ Track focus,
+  Enter play, E edit, Y lyrics, A queue, F favorite, I import. Current playback
+  and keyboard focus now use distinct markers. Global shortcuts are blocked
+  while editors, setup and modal workflows own input.
+- TUI import review uses precise duplicate qualifiers and documents `u` for
+  explicit update of a unique exact-audio duplicate; compact help is used below
+  80 columns.
+- Added regression coverage for duplicate status precision, idempotent
+  duplicate review, partial import outcome labels, queue entry activation,
+  participant confirmation, same-name Artist disambiguation, keyboard
+  navigation/focus and input suppression in editors.
+- Documented the audit, fixes and remaining accessibility limits in
+  `docs/m24-interaction-hardening.md`.
+
 ### M23 product UX/UI redesign
 
 - Added a shared product design language (`docs/design-system.md`) covering
