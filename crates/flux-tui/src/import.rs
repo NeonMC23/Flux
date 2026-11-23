@@ -15,6 +15,22 @@ use flux_app::{
 
 use crate::*;
 
+/// Short, precise review qualifier for one duplicate state.
+pub(crate) fn candidate_status_detail(status: &CandidateStatus) -> Option<&'static str> {
+    match status {
+        CandidateStatus::New => None,
+        CandidateStatus::ExistingPath(_) => Some("same managed file"),
+        CandidateStatus::SameContent {
+            track_id: Some(_), ..
+        } => Some("same audio · unique match"),
+        CandidateStatus::SameContent { track_id: None, .. } => Some("duplicate within this batch"),
+        CandidateStatus::SimilarMetadata(_) => Some("metadata matches existing Track"),
+        CandidateStatus::SameTitleDifferentAudio(_) => Some("same title · different audio"),
+        CandidateStatus::ProbableAudio(_) => Some("probable duplicate · verify"),
+        CandidateStatus::AmbiguousAudio(_) => Some("ambiguous match · decide manually"),
+    }
+}
+
 pub(crate) struct TuiImport {
     pub(crate) progress: Arc<Mutex<ImportProgress>>,
     pub(crate) cancel: Arc<AtomicBool>,

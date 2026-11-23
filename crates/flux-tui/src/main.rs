@@ -1610,6 +1610,9 @@ impl Tui {
         self.queue_offset = self.queue_cursor;
         self.queue_follow = true;
         self.mode = Mode::QueueView;
+        self.lifecycle_msg = Some(
+            "Queue view · Enter play · d/Delete remove · Ctrl+↑/↓ reorder · Esc back".to_owned(),
+        );
     }
 
     fn event_loop(&mut self, out: &mut impl Write) -> std::io::Result<()> {
@@ -5044,6 +5047,23 @@ impl ImageEdit {
     }
 }
 
+fn artist_display_name(controller: &Controller, id: ArtistId) -> String {
+    let Some(artist) = controller.artist(id) else {
+        return format!("Artist {id}");
+    };
+    let duplicate = controller
+        .artists()
+        .iter()
+        .filter(|candidate| candidate.name().eq_ignore_ascii_case(artist.name()))
+        .count()
+        > 1;
+    if duplicate {
+        format!("{} [ID {}]", artist.name(), id)
+    } else {
+        artist.name().to_owned()
+    }
+}
+
 fn credit_display(controller: &Controller, id: TrackId) -> String {
     let credits = controller.track_credits(id);
     if credits.is_empty() {
@@ -5055,12 +5075,7 @@ fn credit_display(controller: &Controller, id: TrackId) -> String {
     }
     credits
         .iter()
-        .map(|artist| {
-            controller
-                .artist(*artist)
-                .map(|artist| artist.name().to_owned())
-                .unwrap_or_else(|| format!("Artist {artist}"))
-        })
+        .map(|artist| artist_display_name(controller, *artist))
         .collect::<Vec<_>>()
         .join(" · ")
 }
@@ -5239,13 +5254,15 @@ mod tests {
     use super::{
         AlbumTransferPlan, ArtistDeletionPlan, Detail, ImageEdit, ImportWorkerMessage, LayoutMode,
         Mode, Row, StorageMode, Track, Tui, View, VizMode, WaveformScope, album_edit_form,
-        clamp_terminal_size, detail_view_fits, display_width, fit_input_line, help_lines,
-        normal_help, pad_with_right, parse_album_edit_form, parse_artist_edit_form,
+        artist_display_name, clamp_terminal_size, detail_view_fits, display_width, fit_input_line,
+        help_lines, normal_help, pad_with_right, parse_album_edit_form, parse_artist_edit_form,
         parse_release_type, resource_label, terminal_too_small, truncate_to_width,
         visualization_canvas,
     };
+    use crate::import::candidate_status_detail;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use flux_app::ImportDecision;
+    use flux_app::{CandidateStatus, ImportDecision};
+    use flux_core::TrackId;
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5913,6 +5930,30 @@ mod tests {
     }
 
     #[test]
+    fn tui_duplicate_status_text_is_precise() {
+        assert_eq!(candidate_status_detail(&CandidateStatus::New), None);
+        assert_eq!(
+            candidate_status_detail(&CandidateStatus::ExistingPath(TrackId::new(1))),
+            Some("same managed file")
+        );
+        assert_eq!(
+            candidate_status_detail(&CandidateStatus::SameContent {
+                track_id: Some(TrackId::new(1)),
+                other_source: None,
+            }),
+            Some("same audio · unique match")
+        );
+        assert_eq!(
+            candidate_status_detail(&CandidateStatus::SameTitleDifferentAudio(TrackId::new(1))),
+            Some("same title · different audio")
+        );
+        assert_eq!(
+            candidate_status_detail(&CandidateStatus::ProbableAudio(TrackId::new(1))),
+            Some("probable duplicate · verify")
+        );
+    }
+
+    #[test]
     fn tui_import_review_updates_an_exact_duplicate_without_duplicating_it() {
         let dir = TempDir::new("tui-import-update");
         let root = dir.path().join("library");
@@ -5940,6 +5981,18 @@ mod tests {
         key(&mut tui, KeyCode::Char('i'));
         type_path(&mut tui, &managed);
         wait_for_mode(&mut tui, Mode::ImportReview);
+        let mut rendered = Vec::new();
+        tui.draw_sized(&mut rendered, 120, 36)
+            .expect("duplicate review renders");
+        let rendered = String::from_utf8_lossy(&rendered);
+        assert!(
+            rendered.contains("same managed file"),
+            "review shows a precise exact-path state"
+        );
+        assert!(
+            rendered.contains("u update exact"),
+            "review advertises the explicit repair action"
+        );
         assert!(
             tui.import_ui
                 .as_ref()
@@ -7225,6 +7278,41 @@ mod tests {
         assert!(tui.controller.track(id).is_some());
         tui.controller.shutdown();
     }
+    #[test]
+    fn same_named_artists_are_disambiguated_in_tui_labels() {
+        let dir = TempDir::new("tui-same-name-artists");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut tui = tui(&dir);
+        tui.controller
+            .switch_to_canonical(&root)
+            .expect("switch canonical");
+        let first = tui.controller.create_artist("Nirvana").expect("first");
+        let second = tui.controller.create_artist("Nirvana").expect("second");
+        let first_label = artist_display_name(&tui.controller, first);
+        let second_label = artist_display_name(&tui.controller, second);
+        assert_ne!(first_label, second_label);
+        assert!(first_label.contains(&format!("ID {first}")));
+        assert!(second_label.contains(&format!("ID {second}")));
+        tui.view = View::Artists;
+        let rendered = tui
+            .view_rows()
+            .iter()
+            .map(|row| tui.row_text(*row, 100))
+            .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .iter()
+                .any(|label| label.contains(&format!("ID {first}")))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|label| label.contains(&format!("ID {second}")))
+        );
+        tui.controller.shutdown();
+    }
+
     #[test]
     fn tui_navigates_and_edits_collaborative_album_participants() {
         let dir = TempDir::new("tui-album-participants");

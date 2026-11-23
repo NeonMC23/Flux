@@ -187,14 +187,8 @@ impl Tui {
                 .map(|plan| {
                     format!(
                         "Transfer album · {} → {} · {} track(s) · {} issue(s)",
-                        self.controller
-                            .artist(plan.from_owner)
-                            .map(|artist| artist.name().to_owned())
-                            .unwrap_or_else(|| plan.from_owner.to_string()),
-                        self.controller
-                            .artist(plan.to_owner)
-                            .map(|artist| artist.name().to_owned())
-                            .unwrap_or_else(|| plan.to_owner.to_string()),
+                        artist_display_name(&self.controller, plan.from_owner),
+                        artist_display_name(&self.controller, plan.to_owner),
                         plan.tracks.len(),
                         plan.issues.len()
                     )
@@ -419,8 +413,12 @@ impl Tui {
             Mode::ImportScanning | Mode::ImportPreparing => {
                 "Import worker running — Esc cancels · q quits after the worker stops.".to_owned()
             }
+            Mode::ImportReview if width < 80 => {
+                "Review — ↑/↓ · Space toggle · u update · Enter import · Esc cancel"
+                    .to_owned()
+            }
             Mode::ImportReview => {
-                "Review — ↑/↓ select · Space include/skip · e edit · A/T/L artwork/lyrics · a all · s skip all · Enter import · Esc cancel"
+                "Review — ↑/↓ · Space include/skip · u update exact · e edit · F album · A/T/L assets · Enter import · Esc cancel"
                     .to_owned()
             }
             Mode::ConfirmPreserveIndex => {
@@ -928,10 +926,7 @@ impl Tui {
                 ArtistDeletionDecision::Unresolved => "unresolved".to_owned(),
                 ArtistDeletionDecision::Transfer { new_owner, .. } => format!(
                     "transfer → {}",
-                    self.controller
-                        .artist(*new_owner)
-                        .map(|artist| artist.name().to_owned())
-                        .unwrap_or_else(|| format!("Artist {new_owner}"))
+                    artist_display_name(&self.controller, *new_owner)
                 ),
                 ArtistDeletionDecision::RemoveCredit { .. } => "remove credit".to_owned(),
                 ArtistDeletionDecision::Delete { confirmed: true } => {
@@ -996,11 +991,7 @@ impl Tui {
             .album_transfer_artist_cursor
             .min(artists.len().saturating_sub(1));
         for (index, artist) in artists.iter().take(height).enumerate() {
-            let name = self
-                .controller
-                .artist(*artist)
-                .map(|artist| artist.name().to_owned())
-                .unwrap_or_else(|| format!("Artist {artist}"));
+            let name = artist_display_name(&self.controller, *artist);
             let text = format!(
                 "{} {}",
                 if index == self.album_transfer_artist_cursor {
@@ -1090,11 +1081,7 @@ impl Tui {
             .artist_owner_cursor
             .min(track.eligible_owners.len().saturating_sub(1));
         for (index, artist) in track.eligible_owners.iter().take(height).enumerate() {
-            let name = self
-                .controller
-                .artist(*artist)
-                .map(|artist| artist.name().to_owned())
-                .unwrap_or_else(|| format!("Artist {artist}"));
+            let name = artist_display_name(&self.controller, *artist);
             let text = format!(
                 "{} {}",
                 if index == self.artist_owner_cursor {
@@ -1146,11 +1133,7 @@ impl Tui {
             _ => None,
         });
         for (index, artist) in participants.iter().take(height).enumerate() {
-            let name = self
-                .controller
-                .artist(*artist)
-                .map(|artist| artist.name().to_owned())
-                .unwrap_or_else(|| format!("Artist {artist}"));
+            let name = artist_display_name(&self.controller, *artist);
             let text = format!(
                 "{} {}{}",
                 if index == self.album_participant_cursor {
@@ -1203,11 +1186,7 @@ impl Tui {
             .album_participant_pick_cursor
             .min(artists.len().saturating_sub(1));
         for (index, artist) in artists.iter().take(height).enumerate() {
-            let name = self
-                .controller
-                .artist(*artist)
-                .map(|artist| artist.name().to_owned())
-                .unwrap_or_else(|| format!("Artist {artist}"));
+            let name = artist_display_name(&self.controller, *artist);
             let text = format!(
                 "{} {}",
                 if index == self.album_participant_pick_cursor {
@@ -1534,17 +1513,9 @@ impl Tui {
                         .album()
                         .map(|album| format!(" · {album}"))
                         .unwrap_or_else(|| " · standalone".to_owned());
-                    let status = match candidate.status() {
-                        CandidateStatus::New => String::new(),
-                        CandidateStatus::ExistingPath(_) => " · same path".to_owned(),
-                        CandidateStatus::SameContent { .. } => " · same audio".to_owned(),
-                        CandidateStatus::SimilarMetadata(_) => " · check details".to_owned(),
-                        CandidateStatus::SameTitleDifferentAudio(_) => {
-                            " · different audio".to_owned()
-                        }
-                        CandidateStatus::ProbableAudio(_) => " · possible duplicate".to_owned(),
-                        CandidateStatus::AmbiguousAudio(_) => " · needs a decision".to_owned(),
-                    };
+                    let status = crate::import::candidate_status_detail(candidate.status())
+                        .map(|detail| format!(" · {detail}"))
+                        .unwrap_or_default();
                     (
                         index == ui.selected,
                         format!(
@@ -1616,11 +1587,7 @@ impl Tui {
         if let Some(detail) = self.detail {
             match detail {
                 Detail::Artist(id) => {
-                    let name = self
-                        .controller
-                        .artist(id)
-                        .map(|artist| artist.name().to_owned())
-                        .unwrap_or_else(|| "Artist".to_owned());
+                    let name = artist_display_name(&self.controller, id);
                     let tracks = self
                         .controller
                         .tracks()
@@ -1644,19 +1611,11 @@ impl Tui {
                 }
                 Detail::Album(id) => {
                     if let Some(album) = self.controller.album(id) {
-                        let owner = self
-                            .controller
-                            .artist(album.owner_artist_id)
-                            .map(|artist| artist.name().to_owned())
-                            .unwrap_or_else(|| "Unknown artist".to_owned());
+                        let owner = artist_display_name(&self.controller, album.owner_artist_id);
                         let participants = album
                             .participant_artist_ids
                             .iter()
-                            .filter_map(|artist| {
-                                self.controller
-                                    .artist(*artist)
-                                    .map(|artist| artist.name().to_owned())
-                            })
+                            .map(|artist| artist_display_name(&self.controller, *artist))
                             .collect::<Vec<_>>();
                         return format!(
                             "Album · {} · {owner} · {} · {} track(s) · participants: {}",
@@ -1773,9 +1732,9 @@ impl Tui {
                 pad_with_right(&text, &duration, width)
             }
             Row::Artist(id) => {
-                let Some(artist) = self.controller.artist(id) else {
+                if self.controller.artist(id).is_none() {
                     return "Missing artist".to_owned();
-                };
+                }
                 let tracks = self
                     .controller
                     .tracks()
@@ -1794,7 +1753,7 @@ impl Tui {
                 pad_with_right(
                     &format!(
                         "{}  · {} album(s) · {} track(s)",
-                        artist.name(),
+                        artist_display_name(&self.controller, id),
                         albums,
                         tracks
                     ),
@@ -1806,11 +1765,7 @@ impl Tui {
                 let Some(album) = self.controller.album(id) else {
                     return "Missing album".to_owned();
                 };
-                let owner = self
-                    .controller
-                    .artist(album.owner_artist_id)
-                    .map(|artist| artist.name().to_owned())
-                    .unwrap_or_else(|| "Unknown artist".to_owned());
+                let owner = artist_display_name(&self.controller, album.owner_artist_id);
                 let mut text = format!(
                     "{}  · {owner}  · {}  · {} track(s)  · {} participant(s)",
                     album.title,
