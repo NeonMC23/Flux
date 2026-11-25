@@ -155,6 +155,8 @@ pub struct LoadedSettings {
     pub accent: Accent,
     /// Persisted interface text-scale percentage.
     pub text_scale: u16,
+    /// Whether non-essential visual motion should be suppressed.
+    pub reduced_motion: bool,
     /// A malformed/unreadable file diagnostic. The original file is left
     /// untouched and `store.write_protected()` is true.
     pub warning: Option<String>,
@@ -240,6 +242,7 @@ impl SettingsStore {
         let audio_output_device = recover_audio_output_device(root.get("audio_output"));
         let accent = recover_accent(root.get("theme"));
         let text_scale = recover_text_scale(root.get("interface"));
+        let reduced_motion = recover_reduced_motion(root.get("interface"));
         LoadedSettings {
             store: Self {
                 path,
@@ -250,6 +253,7 @@ impl SettingsStore {
             audio_output_device,
             accent,
             text_scale,
+            reduced_motion,
             warning: None,
         }
     }
@@ -269,6 +273,7 @@ impl SettingsStore {
             audio_output_device: None,
             accent: Accent::default(),
             text_scale: TEXT_SCALE_DEFAULT,
+            reduced_motion: false,
             warning,
         }
     }
@@ -284,6 +289,7 @@ impl SettingsStore {
             audio_output_device: None,
             accent: Accent::default(),
             text_scale: TEXT_SCALE_DEFAULT,
+            reduced_motion: false,
             warning: Some(warning),
         }
     }
@@ -325,6 +331,39 @@ impl SettingsStore {
         let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
         bytes.push(b'\n');
 
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+
+    /// Atomically updates only the reduced-motion preference.
+    pub fn save_reduced_motion(&mut self, reduced: bool) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let mut root = match self.document.clone() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let interface = root
+            .entry("interface")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !interface.is_object() {
+            *interface = Value::Object(Map::new());
+        }
+        interface
+            .as_object_mut()
+            .expect("object inserted")
+            .insert("reduced_motion".to_owned(), Value::Bool(reduced));
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -463,6 +502,14 @@ fn normalize_text_scale(percent: u16) -> u16 {
         .into_iter()
         .min_by_key(|level| level.abs_diff(percent))
         .unwrap_or(TEXT_SCALE_DEFAULT)
+}
+
+fn recover_reduced_motion(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("reduced_motion"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn recover_text_scale(value: Option<&Value>) -> u16 {
@@ -838,6 +885,35 @@ mod tests {
         assert_eq!(saved["future"]["kept"], true);
         assert_eq!(saved["audio_output"]["device_id"], "alsa:test");
         assert_eq!(saved["crossfade"]["duration_ms"], 2_500);
+    }
+
+    #[test]
+    fn reduced_motion_round_trips_and_preserves_other_settings() {
+        let dir = TempDir::new("reduced-motion");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"crossfade":{"enabled":true,"duration_ms":4200},"theme":{"accent":"teal"},"interface":{"text_scale":110,"reduced_motion":true},"future":{"kept":true}}"#,
+        )
+        .expect("seed settings");
+        let loaded = SettingsStore::load(&path);
+        assert!(loaded.reduced_motion);
+        assert_eq!(loaded.text_scale, 110);
+        let mut store = loaded.store;
+        store.save_text_scale(120).expect("save scale");
+        let reloaded = SettingsStore::load(&path);
+        assert!(
+            reloaded.reduced_motion,
+            "other interface settings preserve it"
+        );
+        store
+            .save_reduced_motion(false)
+            .expect("save reduced motion");
+        let reloaded = SettingsStore::load(&path);
+        assert!(!reloaded.reduced_motion);
+        assert_eq!(reloaded.accent, Accent::Teal);
+        assert_eq!(reloaded.text_scale, 120);
+        assert_eq!(reloaded.crossfade.duration_ms, 4200);
     }
 
     #[test]

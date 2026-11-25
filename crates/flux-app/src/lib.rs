@@ -1836,6 +1836,8 @@ pub struct Controller {
     accent: Accent,
     /// Persisted interface text-scale percentage.
     text_scale: u16,
+    /// Whether non-essential rendered motion should be suppressed.
+    reduced_motion: bool,
     /// Lazily probed durations for existing catalogue records that predate
     /// technical-duration persistence.
     duration_hints: RefCell<BTreeMap<(u64, TrackId), Option<u64>>>,
@@ -2227,6 +2229,7 @@ impl Controller {
             crossfade_duration_ms: CROSSFADE_DEFAULT_MS,
             accent: Accent::default(),
             text_scale: TEXT_SCALE_DEFAULT,
+            reduced_motion: false,
             duration_hints: RefCell::new(BTreeMap::new()),
             history_generation: 0,
             shuffle: false,
@@ -3439,6 +3442,35 @@ impl Controller {
         self.text_scale
     }
 
+    /// Whether non-essential rendered motion should be suppressed.
+    #[must_use]
+    pub fn reduced_motion(&self) -> bool {
+        self.reduced_motion
+    }
+
+    /// Persists the reduced-motion preference.
+    pub fn set_reduced_motion(&mut self, reduced: bool) -> Result<(), String> {
+        self.reduced_motion = reduced;
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        if let Err(error) = store.save_reduced_motion(reduced) {
+            let message = format!(
+                "Could not save the reduced-motion preference to {}: {error}. It is active for this session only.",
+                path.display()
+            );
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.report_status(if reduced {
+            "Reduced motion enabled; the waveform visualization is static.".to_owned()
+        } else {
+            "Reduced motion disabled; the waveform visualization follows audio.".to_owned()
+        });
+        Ok(())
+    }
+
     /// Persists a supported interface text-scale percentage.
     pub fn set_text_scale(&mut self, percent: u16) -> Result<(), String> {
         self.text_scale = TEXT_SCALE_LEVELS
@@ -3500,10 +3532,12 @@ impl Controller {
             audio_output_device: _,
             accent,
             text_scale,
+            reduced_motion,
             warning,
         } = loaded;
         self.accent = accent;
         self.text_scale = text_scale;
+        self.reduced_motion = reduced_motion;
         self.crossfade_enabled = crossfade.enabled;
         self.crossfade_duration_ms = crossfade.duration_ms;
         self.engine.set_crossfade_ms(crossfade.effective_ms());

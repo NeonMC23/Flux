@@ -2315,8 +2315,10 @@ struct FluxReady {
     show_setup: bool,
     queue_visible: bool,
     queue_overlay_open: bool,
+    queue_keyboard_index: usize,
     lyrics_overlay_open: bool,
     track_menu: Option<TrackId>,
+    track_menu_index: usize,
     window_width: f32,
     window_height: f32,
     close_confirm: bool,
@@ -2666,6 +2668,7 @@ enum Message {
     CrossfadeEnabledChanged(bool),
     AccentChanged(Accent),
     InterfaceScaleChanged(u16),
+    ReducedMotionChanged(bool),
     CrossfadeDurationPreview(f32),
     CrossfadeDurationCommit,
     KeyPressed(Key, Modifiers),
@@ -2839,8 +2842,10 @@ impl FluxReady {
             show_setup,
             queue_visible: true,
             queue_overlay_open: false,
+            queue_keyboard_index: 0,
             lyrics_overlay_open: false,
             track_menu: None,
+            track_menu_index: 0,
             window_width: 1_180.0,
             window_height: 760.0,
             close_confirm: false,
@@ -2865,6 +2870,7 @@ impl FluxReady {
         ];
         if self.controller.player_state() == PlaybackState::Playing
             && self.controller.audio_status().is_ready()
+            && !self.controller.reduced_motion()
         {
             subscriptions.push(iced::time::every(WAVE_TICK).map(|_| Message::WaveTick));
         }
@@ -4549,6 +4555,14 @@ impl FluxReady {
             false
         } else {
             self.queue_overlay_open = !self.queue_overlay_open;
+            if self.queue_overlay_open {
+                self.queue_keyboard_index = self
+                    .controller
+                    .current_queue_entry_id()
+                    .and_then(|entry| self.controller.queue_entry_index(entry))
+                    .unwrap_or(0);
+                self.queue_page = self.queue_keyboard_index / QUEUE_PAGE_SIZE;
+            }
             self.queue_overlay_open
         }
     }
@@ -8065,6 +8079,7 @@ impl FluxReady {
             Message::TrackMenuOpen(id) => {
                 if self.controller.track(id).is_some() {
                     self.track_menu = Some(id);
+                    self.track_menu_index = 0;
                 }
             }
             Message::TrackMenuClose => {
@@ -8173,6 +8188,11 @@ impl FluxReady {
                 }
             }
             Message::SeekCommit => self.commit_seek_preview(),
+            Message::ReducedMotionChanged(reduced) => {
+                if let Err(error) = self.controller.set_reduced_motion(reduced) {
+                    self.lifecycle_msg = Some(error);
+                }
+            }
             Message::InterfaceScaleChanged(percent) => {
                 if let Err(error) = self.controller.set_text_scale(percent) {
                     self.lifecycle_msg = Some(error);
@@ -8322,17 +8342,95 @@ impl FluxReady {
                     }
                     return Task::none();
                 }
+                if self.queue_overlay_open {
+                    let entries = self.controller.queue_entries();
+                    match key.as_ref() {
+                        Key::Named(Named::Escape) | Key::Character("q") => {
+                            self.queue_overlay_open = false;
+                            return iced::widget::operation::focus(iced::widget::Id::new(
+                                "flux-search",
+                            ));
+                        }
+                        Key::Named(Named::ArrowDown) | Key::Character("j") => {
+                            self.queue_keyboard_index = (self.queue_keyboard_index + 1)
+                                .min(entries.len().saturating_sub(1));
+                        }
+                        Key::Named(Named::ArrowUp) | Key::Character("k") => {
+                            self.queue_keyboard_index = self.queue_keyboard_index.saturating_sub(1);
+                        }
+                        Key::Named(Named::Enter) => {
+                            if let Some(entry) = entries.get(self.queue_keyboard_index) {
+                                return self.update(Message::PlayQueueEntry(entry.id()));
+                            }
+                        }
+                        Key::Named(Named::Delete)
+                        | Key::Named(Named::Backspace)
+                        | Key::Character("d") => {
+                            if let Some(entry) = entries.get(self.queue_keyboard_index).copied() {
+                                let _ = self.controller.remove_queue_entry(entry.id());
+                                self.follow_queue_current();
+                                self.queue_keyboard_index = self
+                                    .queue_keyboard_index
+                                    .min(self.controller.queue_entries().len().saturating_sub(1));
+                                self.queue_page = self.queue_keyboard_index / QUEUE_PAGE_SIZE;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return Task::none();
+                }
+                if matches!(key, Key::Named(Named::Tab)) {
+                    if modifiers.contains(Modifiers::CTRL) {
+                        if !self.modals_visible()
+                            && !self.show_setup
+                            && self.track_editor.is_none()
+                            && self.lyrics_editor.is_none()
+                        {
+                            let delta = if modifiers.contains(Modifiers::SHIFT) {
+                                -1
+                            } else {
+                                1
+                            };
+                            self.cycle_view(delta);
+                        }
+                        return Task::none();
+                    }
+                    if modifiers.contains(Modifiers::SHIFT) {
+                        return iced::widget::operation::focus_previous();
+                    }
+                    return iced::widget::operation::focus_next();
+                }
                 if self.import_manager.is_some() {
                     return self.handle_import_key(&key, &modifiers);
                 }
-                if self.track_menu.is_some() {
-                    if matches!(key, Key::Named(Named::Escape)) {
-                        self.track_menu = None;
-                        return iced::widget::operation::focus(iced::widget::Id::new(
-                            "flux-search",
-                        ));
+                if let Some(menu_track) = self.track_menu {
+                    match key.as_ref() {
+                        Key::Named(Named::Escape) => {
+                            self.track_menu = None;
+                            return iced::widget::operation::focus(iced::widget::Id::new(
+                                "flux-search",
+                            ));
+                        }
+                        Key::Named(Named::ArrowDown) => {
+                            let count = self.track_menu_actions_flat(menu_track).len();
+                            self.track_menu_index =
+                                (self.track_menu_index + 1).min(count.saturating_sub(1));
+                            return Task::none();
+                        }
+                        Key::Named(Named::ArrowUp) => {
+                            self.track_menu_index = self.track_menu_index.saturating_sub(1);
+                            return Task::none();
+                        }
+                        Key::Named(Named::Enter) => {
+                            let actions = self.track_menu_actions_flat(menu_track);
+                            if let Some((action, true)) = actions.get(self.track_menu_index) {
+                                let action = *action;
+                                return self.update(Message::TrackMenu(menu_track, action));
+                            }
+                            return Task::none();
+                        }
+                        _ => return Task::none(),
                     }
-                    return Task::none();
                 }
                 if (self.show_setup
                     || self.track_editor.is_some()
@@ -8359,15 +8457,6 @@ impl FluxReady {
                 }
                 if !self.show_setup && self.track_editor.is_none() {
                     match key.as_ref() {
-                        Key::Named(Named::Tab) => {
-                            let delta = if modifiers.contains(Modifiers::SHIFT) {
-                                -1
-                            } else {
-                                1
-                            };
-                            self.cycle_view(delta);
-                            return Task::none();
-                        }
                         Key::Named(Named::ArrowDown) => {
                             if !self.modals_visible() {
                                 self.focus_relative_track(1);
@@ -8400,6 +8489,12 @@ impl FluxReady {
                     }
                     Key::Character("q") => {
                         self.toggle_queue();
+                    }
+                    Key::Character("m") => {
+                        if let Some(id) = self.keyboard_track() {
+                            self.track_menu = Some(id);
+                            self.track_menu_index = 0;
+                        }
                     }
                     Key::Character("e") => {
                         if let Some(id) = self.keyboard_track() {
@@ -9519,6 +9614,40 @@ impl FluxReady {
         .into()
     }
 
+    /// Ordered Track actions with their enabled state. Kept in the same order
+    /// as the visible menu so keyboard navigation can dispatch the highlighted
+    /// action without duplicating menu semantics.
+    fn track_menu_actions_flat(&self, id: TrackId) -> Vec<(TrackMenuAction, bool)> {
+        let editable = matches!(
+            self.controller.storage_mode(),
+            StorageMode::Portable | StorageMode::Canonical
+        );
+        let rating = self.controller.rating(id).and_then(|rating| rating.rating);
+        let mut actions = vec![
+            (TrackMenuAction::PlayNext, true),
+            (TrackMenuAction::AddToQueue, true),
+        ];
+        if editable {
+            actions.push((TrackMenuAction::Edit, true));
+        }
+        actions.push((TrackMenuAction::FavoriteToggle, true));
+        actions.push((
+            TrackMenuAction::RateUp,
+            rating.is_none_or(|value| value < 5),
+        ));
+        if rating.is_some() {
+            actions.push((TrackMenuAction::ClearRating, true));
+        }
+        actions.push((TrackMenuAction::OpenLyrics, true));
+        if self.controller.track_artist_id(id).is_some() {
+            actions.push((TrackMenuAction::OpenArtist, true));
+        }
+        if self.controller.track_album_id(id).is_some() {
+            actions.push((TrackMenuAction::OpenAlbum, true));
+        }
+        actions
+    }
+
     fn track_menu_overlay(&self) -> Element<'_, Message> {
         let Some(id) = self.track_menu else {
             return iced::widget::Space::new().height(0).into();
@@ -9576,6 +9705,7 @@ impl FluxReady {
             go_to,
         ];
         let mut list = column![].spacing(3);
+        let mut flat_index = 0usize;
         for (group_index, actions) in groups.into_iter().enumerate() {
             if group_index > 0 {
                 list = list.push(
@@ -9585,6 +9715,8 @@ impl FluxReady {
                 );
             }
             for (action, label) in actions {
+                let selected = flat_index == self.track_menu_index;
+                flat_index += 1;
                 let enabled =
                     !(action == TrackMenuAction::RateUp && rating.is_some_and(|value| value >= 5));
                 let icon_color = if !enabled {
@@ -9628,7 +9760,7 @@ impl FluxReady {
                     )
                     .width(Length::Fill)
                     .padding([7, 9])
-                    .style(ghost_style)
+                    .style(nav_style(selected))
                     .on_press_maybe(enabled.then_some(Message::TrackMenu(id, action))),
                 );
             }
@@ -12059,12 +12191,12 @@ impl FluxReady {
                     .size(ts(11.5))
                     .color(TEXT),
                 text(
-                    "Tab/Shift+Tab · next/previous destination    ↑/↓ · move Track focus    Enter · play focused Track"
+                    "Tab/Shift+Tab · move form focus    Ctrl+Tab · next/previous destination    ↑/↓ · move Track focus    Enter · play"
                 )
                 .size(ts(11.5))
                 .color(TEXT),
                 text(
-                    "E · edit    Y · lyrics    A · add to queue    F · favorite    I · import"
+                    "E · edit    M · Track actions    Y · lyrics    A · queue    F · favorite    I · import"
                 )
                 .size(ts(11.5))
                 .color(TEXT),
@@ -12134,8 +12266,26 @@ impl FluxReady {
                 .on_press(Message::InterfaceScaleChanged(level)),
             );
         }
+        let reduced_motion_row = row![
+            column![
+                text("Reduce motion").size(ts(FONT_BODY)).color(TEXT),
+                text("Freezes the continuously moving waveform visualization. Playback, timing and controls are unchanged.")
+                    .size(ts(11.5))
+                    .color(MUTED),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            toggler(self.controller.reduced_motion())
+                .on_toggle(Message::ReducedMotionChanged)
+                .style(crossfade_toggler_style)
+                .size(26.0),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
         let appearance_card = container(
             column![
+                reduced_motion_row,
+                horizontal_rule(),
                 text("Interface scale").size(ts(FONT_BODY)).color(TEXT),
                 text("Scales interface text without changing artwork or player layout proportions. The default remains Comfortable.")
                     .size(ts(11.5))
@@ -18394,6 +18544,7 @@ impl FluxReady {
                     index,
                     current_entry_id,
                     dragged == Some(entry.id()),
+                    self.queue_overlay_open && index == self.queue_keyboard_index,
                     self.controller.track(entry.track()),
                     self.controller.track_duration_hint(entry.track()),
                     resource_badge(self.controller.track_audio_resource_state(entry.track())),
@@ -18654,10 +18805,14 @@ impl FluxReady {
     /// Flow's real-time oscilloscope, fed by post-gain output samples
     /// captured through the engine's lock-free waveform tap.
     fn oscilloscope(&self) -> Element<'_, Message> {
-        FlowOscilloscope {
-            samples: self.scope.samples(),
+        if self.controller.reduced_motion() {
+            FlowOscilloscope { samples: &[] }.into()
+        } else {
+            FlowOscilloscope {
+                samples: self.scope.samples(),
+            }
+            .into()
         }
-        .into()
     }
 }
 
@@ -19277,11 +19432,13 @@ fn playlist_entry_row<'a>(
     .into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_row<'a>(
     entry: QueueEntry,
     index: usize,
     current: Option<QueueEntryId>,
     dragging: bool,
+    focused: bool,
     track: Option<&'a Track>,
     duration: Option<Duration>,
     resource: Option<TrackResourceBadge>,
@@ -19340,7 +19497,7 @@ fn queue_row<'a>(
         .width(Length::Fill)
         .height(Length::Fixed(QUEUE_ROW_HEIGHT))
         .padding([3, 5])
-        .style(track_row_style(is_current || dragging))
+        .style(track_row_style(is_current || dragging || focused))
         .on_press(Message::PlayQueueEntry(entry.id()));
     let remove = button(icons::icon::<Message>(Icon::Close, 12.0, MUTED))
         .style(ghost_style)
@@ -19827,8 +19984,10 @@ mod tests {
             show_setup: false,
             queue_visible: true,
             queue_overlay_open: false,
+            queue_keyboard_index: 0,
             lyrics_overlay_open: false,
             track_menu: None,
+            track_menu_index: 0,
             window_width: 1_180.0,
             window_height: 760.0,
             close_confirm: false,
@@ -21176,10 +21335,19 @@ mod tests {
             &mut gui,
             Message::KeyPressed(Key::Named(Named::Tab), Modifiers::default()),
         );
+        assert_eq!(
+            gui.view,
+            LibraryView::Tracks,
+            "plain Tab is reserved for form focus traversal"
+        );
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Tab), Modifiers::CTRL),
+        );
         assert_eq!(gui.view, LibraryView::Artists);
         send(
             &mut gui,
-            Message::KeyPressed(Key::Named(Named::Tab), Modifiers::SHIFT),
+            Message::KeyPressed(Key::Named(Named::Tab), Modifiers::CTRL | Modifiers::SHIFT),
         );
         assert_eq!(gui.view, LibraryView::Tracks);
         send(&mut gui, Message::EditTrack(expected));
@@ -21750,10 +21918,28 @@ mod tests {
         assert!(root.join("assets/icons/flux-256.png").is_file());
         assert!(root.join("assets/icons/flux.ico").is_file());
         assert!(root.join("assets/icons/flux.icns").is_file());
+        for size in [16, 24, 32, 48, 64, 128, 256, 512, 1024] {
+            let bytes = std::fs::read(root.join(format!("assets/icons/flux-{size}.png")))
+                .expect("canonical PNG");
+            let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .expect("PNG format")
+                .into_dimensions()
+                .expect("PNG dimensions");
+            assert_eq!(dimensions, (size, size), "canonical PNG size");
+        }
+        let ico = std::fs::read(root.join("assets/icons/flux.ico")).expect("ICO");
+        assert_eq!(&ico[..4], &[0, 0, 1, 0], "Windows ICO header");
+        let icns = std::fs::read(root.join("assets/icons/flux.icns")).expect("ICNS");
+        assert_eq!(&icns[..4], b"icns", "macOS ICNS header");
         let desktop = root.join(format!("packaging/linux/{APP_ID}.desktop"));
         let contents = std::fs::read_to_string(&desktop).expect("desktop entry");
         assert!(contents.contains(&format!("Icon={APP_ID}")));
         assert!(contents.contains(&format!("StartupWMClass={APP_ID}")));
+        assert!(contents.contains("Exec=flux"));
+        let metainfo = root.join(format!("packaging/linux/{APP_ID}.metainfo.xml"));
+        let metainfo = std::fs::read_to_string(metainfo).expect("metainfo");
+        assert!(metainfo.contains("<id>io.github.neonmc23.flux</id>"));
     }
 
     #[test]
@@ -21796,6 +21982,19 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_setting_updates_the_controller() {
+        let dir = TempDir::new("gui-reduced-motion");
+        let mut gui = gui(&dir);
+        assert!(!gui.controller.reduced_motion());
+        send(&mut gui, Message::ReducedMotionChanged(true));
+        assert!(gui.controller.reduced_motion());
+        let _ = gui.settings_view();
+        send(&mut gui, Message::ReducedMotionChanged(false));
+        assert!(!gui.controller.reduced_motion());
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn interface_scale_setting_updates_text_metrics() {
         let dir = TempDir::new("gui-scale");
         let mut gui = gui(&dir);
@@ -21817,6 +22016,54 @@ mod tests {
         assert_eq!(accent(), Color::from_rgb8(0x60, 0xa5, 0xfa));
         let _ = gui.view();
         set_accent_color(Accent::Pink);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn queue_overlay_keyboard_navigation_plays_and_removes_entries() {
+        let dir = TempDir::new("gui-queue-keyboard");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let first = source_dir.join("one.wav");
+        let second = source_dir.join("two.wav");
+        std::fs::write(&first, minimal_wav()).expect("first");
+        let mut bytes = minimal_wav();
+        bytes.extend_from_slice(&[0, 1]);
+        std::fs::write(&second, bytes).expect("second");
+        let mut gui = open_canonical_gui(&dir, &root);
+        gui.controller
+            .import_files(&[first, second], false)
+            .expect("import");
+        let entries = gui.controller.queue_entries();
+        assert!(entries.len() >= 2);
+        let expected = entries[1].id();
+        gui.window_width = 920.0;
+        send(&mut gui, Message::ToggleQueue);
+        assert!(gui.queue_overlay_open);
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::ArrowDown), Modifiers::default()),
+        );
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Enter), Modifiers::default()),
+        );
+        assert_eq!(gui.controller.current_queue_entry_id(), Some(expected));
+        let before = gui.controller.queue_entries().len();
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Delete), Modifiers::default()),
+        );
+        assert_eq!(
+            gui.controller.queue_entries().len(),
+            before.saturating_sub(1)
+        );
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(!gui.queue_overlay_open);
         gui.controller.shutdown();
     }
 
