@@ -63,6 +63,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use flux_audio::Player;
@@ -72,8 +74,8 @@ use flux_audio::engine::{EngineError, EngineEvent, EngineHandle};
 mod settings;
 
 pub use settings::{
-    CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, LoadedSettings,
-    SETTINGS_SCHEMA_VERSION, SettingsError, SettingsStore,
+    Accent, CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, LoadedSettings,
+    SETTINGS_SCHEMA_VERSION, SettingsError, SettingsStore, TEXT_SCALE_DEFAULT, TEXT_SCALE_LEVELS,
 };
 
 use flux_core::{
@@ -1830,6 +1832,13 @@ pub struct Controller {
     crossfade_enabled: bool,
     /// Configured duration retained even while crossfade is disabled.
     crossfade_duration_ms: u64,
+    /// Persisted accent preset for this user.
+    accent: Accent,
+    /// Persisted interface text-scale percentage.
+    text_scale: u16,
+    /// Lazily probed durations for existing catalogue records that predate
+    /// technical-duration persistence.
+    duration_hints: RefCell<BTreeMap<(u64, TrackId), Option<u64>>>,
     scan_rx: Option<Receiver<ScanOutcome>>,
     /// In-memory identity of the active library instance. Incremented on
     /// every successful install, including a same-path reopen, so async work
@@ -2216,6 +2225,9 @@ impl Controller {
             settings_store: None,
             crossfade_enabled: false,
             crossfade_duration_ms: CROSSFADE_DEFAULT_MS,
+            accent: Accent::default(),
+            text_scale: TEXT_SCALE_DEFAULT,
+            duration_hints: RefCell::new(BTreeMap::new()),
             history_generation: 0,
             shuffle: false,
             shuffle_order: Vec::new(),
@@ -3291,6 +3303,26 @@ impl Controller {
         self.engine.waveform()
     }
 
+    /// A duration suitable for Track lists and labels.
+    ///
+    /// New imports persist technical duration in the catalogue. Older records
+    /// may not carry one; this probes the audio container once per library
+    /// session and caches the result without modifying the catalogue.
+    #[must_use]
+    pub fn track_duration_hint(&self, id: TrackId) -> Option<Duration> {
+        let track = self.track(id)?;
+        if let Some(duration) = track.duration() {
+            return Some(duration);
+        }
+        let key = (self.library_session, id);
+        if let Some(cached) = self.duration_hints.borrow().get(&key) {
+            return cached.map(Duration::from_millis);
+        }
+        let probed = technical_duration_ms(track.source().path());
+        self.duration_hints.borrow_mut().insert(key, probed);
+        probed.map(Duration::from_millis)
+    }
+
     /// The known duration of the current track, preferring the decoded
     /// stream's facts over the catalogue metadata.
     #[must_use]
@@ -3395,6 +3427,59 @@ impl Controller {
         self.crossfade_duration_ms
     }
 
+    /// The active accent preset.
+    #[must_use]
+    pub fn accent(&self) -> Accent {
+        self.accent
+    }
+
+    /// The persisted interface text-scale percentage.
+    #[must_use]
+    pub fn text_scale(&self) -> u16 {
+        self.text_scale
+    }
+
+    /// Persists a supported interface text-scale percentage.
+    pub fn set_text_scale(&mut self, percent: u16) -> Result<(), String> {
+        self.text_scale = TEXT_SCALE_LEVELS
+            .into_iter()
+            .min_by_key(|level| level.abs_diff(percent))
+            .unwrap_or(TEXT_SCALE_DEFAULT);
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        if let Err(error) = store.save_text_scale(self.text_scale) {
+            let message = format!(
+                "Could not save the interface scale to {}: {error}. The scale is active for this session only.",
+                path.display()
+            );
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.report_status(format!("Interface scale set to {}%.", self.text_scale));
+        Ok(())
+    }
+
+    /// Persists and applies a new accent preset.
+    pub fn set_accent(&mut self, accent: Accent) -> Result<(), String> {
+        self.accent = accent;
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        if let Err(error) = store.save_accent(accent) {
+            let message = format!(
+                "Could not save the accent to {}: {error}. The accent is active for this session only.",
+                path.display()
+            );
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.report_status(format!("Accent set to {}.", accent.label()));
+        Ok(())
+    }
+
     /// The active settings file, when persistent settings are configured.
     #[must_use]
     pub fn settings_path(&self) -> Option<&Path> {
@@ -3413,8 +3498,12 @@ impl Controller {
             store,
             crossfade,
             audio_output_device: _,
+            accent,
+            text_scale,
             warning,
         } = loaded;
+        self.accent = accent;
+        self.text_scale = text_scale;
         self.crossfade_enabled = crossfade.enabled;
         self.crossfade_duration_ms = crossfade.duration_ms;
         self.engine.set_crossfade_ms(crossfade.effective_ms());
@@ -6082,8 +6171,11 @@ impl Controller {
     /// metadata must never come from audio tags.
     pub fn import_canonical_track(
         &mut self,
-        imported: CanonicalImportedTrack,
+        mut imported: CanonicalImportedTrack,
     ) -> Result<TrackId, String> {
+        if imported.duration_ms.is_none() {
+            imported.duration_ms = technical_duration_ms(&imported.source);
+        }
         if let Err(message) = self.portable_maintenance_guard() {
             self.report_error(message.clone());
             return Err(message);
@@ -8535,6 +8627,16 @@ fn infer_canonical_import(path: &Path) -> Option<CanonicalImportedTrack> {
     infer_canonical_import_detailed(path).map(|inference| inference.track)
 }
 
+/// Reads a bounded technical duration from the audio container when the
+/// catalogue record does not carry one. This is presentation repair for older
+/// imports; it never writes tags or changes catalogue metadata.
+pub(crate) fn technical_duration_ms(path: &Path) -> Option<u64> {
+    flux_audio::decode::open_decoder(path)
+        .ok()
+        .and_then(|decoder| decoder.info().duration)
+        .map(|duration| duration.as_millis() as u64)
+}
+
 fn infer_canonical_import_detailed(path: &Path) -> Option<CanonicalImportInference> {
     use crate::import::MetadataSource;
 
@@ -8609,7 +8711,7 @@ fn infer_canonical_import_detailed(path: &Path) -> Option<CanonicalImportInferen
             release_type: ReleaseType::Album,
             track_number,
             disc_number: None,
-            duration_ms: None,
+            duration_ms: technical_duration_ms(path),
         },
         title_source: MetadataSource::Filename,
         artist_source,
@@ -8968,7 +9070,7 @@ mod tests {
     use flux_library::QueueStore;
 
     use super::{
-        AudioDiagnostics, AudioOutputDevice, AudioRecoveryFactory, AudioStatus, Controller,
+        Accent, AudioDiagnostics, AudioOutputDevice, AudioRecoveryFactory, AudioStatus, Controller,
         ControllerEvent, CreateLibraryError, OpenedAudioOutput, PlaybackMode, PortableOpenError,
         ResourceState, ScanOutcome, SettingsStore, StorageMode, SwitchError, TrackMetadataEdit,
         create_canonical_library, create_portable_library, execute_legacy_migration,
@@ -11349,6 +11451,30 @@ mod tests {
         assert!(!controller.crossfade_enabled());
         assert_eq!(controller.crossfade_duration_ms(), 4_200);
         assert_eq!(controller.crossfade_ms(), 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn accent_selection_persists_without_resetting_crossfade() {
+        let dir = TempDir::new("accent-settings");
+        let settings = dir.path().join("config").join("settings.json");
+        fs::create_dir_all(settings.parent().expect("parent")).expect("config dir");
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        assert_eq!(controller.accent(), Accent::Pink);
+        controller.set_crossfade_enabled(true).expect("crossfade");
+        controller
+            .set_crossfade_duration_ms(4_200)
+            .expect("crossfade duration");
+        controller.set_accent(Accent::Teal).expect("accent");
+        assert_eq!(controller.accent(), Accent::Teal);
+        controller.shutdown();
+
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        assert_eq!(controller.accent(), Accent::Teal);
+        assert!(controller.crossfade_enabled());
+        assert_eq!(controller.crossfade_duration_ms(), 4_200);
         controller.shutdown();
     }
 
@@ -16471,6 +16597,26 @@ mod tests {
         assert_eq!(
             controller.playlist(playlist).expect("playlist").track_ids,
             vec![id]
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn import_and_legacy_records_expose_technical_duration() {
+        let dir = TempDir::new("technical-duration");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let track = controller.track(id).expect("track");
+        assert!(
+            track.duration().is_some(),
+            "canonical imports persist a bounded technical duration"
+        );
+        assert_eq!(
+            controller.track_duration_hint(id),
+            track.duration(),
+            "the display hint prefers the persisted duration"
         );
         controller.shutdown();
     }

@@ -17,11 +17,89 @@ use serde_json::{Map, Value};
 /// Current settings schema version written by this build.
 pub const SETTINGS_SCHEMA_VERSION: u64 = 1;
 
+/// Default interface text scale percentage.
+pub const TEXT_SCALE_DEFAULT: u16 = 100;
+
+/// Supported interface text scale levels.
+pub const TEXT_SCALE_LEVELS: [u16; 3] = [100, 110, 120];
+
 /// Sensible crossfade duration used when enabling without a prior value.
 pub const CROSSFADE_DEFAULT_MS: u64 = 3_000;
 
 /// Maximum crossfade duration accepted by the engine.
 pub const CROSSFADE_MAX_MS: u64 = flux_audio::engine::MAX_CROSSFADE_MS;
+
+/// Curated accent presets. All presets are chosen for readable contrast on
+/// Flux's dark neutral-violet surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Accent {
+    /// Flux Pink, the established identity default.
+    #[default]
+    Pink,
+    /// Soft violet.
+    Violet,
+    /// Clear blue.
+    Blue,
+    /// Calm teal.
+    Teal,
+    /// Warm amber.
+    Amber,
+}
+
+impl Accent {
+    /// Every preset in presentation order.
+    pub const ALL: [Self; 5] = [
+        Self::Pink,
+        Self::Violet,
+        Self::Blue,
+        Self::Teal,
+        Self::Amber,
+    ];
+
+    /// Stable settings identifier.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Pink => "pink",
+            Self::Violet => "violet",
+            Self::Blue => "blue",
+            Self::Teal => "teal",
+            Self::Amber => "amber",
+        }
+    }
+
+    /// User-facing preset name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pink => "Flux Pink",
+            Self::Violet => "Violet",
+            Self::Blue => "Blue",
+            Self::Teal => "Teal",
+            Self::Amber => "Amber",
+        }
+    }
+
+    /// Accent RGB used for solid text, icons and primary controls.
+    #[must_use]
+    pub const fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Self::Pink => (0xff, 0x66, 0xcc),
+            Self::Violet => (0xa7, 0x8b, 0xfa),
+            Self::Blue => (0x60, 0xa5, 0xfa),
+            Self::Teal => (0x5e, 0xe0, 0xc8),
+            Self::Amber => (0xf6, 0xc1, 0x5f),
+        }
+    }
+
+    /// Recovers a preset from a persisted identifier.
+    #[must_use]
+    pub fn from_id(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|accent| accent.id().eq_ignore_ascii_case(value.trim()))
+    }
+}
 
 /// User-facing crossfade configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +151,10 @@ pub struct LoadedSettings {
     pub crossfade: CrossfadeSettings,
     /// Persisted explicit output-device ID, or `None` for system default.
     pub audio_output_device: Option<String>,
+    /// Persisted accent preset.
+    pub accent: Accent,
+    /// Persisted interface text-scale percentage.
+    pub text_scale: u16,
     /// A malformed/unreadable file diagnostic. The original file is left
     /// untouched and `store.write_protected()` is true.
     pub warning: Option<String>,
@@ -156,6 +238,8 @@ impl SettingsStore {
         }
         let crossfade = recover_crossfade(root.get("crossfade"));
         let audio_output_device = recover_audio_output_device(root.get("audio_output"));
+        let accent = recover_accent(root.get("theme"));
+        let text_scale = recover_text_scale(root.get("interface"));
         LoadedSettings {
             store: Self {
                 path,
@@ -164,6 +248,8 @@ impl SettingsStore {
             },
             crossfade,
             audio_output_device,
+            accent,
+            text_scale,
             warning: None,
         }
     }
@@ -181,6 +267,8 @@ impl SettingsStore {
             },
             crossfade,
             audio_output_device: None,
+            accent: Accent::default(),
+            text_scale: TEXT_SCALE_DEFAULT,
             warning,
         }
     }
@@ -194,6 +282,8 @@ impl SettingsStore {
             },
             crossfade,
             audio_output_device: None,
+            accent: Accent::default(),
+            text_scale: TEXT_SCALE_DEFAULT,
             warning: Some(warning),
         }
     }
@@ -235,6 +325,75 @@ impl SettingsStore {
         let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
         bytes.push(b'\n');
 
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+
+    /// Atomically updates only the interface text-scale percentage while
+    /// preserving every other setting and unknown fields.
+    pub fn save_text_scale(&mut self, percent: u16) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let percent = normalize_text_scale(percent);
+        let mut root = match self.document.clone() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let interface = root
+            .entry("interface")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !interface.is_object() {
+            *interface = Value::Object(Map::new());
+        }
+        interface
+            .as_object_mut()
+            .expect("object inserted")
+            .insert("text_scale".to_owned(), Value::from(percent));
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+
+    /// Atomically updates only the accent preset while preserving crossfade,
+    /// audio output and unknown fields.
+    pub fn save_accent(&mut self, accent: Accent) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let mut root = match self.document.clone() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let theme = root
+            .entry("theme")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !theme.is_object() {
+            *theme = Value::Object(Map::new());
+        }
+        theme
+            .as_object_mut()
+            .expect("object inserted")
+            .insert("accent".to_owned(), Value::from(accent.id()));
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -299,6 +458,31 @@ fn recover_audio_output_device(value: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn normalize_text_scale(percent: u16) -> u16 {
+    TEXT_SCALE_LEVELS
+        .into_iter()
+        .min_by_key(|level| level.abs_diff(percent))
+        .unwrap_or(TEXT_SCALE_DEFAULT)
+}
+
+fn recover_text_scale(value: Option<&Value>) -> u16 {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("text_scale"))
+        .and_then(Value::as_u64)
+        .map(|value| normalize_text_scale(u16::try_from(value).unwrap_or(TEXT_SCALE_DEFAULT)))
+        .unwrap_or(TEXT_SCALE_DEFAULT)
+}
+
+fn recover_accent(value: Option<&Value>) -> Accent {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("accent"))
+        .and_then(Value::as_str)
+        .and_then(Accent::from_id)
+        .unwrap_or_default()
+}
+
 fn recover_crossfade(value: Option<&Value>) -> CrossfadeSettings {
     let mut settings = CrossfadeSettings::default();
     let Some(object) = value.and_then(Value::as_object) else {
@@ -357,7 +541,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, SettingsError, SettingsStore,
+        Accent, CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, SettingsError,
+        SettingsStore,
     };
 
     struct TempDir(PathBuf);
@@ -653,6 +838,56 @@ mod tests {
         assert_eq!(saved["future"]["kept"], true);
         assert_eq!(saved["audio_output"]["device_id"], "alsa:test");
         assert_eq!(saved["crossfade"]["duration_ms"], 2_500);
+    }
+
+    #[test]
+    fn text_scale_normalizes_and_preserves_unrelated_settings() {
+        let dir = TempDir::new("text-scale");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"crossfade":{"enabled":true,"duration_ms":4200},"theme":{"accent":"violet"},"interface":{"text_scale":116},"future":{"kept":true}}"#,
+        )
+        .expect("seed settings");
+        let loaded = SettingsStore::load(&path);
+        assert_eq!(
+            loaded.text_scale, 120,
+            "unsupported levels snap to the nearest"
+        );
+        assert_eq!(loaded.accent, Accent::Violet);
+        let mut store = loaded.store;
+        store.save_text_scale(110).expect("save text scale");
+        let saved: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(saved["interface"]["text_scale"], 110);
+        assert_eq!(saved["crossfade"]["duration_ms"], 4200);
+        assert_eq!(saved["theme"]["accent"], "violet");
+        assert_eq!(saved["future"]["kept"], true);
+    }
+
+    #[test]
+    fn accent_preset_round_trips_and_preserves_unrelated_settings() {
+        let dir = TempDir::new("accent");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"crossfade":{"enabled":true,"duration_ms":4200},"audio_output":{"device_id":"alsa:test"},"future":{"kept":true}}"#,
+        )
+        .expect("seed settings");
+        let loaded = SettingsStore::load(&path);
+        assert_eq!(loaded.accent, Accent::Pink);
+        let mut store = loaded.store;
+        store.save_accent(Accent::Violet).expect("save accent");
+        let saved: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(saved["theme"]["accent"], "violet");
+        assert_eq!(saved["crossfade"]["duration_ms"], 4200);
+        assert_eq!(saved["audio_output"]["device_id"], "alsa:test");
+        assert_eq!(saved["future"]["kept"], true);
+        let reloaded = SettingsStore::load(&path);
+        assert_eq!(reloaded.accent, Accent::Violet);
+        assert_eq!(reloaded.crossfade.duration_ms, 4200);
+        assert_eq!(reloaded.audio_output_device.as_deref(), Some("alsa:test"));
     }
 
     #[test]

@@ -3301,7 +3301,11 @@ fn apply_import_plan_canonical(
                         .collect(),
                     track_number: candidate.track_number(),
                     disc_number: candidate.disc_number(),
-                    duration_ms: None,
+                    duration_ms: candidate
+                        .source_track()
+                        .duration()
+                        .map(|duration| duration.as_millis() as u64)
+                        .or_else(|| crate::technical_duration_ms(candidate.source_path())),
                     artwork: candidate.artwork.clone(),
                     album_artwork,
                     lyrics: candidate.lyrics.clone(),
