@@ -204,16 +204,18 @@ enum SettingRow {
     Visualizer,
     VisualizationMode,
     FollowPlayback,
+    ReducedMotion,
     RefreshDevices,
     LibrarySetup,
 }
 
 impl SettingRow {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Layout,
         Self::Visualizer,
         Self::VisualizationMode,
         Self::FollowPlayback,
+        Self::ReducedMotion,
         Self::RefreshDevices,
         Self::LibrarySetup,
     ];
@@ -224,6 +226,7 @@ impl SettingRow {
             Self::Visualizer => "Visualizer",
             Self::VisualizationMode => "Visualization mode",
             Self::FollowPlayback => "Lyrics follow playback",
+            Self::ReducedMotion => "Reduce motion",
             Self::RefreshDevices => "Refresh audio devices",
             Self::LibrarySetup => "Library setup",
         }
@@ -1083,6 +1086,18 @@ impl Tui {
                 } else {
                     "Lyrics follow is off; scroll manually.".to_owned()
                 });
+            }
+            SettingRow::ReducedMotion => {
+                let reduced = !self.controller.reduced_motion();
+                if let Err(error) = self.controller.set_reduced_motion(reduced) {
+                    self.lifecycle_msg = Some(error);
+                } else {
+                    self.lifecycle_msg = Some(if reduced {
+                        "Reduced motion enabled; the visualizer is static.".to_owned()
+                    } else {
+                        "Reduced motion disabled; the visualizer follows audio.".to_owned()
+                    });
+                }
             }
             SettingRow::RefreshDevices => self.refresh_audio_devices(),
             SettingRow::LibrarySetup => {
@@ -5325,11 +5340,11 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
 mod tests {
     use super::{
         AlbumTransferPlan, ArtistDeletionPlan, Detail, ImageEdit, ImportWorkerMessage, LayoutMode,
-        Mode, Row, StorageMode, Track, Tui, View, VizMode, WaveformScope, album_edit_form,
-        artist_display_name, clamp_terminal_size, detail_view_fits, display_width, fit_input_line,
-        help_lines, normal_help, pad_with_right, parse_album_edit_form, parse_artist_edit_form,
-        parse_release_type, resource_label, terminal_too_small, truncate_to_width,
-        visualization_canvas,
+        Mode, Row, SettingRow, StorageMode, Track, Tui, View, VizMode, WaveformScope,
+        album_edit_form, artist_display_name, clamp_terminal_size, detail_view_fits, display_width,
+        fit_input_line, help_lines, normal_help, pad_with_right, parse_album_edit_form,
+        parse_artist_edit_form, parse_release_type, resource_label, terminal_too_small,
+        truncate_to_width, visualization_canvas,
     };
     use crate::import::candidate_status_detail;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -7383,6 +7398,27 @@ mod tests {
             rendered
                 .iter()
                 .any(|label| label.contains(&format!("ID {second}")))
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_settings_toggle_reduced_motion_and_surface_audio_state() {
+        let dir = TempDir::new("tui-reduced-motion");
+        let mut tui = tui(&dir);
+        assert!(!tui.controller.reduced_motion());
+        tui.toggle_setting(SettingRow::ReducedMotion);
+        assert!(tui.controller.reduced_motion());
+        tui.toggle_setting(SettingRow::ReducedMotion);
+        assert!(!tui.controller.reduced_motion());
+
+        let mut rendered = Vec::new();
+        tui.draw_sized(&mut rendered, 120, 36)
+            .expect("summary renders");
+        let rendered = String::from_utf8_lossy(&rendered);
+        assert!(
+            rendered.contains("no audio backend"),
+            "the TUI must not claim ordinary playback without an output backend"
         );
         tui.controller.shutdown();
     }

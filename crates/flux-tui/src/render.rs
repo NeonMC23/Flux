@@ -507,6 +507,7 @@ impl Tui {
         }
         if self.controller.player_state() == PlaybackState::Playing
             && self.controller.audio_status().is_ready()
+            && !self.controller.reduced_motion()
         {
             let waveform = self.controller.waveform();
             self.scope.update(&waveform);
@@ -1958,6 +1959,13 @@ impl Tui {
                             "Off".to_owned()
                         }
                     }
+                    SettingRow::ReducedMotion => {
+                        if self.controller.reduced_motion() {
+                            "On".to_owned()
+                        } else {
+                            "Off".to_owned()
+                        }
+                    }
                     SettingRow::RefreshDevices => {
                         if self.audio_loading {
                             "Refreshing…".to_owned()
@@ -2195,8 +2203,14 @@ impl Tui {
         } else {
             "Xfade off".to_owned()
         };
+        let audio = match self.controller.audio_status() {
+            AudioStatus::Ready => "",
+            AudioStatus::BuildWithoutBackend => " · no audio backend",
+            AudioStatus::DeviceUnavailable(_) => " · audio unavailable",
+            AudioStatus::Recovering(_) => " · audio recovering",
+        };
         let line = format!(
-            "{state} · Vol {volume}% · {crossfade} · {} layout",
+            "{state}{audio} · Vol {volume}% · {crossfade} · {} layout",
             self.layout.label()
         );
         self.line(out, y as u16, &line, width, false)
