@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: public release suspended pending M26 visual/playback validation.** Signing and native/manual validation remain external.
+**Status: public release suspended pending M27 accessibility/interaction validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -28,6 +28,11 @@ Both interfaces open on Home and follow a shared product design language documen
 [`docs/design-system.md`](docs/design-system.md): Home-first navigation, dark
 surface hierarchy, restrained pink selection and primary actions, readable type,
 one playback timeline, and explicit Artist/Album collaborative relationships.
+M27 adds Tab-based form focus, keyboard queue and Track-action navigation, a
+persisted reduced-motion preference, TUI Album-participant selection during
+import review and stronger desktop-identity resource checks. Details and limits
+are in [`docs/m27-interaction-accessibility.md`](docs/m27-interaction-accessibility.md).
+
 M25 added a vendored Lucide icon set, player-integrated Queue/Lyrics access,
 detail-first Artist and Album pages, stable-ID Artist/Album selectors in Track
 editing, deterministic same-Album embedded-artwork reuse and managed-only
@@ -163,9 +168,12 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   **Import music** action immediately above **Settings**. **Folders** appears
   only for legacy source-path libraries; managed libraries use Albums and Tracks
   instead of internal Album `tracks` folders. The player bar owns compact Queue
-  and Lyrics entries. Normal browsing supports Tab/Shift+Tab destination
-  cycling, ↑/↓ Track focus, Enter play, E edit, Y lyrics, A queue, F favorite,
-  I import and Q queue. Queue rows play on activation; the drag handle reorders
+  and Lyrics entries. Normal browsing supports Ctrl+Tab/Shift+Ctrl+Tab destination
+  cycling, Tab/Shift+Tab form focus, ↑/↓ Track focus, Enter play, E edit,
+  M Track actions, Y lyrics, A queue, F favorite, I import and Q queue. When
+  the Queue overlay is open, ↑/↓ selects, Enter plays, Delete removes and
+  Escape closes. Settings can freeze the continuous waveform for reduced
+  motion. Queue rows play on activation; the drag handle reorders
   and the remove control is explicit. Track actions open a modal action sheet
   with full labels. Use Import for the review-first copy-only Import Manager: native file or folder picker, Flux Browser, drag-and-drop,
   name-inferred review, duplicate decisions, and real progress/cancel. Final

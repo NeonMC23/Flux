@@ -1,4 +1,4 @@
-# Flux product design system (M26)
+# Flux product design system (M27)
 
 Status: implemented design language for the Iced GUI and the crossterm TUI.
 This document describes the shared product hierarchy. It is not a claim of
@@ -205,9 +205,12 @@ marker. A secondary advanced sort picker sits at the far right. Scrollbars are
 quiet neutral scrollers with an accent scroller only while dragged, and content
 reserves an inset so row actions are never covered.
 
-Keyboard operation: Tab/Shift+Tab cycle primary GUI destinations; ↑/↓ move
-Track focus; Enter plays; E edits; Y opens lyrics; A queues; F favorites; I
-imports; / focuses Search; Q toggles queue. Global shortcuts are suppressed
+Keyboard operation: Tab/Shift+Tab move between focusable form controls;
+Ctrl+Tab/Shift+Ctrl+Tab cycle primary GUI destinations; ↑/↓ move Track focus;
+Enter plays; E edits; M opens the Track action menu; Y opens lyrics; A queues;
+F favorites; I imports; / focuses Search; Q toggles queue. Open queue overlays
+use ↑/↓, Enter, Delete and Escape. Settings can freeze the waveform for reduced
+motion. Global shortcuts are suppressed
 while editors, Setup, import and other modal workflows own input. Queue close and
 Track-action close restore focus to Search where available.
 

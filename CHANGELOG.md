@@ -6,6 +6,25 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M27 interaction quality, accessibility and GUI/TUI parity
+
+- Reworked GUI Tab behavior: Tab/Shift+Tab traverse focusable form controls;
+  Ctrl+Tab/Shift+Ctrl+Tab cycle primary destinations. Visible focus styling and
+  view-switch suppression inside editors are preserved.
+- Added keyboard navigation to the queue overlay (select, play, remove, close)
+  and to the Track action menu (up/down, Enter, Escape, visible selection).
+- Added `M` to open Track actions for the focused/current Track.
+- Added a persisted Reduce motion preference in Settings → Appearance; it
+  freezes the continuously moving waveform while leaving playback unchanged.
+- Implemented TUI import-review Album participant selection with `p`, `a`, `r`,
+  existing-Artist disambiguation, owner separation, cancellation and import
+  publication tests at 120x36, 80x24 and 40x12.
+- Strengthened native identity tests for all canonical PNG sizes, ICO/ICNS
+  headers, desktop identity fields and AppStream metadata.
+- Documented keyboard behavior, accessibility limits, reduced motion, TUI
+  participant workflow and remaining native validation in
+  `docs/m27-interaction-accessibility.md`.
+
 ### M26 visual polish, playback stability and identity
 
 - Raised the GUI reading scale across titles, rows, metadata, dialogs and

@@ -32,7 +32,8 @@ identity and transaction rules are unchanged.
 - Primary keyboard destinations are `1` Tracks, `2` Artists, `3` Albums,
   `4` Playlists, `5` Smart Collections, `6` Lyrics, `7` Home, `8` Recently
   Added, `9` Recently Played, `0` Most Played, `K` Settings and `L` Setup.
-  Tab/Shift+Tab follow the destinations that are actually visible. `G` opens
+  Ctrl+Tab/Shift+Ctrl+Tab follow the destinations that are actually visible.
+  Tab/Shift+Tab traverse focusable form controls. `G` opens
   Folders only where source-path browsing is meaningful.
 
 ## Player, queue and lyrics

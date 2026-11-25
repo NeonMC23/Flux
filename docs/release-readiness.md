@@ -16,8 +16,10 @@ player-integrated Queue/Lyrics, detail-first Artist/Album pages, stable-ID Track
 entity selectors and safer embedded-artwork reuse. M26 raised readability, added
 text scale and accent presets, restored Track artwork/durations, stabilized the
 player geometry, added sortable headers and refreshed identity/context menus.
-Human usability, screen-reader, motion and native Windows/macOS interaction
-audits remain pending. Synthetic migration, rollback and commit-recovery tests pass, but
+M27 added Tab focus traversal, keyboard queue/Track-action operation, a reduced
+motion preference, TUI import participant selection and stronger identity
+resource validation. Human usability, screen-reader, optional transitions and
+native Windows/macOS interaction audits remain pending. Synthetic migration, rollback and commit-recovery tests pass, but
 human validation of collaborative Album workflows and real user libraries is
 still required before any public artifact is authorized.
 
