@@ -12,6 +12,9 @@ authorized release.
   selection, startup unavailability, stream loss, bounded recovery, pause/stop
   intent, output switching, queue identity and shutdown. No concrete engine
   defect was found, so the real audio path was left unchanged.
+- Fixed a GUI/TUI consistency defect: TUI Track and Queue rows now use the same
+  technical-duration fallback as the GUI for older catalogues, including the
+  timeline total.
 - Fixed a GUI/TUI consistency defect: the TUI now reports `no audio backend`,
   `audio unavailable` or `audio recovering` instead of implying audible output
   from playback intent alone.

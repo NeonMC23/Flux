@@ -76,6 +76,10 @@ settings toggle controls and persists the shared reduced-motion preference.
 ## Consistency and UX
 
 - The TUI now distinguishes playback intent from actual output availability.
+- TUI Track and Queue rows use the same technical-duration hint as the GUI, so
+  older catalogues with no persisted duration no longer show an empty value in
+  one interface while the other shows the probed duration. The TUI timeline
+  total also uses the same fallback.
 - Reduced motion is no longer a hidden GUI-only preference.
 - Existing fixed player geometry, artwork precedence, duration hints, sortable
   headers, queue keyboard behavior and canonical entity semantics are preserved.

@@ -1556,8 +1556,12 @@ impl Tui {
                 text.push_str(label);
             }
             let duration = track
-                .and_then(Track::duration)
-                .map(format_duration)
+                .map(|_| {
+                    self.controller
+                        .track_duration_hint(entry.track())
+                        .map(format_duration)
+                        .unwrap_or_else(|| "--:--".to_owned())
+                })
                 .unwrap_or_default();
             let text = pad_with_right(&text, &duration, width);
             let y = (top + row) as u16;
@@ -1869,7 +1873,11 @@ impl Tui {
                     text.push_str("  ");
                     text.push_str(label);
                 }
-                let duration = track.duration().map(format_duration).unwrap_or_default();
+                let duration = self
+                    .controller
+                    .track_duration_hint(id)
+                    .map(format_duration)
+                    .unwrap_or_else(|| "--:--".to_owned());
                 pad_with_right(&text, &duration, width)
             }
             Row::Artist(id) => {
@@ -2231,6 +2239,11 @@ impl Tui {
         let total = self
             .controller
             .current_duration()
+            .or_else(|| {
+                self.controller
+                    .current_id()
+                    .and_then(|id| self.controller.track_duration_hint(id))
+            })
             .map(format_duration)
             .unwrap_or_else(|| "--:--".to_owned());
         let used = display_width(state) + display_width(&elapsed) + display_width(&total) + 4;
