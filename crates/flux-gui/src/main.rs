@@ -13,8 +13,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod icons;
 mod inert;
 
+use icons::Icon;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -163,13 +165,8 @@ fn modal_backdrop_style(_: &Theme) -> container::Style {
 }
 
 fn control_bar_style(_: &Theme) -> container::Style {
-    container::Style::default()
-        .background(Color::from_rgba8(0x18, 0x15, 0x20, 0.72))
-        .border(Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 9.0.into(),
-        })
+    // The browsing toolbar is part of the page header, not a permanent card.
+    container::Style::default().background(Color::TRANSPARENT)
 }
 
 fn import_panel_style(_: &Theme) -> container::Style {
@@ -1132,23 +1129,30 @@ fn decode_artwork(key: &ArtworkKey) -> Result<ArtworkData, String> {
 }
 
 fn fallback_artwork<'a>(seed: Option<&str>, size: f32) -> Element<'a, Message> {
-    let (glyph, color) = match seed {
-        Some(seed) => {
-            let glyph = seed
-                .chars()
-                .find(|value| value.is_alphanumeric())
-                .map(|value| value.to_uppercase().collect::<String>())
-                .unwrap_or_else(|| "♪".to_owned());
-            (glyph, artwork_color(seed))
-        }
-        None => ("♪".to_owned(), SURFACE_HI),
+    let initial = seed.and_then(|seed| {
+        seed.chars()
+            .find(|value| value.is_alphanumeric())
+            .map(|value| value.to_uppercase().collect::<String>())
+    });
+    let color = seed.map_or(SURFACE_HI, artwork_color);
+    let content: Element<'a, Message> = match initial {
+        Some(initial) => text(initial).size(size * 0.34).color(TEXT).into(),
+        None => icons::icon::<Message>(Icon::Music, size * 0.44, MUTED),
     };
-
-    container(text(glyph).size(size * 0.34).color(TEXT))
+    container(content)
         .width(size)
         .height(size)
         .center(size)
         .style(artwork_style(color))
+        .into()
+}
+
+fn icon_tile<'a>(kind: Icon, size: f32, background: Color, tint: Color) -> Element<'a, Message> {
+    container(icons::icon::<Message>(kind, size * 0.48, tint))
+        .width(size)
+        .height(size)
+        .center(size)
+        .style(artwork_style(background))
         .into()
 }
 
@@ -1168,6 +1172,12 @@ fn artwork_image<'a>(
 fn rule<'a>() -> Element<'a, Message> {
     container(iced::widget::Space::new().width(1).height(Length::Fill))
         .style(rule_style)
+        .into()
+}
+
+fn section_heading(label: &'static str) -> Element<'static, Message> {
+    container(text(label).size(9).color(ACCENT))
+        .padding([GAP_SM, 0.0])
         .into()
 }
 
@@ -1833,7 +1843,12 @@ struct TrackEditor {
     track_number: String,
     disc_number: String,
     artist_id: Option<ArtistId>,
+    transfer_title: String,
     new_artist: String,
+    new_artist_open: bool,
+    new_album: String,
+    new_album_open: bool,
+    credits_touched: bool,
     error: Option<String>,
     metadata_plan: Option<TrackMetadataUpdatePlan>,
     credits: Vec<ArtistId>,
@@ -2161,6 +2176,7 @@ struct FluxReady {
     new_album_type: ReleaseType,
     album_title_input: String,
     album_type: ReleaseType,
+    album_edit_open: bool,
     album_participants: Vec<ArtistId>,
     album_participant_filter: String,
     album_participant_choice: Option<ArtistChoice>,
@@ -2178,6 +2194,7 @@ struct FluxReady {
     artist_description_input: String,
     artist_aliases_input: String,
     artist_form_dirty: bool,
+    artist_edit_open: bool,
     artist_image_input: String,
     artist_image_picked: Option<PathBuf>,
     artist_image_preview: Option<ImageHandle>,
@@ -2207,6 +2224,7 @@ struct FluxReady {
     show_setup: bool,
     queue_visible: bool,
     queue_overlay_open: bool,
+    lyrics_overlay_open: bool,
     track_menu: Option<TrackId>,
     window_width: f32,
     window_height: f32,
@@ -2220,12 +2238,16 @@ enum Message {
     LibInputChanged(String),
     EditTrack(TrackId),
     EditorTitleChanged(String),
-    EditorAlbumChanged(String),
+    EditorTransferTitleChanged(String),
     EditorTrackNumberChanged(String),
     EditorDiscNumberChanged(String),
     EditorArtistChanged(Option<ArtistChoice>),
+    EditorToggleNewArtist,
     EditorNewArtistChanged(String),
     EditorCreateArtist,
+    EditorToggleNewAlbum,
+    EditorNewAlbumChanged(String),
+    EditorCreateAlbum,
     EditorSave,
     EditorTransferOwner,
     EditorCancel,
@@ -2491,6 +2513,10 @@ enum Message {
     LyricsEditorCancel,
     LyricsEditorRemove,
     LyricsImportOpen,
+    ToggleLyricsOverlay,
+    LyricsOverlayEdit,
+    ArtistEditToggle,
+    AlbumEditToggle,
     LyricsImportPicked(u64, Result<Option<Vec<PathBuf>>, String>),
     LyricsImportConfirm,
     LyricsImportCancel,
@@ -2668,6 +2694,7 @@ impl FluxReady {
             new_album_type: ReleaseType::Album,
             album_title_input: String::new(),
             album_type: ReleaseType::Album,
+            album_edit_open: false,
             album_participants: Vec::new(),
             album_participant_filter: String::new(),
             album_participant_choice: None,
@@ -2685,6 +2712,7 @@ impl FluxReady {
             artist_description_input: String::new(),
             artist_aliases_input: String::new(),
             artist_form_dirty: false,
+            artist_edit_open: false,
             artist_image_input: String::new(),
             artist_image_picked: None,
             artist_image_preview: None,
@@ -2714,6 +2742,7 @@ impl FluxReady {
             show_setup,
             queue_visible: true,
             queue_overlay_open: false,
+            lyrics_overlay_open: false,
             track_menu: None,
             window_width: 1_180.0,
             window_height: 760.0,
@@ -3078,6 +3107,7 @@ impl FluxReady {
 
     fn sync_artist_editor(&mut self) {
         self.artist_form_dirty = false;
+        self.artist_edit_open = false;
         self.artist_detail_name_input.clear();
         self.artist_description_input.clear();
         self.artist_aliases_input.clear();
@@ -3102,6 +3132,7 @@ impl FluxReady {
 
     fn sync_album_editor(&mut self) {
         self.album_delete_confirm = false;
+        self.album_edit_open = false;
         self.album_cover_remove_confirm = false;
         let Some(album_id) = self.selected_album_id() else {
             self.album_title_input.clear();
@@ -3228,8 +3259,18 @@ impl FluxReady {
                 .disc_number()
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
-            artist_id: self.controller.track_artist_id(id),
+            artist_id: self
+                .controller
+                .track_credits(id)
+                .first()
+                .copied()
+                .or_else(|| self.controller.track_artist_id(id)),
+            transfer_title: track.album().unwrap_or_default().to_owned(),
             new_artist: String::new(),
+            new_artist_open: false,
+            new_album: String::new(),
+            new_album_open: false,
+            credits_touched: false,
             error: None,
             metadata_plan,
             credits: self.controller.track_credits(id),
@@ -3279,18 +3320,120 @@ impl FluxReady {
             .collect()
     }
 
-    fn editor_move_album_choices(&self, track_id: TrackId) -> Vec<AlbumChoice> {
-        let Some(owner) = self.controller.track_artist_id(track_id) else {
-            return Vec::new();
+    fn set_editor_primary_artist(&mut self, choice: Option<ArtistChoice>) {
+        let selected = choice.and_then(|choice| choice.id);
+        let Some(editor) = self.track_editor.as_mut() else {
+            return;
         };
-        let current = self.controller.track_album_id(track_id);
+        editor.artist_id = selected;
+        editor.credits_touched = true;
+        match selected {
+            Some(id) => {
+                editor.credits.retain(|credit| *credit != id);
+                editor.credits.insert(0, id);
+            }
+            None => {
+                if !editor.credits.is_empty() {
+                    editor.credits.remove(0);
+                }
+            }
+        }
+        // Album choices depend on the selected Artist; a pending destination
+        // from another Artist would be misleading.
+        editor.move_destination = None;
+        editor.move_plan = None;
+        editor.error = None;
+        editor.mark_dirty();
+    }
+
+    fn create_album_from_editor(&mut self) {
+        let Some(editor) = self.track_editor.as_ref() else {
+            return;
+        };
+        let title = editor.new_album.trim().to_owned();
+        if title.is_empty() {
+            return;
+        }
+        let Some(owner) = editor
+            .artist_id
+            .or_else(|| self.controller.track_artist_id(editor.id))
+        else {
+            if let Some(editor) = self.track_editor.as_mut() {
+                editor.error =
+                    Some("Select or create an Artist before creating an Album.".to_owned());
+            }
+            return;
+        };
+        match self
+            .controller
+            .create_album(owner, &title, ReleaseType::Album)
+        {
+            Ok(id) => {
+                let label = self.album_choice_label(id, &title, owner);
+                let track_id = self.track_editor.as_ref().map(|editor| editor.id);
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.new_album.clear();
+                    editor.new_album_open = false;
+                    editor.move_destination = Some(AlbumChoice { id, label });
+                    editor.move_plan = None;
+                    editor.error = None;
+                    editor.mark_dirty();
+                    if let Some(track_id) = track_id {
+                        editor.metadata_plan =
+                            self.controller.plan_track_metadata_update(track_id).ok();
+                    }
+                }
+                self.lifecycle_msg = Some(format!("Created Album {title} (ID {id})."));
+            }
+            Err(error) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn editor_album_choices(&self, editor: &TrackEditor) -> Vec<AlbumChoice> {
+        let track_owner = self.controller.track_artist_id(editor.id);
+        let subject = editor.artist_id.or(track_owner);
+        let current = self.controller.track_album_id(editor.id);
+        let credited = subject.map_or_else(Vec::new, |artist| {
+            self.controller.albums_credited_for(artist)
+        });
         self.controller
             .albums()
             .into_iter()
-            .filter(|album| album.owner_artist_id == owner && Some(album.id) != current)
-            .map(|album| AlbumChoice {
-                id: album.id,
-                label: self.album_choice_label(album.id, &album.title, album.owner_artist_id),
+            .filter(|album| {
+                if Some(album.id) == current {
+                    return true;
+                }
+                // Canonical ownership requires the destination Album owner to
+                // equal the Track's physical owner. Participating Albums owned
+                // by another Artist therefore cannot receive this Track without
+                // an explicit ownership transfer, so they are not offered as
+                // immediate move targets.
+                if Some(album.owner_artist_id) != track_owner {
+                    return false;
+                }
+                subject.is_some_and(|artist| {
+                    album.owner_artist_id == artist
+                        || album.participant_artist_ids.contains(&artist)
+                        || credited.contains(&album.id)
+                })
+            })
+            .map(|album| {
+                let base = self.album_choice_label(album.id, &album.title, album.owner_artist_id);
+                let label = match subject {
+                    Some(artist) if album.owner_artist_id != artist => format!(
+                        "{base} · owned by {}",
+                        self.artist_label(album.owner_artist_id)
+                    ),
+                    _ => base,
+                };
+                AlbumChoice {
+                    id: album.id,
+                    label,
+                }
             })
             .collect()
     }
@@ -3310,6 +3453,7 @@ impl FluxReady {
         editor.credits.push(artist);
         editor.credit_artist = None;
         editor.error = None;
+        editor.credits_touched = true;
         editor.mark_dirty();
     }
 
@@ -3325,6 +3469,7 @@ impl FluxReady {
             return;
         }
         editor.credits.swap(index, target as usize);
+        editor.credits_touched = true;
         editor.mark_dirty();
     }
 
@@ -3341,6 +3486,7 @@ impl FluxReady {
             return;
         }
         editor.credits.remove(index);
+        editor.credits_touched = true;
         editor.mark_dirty();
     }
 
@@ -3592,6 +3738,17 @@ impl FluxReady {
             return;
         };
         let id = editor.id;
+        if let Some(destination) = &editor.move_destination
+            && Some(destination.id) != self.controller.track_album_id(id)
+        {
+            if let Some(editor) = self.track_editor.as_mut() {
+                editor.error = Some(
+                    "Review and confirm the Album move before saving metadata, or select the current Album."
+                        .to_owned(),
+                );
+            }
+            return;
+        }
         let (track_number, disc_number) = match (
             parse_optional_number(&editor.track_number, "track number"),
             parse_optional_number(&editor.disc_number, "disc number"),
@@ -3607,7 +3764,7 @@ impl FluxReady {
         let edit = TrackMetadataEdit {
             title: nonempty_string(&editor.title),
             artist_id: self.controller.track_artist_id(id),
-            credited_artist_ids: Some(editor.credits.clone()),
+            credited_artist_ids: editor.credits_touched.then(|| editor.credits.clone()),
             album: nonempty_string(&editor.album),
             track_number,
             disc_number,
@@ -3641,7 +3798,7 @@ impl FluxReady {
             }
             return;
         };
-        let album_title = editor.album.trim().to_owned();
+        let album_title = editor.transfer_title.trim().to_owned();
         if album_title.is_empty() {
             if let Some(editor) = self.track_editor.as_mut() {
                 editor.error = Some("Enter the destination release title.".to_owned());
@@ -3707,8 +3864,14 @@ impl FluxReady {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.artist_id = Some(id);
                     editor.credit_artist = Some(id);
+                    editor.credits.retain(|credit| *credit != id);
+                    editor.credits.insert(0, id);
+                    editor.credits_touched = true;
                     editor.new_artist.clear();
+                    editor.new_artist_open = false;
                     editor.error = None;
+                    editor.dirty = true;
+                    editor.discard_confirm = false;
                     if let Some(track_id) = track_id {
                         editor.metadata_plan =
                             self.controller.plan_track_metadata_update(track_id).ok();
@@ -4228,6 +4391,11 @@ impl FluxReady {
             return;
         }
         self.navigation_stack.clear();
+        let view = if view == LibraryView::Folders && !self.folder_browsing_available() {
+            LibraryView::Albums
+        } else {
+            view
+        };
         self.view = view;
         self.selected_group = None;
         self.focused_track = None;
@@ -4238,6 +4406,7 @@ impl FluxReady {
         self.playlist_entry_selection.clear();
         self.playlist_drag = None;
         self.queue_overlay_open = false;
+        self.lyrics_overlay_open = false;
         self.selected_lyrics = None;
         self.lyrics_follow_current = false;
         self.lyrics_editor = None;
@@ -4265,6 +4434,9 @@ impl FluxReady {
 
     fn toggle_queue(&mut self) -> bool {
         self.cancel_queue_drag();
+        if !self.queue_overlay_open {
+            self.lyrics_overlay_open = false;
+        }
         if self.window_width >= QUEUE_INLINE_MIN_WIDTH {
             self.queue_visible = !self.queue_visible;
             self.queue_overlay_open = false;
@@ -4432,10 +4604,9 @@ impl FluxReady {
                     editor.mark_dirty();
                 }
             }
-            Message::EditorAlbumChanged(value) => {
+            Message::EditorTransferTitleChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
-                    editor.album = value;
-                    editor.mark_dirty();
+                    editor.transfer_title = value;
                 }
             }
             Message::EditorTrackNumberChanged(value) => {
@@ -4450,19 +4621,31 @@ impl FluxReady {
                     editor.mark_dirty();
                 }
             }
-            Message::EditorArtistChanged(choice) => {
+            Message::EditorArtistChanged(choice) => self.set_editor_primary_artist(choice),
+            Message::EditorToggleNewArtist => {
                 if let Some(editor) = self.track_editor.as_mut() {
-                    editor.artist_id = choice.and_then(|choice| choice.id);
-                    editor.mark_dirty();
+                    editor.new_artist_open = !editor.new_artist_open;
+                    editor.new_artist.clear();
                 }
             }
             Message::EditorNewArtistChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
                     editor.new_artist = value;
-                    editor.mark_dirty();
                 }
             }
             Message::EditorCreateArtist => self.create_artist_from_editor(),
+            Message::EditorToggleNewAlbum => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.new_album_open = !editor.new_album_open;
+                    editor.new_album.clear();
+                }
+            }
+            Message::EditorNewAlbumChanged(value) => {
+                if let Some(editor) = self.track_editor.as_mut() {
+                    editor.new_album = value;
+                }
+            }
+            Message::EditorCreateAlbum => self.create_album_from_editor(),
             Message::EditorSave => self.save_track_editor(),
             Message::EditorTransferOwner => self.transfer_track_editor_owner(),
             Message::EditorCancel => self.cancel_track_editor(),
@@ -4540,6 +4723,12 @@ impl FluxReady {
             Message::EditorPlanMove => self.plan_editor_move(),
             Message::EditorPlanDetach => self.plan_editor_detach(),
             Message::EditorConfirmMove => self.confirm_editor_move(),
+            Message::ArtistEditToggle => {
+                self.artist_edit_open = !self.artist_edit_open;
+            }
+            Message::AlbumEditToggle => {
+                self.album_edit_open = !self.album_edit_open;
+            }
             Message::ArtistSelected(choice) => {
                 self.artist_selected = choice.as_ref().and_then(|choice| choice.id);
                 self.artist_rename_input = self
@@ -7286,7 +7475,24 @@ impl FluxReady {
                     drag.moved = true;
                 }
             }
+            Message::ToggleLyricsOverlay => {
+                self.lyrics_overlay_open = !self.lyrics_overlay_open;
+                if self.lyrics_overlay_open {
+                    self.queue_overlay_open = false;
+                }
+            }
+            Message::LyricsOverlayEdit => {
+                if let Some(id) = self.controller.current_id() {
+                    self.lyrics_overlay_open = false;
+                    self.selected_lyrics = Some(id);
+                    self.view = LibraryView::Lyrics;
+                    self.lyrics_mode = LyricsMode::Edit;
+                    self.selected_group = None;
+                    self.open_lyrics_editor();
+                }
+            }
             Message::LyricsSelect(id) => {
+                self.lyrics_overlay_open = false;
                 if let Some(editor) = self.lyrics_editor.as_mut()
                     && editor.dirty
                     && !editor.discard_confirm
@@ -7337,6 +7543,7 @@ impl FluxReady {
                     return Task::none();
                 }
                 if let Some(id) = self.controller.current_id() {
+                    self.lyrics_overlay_open = false;
                     self.view = LibraryView::Lyrics;
                     self.selected_lyrics = Some(id);
                     self.lyrics_mode = LyricsMode::Read;
@@ -8112,13 +8319,16 @@ impl FluxReady {
                     Key::Character("1") => self.select_view(LibraryView::Tracks),
                     Key::Character("2") => self.select_view(LibraryView::Artists),
                     Key::Character("3") => self.select_view(LibraryView::Albums),
-                    Key::Character("4") => self.select_view(LibraryView::Folders),
-                    Key::Character("5") => self.select_view(LibraryView::Playlists),
+                    Key::Character("4") => self.select_view(LibraryView::Playlists),
+                    Key::Character("5") => self.select_view(LibraryView::Collections),
                     Key::Character("6") => self.select_view(LibraryView::Lyrics),
                     Key::Character("7") => self.select_view(LibraryView::Dashboard),
-                    Key::Character("8") => self.select_view(LibraryView::Collections),
-                    Key::Character("9") => self.select_view(LibraryView::RecentlyAdded),
-                    Key::Character("0") => self.select_view(LibraryView::RecentlyPlayed),
+                    Key::Character("8") => self.select_view(LibraryView::RecentlyAdded),
+                    Key::Character("9") => self.select_view(LibraryView::RecentlyPlayed),
+                    Key::Character("0") => self.select_view(LibraryView::MostPlayed),
+                    Key::Character("g") if self.folder_browsing_available() => {
+                        self.select_view(LibraryView::Folders)
+                    }
                     Key::Character("k") => self.select_view(LibraryView::Settings),
                     Key::Character("l") => self.toggle_setup(),
                     Key::Named(Named::Escape) => {
@@ -8139,6 +8349,12 @@ impl FluxReady {
                             self.playlist_create_name.clear();
                             self.playlist_error = None;
                             return Task::none();
+                        }
+                        if self.lyrics_overlay_open {
+                            self.lyrics_overlay_open = false;
+                            return iced::widget::operation::focus(iced::widget::Id::new(
+                                "flux-search",
+                            ));
                         }
                         if self.queue_overlay_open {
                             self.queue_overlay_open = false;
@@ -8276,11 +8492,14 @@ impl FluxReady {
         }
 
         let body: Element<'_, Message> = body.into();
-        let base: Element<'_, Message> = if queue_placement == QueuePlacement::Overlay {
+        let mut base: Element<'_, Message> = if queue_placement == QueuePlacement::Overlay {
             modal_stack(body, self.queue_overlay())
         } else {
             body
         };
+        if self.lyrics_overlay_open {
+            base = modal_stack(base, self.lyrics_overlay());
+        }
         let body: Element<'_, Message> = if self.lyrics_import.is_some() {
             modal_stack(base, self.lyrics_import_overlay())
         } else if self.playlist_create_open {
@@ -9406,7 +9625,7 @@ impl FluxReady {
                 ),
             }
         };
-        let close = button(text("×").size(18).color(MUTED))
+        let close = button(icons::icon::<Message>(Icon::Close, 18.0, MUTED))
             .style(ghost_style)
             .padding([2, 8])
             .on_press(Message::ImportClose);
@@ -9565,19 +9784,12 @@ impl FluxReady {
             .on_press(Message::ImportRecursiveToggled),
         );
 
-        body = body.push(
-            button(
-                text(if manager.advanced_open {
-                    "▾ Advanced Options"
-                } else {
-                    "▸ Advanced Options"
-                })
-                .size(10),
-            )
-            .style(ghost_style)
-            .padding([5, 8])
-            .on_press(Message::ImportAdvancedToggled),
-        );
+        body = body.push(expand_button(
+            manager.advanced_open,
+            "Advanced Options",
+            "Advanced Options",
+            Message::ImportAdvancedToggled,
+        ));
         if manager.advanced_open {
             body = body.push(
                 column![
@@ -9661,7 +9873,7 @@ impl FluxReady {
                 rows = rows.push(
                     button(
                         row![
-                            text("▸").size(11).color(ACCENT),
+                            icons::icon::<Message>(Icon::Forward, 11.0, ACCENT),
                             text(&entry.name).size(11).color(TEXT).width(Length::Fill),
                             text("folder").size(9).color(MUTED),
                         ]
@@ -9676,11 +9888,15 @@ impl FluxReady {
             } else {
                 let selected = browser.selected.contains(&entry.path);
                 let color = if entry.supported { TEXT } else { MUTED };
+                let check: Element<'_, Message> = if selected {
+                    icons::icon(Icon::Check, 12.0, ACCENT)
+                } else {
+                    iced::widget::Space::new().width(0).into()
+                };
                 let row: Element<'_, Message> = row![
-                    text(if selected { "✓" } else { " " })
-                        .size(11)
-                        .color(ACCENT)
-                        .width(Length::Fixed(18.0)),
+                    container(check)
+                        .width(Length::Fixed(18.0))
+                        .center_x(Length::Fixed(18.0)),
                     text(&entry.name).size(11).color(color).width(Length::Fill),
                     text(if entry.supported {
                         human_size(entry.size)
@@ -10209,7 +10425,14 @@ impl FluxReady {
             }
         }
 
-        body = body.push(text("ARTWORK").size(8).color(MUTED));
+        body = body.push(
+            row![
+                icons::icon::<Message>(Icon::Image, 11.0, MUTED),
+                text("ARTWORK").size(8).color(MUTED),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        );
         let album_art = candidate.album_artwork_path().map(|path| {
             path.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -10322,19 +10545,12 @@ impl FluxReady {
             body = body.push(text(error).size(9).color(DANGER));
         }
 
-        body = body.push(
-            button(
-                text(if manager.advanced_open {
-                    "▾ Advanced Options"
-                } else {
-                    "▸ Advanced Options"
-                })
-                .size(10),
-            )
-            .style(ghost_style)
-            .padding([5, 8])
-            .on_press(Message::ImportAdvancedToggled),
-        );
+        body = body.push(expand_button(
+            manager.advanced_open,
+            "Advanced Options",
+            "Advanced Options",
+            Message::ImportAdvancedToggled,
+        ));
 
         if manager.advanced_open {
             body = body.push(text("TRACK NUMBER").size(8).color(MUTED));
@@ -10399,15 +10615,15 @@ impl FluxReady {
                                     .on_press(Message::ImportCreditSetOwner(credit_index)),
                             )
                         },
-                        button(text("↑").size(10))
+                        button(icons::icon::<Message>(Icon::Up, 11.0, MUTED))
                             .style(ghost_style)
                             .padding([3, 5])
                             .on_press(Message::ImportCreditMove(credit_index, -1)),
-                        button(text("↓").size(10))
+                        button(icons::icon::<Message>(Icon::Down, 11.0, MUTED))
                             .style(ghost_style)
                             .padding([3, 5])
                             .on_press(Message::ImportCreditMove(credit_index, 1)),
-                        button(text("×").size(10))
+                        button(icons::icon::<Message>(Icon::Close, 11.0, MUTED))
                             .style(ghost_style)
                             .padding([3, 5])
                             .on_press_maybe(
@@ -10894,7 +11110,22 @@ impl FluxReady {
         }
         if let Some(report) = &manager.report {
             let committed = report.imported + report.updated;
-            body = body.push(text(import_outcome_heading(report)).size(18).color(TEXT));
+            body = body.push(
+                row![
+                    icons::icon::<Message>(
+                        if report.failed > 0 {
+                            Icon::Close
+                        } else {
+                            Icon::Success
+                        },
+                        18.0,
+                        if report.failed > 0 { DANGER } else { SUCCESS },
+                    ),
+                    text(import_outcome_heading(report)).size(18).color(TEXT),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
             let mut summary = vec![
                 pluralize(report.imported, "new Track"),
                 pluralize(report.updated, "updated Track"),
@@ -11018,21 +11249,24 @@ impl FluxReady {
 
         let mut nav_items = column![].spacing(2);
         nav_items = nav_items.push(sidebar_destination(
-            view_glyph(LibraryView::Dashboard),
+            view_icon(LibraryView::Dashboard),
             LibraryView::Dashboard.label(),
             self.view == LibraryView::Dashboard && !self.show_setup,
             Message::SelectView(LibraryView::Dashboard),
         ));
         nav_items = nav_items.push(iced::widget::Space::new().height(Length::Fixed(GAP_MD)));
         nav_items = nav_items.push(sidebar_section("LIBRARY"));
-        for view in [
+        let mut library_destinations = vec![
             LibraryView::Tracks,
             LibraryView::Artists,
             LibraryView::Albums,
-            LibraryView::Folders,
-        ] {
+        ];
+        if self.folder_browsing_available() {
+            library_destinations.push(LibraryView::Folders);
+        }
+        for view in library_destinations {
             nav_items = nav_items.push(sidebar_destination(
-                view_glyph(view),
+                view_icon(view),
                 view.label(),
                 self.view == view && !self.show_setup,
                 Message::SelectView(view),
@@ -11046,7 +11280,7 @@ impl FluxReady {
             LibraryView::Lyrics,
         ] {
             nav_items = nav_items.push(sidebar_destination(
-                view_glyph(view),
+                view_icon(view),
                 view.label(),
                 self.view == view && !self.show_setup,
                 Message::SelectView(view),
@@ -11056,19 +11290,6 @@ impl FluxReady {
         let mut nav = column![
             brand,
             iced::widget::Space::new().height(Length::Fixed(GAP_LG)),
-            button(
-                row![
-                    text("+").size(FONT_TITLE).color(BG),
-                    text("Import music").size(FONT_BODY).color(BG),
-                ]
-                .spacing(7)
-                .align_y(Alignment::Center),
-            )
-            .width(Length::Fill)
-            .padding([9, 11])
-            .style(accent_button_style)
-            .on_press(Message::ImportOpen),
-            iced::widget::Space::new().height(Length::Fixed(GAP_MD)),
         ]
         .spacing(0);
         nav = nav.push(scrollable(nav_items).height(Length::Fill));
@@ -11087,18 +11308,10 @@ impl FluxReady {
                             .style(ghost_style)
                             .padding([0, 0])
                             .on_press_maybe(current.map(Message::SearchNavigateTrack)),
-                        row![
-                            text(subtitle)
-                                .size(FONT_LABEL)
-                                .color(MUTED)
-                                .width(Length::Fill),
-                            button(text("Lyrics").size(FONT_LABEL))
-                                .style(ghost_style)
-                                .padding([3, 5])
-                                .on_press(Message::LyricsOpenCurrent),
-                        ]
-                        .spacing(GAP_XS)
-                        .align_y(Alignment::Center),
+                        text(subtitle)
+                            .size(FONT_LABEL)
+                            .color(MUTED)
+                            .width(Length::Fill),
                     ]
                     .spacing(3),
                 )
@@ -11108,8 +11321,15 @@ impl FluxReady {
             );
             nav = nav.push(iced::widget::Space::new().height(Length::Fixed(GAP_SM)));
         }
+        nav = nav.push(horizontal_rule());
+        nav = nav.push(iced::widget::Space::new().height(Length::Fixed(GAP_XS)));
+        nav = nav.push(sidebar_action(
+            Icon::Import,
+            "Import music",
+            Message::ImportOpen,
+        ));
         nav = nav.push(sidebar_destination(
-            view_glyph(LibraryView::Settings),
+            Icon::Settings,
             "Settings",
             self.view == LibraryView::Settings && !self.show_setup,
             Message::SelectView(LibraryView::Settings),
@@ -11121,6 +11341,32 @@ impl FluxReady {
             .padding([GAP_LG, GAP_MD])
             .style(sidebar_style)
             .into()
+    }
+
+    /// Folder browsing is only meaningful when the catalogue references
+    /// user-owned source paths. Canonical and portable libraries store audio in
+    /// internal per-Album `tracks` folders that are not user navigation.
+    fn folder_browsing_available(&self) -> bool {
+        matches!(self.controller.storage_mode(), StorageMode::Legacy)
+    }
+
+    fn primary_destinations(&self) -> Vec<LibraryView> {
+        let mut destinations = vec![
+            LibraryView::Dashboard,
+            LibraryView::Tracks,
+            LibraryView::Artists,
+            LibraryView::Albums,
+        ];
+        if self.folder_browsing_available() {
+            destinations.push(LibraryView::Folders);
+        }
+        destinations.extend([
+            LibraryView::Playlists,
+            LibraryView::Collections,
+            LibraryView::Lyrics,
+            LibraryView::Settings,
+        ]);
+        destinations
     }
 
     fn sidebar_width(&self) -> f32 {
@@ -11332,26 +11578,11 @@ impl FluxReady {
 
         let mut bar = row![].spacing(10).align_y(Alignment::Center);
         if !self.navigation_stack.is_empty() && !self.show_setup && self.track_editor.is_none() {
-            bar = bar.push(
-                button(text("‹ Back").size(11))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::NavigateBack),
-            );
+            bar = bar.push(back_button("Back", Message::NavigateBack));
         } else if self.selected_group.is_some() && !self.show_setup && self.track_editor.is_none() {
-            bar = bar.push(
-                button(text("‹ Back").size(11))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::SelectGroup(None)),
-            );
+            bar = bar.push(back_button("Back", Message::SelectGroup(None)));
         } else if self.collection.is_some() && self.view == LibraryView::Collections {
-            bar = bar.push(
-                button(text("‹ Collections").size(11))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::CollectionBack),
-            );
+            bar = bar.push(back_button("Collections", Message::CollectionBack));
         }
         bar = bar.push(
             column![
@@ -11363,6 +11594,7 @@ impl FluxReady {
         );
 
         if !self.show_setup && self.track_editor.is_none() {
+            bar = bar.push(icons::icon::<Message>(Icon::Search, 14.0, MUTED));
             bar = bar.push(
                 text_input("Search", &self.search)
                     .id(iced::widget::Id::new("flux-search"))
@@ -11378,14 +11610,6 @@ impl FluxReady {
                         .on_press(Message::ClearSearch),
                 );
             }
-        }
-        if self.track_editor.is_none() {
-            bar = bar.push(
-                button(text("Queue").size(11))
-                    .style(nav_style(self.queue_placement() != QueuePlacement::Hidden))
-                    .padding([6, 10])
-                    .on_press(Message::ToggleQueue),
-            );
         }
         if self.track_editor.is_none() {
             bar = bar.push(
@@ -11710,7 +11934,7 @@ impl FluxReady {
 
     fn empty_library(&self) -> Element<'_, Message> {
         let card = column![
-            text("♪").size(46).color(ACCENT),
+            icons::icon::<Message>(Icon::Music, 46.0, ACCENT),
             text("Your library is empty").size(22).color(TEXT),
             text(
                 "Add a folder of music to get started. You can review everything before it is imported."
@@ -12007,7 +12231,24 @@ impl FluxReady {
                 .width(Length::Fill),
         );
 
-        body = body.push(text("ARTIST").size(8).color(MUTED));
+        body = body.push(
+            row![
+                text("PRIMARY ARTIST").size(8).color(MUTED),
+                iced::widget::Space::new().width(Length::Fill),
+                button(
+                    row![
+                        icons::icon::<Message>(Icon::Add, 11.0, MUTED),
+                        text("New Artist").size(9).color(MUTED),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                )
+                .style(ghost_style)
+                .padding([3, 6])
+                .on_press(Message::EditorToggleNewArtist),
+            ]
+            .align_y(Alignment::Center),
+        );
         body = body.push(
             pick_list(choices, selected, |choice| {
                 Message::EditorArtistChanged(Some(choice))
@@ -12016,24 +12257,189 @@ impl FluxReady {
             .padding([7, 9])
             .width(Length::Fill),
         );
-
-        body = body.push(text("ALBUM").size(8).color(MUTED));
-        if self.controller.track_album_id(editor.id).is_some() {
+        if editor.new_artist_open {
             body = body.push(
-                text_input("Album", &editor.album)
-                    .on_input(Message::EditorAlbumChanged)
-                    .style(input_style)
-                    .width(Length::Fill),
+                row![
+                    text_input("New Artist name…", &editor.new_artist)
+                        .on_input(Message::EditorNewArtistChanged)
+                        .on_submit(Message::EditorCreateArtist)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Create").size(10))
+                        .style(accent_button_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            (!editor.new_artist.trim().is_empty())
+                                .then_some(Message::EditorCreateArtist)
+                        ),
+                    button(icons::icon::<Message>(Icon::Close, 12.0, MUTED))
+                        .style(ghost_style)
+                        .padding([6, 8])
+                        .on_press(Message::EditorToggleNewArtist),
+                ]
+                .spacing(6),
+            );
+        }
+        body = body.push(
+            text(format!(
+                "Physical owner: {owner_name} · additional credits remain independent."
+            ))
+            .size(9)
+            .color(MUTED),
+        );
+
+        let album_choices = self.editor_album_choices(editor);
+        let current_album = self.controller.track_album_id(editor.id);
+        let selected_album = editor
+            .move_destination
+            .as_ref()
+            .and_then(|choice| {
+                album_choices
+                    .iter()
+                    .find(|entry| entry.id == choice.id)
+                    .cloned()
+            })
+            .or_else(|| {
+                current_album.and_then(|album| {
+                    album_choices
+                        .iter()
+                        .find(|entry| entry.id == album)
+                        .cloned()
+                })
+            });
+        let pending_move = editor
+            .move_destination
+            .as_ref()
+            .is_some_and(|choice| Some(choice.id) != current_album);
+        body = body.push(
+            row![
+                text("ALBUM").size(8).color(MUTED),
+                iced::widget::Space::new().width(Length::Fill),
+                button(
+                    row![
+                        icons::icon::<Message>(Icon::Add, 11.0, MUTED),
+                        text("New Album").size(9).color(MUTED),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                )
+                .style(ghost_style)
+                .padding([3, 6])
+                .on_press(Message::EditorToggleNewAlbum),
+            ]
+            .align_y(Alignment::Center),
+        );
+        if let Some(album) = current_album.and_then(|album| self.controller.album(album)) {
+            body = body.push(
+                text(format!(
+                    "Current: {} · owner {}",
+                    album.title,
+                    self.artist_label(album.owner_artist_id)
+                ))
+                .size(9)
+                .color(MUTED),
             );
         } else {
             body = body.push(
                 text("Standalone track · not in an album")
-                    .size(10)
+                    .size(9)
                     .color(MUTED),
             );
         }
+        body = body.push(
+            pick_list(album_choices, selected_album, |choice| {
+                Message::EditorMoveDestination(Some(choice))
+            })
+            .placeholder("Choose an Album…")
+            .text_size(11)
+            .padding([7, 9])
+            .width(Length::Fill),
+        );
+        body = body.push(
+            text("Move targets are Albums owned by this Track's physical owner. Use Transfer ownership first to change that owner.")
+                .size(8)
+                .color(MUTED),
+        );
+        if editor.new_album_open {
+            body = body.push(
+                row![
+                    text_input("New Album title…", &editor.new_album)
+                        .on_input(Message::EditorNewAlbumChanged)
+                        .on_submit(Message::EditorCreateAlbum)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Create").size(10))
+                        .style(accent_button_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            (!editor.new_album.trim().is_empty())
+                                .then_some(Message::EditorCreateAlbum)
+                        ),
+                    button(icons::icon::<Message>(Icon::Close, 12.0, MUTED))
+                        .style(ghost_style)
+                        .padding([6, 8])
+                        .on_press(Message::EditorToggleNewAlbum),
+                ]
+                .spacing(6),
+            );
+        }
+        if pending_move || editor.move_plan.is_some() {
+            body = body.push(
+                row![
+                    text_input("Position", &editor.move_position)
+                        .on_input(Message::EditorMovePositionChanged)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Review move").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press(Message::EditorPlanMove),
+                    button(text("Confirm move").size(10))
+                        .style(accent_button_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            editor
+                                .move_plan
+                                .is_some()
+                                .then_some(Message::EditorConfirmMove)
+                        ),
+                ]
+                .spacing(6),
+            );
+            if let Some(plan) = &editor.move_plan {
+                body = body.push(
+                    text(format!(
+                        "Reviewed: {} → {} at position {} · {}",
+                        plan.from_album_title.as_deref().unwrap_or("Standalone"),
+                        plan.to_album_title.as_deref().unwrap_or("Standalone"),
+                        plan.insertion_index + 1,
+                        if plan.to_album_id.is_some() {
+                            "the source album is kept even if empty"
+                        } else {
+                            "the source album is kept; album artwork inheritance stops"
+                        }
+                    ))
+                    .size(9)
+                    .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+                );
+            }
+        } else if current_album.is_some() {
+            body = body.push(
+                button(text("Make standalone…").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::EditorPlanDetach),
+            );
+        }
 
-        body = body.push(text("ARTWORK").size(8).color(MUTED));
+        body = body.push(
+            row![
+                icons::icon::<Message>(Icon::Image, 11.0, MUTED),
+                text("ARTWORK").size(8).color(MUTED),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        );
         let artwork_status = if let Some(picked) = &editor.artwork_picked {
             format!(
                 "Selected: {} · not published yet",
@@ -12143,19 +12549,12 @@ impl FluxReady {
             .align_y(Alignment::Center),
         );
 
-        body = body.push(
-            button(
-                text(if self.track_editor_advanced_open {
-                    "▾ Hide Advanced Options"
-                } else {
-                    "▸ Advanced Options"
-                })
-                .size(10),
-            )
-            .style(ghost_style)
-            .padding([5, 8])
-            .on_press(Message::TrackEditorAdvancedToggled),
-        );
+        body = body.push(expand_button(
+            self.track_editor_advanced_open,
+            "Hide Advanced Options",
+            "Advanced Options",
+            Message::TrackEditorAdvancedToggled,
+        ));
 
         if self.track_editor_advanced_open {
             body = body.push(text("Advanced Options".to_owned()).size(9).color(ACCENT));
@@ -12209,15 +12608,15 @@ impl FluxReady {
                             TEXT
                         })
                         .width(Length::Fill),
-                        button(text("↑").size(10))
+                        button(icons::icon::<Message>(Icon::Up, 11.0, MUTED))
                             .style(ghost_style)
                             .padding([4, 6])
                             .on_press(Message::EditorCreditMove(credit_index, -1)),
-                        button(text("↓").size(10))
+                        button(icons::icon::<Message>(Icon::Down, 11.0, MUTED))
                             .style(ghost_style)
                             .padding([4, 6])
                             .on_press(Message::EditorCreditMove(credit_index, 1)),
-                        button(text("×").size(10))
+                        button(icons::icon::<Message>(Icon::Close, 11.0, MUTED))
                             .style(ghost_style)
                             .padding([4, 6])
                             .on_press_maybe(
@@ -12270,14 +12669,23 @@ impl FluxReady {
                 ]
                 .spacing(8),
             );
+            body = body.push(text("TRANSFER OWNERSHIP").size(8).color(MUTED));
             body = body.push(
-                button(text("Transfer ownership…").size(10))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press_maybe(
-                        matches!(self.controller.storage_mode(), StorageMode::Canonical)
-                            .then_some(Message::EditorTransferOwner),
-                    ),
+                row![
+                    text_input("Destination release title…", &editor.transfer_title)
+                        .on_input(Message::EditorTransferTitleChanged)
+                        .on_submit(Message::EditorTransferOwner)
+                        .style(input_style)
+                        .width(Length::Fill),
+                    button(text("Transfer ownership…").size(10))
+                        .style(ghost_style)
+                        .padding([6, 9])
+                        .on_press_maybe(
+                            matches!(self.controller.storage_mode(), StorageMode::Canonical)
+                                .then_some(Message::EditorTransferOwner),
+                        ),
+                ]
+                .spacing(8),
             );
 
             body = body.push(text("ARTWORK FILE").size(8).color(MUTED));
@@ -12353,83 +12761,6 @@ impl FluxReady {
                     .size(9)
                     .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
                 );
-            }
-
-            body = body.push(text("ALBUM MEMBERSHIP").size(8).color(MUTED));
-            body = body.push(
-                text("Save metadata changes before changing album membership.")
-                    .size(9)
-                    .color(MUTED),
-            );
-            if self.controller.track_album_id(editor.id).is_some() {
-                body = body.push(
-                    button(text("Convert to standalone track…").size(10))
-                        .style(ghost_style)
-                        .padding([6, 9])
-                        .on_press(Message::EditorPlanDetach),
-                );
-            }
-            let move_choices = self.editor_move_album_choices(editor.id);
-            let move_selected = editor.move_destination.as_ref().and_then(|choice| {
-                move_choices
-                    .iter()
-                    .find(|entry| entry.id == choice.id)
-                    .cloned()
-            });
-            if move_choices.is_empty() {
-                body = body.push(
-                    text("No other album owned by this track's artist is available.")
-                        .size(9)
-                        .color(MUTED),
-                );
-            } else {
-                body = body.push(
-                    pick_list(move_choices, move_selected, |choice| {
-                        Message::EditorMoveDestination(Some(choice))
-                    })
-                    .text_size(11)
-                    .padding([6, 8])
-                    .width(Length::Fill),
-                );
-                body = body.push(
-                    row![
-                        text_input("Position", &editor.move_position)
-                            .on_input(Message::EditorMovePositionChanged)
-                            .style(input_style)
-                            .width(Length::Fill),
-                        button(text("Review move").size(10))
-                            .style(ghost_style)
-                            .padding([6, 9])
-                            .on_press(Message::EditorPlanMove),
-                        button(text("Confirm move").size(10))
-                            .style(accent_button_style)
-                            .padding([6, 9])
-                            .on_press_maybe(
-                                editor
-                                    .move_plan
-                                    .is_some()
-                                    .then_some(Message::EditorConfirmMove)
-                            ),
-                    ]
-                    .spacing(8),
-                );
-                if let Some(plan) = &editor.move_plan {
-                    body = body.push(
-                        text(format!(
-                            "Reviewed: {} → {} at position {} · {}",
-                            plan.from_album_title.as_deref().unwrap_or("Standalone"),
-                            plan.to_album_title.as_deref().unwrap_or("Standalone"),
-                            plan.insertion_index + 1,
-                            if plan.to_album_id.is_some() {
-                                "the source album is kept even if empty"
-                            } else {
-                                "the source album is kept; album artwork inheritance stops"
-                            }
-                        ))
-                        .size(9)
-                        .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
-                    );
-                }
             }
 
             body = body.push(text("DELETE TRACK").size(8).color(DANGER));
@@ -12743,7 +13074,7 @@ impl FluxReady {
                 ]
                 .spacing(3)
                 .width(Length::Fill),
-                text("›").size(20).color(MUTED),
+                icons::icon::<Message>(Icon::Forward, 18.0, MUTED),
             ]
             .spacing(12)
             .align_y(Alignment::Center);
@@ -13154,7 +13485,15 @@ impl FluxReady {
         let mut header = row![
             button(
                 row![
-                    text(if self.filters_open { "⌃" } else { "⌄" }).size(10),
+                    icons::icon::<Message>(
+                        Icon::Filter,
+                        12.0,
+                        if self.filters_open || active_filters > 0 {
+                            ACCENT
+                        } else {
+                            MUTED
+                        },
+                    ),
                     text("Filters").size(10),
                     if active_filters > 0 {
                         text(active_filters.to_string()).size(8).color(BG)
@@ -13201,6 +13540,7 @@ impl FluxReady {
         if album_mode {
             header = header.push(text("Album order").size(9).color(MUTED));
         } else {
+            header = header.push(icons::icon::<Message>(Icon::Sort, 12.0, MUTED));
             header = header.push(
                 pick_list(
                     vec![
@@ -13224,10 +13564,18 @@ impl FluxReady {
                 .width(Length::Fixed(122.0)),
             );
             header = header.push(
-                button(text(if self.sort_descending { "↓" } else { "↑" }).size(10))
-                    .style(nav_style(self.sort_descending))
-                    .padding([4, 7])
-                    .on_press(Message::SortDirectionToggled),
+                button(icons::icon::<Message>(
+                    if self.sort_descending {
+                        Icon::Down
+                    } else {
+                        Icon::Up
+                    },
+                    13.0,
+                    if self.sort_descending { ACCENT } else { MUTED },
+                ))
+                .style(nav_style(self.sort_descending))
+                .padding([4, 7])
+                .on_press(Message::SortDirectionToggled),
             );
         }
 
@@ -13280,7 +13628,7 @@ impl FluxReady {
             bar = bar.push(filters.wrap());
         }
         container(bar)
-            .padding([5, 9])
+            .padding([2, 2])
             .width(Length::Fill)
             .style(control_bar_style)
             .into()
@@ -13294,6 +13642,7 @@ impl FluxReady {
             || self.playlist_create_open
             || self.lyrics_import.is_some()
             || self.queue_overlay_open
+            || self.lyrics_overlay_open
     }
 
     fn keyboard_track(&self) -> Option<TrackId> {
@@ -13333,17 +13682,7 @@ impl FluxReady {
     }
 
     fn cycle_view(&mut self, delta: isize) {
-        let destinations = [
-            LibraryView::Dashboard,
-            LibraryView::Tracks,
-            LibraryView::Artists,
-            LibraryView::Albums,
-            LibraryView::Folders,
-            LibraryView::Playlists,
-            LibraryView::Collections,
-            LibraryView::Lyrics,
-            LibraryView::Settings,
-        ];
+        let destinations = self.primary_destinations();
         let index = destinations
             .iter()
             .position(|view| *view == self.view)
@@ -13599,7 +13938,7 @@ impl FluxReady {
                         ]
                         .spacing(2)
                         .width(Length::Fill),
-                        text("›").size(20).color(MUTED),
+                        icons::icon::<Message>(Icon::Forward, 18.0, MUTED),
                     ]
                     .spacing(10)
                     .align_y(Alignment::Center),
@@ -13625,10 +13964,7 @@ impl FluxReady {
         let selected_count = self.playlist_entry_selection.len();
         let mut body = column![
             row![
-                button(text("‹ Back").size(11))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::PlaylistBack),
+                back_button("Back", Message::PlaylistBack),
                 column![
                     text(playlist.name.clone()).size(22).color(TEXT),
                     text(format!(
@@ -14384,7 +14720,7 @@ impl FluxReady {
             list = list.push(
                 button(
                     row![
-                        container(text("♪").size(16).color(ACCENT))
+                        container(icons::icon::<Message>(Icon::Lyrics, 16.0, ACCENT))
                             .width(38)
                             .height(38)
                             .center(38)
@@ -14432,7 +14768,7 @@ impl FluxReady {
                         } else {
                             MUTED
                         }),
-                        text("›").size(18).color(MUTED),
+                        icons::icon::<Message>(Icon::Forward, 16.0, MUTED),
                     ]
                     .spacing(9)
                     .align_y(Alignment::Center),
@@ -14479,10 +14815,7 @@ impl FluxReady {
         let album = self.controller.track_album_id(id);
         let owner = self.controller.track_artist_id(id);
         let mut header = row![
-            button(text("‹ Back").size(11))
-                .style(ghost_style)
-                .padding([6, 9])
-                .on_press(Message::LyricsBack),
+            back_button("Back", Message::LyricsBack),
             column![
                 text(track.title().to_owned()).size(22).color(TEXT),
                 text(format!(
@@ -14668,12 +15001,26 @@ impl FluxReady {
                     ]
                     .spacing(6),
                     row![
-                        button(text("Save .lrc…").size(10))
-                            .style(ghost_style)
+                        button(
+                            row![
+                                icons::icon::<Message>(Icon::Download, 12.0, MUTED),
+                                text("Save .lrc…").size(10).color(MUTED),
+                            ]
+                            .spacing(5)
+                            .align_y(Alignment::Center),
+                        )
+                        .style(ghost_style)
                             .padding([6, 8])
                             .on_press_maybe(document.is_some().then_some(Message::LyricsExportSave("lrc".to_owned()))),
-                        button(text("Save .txt…").size(10))
-                            .style(ghost_style)
+                        button(
+                            row![
+                                icons::icon::<Message>(Icon::Download, 12.0, MUTED),
+                                text("Save .txt…").size(10).color(MUTED),
+                            ]
+                            .spacing(5)
+                            .align_y(Alignment::Center),
+                        )
+                        .style(ghost_style)
                             .padding([6, 8])
                             .on_press_maybe(document.is_some().then_some(Message::LyricsExportSave("txt".to_owned()))),
                         text("Uses the native save dialog when available; the typed path above remains the fallback.")
@@ -14709,10 +15056,7 @@ impl FluxReady {
         let current_playback = self.controller.current_id() == Some(editor.track_id);
         let mut body = column![
             row![
-                button(text("‹ Cancel").size(10))
-                    .style(ghost_style)
-                    .padding([6, 8])
-                    .on_press(Message::LyricsEditorCancel),
+                back_button("Cancel", Message::LyricsEditorCancel),
                 column![
                     text(format!("Edit lyrics · {track_title}")).size(20).color(TEXT),
                     text(if editor.dirty { "Unsaved changes" } else { "No unsaved changes" })
@@ -14739,7 +15083,7 @@ impl FluxReady {
             ]
             .spacing(7)
             .align_y(Alignment::Center),
-            text("Edit text and timestamps. Leave a timestamp empty for an untimed line. Timestamps use mm:ss.xxx and must be non-decreasing in line order.")
+            text("Edit one line per row. Leave the timestamp empty for an untimed line. Existing timestamps are preserved unless you change them; synchronized values use mm:ss.xxx and must be non-decreasing.")
                 .size(9)
                 .color(MUTED),
         ]
@@ -14747,61 +15091,61 @@ impl FluxReady {
         if let Some(error) = &editor.error {
             body = body.push(text(error).size(10).color(DANGER));
         }
-        let mut rows = column![].spacing(3);
+        let mut rows = column![].spacing(6);
         for (index, line) in editor.lines.iter().enumerate() {
-            let mut actions = row![
+            let main = row![
                 text(format!("{}", index + 1))
                     .size(9)
                     .color(MUTED)
-                    .width(Length::Fixed(24.0)),
+                    .width(Length::Fixed(22.0)),
                 text_input("Lyric line…", &line.text)
                     .on_input(move |value| Message::LyricsEditorTextChanged(index, value))
                     .style(input_style)
-                    .width(Length::FillPortion(5)),
+                    .width(Length::Fill),
                 text_input("mm:ss.xxx", &line.timestamp)
                     .on_input(move |value| Message::LyricsEditorTimestampChanged(index, value))
                     .style(input_style)
-                    .width(Length::Fixed(112.0)),
-            ]
-            .spacing(5)
-            .align_y(Alignment::Center);
-            actions = actions.push(
-                button(text("Now").size(9))
+                    .width(Length::Fixed(104.0)),
+                button(text("Use playback time").size(9))
                     .style(ghost_style)
-                    .padding([4, 6])
+                    .padding([5, 7])
                     .on_press_maybe(
                         current_playback.then_some(Message::LyricsEditorSetCurrentTime(index)),
                     ),
-            );
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            let mut tools = row![].spacing(4).align_y(Alignment::Center);
             for (label, delta) in [
-                ("-1s", -1000i64),
-                ("-100", -100),
+                ("−1 s", -1000i64),
+                ("−100", -100),
                 ("+100", 100),
-                ("+1s", 1000),
+                ("+1 s", 1000),
             ] {
-                actions = actions.push(
+                tools = tools.push(
                     button(text(label).size(8))
                         .style(ghost_style)
-                        .padding([4, 5])
+                        .padding([4, 6])
                         .on_press(Message::LyricsEditorNudge(index, delta)),
                 );
             }
-            actions = actions.push(
-                button(text("Clear").size(8))
+            tools = tools.push(
+                button(text("Clear time").size(8))
                     .style(ghost_style)
-                    .padding([4, 5])
+                    .padding([4, 6])
                     .on_press(Message::LyricsEditorClearTimestamp(index)),
             );
-            actions = actions.push(
-                button(text("↑").size(9))
+            tools = tools.push(iced::widget::Space::new().width(Length::Fill));
+            tools = tools.push(
+                button(icons::icon::<Message>(Icon::Up, 10.0, MUTED))
                     .style(ghost_style)
                     .padding([4, 5])
                     .on_press_maybe(
                         (index > 0).then_some(Message::LyricsEditorMoveLine(index, -1)),
                     ),
             );
-            actions = actions.push(
-                button(text("↓").size(9))
+            tools = tools.push(
+                button(icons::icon::<Message>(Icon::Down, 10.0, MUTED))
                     .style(ghost_style)
                     .padding([4, 5])
                     .on_press_maybe(
@@ -14809,13 +15153,26 @@ impl FluxReady {
                             .then_some(Message::LyricsEditorMoveLine(index, 1)),
                     ),
             );
-            actions = actions.push(
-                button(text("×").size(9))
+            tools = tools.push(
+                button(icons::icon::<Message>(Icon::Remove, 10.0, DANGER))
                     .style(danger_button_style)
                     .padding([4, 5])
                     .on_press(Message::LyricsEditorRemoveLine(index)),
             );
-            rows = rows.push(actions);
+            rows = rows.push(
+                container(column![main, tools].spacing(4))
+                    .padding([5, 7])
+                    .width(Length::Fill)
+                    .style(|_theme| {
+                        container::Style::default()
+                            .background(Color::from_rgba8(0x18, 0x15, 0x1e, 0.45))
+                            .border(Border {
+                                color: BORDER,
+                                width: 1.0,
+                                radius: 8.0.into(),
+                            })
+                    }),
+            );
         }
         body = body.push(scrollable(rows).height(Length::Fill));
         body = body.push(
@@ -14857,10 +15214,7 @@ impl FluxReady {
         };
         let mut body = column![
             row![
-                button(text("‹ Back").size(11))
-                    .style(ghost_style)
-                    .padding([6, 9])
-                    .on_press(Message::LyricsModeChanged(LyricsMode::Read)),
+                back_button("Back", Message::LyricsModeChanged(LyricsMode::Read)),
                 column![
                     text(track.title().to_owned()).size(20).color(TEXT),
                     text(format!(
@@ -15777,7 +16131,7 @@ impl FluxReady {
             list = list.push(
                 button(
                     row![
-                        fallback_artwork(Some(collection.label()), 38.0),
+                        icon_tile(smart_collection_icon(collection), 38.0, SURFACE_HI, ACCENT),
                         column![
                             text(collection.label()).size(14).color(TEXT),
                             text(subtitle).size(9).color(MUTED),
@@ -15785,7 +16139,7 @@ impl FluxReady {
                         .spacing(2)
                         .width(Length::Fill),
                         text(format!("{}", ids.len())).size(12).color(ACCENT),
-                        text("›").size(18).color(MUTED),
+                        icons::icon::<Message>(Icon::Forward, 16.0, MUTED),
                     ]
                     .spacing(9)
                     .align_y(Alignment::Center),
@@ -15807,11 +16161,19 @@ impl FluxReady {
                 .color(MUTED)
                 .into();
         };
-        let mut album_ids = self.controller.albums_owned_by(artist_id);
-        album_ids.extend(self.controller.albums_participating_for(artist_id));
-        album_ids.extend(self.controller.albums_credited_for(artist_id));
-        album_ids.sort_by_key(|id| id.get());
-        album_ids.dedup();
+        let owned = self.controller.albums_owned_by(artist_id);
+        let participating = self
+            .controller
+            .albums_participating_for(artist_id)
+            .into_iter()
+            .filter(|album| !owned.contains(album))
+            .collect::<Vec<_>>();
+        let credited = self
+            .controller
+            .albums_credited_for(artist_id)
+            .into_iter()
+            .filter(|album| !owned.contains(album) && !participating.contains(album))
+            .collect::<Vec<_>>();
         let tracks = self
             .controller
             .tracks()
@@ -15822,215 +16184,221 @@ impl FluxReady {
             })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
+        let description = self
+            .controller
+            .artist_description(artist_id)
+            .filter(|description| !description.is_empty());
+        let aliases = self.controller.artist_aliases(artist_id);
 
+        let mut header = column![
+            text(artist.name().to_owned())
+                .size(FONT_SECTION)
+                .color(TEXT),
+            text(format!(
+                "{} · {} · {}",
+                pluralize(owned.len() + participating.len() + credited.len(), "album"),
+                pluralize(tracks.len(), "track"),
+                if self.controller.artist_image_path(artist_id).is_some() {
+                    "managed portrait"
+                } else {
+                    "no portrait"
+                }
+            ))
+            .size(FONT_META)
+            .color(MUTED),
+        ]
+        .spacing(3)
+        .width(Length::Fill);
+        if let Some(description) = description {
+            header = header.push(text(description.to_owned()).size(FONT_BODY).color(MUTED));
+        }
+        if !aliases.is_empty() {
+            header = header.push(
+                text(format!("Also known as: {}", aliases.join(", ")))
+                    .size(FONT_META)
+                    .color(MUTED),
+            );
+        }
         let mut body = column![
             container(
                 row![
-                self.artist_artwork(artist_id, 128.0),
-                column![
-                    text(artist.name().to_owned()).size(FONT_SECTION).color(TEXT),
-                    text(format!(
-                        "ArtistId {} · {} · {} · image {}",
-                        artist.id(),
-                        pluralize(album_ids.len(), "album"),
-                        pluralize(tracks.len(), "track"),
-                        if self.controller.artist_image_path(artist_id).is_some() {
-                            "managed"
-                        } else {
-                            "none"
-                        }
-                    ))
-                    .size(FONT_META)
-                    .color(MUTED),
-                    text(
-                        self.controller
-                            .artist_description(artist_id)
-                            .filter(|description| !description.is_empty())
-                            .unwrap_or("No description yet.")
+                    self.artist_artwork(artist_id, 132.0),
+                    header,
+                    button(
+                        row![
+                            icons::icon::<Message>(Icon::Edit, 13.0, MUTED),
+                            text(if self.artist_edit_open {
+                                "Close editor"
+                            } else {
+                                "Edit details"
+                            })
+                            .size(FONT_LABEL)
+                            .color(MUTED),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
                     )
-                    .size(FONT_META)
-                    .color(MUTED),
-                    text(if self.controller.artist_aliases(artist_id).is_empty() {
-                        "No aliases.".to_owned()
-                    } else {
-                        format!(
-                            "Also known as: {}",
-                            self.controller.artist_aliases(artist_id).join(", ")
-                        )
-                    })
-                    .size(FONT_META)
-                    .color(MUTED),
+                    .style(ghost_style)
+                    .padding([7, 10])
+                    .on_press(Message::ArtistEditToggle),
                 ]
-                .spacing(4)
-                .width(Length::Fill),
-            ]
-            .spacing(GAP_MD)
-            .align_y(Alignment::Center),
+                .spacing(GAP_MD)
+                .align_y(Alignment::Center),
             )
             .padding(GAP_LG)
             .style(card_style),
-            container(
-                column![
-                    text("ARTIST METADATA").size(FONT_LABEL).color(ACCENT),
-                    text_input("Artist display name…", &self.artist_detail_name_input)
-                        .on_input(Message::ArtistDetailNameChanged)
-                        .on_submit(Message::ArtistMetadataSave)
-                        .style(input_style)
-                        .width(Length::Fill),
-                    text_input("Description (optional)…", &self.artist_description_input)
-                        .on_input(Message::ArtistDescriptionChanged)
-                        .on_submit(Message::ArtistMetadataSave)
-                        .style(input_style)
-                        .width(Length::Fill),
-                    text_input(
-                        "Aliases, separated by ; (optional)…",
-                        &self.artist_aliases_input,
-                    )
-                    .on_input(Message::ArtistAliasesChanged)
-                    .on_submit(Message::ArtistMetadataSave)
-                    .style(input_style)
-                    .width(Length::Fill),
-                    button(text("Save artist metadata").size(10))
-                        .style(accent_button_style)
-                        .padding([6, 9])
-                        .on_press(Message::ArtistMetadataSave),
-                    button(text("Revert unsaved edits").size(10))
-                        .style(ghost_style)
-                        .padding([6, 9])
-                        .on_press_maybe(
-                            self.artist_form_dirty
-                                .then_some(Message::ArtistMetadataRevert),
-                        ),
-                ]
-                .spacing(6),
-            )
-            .padding(10)
-            .style(card_style),
-            container(
-                column![
-                    text("ARTIST IMAGE").size(9).color(ACCENT),
-                    text("Managed PNG/JPEG/WebP image. It is validated before publication.")
-                        .size(9)
-                        .color(MUTED),
-                    row![
-                        text_input("Artist image path…", &self.artist_image_input)
-                            .on_input(Message::ArtistImageChanged)
-                            .on_submit(Message::ArtistImageApply)
+        ];
+        if self.artist_edit_open {
+            body = body.push(
+                container(
+                    column![
+                        text("ARTIST DETAILS").size(FONT_LABEL).color(ACCENT),
+                        text_input("Artist display name…", &self.artist_detail_name_input)
+                            .on_input(Message::ArtistDetailNameChanged)
+                            .on_submit(Message::ArtistMetadataSave)
                             .style(input_style)
                             .width(Length::Fill),
-                        button(text("Choose image…").size(10))
-                            .style(accent_button_style)
-                            .padding([6, 9])
-                            .on_press(Message::ArtistImageChoose),
-                        button(text("Preview").size(10))
-                            .style(ghost_style)
-                            .padding([6, 9])
-                            .on_press(Message::ArtistImagePreview),
-                        button(text("Assign / replace").size(10))
-                            .style(ghost_style)
-                            .padding([6, 9])
-                            .on_press(Message::ArtistImageApply),
-                        button(
-                            text(if self.artist_image_remove_confirm {
-                                "Confirm remove image"
-                            } else {
-                                "Remove image"
-                            })
-                            .size(10),
+                        text_input("Description (optional)…", &self.artist_description_input)
+                            .on_input(Message::ArtistDescriptionChanged)
+                            .on_submit(Message::ArtistMetadataSave)
+                            .style(input_style)
+                            .width(Length::Fill),
+                        text_input(
+                            "Aliases, separated by ; (optional)…",
+                            &self.artist_aliases_input,
                         )
-                        .style(danger_button_style)
-                        .padding([6, 9])
-                        .on_press_maybe(
-                            self.controller
-                                .artist_image_path(artist_id)
-                                .is_some()
-                                .then_some(Message::ArtistImageRemove),
-                        ),
+                        .on_input(Message::ArtistAliasesChanged)
+                        .on_submit(Message::ArtistMetadataSave)
+                        .style(input_style)
+                        .width(Length::Fill),
+                        row![
+                            button(text("Save artist details").size(10))
+                                .style(accent_button_style)
+                                .padding([6, 9])
+                                .on_press(Message::ArtistMetadataSave),
+                            button(text("Revert unsaved edits").size(10))
+                                .style(ghost_style)
+                                .padding([6, 9])
+                                .on_press_maybe(
+                                    self.artist_form_dirty
+                                        .then_some(Message::ArtistMetadataRevert),
+                                ),
+                        ]
+                        .spacing(6),
                     ]
                     .spacing(6),
-                    if let Some(handle) = &self.artist_image_preview {
-                        Element::from(
-                            row![
-                                artwork_image(handle, 56.0, ContentFit::Cover),
-                                text("Selected Artist image preview — Assign publishes it; nothing changed yet.")
+                )
+                .padding(10)
+                .style(card_style),
+            );
+            body = body.push(
+                container(
+                    column![
+                        text("ARTIST IMAGE").size(FONT_LABEL).color(ACCENT),
+                        text("Managed PNG/JPEG/WebP image. It is validated before publication.")
+                            .size(9)
+                            .color(MUTED),
+                        row![
+                            text_input("Artist image path…", &self.artist_image_input)
+                                .on_input(Message::ArtistImageChanged)
+                                .on_submit(Message::ArtistImageApply)
+                                .style(input_style)
+                                .width(Length::Fill),
+                            button(text("Choose image…").size(10))
+                                .style(accent_button_style)
+                                .padding([6, 9])
+                                .on_press(Message::ArtistImageChoose),
+                            button(text("Preview").size(10))
+                                .style(ghost_style)
+                                .padding([6, 9])
+                                .on_press(Message::ArtistImagePreview),
+                            button(text("Assign / replace").size(10))
+                                .style(ghost_style)
+                                .padding([6, 9])
+                                .on_press(Message::ArtistImageApply),
+                            button(
+                                text(if self.artist_image_remove_confirm {
+                                    "Confirm remove image"
+                                } else {
+                                    "Remove image"
+                                })
+                                .size(10),
+                            )
+                            .style(danger_button_style)
+                            .padding([6, 9])
+                            .on_press_maybe(
+                                self.controller
+                                    .artist_image_path(artist_id)
+                                    .is_some()
+                                    .then_some(Message::ArtistImageRemove),
+                            ),
+                        ]
+                        .spacing(6),
+                        if let Some(handle) = &self.artist_image_preview {
+                            Element::from(
+                                row![
+                                    artwork_image(handle, 56.0, ContentFit::Cover),
+                                    text("Selected Artist image preview — Assign publishes it; nothing changed yet.")
+                                        .size(9)
+                                        .color(MUTED),
+                                ]
+                                .spacing(8)
+                                .align_y(Alignment::Center),
+                            )
+                        } else {
+                            Element::from(iced::widget::Space::new().height(0))
+                        },
+                        if let Some(reason) = self.artist_image_resource_state_label(artist_id) {
+                            Element::from(text(reason).size(9).color(DANGER))
+                        } else {
+                            Element::from(
+                                text("No managed image yet. Choosing an image replaces the generated fallback.")
                                     .size(9)
                                     .color(MUTED),
-                            ]
-                            .spacing(8)
-                            .align_y(Alignment::Center),
-                        )
-                    } else {
-                        Element::from(iced::widget::Space::new().height(0))
-                    },
-                    if let Some(reason) = self.artist_image_resource_state_label(artist_id) {
-                        Element::from(text(reason).size(9).color(DANGER))
-                    } else {
-                        Element::from(
-                            text("No managed image yet. Choosing an image replaces the generated fallback.")
-                                .size(9)
-                                .color(MUTED),
-                        )
-                    },
-                ]
-                .spacing(6),
-            )
-            .padding(10)
-            .style(card_style),
-        ];
-        body = body.push(text("ALBUMS").size(9).color(ACCENT));
-        if album_ids.is_empty() {
+                            )
+                        },
+                    ]
+                    .spacing(6),
+                )
+                .padding(10)
+                .style(card_style),
+            );
+        }
+
+        body = body.push(section_heading("DISCOGRAPHY"));
+        let columns = self.discography_columns();
+        if owned.is_empty() {
             body = body.push(
-                text("No albums associated with this artist yet.")
+                text("No Albums are owned by this Artist yet.")
                     .size(11)
                     .color(MUTED),
             );
         } else {
-            for album_id in album_ids {
-                let Some(album) = self.controller.album(album_id) else {
-                    continue;
-                };
-                body = body.push(
-                    button(
-                        row![
-                            self.album_artwork(Some(album_id), 34.0, ContentFit::Cover),
-                            column![
-                                text(album.title.clone()).size(12).color(TEXT),
-                                text(format!(
-                                    "{} · {} track(s) · {}",
-                                    release_type_label(album.release_type),
-                                    album.track_order.len(),
-                                    if album.owner_artist_id == artist_id {
-                                        "physical owner".to_owned()
-                                    } else if album.participant_artist_ids.contains(&artist_id) {
-                                        format!(
-                                            "participating · owner {}",
-                                            self.controller
-                                                .artist(album.owner_artist_id)
-                                                .map(|owner| owner.name().to_owned())
-                                                .unwrap_or_else(|| "unknown".to_owned())
-                                        )
-                                    } else {
-                                        "track credits only".to_owned()
-                                    }
-                                ))
-                                .size(9)
-                                .color(MUTED),
-                            ]
-                            .spacing(1)
-                            .width(Length::Fill),
-                            text("›").size(18).color(MUTED),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                    )
-                    .width(Length::Fill)
-                    .padding(7)
-                    .style(group_style)
-                    .on_press(Message::OpenAlbum(album_id)),
-                );
+            for chunk in owned.chunks(columns) {
+                let mut grid = row![].spacing(10);
+                for album_id in chunk {
+                    grid = grid.push(self.discography_card(*album_id, artist_id));
+                }
+                for _ in chunk.len()..columns {
+                    grid = grid.push(iced::widget::Space::new().width(Length::FillPortion(1)));
+                }
+                body = body.push(grid);
             }
         }
-        body = body.push(text("TRACKS").size(9).color(ACCENT));
+        if !participating.is_empty() {
+            body = body.push(section_heading("PARTICIPATING ALBUMS"));
+            for album_id in participating {
+                body = body.push(self.album_relation_row(album_id, "participating"));
+            }
+        }
+        if !credited.is_empty() {
+            body = body.push(section_heading("APPEARANCES"));
+            for album_id in credited {
+                body = body.push(self.album_relation_row(album_id, "credited"));
+            }
+        }
+
+        body = body.push(section_heading("TRACKS"));
         if tracks.is_empty() {
             body = body.push(
                 text("No tracks associated with this artist yet.")
@@ -16068,9 +16436,9 @@ impl FluxReady {
                             .style(ghost_style)
                             .padding([5, 8])
                             .on_press(Message::PlayTrack(track_id)),
-                        button(text("Edit").size(9))
+                        button(icons::icon::<Message>(Icon::Edit, 11.0, MUTED))
                             .style(ghost_style)
-                            .padding([5, 8])
+                            .padding([5, 7])
                             .on_press(Message::EditTrack(track_id)),
                     ]
                     .spacing(8)
@@ -16101,6 +16469,89 @@ impl FluxReady {
             .into()
     }
 
+    fn discography_columns(&self) -> usize {
+        let available = self.window_width - self.sidebar_width() - 80.0;
+        if available >= 1_050.0 {
+            5
+        } else if available >= 840.0 {
+            4
+        } else if available >= 620.0 {
+            3
+        } else {
+            2
+        }
+    }
+
+    fn discography_card(&self, album_id: AlbumId, artist_id: ArtistId) -> Element<'_, Message> {
+        let Some(album) = self.controller.album(album_id) else {
+            return iced::widget::Space::new().width(0).into();
+        };
+        let relation = if album.owner_artist_id == artist_id {
+            release_type_label(album.release_type).to_owned()
+        } else {
+            format!("with {}", self.artist_label(album.owner_artist_id))
+        };
+        button(
+            column![
+                container(self.album_artwork(Some(album_id), 124.0, ContentFit::Cover))
+                    .width(Length::Fill)
+                    .center_x(Length::Fill),
+                text(truncate_label(&album.title, 26))
+                    .size(FONT_TITLE)
+                    .color(TEXT),
+                text(format!(
+                    "{} · {}",
+                    relation,
+                    pluralize(album.track_order.len(), "track")
+                ))
+                .size(FONT_LABEL)
+                .color(MUTED),
+            ]
+            .spacing(5)
+            .width(Length::Fill)
+            .padding(8),
+        )
+        .width(Length::FillPortion(1))
+        .style(group_style)
+        .on_press(Message::OpenAlbum(album_id))
+        .into()
+    }
+
+    fn album_relation_row(
+        &self,
+        album_id: AlbumId,
+        relation: &'static str,
+    ) -> Element<'_, Message> {
+        let Some(album) = self.controller.album(album_id) else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        button(
+            row![
+                self.album_artwork(Some(album_id), 38.0, ContentFit::Cover),
+                column![
+                    text(album.title.clone()).size(12).color(TEXT),
+                    text(format!(
+                        "{relation} · owner {} · {}",
+                        self.artist_label(album.owner_artist_id),
+                        pluralize(album.track_order.len(), "track")
+                    ))
+                    .size(9)
+                    .color(MUTED),
+                ]
+                .spacing(1)
+                .width(Length::Fill),
+                icons::icon::<Message>(Icon::Forward, 16.0, MUTED),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(7)
+        .style(group_style)
+        .on_press(Message::OpenAlbum(album_id))
+        .into()
+    }
+
     fn album_detail_view(&self, album_id: AlbumId) -> Element<'_, Message> {
         let Some(album) = self.controller.album(album_id) else {
             return text("Album is no longer in the library.")
@@ -16108,50 +16559,90 @@ impl FluxReady {
                 .color(MUTED)
                 .into();
         };
-        let owner = self
-            .controller
-            .artist(album.owner_artist_id)
-            .map(|artist| artist.name().to_owned())
-            .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+        let owner = self.artist_label(album.owner_artist_id);
         let mut body = column![
             container(
-                row![
-                    self.album_artwork(Some(album_id), 128.0, ContentFit::Contain),
-                    column![
-                        text(album.title.clone()).size(FONT_SECTION).color(TEXT),
-                        text(format!(
-                            "AlbumId {} · owner {} · {} · {} · {} · cover {}",
-                            album.id,
-                            owner,
-                            pluralize(album.participant_artist_ids.len(), "participant"),
-                            release_type_label(album.release_type),
-                            pluralize(album.track_order.len(), "track"),
-                            if album.cover.is_some() {
-                                "managed"
-                            } else {
-                                "none"
-                            }
-                        ))
-                        .size(FONT_META)
-                        .color(MUTED),
+                column![
+                    row![
+                        self.album_artwork(Some(album_id), 128.0, ContentFit::Contain),
+                        column![
+                            text(album.title.clone()).size(FONT_SECTION).color(TEXT),
+                            text(format!(
+                                "AlbumId {} · owner {} · {} · {} · {} · cover {}",
+                                album.id,
+                                owner,
+                                pluralize(album.participant_artist_ids.len(), "participant"),
+                                release_type_label(album.release_type),
+                                pluralize(album.track_order.len(), "track"),
+                                if album.cover.is_some() {
+                                    "managed"
+                                } else {
+                                    "none"
+                                }
+                            ))
+                            .size(FONT_META)
+                            .color(MUTED),
+                        ]
+                        .spacing(4)
+                        .width(Length::Fill),
                     ]
-                    .spacing(4)
-                    .width(Length::Fill),
-                    button(text("Open owner").size(FONT_LABEL))
-                        .style(ghost_style)
-                        .padding([7, 10])
-                        .on_press(Message::OpenArtist(album.owner_artist_id)),
-                    button(text("Add tracks…").size(FONT_LABEL))
-                        .style(accent_button_style)
-                        .padding([7, 10])
-                        .on_press(Message::AlbumAddTracks),
-                    button(text("Transfer album…").size(FONT_LABEL))
-                        .style(ghost_style)
-                        .padding([7, 10])
-                        .on_press(Message::AlbumTransferOpen),
+                    .spacing(GAP_MD)
+                    .align_y(Alignment::Center),
+                    row![
+                            button(
+                                row![
+                                    icons::icon::<Message>(Icon::Play, 12.0, BG),
+                                    text("Play album").size(FONT_LABEL).color(BG),
+                                ]
+                                .spacing(5)
+                                .align_y(Alignment::Center),
+                            )
+                            .style(accent_button_style)
+                            .padding([7, 10])
+                            .on_press_maybe(
+                                album.track_order.first().copied().map(Message::PlayTrack),
+                            ),
+                            button(
+                                row![
+                                    icons::icon::<Message>(Icon::Edit, 13.0, MUTED),
+                                    text(if self.album_edit_open {
+                                        "Close editor"
+                                    } else {
+                                        "Edit details"
+                                    })
+                                    .size(FONT_LABEL)
+                                    .color(MUTED),
+                                ]
+                                .spacing(5)
+                                .align_y(Alignment::Center),
+                            )
+                            .style(ghost_style)
+                            .padding([7, 10])
+                            .on_press(Message::AlbumEditToggle),
+                            button(
+                                row![
+                                    icons::icon::<Message>(Icon::External, 12.0, MUTED),
+                                    text("Open owner").size(FONT_LABEL).color(MUTED),
+                                ]
+                                .spacing(5)
+                                .align_y(Alignment::Center),
+                            )
+                            .style(ghost_style)
+                            .padding([7, 10])
+                            .on_press(Message::OpenArtist(album.owner_artist_id)),
+                            button(text("Add tracks…").size(FONT_LABEL))
+                                .style(accent_button_style)
+                                .padding([7, 10])
+                                .on_press(Message::AlbumAddTracks),
+                            button(text("Transfer album…").size(FONT_LABEL))
+                                .style(ghost_style)
+                                .padding([7, 10])
+                                .on_press(Message::AlbumTransferOpen),
+                        ]
+                    .spacing(6)
+                    .wrap(),
                 ]
-                .spacing(GAP_MD)
-                .align_y(Alignment::Center),
+                .spacing(10),
             )
             .padding(GAP_LG)
             .style(card_style),
@@ -16171,94 +16662,95 @@ impl FluxReady {
         {
             body = body.push(text("Loading artwork…").size(9).color(MUTED));
         }
-        body = body.push(
-            container(
-                column![
-                    text("METADATA").size(FONT_LABEL).color(ACCENT),
-                    row![
-                        text_input("Album title…", &self.album_title_input)
-                            .on_input(Message::AlbumTitleChanged)
-                            .on_submit(Message::AlbumMetadataSave)
-                            .style(input_style)
-                            .width(Length::Fill),
-                        button(text("Save metadata").size(10))
-                            .style(accent_button_style)
-                            .padding([6, 9])
-                            .on_press(Message::AlbumMetadataSave),
+        if self.album_edit_open {
+            body = body.push(
+                container(
+                    column![
+                        text("METADATA").size(FONT_LABEL).color(ACCENT),
+                        row![
+                            text_input("Album title…", &self.album_title_input)
+                                .on_input(Message::AlbumTitleChanged)
+                                .on_submit(Message::AlbumMetadataSave)
+                                .style(input_style)
+                                .width(Length::Fill),
+                            button(text("Save metadata").size(10))
+                                .style(accent_button_style)
+                                .padding([6, 9])
+                                .on_press(Message::AlbumMetadataSave),
+                        ]
+                        .spacing(6),
+                        row![
+                            text("RELEASE TYPE").size(8).color(MUTED),
+                            release_type_buttons(self.album_type, Message::AlbumType),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
                     ]
                     .spacing(6),
-                    row![
-                        text("RELEASE TYPE").size(8).color(MUTED),
-                        release_type_buttons(self.album_type, Message::AlbumType),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                ]
-                .spacing(6),
-            )
-            .padding(10)
-            .style(card_style),
-        );
-        let mut participant_rows = column![].spacing(2);
-        if self.album_participants.is_empty() {
-            participant_rows = participant_rows.push(
+                )
+                .padding(10)
+                .style(card_style),
+            );
+            let mut participant_rows = column![].spacing(2);
+            if self.album_participants.is_empty() {
+                participant_rows = participant_rows.push(
                 text(
                     "No Artists are associated with this Album. The Album remains a valid entity.",
                 )
                 .size(10)
                 .color(MUTED),
             );
-        } else {
-            for participant in &self.album_participants {
-                let name = self.artist_label(*participant);
-                participant_rows = participant_rows.push(
-                    row![
-                        button(text(name).size(10))
-                            .style(ghost_style)
-                            .padding([4, 7])
-                            .on_press(Message::OpenArtist(*participant)),
-                        if *participant == album.owner_artist_id {
-                            text("physical owner").size(8).color(MUTED)
-                        } else {
-                            text("").size(8)
-                        },
-                        iced::widget::Space::new().width(Length::Fill),
-                        button(
-                            text(
+            } else {
+                for participant in &self.album_participants {
+                    let name = self.artist_label(*participant);
+                    participant_rows = participant_rows.push(
+                        row![
+                            button(text(name).size(10))
+                                .style(ghost_style)
+                                .padding([4, 7])
+                                .on_press(Message::OpenArtist(*participant)),
+                            if *participant == album.owner_artist_id {
+                                text("physical owner").size(8).color(MUTED)
+                            } else {
+                                text("").size(8)
+                            },
+                            iced::widget::Space::new().width(Length::Fill),
+                            button(
+                                text(
+                                    if self.album_participant_remove_confirm == Some(*participant) {
+                                        "Confirm remove"
+                                    } else {
+                                        "Remove"
+                                    }
+                                )
+                                .size(9),
+                            )
+                            .style(
                                 if self.album_participant_remove_confirm == Some(*participant) {
-                                    "Confirm remove"
+                                    danger_button_style
                                 } else {
-                                    "Remove"
+                                    ghost_style
                                 }
                             )
-                            .size(9),
-                        )
-                        .style(
-                            if self.album_participant_remove_confirm == Some(*participant) {
-                                danger_button_style
-                            } else {
-                                ghost_style
-                            }
-                        )
-                        .padding([3, 6])
-                        .on_press(Message::AlbumParticipantRemove(*participant)),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                );
+                            .padding([3, 6])
+                            .on_press(Message::AlbumParticipantRemove(*participant)),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    );
+                }
             }
-        }
-        let participant_choices = self.album_participant_choices();
-        let participant_picker = pick_list(
-            participant_choices,
-            self.album_participant_choice.clone(),
-            |choice| Message::AlbumParticipantPicked(Some(choice)),
-        )
-        .placeholder("Choose an existing Artist…")
-        .text_size(10)
-        .padding([5, 7])
-        .width(Length::Fill);
-        body = body.push(
+            let participant_choices = self.album_participant_choices();
+            let participant_picker = pick_list(
+                participant_choices,
+                self.album_participant_choice.clone(),
+                |choice| Message::AlbumParticipantPicked(Some(choice)),
+            )
+            .placeholder("Choose an existing Artist…")
+            .text_size(10)
+            .padding([5, 7])
+            .width(Length::Fill);
+            body = body.push(
             container(
                 column![
                     text("ALBUM PARTICIPANTS").size(FONT_LABEL).color(ACCENT),
@@ -16288,7 +16780,7 @@ impl FluxReady {
             .padding(10)
             .style(card_style),
         );
-        body = body.push(
+            body = body.push(
             container(
                 column![
                     text("COVER ARTWORK").size(FONT_LABEL).color(ACCENT),
@@ -16346,6 +16838,53 @@ impl FluxReady {
             .padding(10)
             .style(card_style),
         );
+        }
+        if !self.album_edit_open {
+            let participants = if album.participant_artist_ids.is_empty() {
+                vec![album.owner_artist_id]
+            } else {
+                album.participant_artist_ids.clone()
+            };
+            let mut chip_elements: Vec<Element<'_, Message>> = Vec::new();
+            for participant in participants {
+                let name = self.artist_label(participant);
+                chip_elements.push(
+                    button(
+                        row![
+                            text(name).size(10).color(TEXT),
+                            if participant == album.owner_artist_id {
+                                Element::from(text("owner").size(8).color(MUTED))
+                            } else {
+                                Element::from(text("participant").size(8).color(MUTED))
+                            },
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::OpenArtist(participant))
+                    .into(),
+                );
+            }
+            let chips = row(chip_elements).spacing(6).wrap();
+            let chips: Element<'_, Message> = chips.into();
+            body = body.push(
+                container(
+                    column![
+                        text("PARTICIPANTS").size(FONT_LABEL).color(ACCENT),
+                        text("Album participation is independent of Track credits. Use Edit details to add or remove a participant.")
+                            .size(9)
+                            .color(MUTED),
+                        chips,
+                    ]
+                    .spacing(6),
+                )
+                .padding(10)
+                .width(Length::Fill)
+                .style(card_style),
+            );
+        }
         match self.controller.album_cover_resource_state(album_id) {
             Some(ResourceState::Missing) => body = body.push(
                 text("The catalogue references a cover file that is missing. Assign a new image or remove the reference.")
@@ -16424,6 +16963,10 @@ impl FluxReady {
                 list = list.push(
                     container(
                         row![
+                            button(icons::icon::<Message>(Icon::Play, 11.0, MUTED))
+                                .style(ghost_style)
+                                .padding([4, 5])
+                                .on_press(Message::PlayTrack(*track_id)),
                             text(format!("{}", index + 1))
                                 .size(10)
                                 .color(MUTED)
@@ -16444,15 +16987,15 @@ impl FluxReady {
                             .size(9)
                             .color(MUTED)
                             .width(Length::Fixed(46.0)),
-                            button(text("↑").size(10))
+                            button(icons::icon::<Message>(Icon::Up, 11.0, MUTED))
                                 .style(ghost_style)
                                 .padding([4, 6])
                                 .on_press(Message::AlbumTrackMove(*track_id, -1)),
-                            button(text("↓").size(10))
+                            button(icons::icon::<Message>(Icon::Down, 11.0, MUTED))
                                 .style(ghost_style)
                                 .padding([4, 6])
                                 .on_press(Message::AlbumTrackMove(*track_id, 1)),
-                            button(text("✎").size(10))
+                            button(icons::icon::<Message>(Icon::Edit, 11.0, MUTED))
                                 .style(ghost_style)
                                 .padding([4, 6])
                                 .on_press(Message::EditTrack(*track_id)),
@@ -16561,10 +17104,9 @@ impl FluxReady {
         );
         if !compact_rows {
             header = header.push(
-                text("♥")
-                    .size(FONT_LABEL)
-                    .color(MUTED)
-                    .width(Length::Fixed(28.0)),
+                container(icons::icon::<Message>(Icon::Favorite, 12.0, MUTED))
+                    .width(Length::Fixed(28.0))
+                    .center_x(Length::Fixed(28.0)),
             );
         }
         let header = header
@@ -16750,10 +17292,17 @@ impl FluxReady {
         }
         audio_status = audio_status.push(
             row![
-                button(text("Refresh devices").size(10))
-                    .style(ghost_style)
-                    .padding([5, 8])
-                    .on_press(Message::RefreshAudioDevices),
+                button(
+                    row![
+                        icons::icon::<Message>(Icon::Refresh, 12.0, MUTED),
+                        text("Refresh devices").size(10).color(MUTED),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                )
+                .style(ghost_style)
+                .padding([5, 8])
+                .on_press(Message::RefreshAudioDevices),
                 if self.audio_devices_loading {
                     Element::from(text("Refreshing device list…").size(9).color(ACCENT))
                 } else {
@@ -16916,19 +17465,12 @@ impl FluxReady {
             portable_body,
         ));
 
-        setup = setup.push(
-            button(
-                text(if self.setup_advanced_open {
-                    "▾ Hide advanced library tools"
-                } else {
-                    "▸ Advanced library tools"
-                })
-                .size(10),
-            )
-            .style(ghost_style)
-            .padding([5, 8])
-            .on_press(Message::ToggleSetupAdvanced),
-        );
+        setup = setup.push(expand_button(
+            self.setup_advanced_open,
+            "Hide advanced library tools",
+            "Advanced library tools",
+            Message::ToggleSetupAdvanced,
+        ));
         if self.setup_advanced_open {
             let choices = self.artist_choices();
             let selected_artist = self
@@ -17159,6 +17701,150 @@ impl FluxReady {
         scrollable(setup).height(Length::Fill).into()
     }
 
+    fn lyrics_overlay(&self) -> Element<'_, Message> {
+        let Some(id) = self.controller.current_id() else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        let Some(track) = self.controller.track(id) else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        let entry = self.lyrics_cache_entry(id);
+        let document = entry.as_ref().and_then(|entry| entry.document.clone());
+        let position_ms = self
+            .seek_preview
+            .map(|seconds| (f64::from(seconds) * 1000.0) as u64)
+            .unwrap_or_else(|| self.controller.position().as_millis() as u64);
+        let mut lines = column![].spacing(5);
+        if let Some(document) = &document {
+            let events = document.sync_events();
+            if !events.is_empty() {
+                let current_event = document.current_event_index(position_ms);
+                for (index, event) in events.iter().enumerate() {
+                    let active = current_event == Some(index);
+                    lines = lines.push(
+                        row![
+                            text(format_timestamp_ms(event.time_ms))
+                                .size(8)
+                                .color(MUTED)
+                                .width(Length::Fixed(52.0)),
+                            text(event.text.clone())
+                                .size(if active { 15 } else { 12 })
+                                .color(if active {
+                                    ACCENT
+                                } else if current_event.is_some_and(|current| index < current) {
+                                    MUTED
+                                } else {
+                                    TEXT
+                                }),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    );
+                }
+                let untimed = document
+                    .lines
+                    .iter()
+                    .filter(|line| line.timestamp_ms.is_none())
+                    .collect::<Vec<_>>();
+                if !untimed.is_empty() {
+                    lines = lines.push(section_heading("UNTIMED"));
+                    for line in untimed {
+                        lines = lines.push(text(line.text.clone()).size(11).color(TEXT));
+                    }
+                }
+            } else {
+                for line in &document.lines {
+                    lines = lines.push(text(line.text.clone()).size(12).color(TEXT));
+                }
+            }
+        } else {
+            lines = lines.push(
+                text("No managed lyrics for this Track yet.")
+                    .size(11)
+                    .color(MUTED),
+            );
+            lines = lines.push(
+                text("Create them here or open the full lyrics page.")
+                    .size(9)
+                    .color(MUTED),
+            );
+        }
+        if let Some(error) = entry.as_ref().and_then(|entry| entry.error.as_ref()) {
+            lines = lines.push(
+                text(format!("Lyrics cannot be parsed: {error}"))
+                    .size(9)
+                    .color(DANGER),
+            );
+        }
+        let mut panel = column![
+            row![
+                text("LYRICS").size(9).color(ACCENT),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Close").size(9))
+                    .style(ghost_style)
+                    .padding([4, 7])
+                    .on_press(Message::ToggleLyricsOverlay),
+            ]
+            .align_y(Alignment::Center),
+            text(track.title().to_owned()).size(17).color(TEXT),
+            text(format!(
+                "{} · {}",
+                display_artist(track),
+                display_album(track)
+            ))
+            .size(9)
+            .color(MUTED),
+            horizontal_rule(),
+            scrollable(lines).height(Length::Fill),
+        ]
+        .spacing(8)
+        .height(Length::Fill);
+        panel = panel.push(
+            row![
+                button(text("Open full lyrics").size(9))
+                    .style(ghost_style)
+                    .padding([5, 8])
+                    .on_press(Message::LyricsSelect(id)),
+                button(text("Edit lyrics").size(9))
+                    .style(accent_button_style)
+                    .padding([5, 8])
+                    .on_press(Message::LyricsOverlayEdit),
+            ]
+            .spacing(6),
+        );
+        let backdrop = mouse_area(
+            container(
+                iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(modal_backdrop_style),
+        )
+        .on_press(Message::ToggleLyricsOverlay);
+        stack([
+            backdrop.into(),
+            container(
+                row![
+                    iced::widget::Space::new().width(Length::Fill),
+                    container(panel)
+                        .width(Length::Fixed(360.0))
+                        .height(Length::Fill)
+                        .padding(16)
+                        .style(import_panel_style),
+                ]
+                .height(Length::Fill),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        ])
+        .height(Length::Fill)
+        .into()
+    }
+
     fn queue_overlay(&self) -> Element<'_, Message> {
         let backdrop = mouse_area(
             container(
@@ -17220,9 +17906,17 @@ impl FluxReady {
                     .on_press(Message::ToggleQueue),
             );
         }
+        let now_art_size = if overlay { 132.0 } else { 176.0 };
         let now_art = current_entry.map_or_else(
-            || self.album_artwork(current_album, 176.0, ContentFit::Cover),
-            |entry| self.track_artwork(entry.track(), current_album, 176.0, ContentFit::Cover),
+            || self.album_artwork(current_album, now_art_size, ContentFit::Cover),
+            |entry| {
+                self.track_artwork(
+                    entry.track(),
+                    current_album,
+                    now_art_size,
+                    ContentFit::Cover,
+                )
+            },
         );
         let now_actions: Element<'_, Message> = if let Some(entry) = current_entry {
             let track_id = entry.track();
@@ -17399,12 +18093,18 @@ impl FluxReady {
         let stop_enabled = transport_enabled && state != PlaybackState::Stopped;
 
         let transport = row![
-            transport_button("|<", "Previous", false, skip_enabled, Message::Previous),
+            transport_button(
+                Icon::Previous,
+                "Previous",
+                false,
+                skip_enabled,
+                Message::Previous
+            ),
             transport_button(
                 if state == PlaybackState::Playing {
-                    "II"
+                    Icon::Pause
                 } else {
-                    "▶"
+                    Icon::Play
                 },
                 if state == PlaybackState::Playing {
                     "Pause"
@@ -17415,8 +18115,8 @@ impl FluxReady {
                 play_enabled,
                 Message::TogglePlayPause,
             ),
-            transport_button(">|", "Next", false, skip_enabled, Message::Next),
-            transport_button("■", "Stop", false, stop_enabled, Message::Stop),
+            transport_button(Icon::Next, "Next", false, skip_enabled, Message::Next),
+            transport_button(Icon::Stop, "Stop", false, stop_enabled, Message::Stop),
             repeat_button(self.controller.playback_mode()),
         ]
         .spacing(6)
@@ -17477,22 +18177,20 @@ impl FluxReady {
         if !audio_ready {
             let (message, color) = match self.controller.audio_status() {
                 AudioStatus::Recovering(_) => (
-                    "Audio recovering · playback follows the current state when the device returns"
-                        .to_owned(),
+                    "Audio recovering · playback resumes when the device returns".to_owned(),
                     ACCENT,
                 ),
                 AudioStatus::DeviceUnavailable(_) if self.controller.can_retry_audio_output() => (
-                    "Audio unavailable · retry in Library setup, or press Play to retry".to_owned(),
+                    "Audio unavailable · retry output in Setup".to_owned(),
                     DANGER,
                 ),
                 AudioStatus::DeviceUnavailable(_) => (
-                    "Audio unavailable · check the output device in Library setup".to_owned(),
+                    "Audio unavailable · choose an output in Setup".to_owned(),
                     DANGER,
                 ),
-                AudioStatus::BuildWithoutBackend => (
-                    "Audio unavailable · this build has no output backend".to_owned(),
-                    MUTED,
-                ),
+                AudioStatus::BuildWithoutBackend => {
+                    ("No audio backend in this build".to_owned(), MUTED)
+                }
                 AudioStatus::Ready => (String::new(), MUTED),
             };
             info = info.push(text(message).size(9).color(color));
@@ -17515,10 +18213,22 @@ impl FluxReady {
             .spacing(4)
             .width(Length::Fill);
 
-        let volume_width = if compact { 78.0 } else { 105.0 };
+        let volume_width = if compact { 64.0 } else { 92.0 };
+        let queue_open = self.queue_placement() != QueuePlacement::Hidden;
+        let lyrics_open = self.lyrics_overlay_open
+            || (self.view == LibraryView::Lyrics
+                && self.selected_lyrics == self.controller.current_id());
         let right = container(
             row![
-                text("VOL").size(9).color(MUTED),
+                player_icon_button(Icon::Queue, "Queue", queue_open, true, Message::ToggleQueue),
+                player_icon_button(
+                    Icon::Lyrics,
+                    "Lyrics",
+                    lyrics_open,
+                    current.is_some(),
+                    Message::ToggleLyricsOverlay
+                ),
+                icons::icon::<Message>(Icon::Volume, 13.0, MUTED),
                 slider(0.0..=1.0, self.controller.volume(), Message::VolumeChanged)
                     .step(0.01_f32)
                     .style(volume_style)
@@ -17530,10 +18240,10 @@ impl FluxReady {
                 .size(9)
                 .color(MUTED),
             ]
-            .spacing(6)
+            .spacing(7)
             .align_y(Alignment::Center),
         )
-        .width(Length::Fixed(if compact { 170.0 } else { 190.0 }))
+        .width(Length::Fixed(if compact { 250.0 } else { 292.0 }))
         .align_x(Alignment::End);
 
         let top = row![left, center, right]
@@ -17744,23 +18454,38 @@ fn sidebar_section(label: &'static str) -> Element<'static, Message> {
         .into()
 }
 
-fn view_glyph(view: LibraryView) -> &'static str {
+fn view_icon(view: LibraryView) -> Icon {
     match view {
-        LibraryView::Tracks => "♪",
-        LibraryView::Artists => "◎",
-        LibraryView::Albums => "▣",
-        LibraryView::Playlists => "☰",
-        LibraryView::Folders => "▤",
-        LibraryView::Lyrics => "¶",
-        LibraryView::Collections => "✦",
-        LibraryView::Dashboard => "⌂",
-        LibraryView::Settings => "⚙",
-        LibraryView::RecentlyAdded | LibraryView::RecentlyPlayed | LibraryView::MostPlayed => "◷",
+        LibraryView::Tracks => Icon::Tracks,
+        LibraryView::Artists => Icon::Artists,
+        LibraryView::Albums => Icon::Albums,
+        LibraryView::Playlists => Icon::Playlists,
+        LibraryView::Folders => Icon::Folders,
+        LibraryView::Lyrics => Icon::Lyrics,
+        LibraryView::Collections => Icon::Collections,
+        LibraryView::Dashboard => Icon::Home,
+        LibraryView::Settings => Icon::Settings,
+        LibraryView::RecentlyAdded | LibraryView::RecentlyPlayed | LibraryView::MostPlayed => {
+            Icon::Clock
+        }
+    }
+}
+
+fn smart_collection_icon(collection: SmartCollection) -> Icon {
+    match collection {
+        SmartCollection::Favorites => Icon::Favorite,
+        SmartCollection::HighlyRated => Icon::Star,
+        SmartCollection::RecentlyAdded => Icon::CalendarAdded,
+        SmartCollection::RecentlyPlayed => Icon::History,
+        SmartCollection::MostPlayed => Icon::Trending,
+        SmartCollection::NoLyrics => Icon::LyricsMissing,
+        SmartCollection::SyncedLyrics => Icon::SyncedLyrics,
+        SmartCollection::NoArtwork => Icon::ArtworkMissing,
     }
 }
 
 fn sidebar_destination<'a>(
-    glyph: &'static str,
+    glyph: Icon,
     label: &'static str,
     active: bool,
     message: Message,
@@ -17768,11 +18493,9 @@ fn sidebar_destination<'a>(
     let color = if active { ACCENT } else { MUTED };
     button(
         row![
-            text(glyph)
-                .size(13)
-                .color(color)
+            container(icons::icon::<Message>(glyph, 15.0, color))
                 .width(Length::Fixed(20.0))
-                .align_x(Alignment::Center),
+                .center_x(Length::Fixed(20.0)),
             text(label)
                 .size(FONT_BODY)
                 .color(if active { TEXT } else { MUTED }),
@@ -17787,6 +18510,61 @@ fn sidebar_destination<'a>(
     .into()
 }
 
+fn expand_button(
+    open: bool,
+    open_label: &'static str,
+    closed_label: &'static str,
+    message: Message,
+) -> Element<'static, Message> {
+    button(
+        row![
+            icons::icon::<Message>(if open { Icon::Down } else { Icon::Forward }, 12.0, MUTED),
+            text(if open { open_label } else { closed_label })
+                .size(10)
+                .color(MUTED),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center),
+    )
+    .style(ghost_style)
+    .padding([5, 8])
+    .on_press(message)
+    .into()
+}
+
+fn back_button<'a>(label: &'static str, message: Message) -> Element<'a, Message> {
+    button(
+        row![
+            icons::icon::<Message>(Icon::Back, 13.0, MUTED),
+            text(label).size(11).color(MUTED),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center),
+    )
+    .style(ghost_style)
+    .padding([6, 9])
+    .on_press(message)
+    .into()
+}
+
+fn sidebar_action<'a>(glyph: Icon, label: &'static str, message: Message) -> Element<'a, Message> {
+    button(
+        row![
+            container(icons::icon::<Message>(glyph, 15.0, MUTED))
+                .width(Length::Fixed(20.0))
+                .center_x(Length::Fixed(20.0)),
+            text(label).size(FONT_BODY).color(MUTED),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([7, 8])
+    .style(ghost_style)
+    .on_press(message)
+    .into()
+}
+
 fn track_row<'a>(
     index: usize,
     id: TrackId,
@@ -17797,12 +18575,12 @@ fn track_row<'a>(
 ) -> Element<'a, Message> {
     let is_current = state.current == Some(id);
     let selected = is_current || state.focused;
-    let marker = if is_current {
-        "▶".to_owned()
+    let marker: Element<'a, Message> = if is_current {
+        icons::icon(Icon::Play, 10.0, ACCENT)
     } else if state.focused {
-        "›".to_owned()
+        icons::icon(Icon::Forward, 11.0, TEXT)
     } else {
-        index.to_string()
+        text(index).size(10).color(MUTED).into()
     };
     let title_color = if is_current { ACCENT } else { TEXT };
     let duration = track.duration().map(format_duration).unwrap_or_default();
@@ -17825,16 +18603,9 @@ fn track_row<'a>(
     }
 
     let content = row![
-        text(marker)
-            .size(10)
-            .color(if is_current {
-                ACCENT
-            } else if state.focused {
-                TEXT
-            } else {
-                MUTED
-            })
-            .width(Length::Fixed(28.0)),
+        container(marker)
+            .width(Length::Fixed(28.0))
+            .center_x(Length::Fixed(28.0)),
         column![title, text(credits.to_owned()).size(FONT_META).color(MUTED),]
             .spacing(2)
             .width(Length::FillPortion(if compact { 8 } else { 5 })),
@@ -17849,16 +18620,17 @@ fn track_row<'a>(
                 .color(MUTED)
                 .width(Length::FillPortion(4)),
         );
-        content = content.push(
-            text(
-                state
-                    .rating
-                    .map_or_else(String::new, |rating| format!("★{rating}")),
-            )
-            .size(FONT_LABEL)
-            .color(ACCENT)
-            .width(Length::Fixed(26.0)),
-        );
+        let rating: Element<'a, Message> = match state.rating {
+            Some(rating) => row![
+                icons::icon::<Message>(Icon::Star, 9.0, ACCENT),
+                text(rating.to_string()).size(FONT_LABEL).color(ACCENT),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .into(),
+            None => iced::widget::Space::new().width(0).into(),
+        };
+        content = content.push(container(rating).width(Length::Fixed(30.0)));
     }
     content = content.push(
         text(duration)
@@ -17867,10 +18639,18 @@ fn track_row<'a>(
             .width(Length::Fixed(48.0)),
     );
 
-    let check = button(text(if state.checked { "✓" } else { "○" }).size(11))
-        .style(ghost_style)
-        .padding([5, 7])
-        .on_press(Message::TrackSelectionToggle(id));
+    let check = button(icons::icon::<Message>(
+        if state.checked {
+            Icon::Check
+        } else {
+            Icon::Circle
+        },
+        13.0,
+        if state.checked { ACCENT } else { MUTED },
+    ))
+    .style(ghost_style)
+    .padding([5, 7])
+    .on_press(Message::TrackSelectionToggle(id));
     let check = tooltip(
         check,
         container(text("Select Track").size(9).color(TEXT))
@@ -17885,10 +18665,14 @@ fn track_row<'a>(
         .padding([9, 10])
         .style(track_row_style(selected || state.checked))
         .on_press(Message::PlayTrack(id));
-    let favorite = button(text(if state.favorite { "♥" } else { "♡" }).size(12))
-        .style(ghost_style)
-        .padding([5, 7])
-        .on_press(Message::TrackFavoriteToggle(id));
+    let favorite = button(icons::icon::<Message>(
+        Icon::Favorite,
+        13.0,
+        if state.favorite { ACCENT } else { MUTED },
+    ))
+    .style(ghost_style)
+    .padding([5, 7])
+    .on_press(Message::TrackFavoriteToggle(id));
     let favorite = tooltip(
         favorite,
         container(
@@ -17907,7 +18691,7 @@ fn track_row<'a>(
     .gap(6)
     .delay(Duration::from_millis(350));
 
-    let menu = button(text("⋯").size(14))
+    let menu = button(icons::icon::<Message>(Icon::More, 14.0, MUTED))
         .style(ghost_style)
         .padding([5, 7])
         .on_press(Message::TrackMenuOpen(id));
@@ -17941,27 +18725,39 @@ fn playlist_entry_row<'a>(
     let is_current = current == Some(track_id);
     let duration = track.duration().map(format_duration).unwrap_or_default();
     let title_color = if is_current { ACCENT } else { TEXT };
-    let check = button(text(if checked { "✓" } else { "○" }).size(11))
-        .style(ghost_style)
-        .padding([4, 5])
-        .on_press(Message::PlaylistEntryToggle(position));
-    let play = button(text(if is_current { "▶" } else { "›" }).size(12))
-        .style(ghost_style)
-        .padding([4, 5])
-        .on_press(Message::PlaylistPlayEntry(position));
-    let queue = button(text("+").size(11))
+    let check = button(icons::icon::<Message>(
+        if checked { Icon::Check } else { Icon::Circle },
+        12.0,
+        if checked { ACCENT } else { MUTED },
+    ))
+    .style(ghost_style)
+    .padding([4, 5])
+    .on_press(Message::PlaylistEntryToggle(position));
+    let play = button(icons::icon::<Message>(
+        if is_current {
+            Icon::Play
+        } else {
+            Icon::Forward
+        },
+        12.0,
+        if is_current { ACCENT } else { MUTED },
+    ))
+    .style(ghost_style)
+    .padding([4, 5])
+    .on_press(Message::PlaylistPlayEntry(position));
+    let queue = button(icons::icon::<Message>(Icon::Add, 12.0, MUTED))
         .style(ghost_style)
         .padding([4, 5])
         .on_press(Message::PlaylistEnqueueEntry(position));
-    let up = button(text("↑").size(10))
+    let up = button(icons::icon::<Message>(Icon::Up, 11.0, MUTED))
         .style(ghost_style)
         .padding([4, 5])
         .on_press_maybe((position > 0).then_some(Message::PlaylistEntryMove(position, -1)));
-    let down = button(text("↓").size(10))
+    let down = button(icons::icon::<Message>(Icon::Down, 11.0, MUTED))
         .style(ghost_style)
         .padding([4, 5])
         .on_press(Message::PlaylistEntryMove(position, 1));
-    let remove = button(text("×").size(11))
+    let remove = button(icons::icon::<Message>(Icon::Remove, 11.0, DANGER))
         .style(danger_button_style)
         .padding([4, 5])
         .on_press(Message::PlaylistEntryRemove(position));
@@ -17984,7 +18780,7 @@ fn playlist_entry_row<'a>(
     }
     mouse_area(
         row![
-            text("≡").size(11).color(MUTED),
+            icons::icon::<Message>(Icon::Grip, 11.0, MUTED),
             check,
             text(format!("{}", position + 1))
                 .size(9)
@@ -18049,16 +18845,15 @@ fn queue_row<'a>(
         ),
     };
 
-    let marker = if is_current {
-        "▶".to_owned()
+    let marker: Element<'a, Message> = if is_current {
+        icons::icon(Icon::Play, 9.0, ACCENT)
     } else {
-        (index + 1).to_string()
+        text(index + 1).size(9).color(MUTED).into()
     };
     let content = row![
-        text(marker)
-            .size(9)
-            .color(if is_current { ACCENT } else { MUTED })
-            .width(Length::Fixed(20.0)),
+        container(marker)
+            .width(Length::Fixed(20.0))
+            .center_x(Length::Fixed(20.0)),
         column![
             text(truncate_label(&title, 34))
                 .size(11)
@@ -18078,7 +18873,7 @@ fn queue_row<'a>(
         .padding([3, 5])
         .style(track_row_style(is_current || dragging))
         .on_press(Message::PlayQueueEntry(entry.id()));
-    let remove = button(text("×").size(11))
+    let remove = button(icons::icon::<Message>(Icon::Close, 12.0, MUTED))
         .style(ghost_style)
         .padding([3, 4])
         .on_press(Message::RemoveQueueEntry(entry.id()));
@@ -18100,11 +18895,11 @@ fn queue_row<'a>(
         })
     };
     let drag = mouse_area(
-        container(
-            text("⠿")
-                .size(12)
-                .color(if dragging { ACCENT } else { MUTED }),
-        )
+        container(icons::icon::<Message>(
+            Icon::Grip,
+            12.0,
+            if dragging { ACCENT } else { MUTED },
+        ))
         .height(Length::Fixed(QUEUE_ROW_HEIGHT))
         .padding([0, 5])
         .center_y(Length::Fixed(QUEUE_ROW_HEIGHT)),
@@ -18134,17 +18929,28 @@ fn queue_row<'a>(
 }
 
 fn transport_button<'a>(
-    icon: &'static str,
+    icon: Icon,
     label: &'static str,
     primary: bool,
     enabled: bool,
     message: Message,
 ) -> Element<'a, Message> {
-    let content = container(text(icon).size(if primary { 16 } else { 12 }))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill);
+    let color = if !enabled {
+        Color::from_rgba8(0x99, 0x8f, 0xa6, 0.35)
+    } else if primary {
+        BG
+    } else {
+        TEXT
+    };
+    let content = container(icons::icon::<Message>(
+        icon,
+        if primary { 16.0 } else { 13.0 },
+        color,
+    ))
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill);
     let button = button(content)
         .width(Length::Fixed(if primary { 40.0 } else { 32.0 }))
         .height(Length::Fixed(32.0))
@@ -18163,19 +18969,63 @@ fn transport_button<'a>(
     .into()
 }
 
+fn player_icon_button<'a>(
+    icon: Icon,
+    label: &'static str,
+    active: bool,
+    enabled: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    let color = if !enabled {
+        Color::from_rgba8(0x99, 0x8f, 0xa6, 0.35)
+    } else if active {
+        ACCENT
+    } else {
+        MUTED
+    };
+    let button = button(
+        container(icons::icon::<Message>(icon, 15.0, color))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(Length::Fixed(30.0))
+    .height(Length::Fixed(28.0))
+    .padding(0)
+    .style(nav_style(active))
+    .on_press_maybe(enabled.then_some(message));
+    tooltip(
+        button,
+        container(text(label).size(10).color(TEXT))
+            .padding([4, 7])
+            .style(tooltip_style),
+        tooltip::Position::Top,
+    )
+    .gap(6)
+    .delay(Duration::from_millis(350))
+    .into()
+}
+
 fn repeat_button<'a>(mode: PlaybackMode) -> Element<'a, Message> {
     let icon = match mode {
-        PlaybackMode::Normal => "↻",
-        PlaybackMode::RepeatOne => "↻1",
-        PlaybackMode::RepeatAll => "↻A",
-        PlaybackMode::Shuffle => "⤨",
-        PlaybackMode::ShuffleAll => "⤨A",
+        PlaybackMode::Normal | PlaybackMode::RepeatAll => Icon::Repeat,
+        PlaybackMode::RepeatOne => Icon::RepeatOne,
+        PlaybackMode::Shuffle | PlaybackMode::ShuffleAll => Icon::Shuffle,
     };
-    let content = container(text(icon).size(12))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill);
+    let content = container(icons::icon::<Message>(
+        icon,
+        13.0,
+        if mode == PlaybackMode::Normal {
+            TEXT
+        } else {
+            ACCENT
+        },
+    ))
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill);
     let button = button(content)
         .width(Length::Fixed(32.0))
         .height(Length::Fixed(32.0))
@@ -18460,6 +19310,7 @@ mod tests {
             new_album_type: ReleaseType::Album,
             album_title_input: String::new(),
             album_type: ReleaseType::Album,
+            album_edit_open: false,
             album_participants: Vec::new(),
             album_participant_filter: String::new(),
             album_participant_choice: None,
@@ -18477,6 +19328,7 @@ mod tests {
             artist_description_input: String::new(),
             artist_aliases_input: String::new(),
             artist_form_dirty: false,
+            artist_edit_open: false,
             artist_image_input: String::new(),
             artist_image_picked: None,
             artist_image_preview: None,
@@ -18506,6 +19358,7 @@ mod tests {
             show_setup: false,
             queue_visible: true,
             queue_overlay_open: false,
+            lyrics_overlay_open: false,
             track_menu: None,
             window_width: 1_180.0,
             window_height: 760.0,
@@ -18795,7 +19648,7 @@ mod tests {
         send(&mut gui, Message::EditTrack(id));
         send(
             &mut gui,
-            Message::EditorAlbumChanged("Another Album".to_owned()),
+            Message::EditorTitleChanged("Another title".to_owned()),
         );
         let _ = gui.update(Message::WindowCloseRequested(iced::window::Id::unique()));
         assert!(!gui.closed);
@@ -20342,6 +21195,217 @@ mod tests {
     }
 
     #[test]
+    fn player_lyrics_overlay_is_contextual_and_restores_playback_content() {
+        let dir = TempDir::new("gui-lyrics-overlay");
+        let root = dir.path().join("library");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = gui.controller.tracks().first().expect("track").0;
+        gui.controller
+            .set_lyrics(id, Some("[00:01.000]First line\n[00:02.000]Second line"))
+            .expect("lyrics");
+        send(&mut gui, Message::PlayTrack(id));
+        send(&mut gui, Message::ToggleQueue);
+        gui.window_width = 920.0;
+        assert!(gui.queue_overlay_open);
+        send(&mut gui, Message::ToggleLyricsOverlay);
+        assert!(gui.lyrics_overlay_open);
+        assert!(
+            !gui.queue_overlay_open,
+            "the player shows one contextual panel"
+        );
+        let _ = gui.view();
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(!gui.lyrics_overlay_open);
+        assert_eq!(gui.controller.current_id(), Some(id));
+        send(&mut gui, Message::ToggleLyricsOverlay);
+        send(&mut gui, Message::LyricsOverlayEdit);
+        assert!(!gui.lyrics_overlay_open);
+        assert_eq!(gui.view, LibraryView::Lyrics);
+        assert_eq!(gui.selected_lyrics, Some(id));
+        assert!(gui.lyrics_editor.is_some());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn canonical_libraries_hide_internal_folder_navigation() {
+        let dir = TempDir::new("gui-folder-navigation");
+        let root = dir.path().join("library");
+        let managed = open_canonical_gui(&dir, &root);
+        assert!(!managed.folder_browsing_available());
+        assert!(
+            !managed
+                .primary_destinations()
+                .contains(&LibraryView::Folders),
+            "managed storage must not expose internal Album tracks folders"
+        );
+        let _ = managed.view();
+        managed.controller.shutdown();
+
+        let legacy = gui(&dir);
+        assert!(legacy.folder_browsing_available());
+        assert!(
+            legacy
+                .primary_destinations()
+                .contains(&LibraryView::Folders)
+        );
+        legacy.controller.shutdown();
+    }
+
+    #[test]
+    fn track_editor_primary_artist_preserves_owner_and_other_credits() {
+        let dir = TempDir::new("gui-editor-primary-artist");
+        let root = dir.path().join("library");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let a = gui.controller.create_artist("Owner").expect("owner");
+        let b = gui.controller.create_artist("Guest").expect("guest");
+        let c = gui.controller.create_artist("Primary").expect("primary");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        let id = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "Owner".to_owned(),
+                credited_artist_ids: vec![a, b],
+                album_title: None,
+                release_type: flux_app::ReleaseType::Single,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import");
+        send(&mut gui, Message::EditTrack(id));
+        send(
+            &mut gui,
+            Message::EditorArtistChanged(Some(ArtistChoice {
+                id: Some(c),
+                label: "Primary".to_owned(),
+            })),
+        );
+        let editor = gui.track_editor.as_ref().expect("editor");
+        assert_eq!(editor.artist_id, Some(c));
+        assert_eq!(editor.credits, vec![c, a, b]);
+        assert!(editor.credits_touched);
+        send(&mut gui, Message::EditorSave);
+        assert!(gui.track_editor.is_none());
+        assert_eq!(gui.controller.track_artist_id(id), Some(a));
+        assert_eq!(gui.controller.track_credits(id), vec![c, a, b]);
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn track_editor_album_choices_follow_the_artist_and_allow_creation() {
+        let dir = TempDir::new("gui-editor-album-selector");
+        let root = dir.path().join("library");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let a = gui.controller.create_artist("A").expect("A");
+        let b = gui.controller.create_artist("B").expect("B");
+        let a1 = gui
+            .controller
+            .create_album(a, "A One", flux_app::ReleaseType::Album)
+            .expect("A1");
+        let b1 = gui
+            .controller
+            .create_album(b, "B One", flux_app::ReleaseType::Album)
+            .expect("B1");
+        let shared = gui
+            .controller
+            .create_album(a, "Shared", flux_app::ReleaseType::Album)
+            .expect("shared");
+        gui.controller
+            .add_album_participant(shared, b)
+            .expect("participant");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        let id = gui
+            .controller
+            .import_canonical_track(flux_app::CanonicalImportedTrack {
+                source,
+                title: "Song".to_owned(),
+                artist_id: Some(a),
+                artist_name: "A".to_owned(),
+                credited_artist_ids: vec![a],
+                album_title: Some("A One".to_owned()),
+                release_type: flux_app::ReleaseType::Album,
+                track_number: Some(1),
+                disc_number: None,
+                duration_ms: None,
+            })
+            .expect("import");
+        send(&mut gui, Message::EditTrack(id));
+        let choices = gui
+            .editor_album_choices(gui.track_editor.as_ref().expect("editor"))
+            .into_iter()
+            .map(|choice| choice.id)
+            .collect::<Vec<_>>();
+        assert!(choices.contains(&a1));
+        assert!(
+            choices.contains(&shared),
+            "participating Albums are included"
+        );
+        assert!(!choices.contains(&b1), "unrelated Albums are excluded");
+
+        send(
+            &mut gui,
+            Message::EditorArtistChanged(Some(ArtistChoice {
+                id: Some(b),
+                label: "B".to_owned(),
+            })),
+        );
+        let choices = gui
+            .editor_album_choices(gui.track_editor.as_ref().expect("editor"))
+            .into_iter()
+            .map(|choice| choice.id)
+            .collect::<Vec<_>>();
+        assert!(
+            choices.contains(&shared),
+            "participating Albums remain available"
+        );
+        assert!(
+            !choices.contains(&b1),
+            "an Album owned by another Artist requires ownership transfer first"
+        );
+
+        send(&mut gui, Message::EditorToggleNewAlbum);
+        send(
+            &mut gui,
+            Message::EditorNewAlbumChanged("Created here".to_owned()),
+        );
+        send(&mut gui, Message::EditorCreateAlbum);
+        let created = gui
+            .controller
+            .albums()
+            .into_iter()
+            .find(|album| album.title == "Created here")
+            .expect("created album");
+        assert_eq!(created.owner_artist_id, b);
+        assert_eq!(
+            gui.track_editor
+                .as_ref()
+                .and_then(|editor| editor.move_destination.as_ref())
+                .map(|choice| choice.id),
+            Some(created.id)
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn album_detail_participants_can_be_added_and_removed_without_touching_tracks() {
         let dir = TempDir::new("gui-album-participants");
         let root = dir.path().join("library");
@@ -20445,6 +21509,38 @@ mod tests {
             "existing participants are preserved and the new association is added"
         );
         assert_eq!(gui.controller.tracks().len(), plan.candidates.len());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn artist_and_album_detail_editors_are_opt_in() {
+        let dir = TempDir::new("gui-detail-first");
+        let root = dir.path().join("library");
+        let source_dir = dir.path().join("Nirvana/Nevermind");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("Lithium.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut gui = open_canonical_gui(&dir, &root);
+        gui.controller
+            .import_files(std::slice::from_ref(&source), true)
+            .expect("import");
+        let id = gui.controller.tracks()[0].0;
+        let album = gui.controller.track_album_id(id).expect("album");
+        let artist = gui.controller.track_artist_id(id).expect("artist");
+
+        send(&mut gui, Message::OpenAlbum(album));
+        assert!(!gui.album_edit_open, "Album detail opens read-first");
+        let _ = gui.album_detail_view(album);
+        send(&mut gui, Message::AlbumEditToggle);
+        assert!(gui.album_edit_open);
+        let _ = gui.album_detail_view(album);
+
+        send(&mut gui, Message::OpenArtist(artist));
+        assert!(!gui.artist_edit_open, "Artist detail opens read-first");
+        let _ = gui.artist_detail_view(artist);
+        send(&mut gui, Message::ArtistEditToggle);
+        assert!(gui.artist_edit_open);
+        let _ = gui.artist_detail_view(artist);
         gui.controller.shutdown();
     }
 
@@ -21129,16 +22225,16 @@ mod tests {
             &mut gui,
             Message::EditorTitleChanged("Edited title".to_owned()),
         );
-        send(
-            &mut gui,
-            Message::EditorAlbumChanged("Edited album".to_owned()),
-        );
         send(&mut gui, Message::EditorSave);
         assert!(gui.track_editor.is_none());
         let track = gui.controller.track(id).expect("edited track");
         assert_eq!(track.title(), "Edited title");
         assert_eq!(track.artist(), Some("Artist"));
-        assert_eq!(track.album(), Some("Edited album"));
+        assert_eq!(
+            track.album(),
+            Some("Album"),
+            "Album titles are edited on the Album entity page, not the Track editor"
+        );
         let artist_id = gui.controller.track_artist_id(id).expect("artist");
 
         send(
@@ -21477,7 +22573,7 @@ mod tests {
         );
         send(
             &mut gui,
-            Message::EditorAlbumChanged("Destination".to_owned()),
+            Message::EditorTransferTitleChanged("Destination".to_owned()),
         );
         send(&mut gui, Message::EditorTransferOwner);
         assert!(
