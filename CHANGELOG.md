@@ -6,6 +6,35 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M25 player experience, icons and entity workflows
+
+- Moved Import music from a primary sidebar button to a subdued action above
+  Settings. Queue and Lyrics now open from compact player controls; Queue keeps
+  stable entry identity, inline/overlay behavior and isolation.
+- Added a contextual Lyrics player panel with current-line highlighting, full
+  lyrics and editing entry points, without duplicating the playback timeline.
+- Replaced GUI Unicode glyphs with a vendored Lucide SVG icon set (ISC license),
+  compiled into the binary and used for navigation, transport, rows, actions and
+  all Smart Collections. No runtime network access.
+- Reworked Track editing: stable-ID primary-Artist selector with inline Artist
+  creation; Artist-filtered Album selector including participating Albums and
+  inline Album creation; reviewed Album move with save protection.
+- Made Artist and Album pages detail-first. Metadata and relationship editors
+  sit behind Edit details. Added a compact responsive Artist discography with
+  artwork cards, separate owned/participating/credited Album groups, and Album
+  play controls.
+- Added ID3 APIC and MP4/M4A `covr` extraction tests alongside FLAC/Vorbis.
+  Same-Album embedded artwork suggestions now resolve to one deterministic
+  cover candidate. Added Album-artwork inheritance and independent Track
+  override/replacement/removal coverage.
+- Hid Folder navigation for canonical and portable libraries, where it exposed
+  internal per-Album `tracks` folders; legacy source-path libraries keep it.
+  Restyled Tracks filters as a compact toolbar rather than a permanent card.
+- Improved the lyrics editor into readable per-line cards while preserving
+  timestamps, Unicode, blank lines and karaoke conversion warnings.
+- Documented the M25 product changes and remaining accessibility/native
+  validation limits in `docs/m25-player-experience.md`.
+
 ### M24 workflow hardening and accessibility foundations
 
 - Import review now distinguishes same managed file, same managed audio,

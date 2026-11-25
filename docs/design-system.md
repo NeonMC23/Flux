@@ -1,4 +1,4 @@
-# Flux product design system (M23)
+# Flux product design system (M25)
 
 Status: implemented design language for the Iced GUI and the crossterm TUI.
 This document describes the shared product hierarchy. It is not a claim of
@@ -9,7 +9,8 @@ human usability validation.
 Flux is a local-first music library and player. The interface should read as a
 calm desktop application: dark, spacious, restrained, and centered on artwork,
 titles, and listening state. The pink accent is a signal for selection, focus,
-primary actions, and playback. It is not a background decoration.
+primary actions, and playback. It is not a background decoration. Icons are a
+vendored Lucide set, not typographic approximations or emoji.
 
 - Product name: **Flux**
 - Accent: `#ff66cc`
@@ -180,6 +181,19 @@ decorative animation, and no animation delays input or playback. The GUI cannot
 honor OS reduced-motion settings for the waveform without replacing the audio
 visualization contract, so the visualizer is opt-in in the TUI and reflects real
 audio only.
+
+Icons: the GUI uses one vendored Lucide SVG family at 9–20 px with a consistent
+stroke weight. Navigation, transport, row actions, filters and Smart Collections
+share it. Icon-only controls require a tooltip or adjacent label; tooltips are
+not screen-reader names.
+
+Navigation hierarchy: Home, Tracks, Artists and Albums lead the sidebar.
+Playlists, Smart Collections and Lyrics follow. Import is a secondary action
+above Settings, not a primary destination. Folders is shown only when the active
+library references user source paths; managed Album `tracks` folders are not
+navigation. Queue and Lyrics are player controls; the Queue stays inline on wide
+windows and overlays on narrower ones. Artist and Album pages are detail-first,
+with editing behind a discreet action.
 
 Keyboard operation: Tab/Shift+Tab cycle primary GUI destinations; ↑/↓ move
 Track focus; Enter plays; E edits; Y opens lyrics; A queues; F favorites; I

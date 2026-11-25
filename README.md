@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: public release suspended pending M24 workflow/accessibility validation.** Signing and native/manual validation remain external.
+**Status: public release suspended pending M25 player-experience validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -28,6 +28,11 @@ Both interfaces open on Home and follow a shared product design language documen
 [`docs/design-system.md`](docs/design-system.md): Home-first navigation, dark
 surface hierarchy, restrained pink selection and primary actions, readable type,
 one playback timeline, and explicit Artist/Album collaborative relationships.
+M25 adds a vendored Lucide icon set, player-integrated Queue/Lyrics access,
+detail-first Artist and Album pages, stable-ID Artist/Album selectors in Track
+editing, deterministic same-Album embedded-artwork reuse and managed-only
+Folder navigation. Details and limits are in
+[`docs/m25-player-experience.md`](docs/m25-player-experience.md).
 
 Canonical schema 2 gives every Album an explicit ordered participant set in
 addition to its physical owner. Participation is independent of Track credits;
@@ -142,14 +147,16 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   finish before switching. Stale import, artwork, lyrics and file-picker
   results are dropped, and the previous library's selection, queue, editor,
   caches and pending playback are cleared while global preferences remain. The
-  sidebar keeps the primary **Home**, **Tracks**, **Artists**, **Albums**,
-  **Folders**, **Playlists**, **Smart Collections** and **Lyrics** destinations,
-  with **Settings** at the bottom. **Import music** is the single primary action.
-  Normal library browsing supports Tab/Shift+Tab destination cycling, ↑/↓ Track
-  focus, Enter play, E edit, Y lyrics, A queue, F favorite, I import and Q queue.
-  Queue rows play on activation; the drag handle reorders and the remove control
-  is explicit. Track actions open a modal action sheet with full labels. Use it for the review-first copy-only Import
-  Manager: native file or folder picker, Flux Browser, drag-and-drop,
+  sidebar keeps **Home**, **Tracks**, **Artists**, **Albums**, **Playlists**,
+  **Smart Collections** and **Lyrics** as primary destinations, with a subdued
+  **Import music** action immediately above **Settings**. **Folders** appears
+  only for legacy source-path libraries; managed libraries use Albums and Tracks
+  instead of internal Album `tracks` folders. The player bar owns compact Queue
+  and Lyrics entries. Normal browsing supports Tab/Shift+Tab destination
+  cycling, ↑/↓ Track focus, Enter play, E edit, Y lyrics, A queue, F favorite,
+  I import and Q queue. Queue rows play on activation; the drag handle reorders
+  and the remove control is explicit. Track actions open a modal action sheet
+  with full labels. Use Import for the review-first copy-only Import Manager: native file or folder picker, Flux Browser, drag-and-drop,
   name-inferred review, duplicate decisions, and real progress/cancel. Final
   result rows retain per-item failure details; Flux Browser warns when entries
   vanish or symbolic links are skipped instead of silently omitting them. Artist, Album
@@ -157,8 +164,11 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   missing managed images are distinguished from inaccessible ones with repair
   guidance. Click a track to
   play it; use the transport row for pause/stop/skip/repeat/volume. The queue is
-  inline on wide windows and opens as a closable overlay on narrower ones via
-  **Queue** or `Q`, so it remains available at the minimum width. The search box
+  inline on wide windows and opens as a closable overlay on narrower ones from
+  the player Queue control or `Q`, so it remains available at the minimum width.
+  The player Lyrics control opens a contextual synchronized/plain lyrics panel
+  without leaving the current page; **Open full lyrics** and **Edit lyrics**
+  remain available. The search box
   performs a grouped, case-insensitive global search over canonical artists,
   albums and tracks with direct navigation. Track rows expose favorite and
   rating controls and label missing versus inaccessible audio distinctly;
