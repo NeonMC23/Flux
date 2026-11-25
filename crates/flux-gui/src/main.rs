@@ -2539,6 +2539,7 @@ enum Message {
     QueueClearConfirm,
     QueueClearCancel,
     PlayTrack(TrackId),
+    PlayAlbum(AlbumId),
     EnqueueTrack(TrackId),
     PlayNextTrack(TrackId),
     TrackMenuOpen(TrackId),
@@ -8000,6 +8001,17 @@ impl FluxReady {
                     }
                     TrackMenuAction::OpenLyrics => Message::LyricsSelect(id),
                 });
+            }
+            Message::PlayAlbum(album_id) => {
+                if let Some(album) = self.controller.album(album_id) {
+                    for track in &album.track_order {
+                        let _ = self.controller.enqueue_track(*track);
+                    }
+                    if let Some(first) = album.track_order.first().copied() {
+                        self.controller.play_track(first);
+                    }
+                    self.follow_queue_current();
+                }
             }
             Message::PlayNextTrack(id) => {
                 let _ = self.controller.play_next_track(id);
@@ -16598,56 +16610,54 @@ impl FluxReady {
                     .spacing(GAP_MD)
                     .align_y(Alignment::Center),
                     row![
-                            button(
-                                row![
-                                    icons::icon::<Message>(Icon::Play, 12.0, BG),
-                                    text("Play album").size(FONT_LABEL).color(BG),
-                                ]
-                                .spacing(5)
-                                .align_y(Alignment::Center),
-                            )
+                        button(
+                            row![
+                                icons::icon::<Message>(Icon::Play, 12.0, BG),
+                                text("Play album").size(FONT_LABEL).color(BG),
+                            ]
+                            .spacing(5)
+                            .align_y(Alignment::Center),
+                        )
+                        .style(accent_button_style)
+                        .padding([7, 10])
+                        .on_press(Message::PlayAlbum(album_id)),
+                        button(
+                            row![
+                                icons::icon::<Message>(Icon::Edit, 13.0, MUTED),
+                                text(if self.album_edit_open {
+                                    "Close editor"
+                                } else {
+                                    "Edit details"
+                                })
+                                .size(FONT_LABEL)
+                                .color(MUTED),
+                            ]
+                            .spacing(5)
+                            .align_y(Alignment::Center),
+                        )
+                        .style(ghost_style)
+                        .padding([7, 10])
+                        .on_press(Message::AlbumEditToggle),
+                        button(
+                            row![
+                                icons::icon::<Message>(Icon::External, 12.0, MUTED),
+                                text("Open owner").size(FONT_LABEL).color(MUTED),
+                            ]
+                            .spacing(5)
+                            .align_y(Alignment::Center),
+                        )
+                        .style(ghost_style)
+                        .padding([7, 10])
+                        .on_press(Message::OpenArtist(album.owner_artist_id)),
+                        button(text("Add tracks…").size(FONT_LABEL))
                             .style(accent_button_style)
                             .padding([7, 10])
-                            .on_press_maybe(
-                                album.track_order.first().copied().map(Message::PlayTrack),
-                            ),
-                            button(
-                                row![
-                                    icons::icon::<Message>(Icon::Edit, 13.0, MUTED),
-                                    text(if self.album_edit_open {
-                                        "Close editor"
-                                    } else {
-                                        "Edit details"
-                                    })
-                                    .size(FONT_LABEL)
-                                    .color(MUTED),
-                                ]
-                                .spacing(5)
-                                .align_y(Alignment::Center),
-                            )
+                            .on_press(Message::AlbumAddTracks),
+                        button(text("Transfer album…").size(FONT_LABEL))
                             .style(ghost_style)
                             .padding([7, 10])
-                            .on_press(Message::AlbumEditToggle),
-                            button(
-                                row![
-                                    icons::icon::<Message>(Icon::External, 12.0, MUTED),
-                                    text("Open owner").size(FONT_LABEL).color(MUTED),
-                                ]
-                                .spacing(5)
-                                .align_y(Alignment::Center),
-                            )
-                            .style(ghost_style)
-                            .padding([7, 10])
-                            .on_press(Message::OpenArtist(album.owner_artist_id)),
-                            button(text("Add tracks…").size(FONT_LABEL))
-                                .style(accent_button_style)
-                                .padding([7, 10])
-                                .on_press(Message::AlbumAddTracks),
-                            button(text("Transfer album…").size(FONT_LABEL))
-                                .style(ghost_style)
-                                .padding([7, 10])
-                                .on_press(Message::AlbumTransferOpen),
-                        ]
+                            .on_press(Message::AlbumTransferOpen),
+                    ]
                     .spacing(6)
                     .wrap(),
                 ]
@@ -21540,6 +21550,14 @@ mod tests {
         send(&mut gui, Message::OpenAlbum(album));
         assert!(!gui.album_edit_open, "Album detail opens read-first");
         let _ = gui.album_detail_view(album);
+        send(&mut gui, Message::PlayAlbum(album));
+        assert_eq!(gui.controller.current_id(), Some(id));
+        assert!(
+            gui.controller
+                .queue_entries()
+                .iter()
+                .any(|entry| entry.track() == id)
+        );
         send(&mut gui, Message::AlbumEditToggle);
         assert!(gui.album_edit_open);
         let _ = gui.album_detail_view(album);
