@@ -908,6 +908,29 @@ pub fn read_embedded_artwork(path: &Path) -> Result<Option<EmbeddedArtwork>, Str
 #[cfg(test)]
 mod embedded_artwork_tests {
     #[test]
+    fn embedded_artwork_reads_id3_apic_and_mp4_covr_pictures() {
+        let dir = crate::test_support::TempDir::new("embedded-artwork-formats");
+        for (name, bytes) in [
+            (
+                "Lithium.mp3",
+                &include_bytes!("../tests/fixtures/tagged.mp3")[..],
+            ),
+            (
+                "Lithium.m4a",
+                &include_bytes!("../tests/fixtures/tagged.m4a")[..],
+            ),
+        ] {
+            let path = dir.write(name, bytes);
+            let artwork = super::read_embedded_artwork(&path)
+                .expect("read embedded artwork")
+                .unwrap_or_else(|| panic!("{name} should expose embedded artwork"));
+            assert_eq!(artwork.extension, "png", "{name}");
+            assert!(artwork.bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "{name}");
+            assert!(artwork.bytes.len() <= super::MAX_EMBEDDED_ARTWORK_BYTES);
+        }
+    }
+
+    #[test]
     fn embedded_artwork_is_bounded_and_signature_checked() {
         let dir = crate::test_support::TempDir::new("embedded-artwork");
         let flac = include_bytes!("../tests/fixtures/tagged.flac");

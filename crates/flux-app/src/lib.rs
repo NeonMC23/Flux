@@ -16476,6 +16476,63 @@ mod tests {
     }
 
     #[test]
+    fn album_artwork_is_shared_and_track_overrides_remain_independent() {
+        let dir = TempDir::new("album-artwork-inheritance");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller.import_files(&[source], false).expect("import");
+        let id = controller.tracks()[0].0;
+        let album = controller.track_album_id(id).expect("album");
+        assert!(
+            controller.track_artwork_path(id).is_none(),
+            "a Track without an override inherits its Album cover"
+        );
+        let album_cover = dir.path().join("album-cover.png");
+        fs::write(&album_cover, b"\x89PNG\r\n\x1a\nalbum-cover").expect("album cover");
+        controller
+            .set_album_cover(album, &album_cover)
+            .expect("album cover");
+        let managed_album_cover = controller.album_cover_path(album).expect("managed cover");
+        assert!(controller.track_artwork_path(id).is_none());
+        assert!(managed_album_cover.is_file());
+
+        let track_cover = dir.path().join("track-cover.png");
+        fs::write(&track_cover, b"\x89PNG\r\n\x1a\ntrack-cover").expect("track cover");
+        controller
+            .set_track_artwork(id, &track_cover)
+            .expect("track override");
+        let managed_track_cover = controller.track_artwork_path(id).expect("override path");
+        assert_ne!(managed_track_cover, managed_album_cover);
+        assert_eq!(
+            controller.album_cover_path(album),
+            Some(managed_album_cover.clone())
+        );
+
+        controller
+            .remove_track_artwork(id)
+            .expect("remove override");
+        assert!(controller.track_artwork_path(id).is_none());
+        assert_eq!(
+            controller.album_cover_path(album),
+            Some(managed_album_cover),
+            "removing a Track override must not remove shared Album artwork"
+        );
+
+        let replacement = dir.path().join("album-cover-2.png");
+        fs::write(&replacement, b"\x89PNG\r\n\x1a\nalbum-cover-2").expect("replacement");
+        controller
+            .set_album_cover(album, &replacement)
+            .expect("replace album cover");
+        assert!(controller.track_artwork_path(id).is_none());
+        assert!(
+            controller
+                .album_cover_path(album)
+                .is_some_and(|path| path.is_file())
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn missing_lyrics_and_artwork_references_can_be_repaired_explicitly() {
         let dir = TempDir::new("repair-lyrics-artwork");
         let (root, source) = canonical_track_fixture(&dir);

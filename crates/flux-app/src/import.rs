@@ -2040,6 +2040,72 @@ pub(crate) fn path_valid_image_sidecar(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Makes embedded or discovered Album-artwork suggestions consistent inside
+/// one reviewed Album group.
+///
+/// Candidates that target the same Album should not each stage a different
+/// cover file: that would make catalogue publication ambiguous and could store
+/// several identical covers. The first manual choice wins; otherwise the first
+/// discovered suggestion is reused for the whole group. Explicit manual choices
+/// on later candidates are preserved so a real disagreement still reaches
+/// review instead of being silently overwritten.
+fn resolve_album_artwork_suggestions(candidates: &mut [ImportCandidate]) {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(album) = candidate.album() else {
+            continue;
+        };
+        if candidate.album_artwork.is_none() {
+            continue;
+        }
+        let owner = candidate
+            .artist_id()
+            .map(|id| format!("id:{id}"))
+            .or_else(|| {
+                candidate
+                    .artist_name()
+                    .map(|name| format!("name:{}", name.trim().to_lowercase()))
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        groups
+            .entry((album.trim().to_lowercase(), owner))
+            .or_default()
+            .push(index);
+    }
+    for indices in groups.into_values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let manual = indices.iter().copied().find(|index| {
+            candidates[*index].provenance.album_artwork == Some(MetadataSource::Manual)
+        });
+        let Some(chosen_index) = manual.or_else(|| indices.first().copied()) else {
+            continue;
+        };
+        let Some(chosen) = candidates[chosen_index].album_artwork.clone() else {
+            continue;
+        };
+        let chosen_source = candidates[chosen_index].provenance.album_artwork;
+        for index in indices {
+            if index == chosen_index {
+                continue;
+            }
+            let candidate = &mut candidates[index];
+            if candidate.provenance.album_artwork == Some(MetadataSource::Manual) {
+                continue;
+            }
+            candidate.album_artwork = Some(chosen.clone());
+            candidate.provenance.album_artwork = chosen_source;
+            candidate.sidecar_notes.push(
+                "Album artwork reused from the first reviewed candidate for this Album, so one consistent cover is published."
+                    .to_owned(),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_candidate(
     source_path: PathBuf,
@@ -2484,6 +2550,7 @@ pub fn prepare_import_plan(
             candidate.force_album_target(&target);
         }
     }
+    resolve_album_artwork_suggestions(&mut plan.candidates);
     plan.recompute_destinations();
     if plan.cancelled {
         update_progress(
@@ -4284,6 +4351,48 @@ mod tests {
                 .get(TrackId::new(1))
                 .map(|track| track.effective_metadata().title),
             Some("Pending title".to_owned())
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn same_album_embedded_artwork_reuses_one_review_candidate() {
+        let dir = TempDir::new("same-album-embedded-art");
+        let root = dir.path().join("FluxLibrary");
+        let source_dir = dir.path().join("source/Nirvana/Nevermind");
+        fs::create_dir_all(&source_dir).expect("source dirs");
+        let first = source_dir.join("Lithium.flac");
+        let second = source_dir.join("Come as You Are.flac");
+        let fixture = include_bytes!("../../flux-library/tests/fixtures/tagged.flac");
+        fs::write(&first, fixture).expect("first flac");
+        fs::write(&second, fixture).expect("second flac");
+        let (controller, _control) = canonical_controller(&root);
+        let plan = prepare_import_plan(
+            canonical_request(&controller, &root, vec![first, second], None),
+            Arc::new(Mutex::new(ImportProgress::default())),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(plan.candidates.len(), 2);
+        let album = plan.candidates[0]
+            .album()
+            .expect("fixture album")
+            .to_owned();
+        assert_eq!(plan.candidates[1].album(), Some(album.as_str()));
+        let first_art = plan.candidates[0]
+            .album_artwork_path()
+            .expect("first embedded artwork");
+        let second_art = plan.candidates[1]
+            .album_artwork_path()
+            .expect("second embedded artwork");
+        assert_eq!(
+            first_art, second_art,
+            "the same Album must publish one consistent cover candidate"
+        );
+        assert!(
+            plan.candidates[1]
+                .sidecar_notes()
+                .iter()
+                .any(|note| note.contains("reused"))
         );
         controller.shutdown();
     }
