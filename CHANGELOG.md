@@ -6,6 +6,22 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M28 product consistency and playback reliability
+
+- Completed a playback lifecycle audit covering explicit/default device
+  selection, startup unavailability, stream loss, bounded recovery, pause/stop
+  intent, output switching, queue identity and shutdown. No concrete engine
+  defect was found, so the real audio path was left unchanged.
+- Fixed a GUI/TUI consistency defect: the TUI now reports `no audio backend`,
+  `audio unavailable` or `audio recovering` instead of implying audible output
+  from playback intent alone.
+- TUI now honors the shared reduced-motion preference and exposes a **Reduce
+  motion** Settings row, keeping visualizer behavior consistent with the GUI.
+- Added regression coverage for TUI audio-state reporting and reduced-motion
+  toggling.
+- Documented the playback audit, coverage and remaining hardware validation in
+  `docs/m28-product-consistency.md`.
+
 ### M27 interaction quality, accessibility and GUI/TUI parity
 
 - Reworked GUI Tab behavior: Tab/Shift+Tab traverse focusable form controls;

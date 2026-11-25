@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: public release suspended pending M27 accessibility/interaction validation.** Signing and native/manual validation remain external.
+**Status: public release suspended pending M28 playback/UX validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -28,10 +28,14 @@ Both interfaces open on Home and follow a shared product design language documen
 [`docs/design-system.md`](docs/design-system.md): Home-first navigation, dark
 surface hierarchy, restrained pink selection and primary actions, readable type,
 one playback timeline, and explicit Artist/Album collaborative relationships.
-M27 adds Tab-based form focus, keyboard queue and Track-action navigation, a
+M27 added Tab-based form focus, keyboard queue and Track-action navigation, a
 persisted reduced-motion preference, TUI Album-participant selection during
-import review and stronger desktop-identity resource checks. Details and limits
-are in [`docs/m27-interaction-accessibility.md`](docs/m27-interaction-accessibility.md).
+import review and stronger desktop-identity resource checks. M28 makes the TUI
+report real audio availability, honors reduced motion in both interfaces and
+documents the playback lifecycle audit and coverage. Details are in
+[`docs/m27-interaction-accessibility.md`](docs/m27-interaction-accessibility.md)
+and
+[`docs/m28-product-consistency.md`](docs/m28-product-consistency.md).
 
 M25 added a vendored Lucide icon set, player-integrated Queue/Lyrics access,
 detail-first Artist and Album pages, stable-ID Artist/Album selectors in Track
@@ -173,7 +177,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   M Track actions, Y lyrics, A queue, F favorite, I import and Q queue. When
   the Queue overlay is open, ↑/↓ selects, Enter plays, Delete removes and
   Escape closes. Settings can freeze the continuous waveform for reduced
-  motion. Queue rows play on activation; the drag handle reorders
+  motion. The TUI now reports `no audio backend`, `audio unavailable` or
+  `audio recovering` alongside playback intent instead of implying audible
+  output without a device. Queue rows play on activation; the drag handle reorders
   and the remove control is explicit. Track actions open a modal action sheet
   with full labels. Use Import for the review-first copy-only Import Manager: native file or folder picker, Flux Browser, drag-and-drop,
   name-inferred review, duplicate decisions, and real progress/cancel. Final

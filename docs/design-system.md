@@ -1,4 +1,4 @@
-# Flux product design system (M27)
+# Flux product design system (M28)
 
 Status: implemented design language for the Iced GUI and the crossterm TUI.
 This document describes the shared product hierarchy. It is not a claim of

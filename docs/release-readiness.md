@@ -18,8 +18,10 @@ text scale and accent presets, restored Track artwork/durations, stabilized the
 player geometry, added sortable headers and refreshed identity/context menus.
 M27 added Tab focus traversal, keyboard queue/Track-action operation, a reduced
 motion preference, TUI import participant selection and stronger identity
-resource validation. Human usability, screen-reader, optional transitions and
-native Windows/macOS interaction audits remain pending. Synthetic migration, rollback and commit-recovery tests pass, but
+resource validation. M28 completed a playback lifecycle audit, made TUI audio
+availability explicit and extended reduced-motion behavior to both interfaces.
+Human usability, screen-reader, physical-device and native Windows/macOS
+interaction audits remain pending. Synthetic migration, rollback and commit-recovery tests pass, but
 human validation of collaborative Album workflows and real user libraries is
 still required before any public artifact is authorized.
 
