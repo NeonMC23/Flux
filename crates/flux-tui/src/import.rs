@@ -522,6 +522,7 @@ impl Tui {
                 self.open_import_form(self.import_ui.as_ref().map_or(0, |ui| ui.selected))
             }
             KeyCode::Char('F') => self.open_import_album_picker(),
+            KeyCode::Char('p') => self.open_import_participants(),
             KeyCode::Char('1') => self.apply_import_release_type(ReleaseType::Album),
             KeyCode::Char('2') => self.apply_import_release_type(ReleaseType::Ep),
             KeyCode::Char('3') => self.apply_import_release_type(ReleaseType::Single),
@@ -537,6 +538,154 @@ impl Tui {
             _ => {}
         }
         false
+    }
+
+    fn import_review_candidate(&self) -> Option<&flux_app::ImportCandidate> {
+        let ui = self.import_ui.as_ref()?;
+        let plan = ui.plan.as_ref()?;
+        plan.candidates.get(ui.selected)
+    }
+
+    /// Resolves the physical owner for review presentation only when the
+    /// candidate has a stable ID or exactly one existing Artist has the
+    /// proposed name. Ambiguous names are never merged.
+    fn import_candidate_owner_hint(
+        &self,
+        candidate: &flux_app::ImportCandidate,
+    ) -> Option<ArtistId> {
+        if let Some(owner) = candidate.artist_id() {
+            return Some(owner);
+        }
+        let name = candidate.artist_name()?;
+        let matches = self
+            .controller
+            .artists()
+            .into_iter()
+            .filter(|artist| artist.name().eq_ignore_ascii_case(name.trim()))
+            .map(|artist| artist.id())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [owner] => Some(*owner),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn import_review_candidate_title(&self) -> Option<String> {
+        self.import_review_candidate()
+            .map(|candidate| candidate.title().to_owned())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn import_review_participant_context(
+        &self,
+    ) -> Option<(String, Option<String>, Option<ArtistId>, Vec<ArtistId>)> {
+        let candidate = self.import_review_candidate()?;
+        Some((
+            candidate.title().to_owned(),
+            candidate.album().map(str::to_owned),
+            self.import_candidate_owner_hint(candidate),
+            candidate.album_participants().to_vec(),
+        ))
+    }
+
+    /// Additional Album participants selected for the currently reviewed
+    /// candidate. The physical owner is deliberately excluded; ownership is
+    /// fixed by the candidate's Artist and is never changed here.
+    pub(crate) fn import_participant_ids(&self) -> Vec<ArtistId> {
+        let Some(candidate) = self.import_review_candidate() else {
+            return Vec::new();
+        };
+        let owner = self.import_candidate_owner_hint(candidate);
+        candidate
+            .album_participants()
+            .iter()
+            .copied()
+            .filter(|artist| Some(*artist) != owner)
+            .collect()
+    }
+
+    /// Existing Artists that can be added without duplicating the owner or an
+    /// existing participant. Display-name identity is never used for matching.
+    pub(crate) fn import_participant_candidates(&self) -> Vec<ArtistId> {
+        let Some(candidate) = self.import_review_candidate() else {
+            return Vec::new();
+        };
+        let owner = self.import_candidate_owner_hint(candidate);
+        let participants = candidate.album_participants();
+        self.controller
+            .artists()
+            .into_iter()
+            .map(|artist| artist.id())
+            .filter(|artist| Some(*artist) != owner && !participants.contains(artist))
+            .collect()
+    }
+
+    pub(crate) fn open_import_participants(&mut self) {
+        let Some(candidate) = self.import_review_candidate() else {
+            return;
+        };
+        if candidate.album().is_none() {
+            self.lifecycle_msg =
+                Some("Set an Album title before selecting Album participants.".to_owned());
+            return;
+        }
+        self.import_participant_cursor = 0;
+        self.import_participant_pick_cursor = 0;
+        self.mode = Mode::ImportParticipants;
+        self.lifecycle_msg = Some(
+            "Import Album participants — ↑/↓ select · a adds · r removes · Esc back".to_owned(),
+        );
+    }
+
+    pub(crate) fn add_import_participant(&mut self, artist: ArtistId) {
+        let owner = self
+            .import_review_candidate()
+            .and_then(|candidate| self.import_candidate_owner_hint(candidate));
+        let Some(ui) = self.import_ui.as_mut() else {
+            return;
+        };
+        let Some(plan) = ui.plan.as_mut() else {
+            return;
+        };
+        let Some(candidate) = plan.candidates.get_mut(ui.selected) else {
+            return;
+        };
+        if candidate.album().is_none() {
+            self.lifecycle_msg =
+                Some("Set an Album title before selecting Album participants.".to_owned());
+            return;
+        }
+        candidate.add_album_participant(artist);
+        self.import_participant_cursor = candidate
+            .album_participants()
+            .iter()
+            .filter(|participant| Some(**participant) != owner)
+            .position(|participant| *participant == artist)
+            .unwrap_or(0);
+        self.mode = Mode::ImportParticipants;
+        self.lifecycle_msg = Some(format!(
+            "Added {} as an Album participant for the reviewed Track. Physical ownership and Track credits are unchanged.",
+            artist_display_name(&self.controller, artist)
+        ));
+    }
+
+    pub(crate) fn remove_import_participant(&mut self, artist: ArtistId) {
+        let Some(ui) = self.import_ui.as_mut() else {
+            return;
+        };
+        let Some(plan) = ui.plan.as_mut() else {
+            return;
+        };
+        let Some(candidate) = plan.candidates.get_mut(ui.selected) else {
+            return;
+        };
+        candidate.remove_album_participant(artist);
+        self.import_participant_cursor = self.import_participant_cursor.saturating_sub(1);
+        self.mode = Mode::ImportParticipants;
+        self.lifecycle_msg = Some(format!(
+            "Removed {} from the reviewed Album participants. Physical ownership and Track credits are unchanged.",
+            artist_display_name(&self.controller, artist)
+        ));
     }
 
     pub(crate) fn import_album_targets(&self) -> Vec<ImportAlbumTarget> {

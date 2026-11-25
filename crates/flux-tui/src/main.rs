@@ -343,6 +343,10 @@ enum Mode {
     ConfirmArtistDelete,
     /// Choosing a fixed target album for import review.
     ImportAlbumPick,
+    /// Reviewing additional Album participants for one import candidate.
+    ImportParticipants,
+    /// Choosing an existing Artist for an import candidate's Album.
+    ImportParticipantPick,
     /// Choosing a destination artist for album ownership transfer.
     AlbumTransferPick,
     /// Reviewing an album ownership transfer.
@@ -510,6 +514,10 @@ struct Tui {
     album_participant_cursor: usize,
     /// Cursor in the add-participant Artist picker.
     album_participant_pick_cursor: usize,
+    /// Cursor in the import-review participant list.
+    import_participant_cursor: usize,
+    /// Cursor in the import-review participant picker.
+    import_participant_pick_cursor: usize,
     /// Pending participant removal confirmation.
     pending_participant_remove: Option<(AlbumId, ArtistId)>,
     /// Title and lines for help/import-detail info views.
@@ -1849,6 +1857,63 @@ impl Tui {
                 return self.handle_import_progress_key(key, ctrl_c);
             }
             Mode::ImportReview => return self.handle_import_review_key(key, ctrl_c),
+            Mode::ImportParticipants => {
+                if ctrl_c {
+                    return true;
+                }
+                let participants = self.import_participant_ids();
+                match key.code {
+                    KeyCode::Esc => self.mode = Mode::ImportReview,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.import_participant_cursor =
+                            self.import_participant_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.import_participant_cursor = (self.import_participant_cursor + 1)
+                            .min(participants.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('a') => {
+                        self.import_participant_pick_cursor = 0;
+                        self.mode = Mode::ImportParticipantPick;
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(artist) =
+                            participants.get(self.import_participant_cursor).copied()
+                        {
+                            self.remove_import_participant(artist);
+                        }
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            Mode::ImportParticipantPick => {
+                if ctrl_c {
+                    return true;
+                }
+                let artists = self.import_participant_candidates();
+                match key.code {
+                    KeyCode::Esc => self.mode = Mode::ImportParticipants,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.import_participant_pick_cursor =
+                            self.import_participant_pick_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.import_participant_pick_cursor = (self.import_participant_pick_cursor
+                            + 1)
+                        .min(artists.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if let Some(artist) =
+                            artists.get(self.import_participant_pick_cursor).copied()
+                        {
+                            self.add_import_participant(artist);
+                        }
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             Mode::FormInput => return self.handle_form_key(key, ctrl_c),
             Mode::CommandInput => return self.handle_command_key(key, ctrl_c),
             Mode::ConfirmPlaylist => return self.handle_playlist_confirm(key, ctrl_c),
@@ -4546,7 +4611,9 @@ impl Tui {
                 match self.mode {
                     Mode::AlbumParticipants
                     | Mode::AlbumParticipantPick
-                    | Mode::ConfirmAlbumParticipantRemove => {}
+                    | Mode::ConfirmAlbumParticipantRemove
+                    | Mode::ImportParticipants
+                    | Mode::ImportParticipantPick => {}
                     Mode::ScanInput => {
                         let path = text.trim();
                         if path.is_empty() {
@@ -5099,6 +5166,9 @@ fn cancel_message(mode: Mode) -> Option<&'static str> {
             Some("Import cancelled; no catalogue changes were made.")
         }
         Mode::ImportReview => Some("Import review closed; nothing was copied or published."),
+        Mode::ImportParticipants | Mode::ImportParticipantPick => {
+            Some("Import participant selection cancelled; the review is unchanged.")
+        }
         Mode::TrackEditInput => Some("Track edit cancelled; no changes were made."),
         Mode::FormInput => Some("Form cancelled; no changes were made."),
         Mode::CommandInput => Some("Command cancelled; nothing changed."),
@@ -5183,6 +5253,8 @@ fn run(initial_dir: Option<PathBuf>) -> std::io::Result<()> {
         content_offset: 0,
         album_participant_cursor: 0,
         album_participant_pick_cursor: 0,
+        import_participant_cursor: 0,
+        import_participant_pick_cursor: 0,
         pending_participant_remove: None,
         info_title: String::new(),
         info_lines: Vec::new(),
@@ -5336,6 +5408,8 @@ mod tests {
             content_offset: 0,
             album_participant_cursor: 0,
             album_participant_pick_cursor: 0,
+            import_participant_cursor: 0,
+            import_participant_pick_cursor: 0,
             pending_participant_remove: None,
             info_title: String::new(),
             info_lines: Vec::new(),
@@ -7309,6 +7383,82 @@ mod tests {
             rendered
                 .iter()
                 .any(|label| label.contains(&format!("ID {second}")))
+        );
+        tui.controller.shutdown();
+    }
+
+    #[test]
+    fn tui_import_review_adds_and_removes_album_participants() {
+        let dir = TempDir::new("tui-import-participants");
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).expect("root");
+        let source_dir = dir.path().join("Alpha/Shared");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let source = source_dir.join("song.wav");
+        std::fs::write(&source, minimal_wav()).expect("source");
+        let mut tui = tui(&dir);
+        key(&mut tui, KeyCode::Char('C'));
+        type_path(&mut tui, &root);
+        let alpha = tui.controller.create_artist("Alpha").expect("alpha");
+        let beta = tui.controller.create_artist("Beta").expect("beta");
+        key(&mut tui, KeyCode::Char('i'));
+        type_path(&mut tui, &source);
+        wait_for_mode(&mut tui, Mode::ImportReview);
+
+        key(&mut tui, KeyCode::Char('p'));
+        assert_eq!(tui.mode, Mode::ImportParticipants);
+        key(&mut tui, KeyCode::Char('a'));
+        assert_eq!(tui.mode, Mode::ImportParticipantPick);
+        assert_eq!(tui.import_participant_candidates(), vec![beta]);
+        key(&mut tui, KeyCode::Enter);
+        assert_eq!(tui.mode, Mode::ImportParticipants);
+        assert_eq!(tui.import_participant_ids(), vec![beta]);
+        for (width, height) in [(120u16, 36u16), (80, 24), (40, 12)] {
+            let mut rendered = Vec::new();
+            tui.draw_sized(&mut rendered, width, height)
+                .expect("participant view renders");
+            assert!(!rendered.is_empty(), "{width}x{height}");
+        }
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.mode, Mode::ImportReview);
+        let candidate = tui
+            .import_ui
+            .as_ref()
+            .and_then(|ui| ui.plan.as_ref())
+            .and_then(|plan| plan.candidates.first())
+            .expect("candidate");
+        assert_eq!(candidate.album_participants(), &[beta]);
+        assert_eq!(
+            tui.import_review_participant_context()
+                .and_then(|(_, _, owner, _)| owner),
+            Some(alpha),
+            "the review identifies the unique physical owner without merging names"
+        );
+
+        key(&mut tui, KeyCode::Char('p'));
+        key(&mut tui, KeyCode::Char('r'));
+        assert!(tui.import_participant_ids().is_empty());
+        key(&mut tui, KeyCode::Esc);
+        key(&mut tui, KeyCode::Char('p'));
+        key(&mut tui, KeyCode::Char('a'));
+        key(&mut tui, KeyCode::Enter);
+        key(&mut tui, KeyCode::Esc);
+        assert_eq!(tui.import_participant_ids(), vec![beta]);
+        key(&mut tui, KeyCode::Enter);
+        wait_for_mode(&mut tui, Mode::Normal);
+        assert_eq!(tui.controller.tracks().len(), 1);
+        let id = tui.controller.tracks()[0].0;
+        let album = tui.controller.track_album_id(id).expect("album");
+        assert_eq!(
+            tui.controller.track_credits(id),
+            vec![alpha],
+            "Track credits remain independent of Album participation"
+        );
+        assert_eq!(tui.controller.track_artist_id(id), Some(alpha));
+        assert_eq!(
+            tui.controller.album_participants(album),
+            vec![alpha, beta],
+            "the reviewed participant is published without changing the owner"
         );
         tui.controller.shutdown();
     }

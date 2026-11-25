@@ -90,6 +90,7 @@ impl Tui {
             Mode::TrackMovePick => "move",
             Mode::ArtistDeletion => "delete",
             Mode::ImportAlbumPick => "import",
+            Mode::ImportParticipants | Mode::ImportParticipantPick => "participants",
             Mode::AlbumParticipants | Mode::AlbumParticipantPick => "participants",
             Mode::ConfirmAlbumParticipantRemove => "confirm",
             Mode::AlbumTransferPick | Mode::AlbumTransferReview => "transfer",
@@ -170,6 +171,13 @@ impl Tui {
             Mode::ConfirmTrackDelete => "Confirm track deletion".to_owned(),
             Mode::ConfirmAlbumDelete => "Confirm empty-album deletion".to_owned(),
             Mode::ImportAlbumPick => "Import into an existing album · choose a target".to_owned(),
+            Mode::ImportParticipants => self
+                .import_review_candidate_title()
+                .map(|title| format!("Import Album participants · {title}"))
+                .unwrap_or_else(|| "Import Album participants".to_owned()),
+            Mode::ImportParticipantPick => {
+                "Add import Album participant · choose an Artist".to_owned()
+            }
             Mode::AlbumParticipants => self
                 .detail
                 .and_then(|detail| match detail {
@@ -252,6 +260,10 @@ impl Tui {
             self.draw_import_view(out, list_top, detail_height, content_width)?;
         } else if self.mode == Mode::ImportAlbumPick {
             self.draw_import_album_picker(out, list_top, detail_height, content_width)?;
+        } else if self.mode == Mode::ImportParticipants {
+            self.draw_import_participants(out, list_top, detail_height, content_width)?;
+        } else if self.mode == Mode::ImportParticipantPick {
+            self.draw_import_participant_picker(out, list_top, detail_height, content_width)?;
         } else if matches!(
             self.mode,
             Mode::AlbumParticipants | Mode::ConfirmAlbumParticipantRemove
@@ -341,6 +353,12 @@ impl Tui {
             Mode::ImportAlbumPick => {
                 "Fixed target — ↑/↓ choose album · Enter apply to every candidate · Esc cancel".to_owned()
             }
+            Mode::ImportParticipants => {
+                "Import participants — ↑/↓ select · a adds · r removes · Esc back".to_owned()
+            }
+            Mode::ImportParticipantPick => {
+                "Add import participant — ↑/↓ choose Artist · Enter adds · Esc back".to_owned()
+            }
             Mode::AlbumTransferPick => {
                 "Album transfer — ↑/↓ choose destination artist · Enter review · Esc cancel".to_owned()
             }
@@ -418,7 +436,7 @@ impl Tui {
                     .to_owned()
             }
             Mode::ImportReview => {
-                "Review — ↑/↓ · Space include/skip · u update exact · e edit · F album · A/T/L assets · Enter import · Esc cancel"
+                "Review — ↑/↓ · Space toggle · u update exact · p participants · e edit · F album · A/T/L assets · Enter import · Esc cancel"
                     .to_owned()
             }
             Mode::ConfirmPreserveIndex => {
@@ -1164,6 +1182,128 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn draw_import_participants(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let Some((title, album, owner, participants)) = self.import_review_participant_context()
+        else {
+            return Ok(());
+        };
+        let header = format!(
+            "{}{}",
+            title,
+            album
+                .as_deref()
+                .map(|album| format!(" · {album}"))
+                .unwrap_or_else(|| " · no Album".to_owned())
+        );
+        self.line(out, top as u16, &header, width, true)?;
+        let owner_label = owner.map_or_else(
+            || "Owner: unresolved".to_owned(),
+            |artist| {
+                format!(
+                    "Physical owner: {}",
+                    artist_display_name(&self.controller, artist)
+                )
+            },
+        );
+        self.line(out, (top + 1) as u16, &owner_label, width, false)?;
+        if participants.is_empty() {
+            self.line(
+                out,
+                (top + 2) as u16,
+                "No additional participants. Press a to add an existing Artist.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
+        self.import_participant_cursor = self
+            .import_participant_cursor
+            .min(participants.len().saturating_sub(1));
+        for (index, artist) in participants
+            .iter()
+            .take(height.saturating_sub(2))
+            .enumerate()
+        {
+            let name = artist_display_name(&self.controller, *artist);
+            let text = format!(
+                "{} {}",
+                if index == self.import_participant_cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                name
+            );
+            let y = (top + 2 + index) as u16;
+            if index == self.import_participant_cursor {
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_import_participant_picker(
+        &mut self,
+        out: &mut impl Write,
+        top: usize,
+        height: usize,
+        width: usize,
+    ) -> std::io::Result<()> {
+        let artists = self.import_participant_candidates();
+        if artists.is_empty() {
+            self.line(
+                out,
+                top as u16,
+                "Every existing Artist already participates in this reviewed Album.",
+                width,
+                false,
+            )?;
+            return Ok(());
+        }
+        self.import_participant_pick_cursor = self
+            .import_participant_pick_cursor
+            .min(artists.len().saturating_sub(1));
+        for (index, artist) in artists.iter().take(height).enumerate() {
+            let name = artist_display_name(&self.controller, *artist);
+            let text = format!(
+                "{} {}",
+                if index == self.import_participant_pick_cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                name
+            );
+            let y = (top + index) as u16;
+            if index == self.import_participant_pick_cursor {
+                queue!(
+                    out,
+                    MoveTo(self.content_offset as u16, y),
+                    SetAttribute(Attribute::Reverse)
+                )?;
+                self.line(out, y, &text, width, false)?;
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            } else {
+                self.line(out, y, &text, width, false)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn draw_album_participant_picker(
         &mut self,
         out: &mut impl Write,
@@ -1531,11 +1671,11 @@ impl Tui {
         };
         let title = if issue_count > 0 {
             format!(
-                "Import review · {count} track(s) · {issue_count} unreadable · e edit · A/T/L assets · Enter import · Esc cancel"
+                "Import review · {count} track(s) · {issue_count} unreadable · p participants · e edit · A/T/L assets · Enter import · Esc cancel"
             )
         } else {
             format!(
-                "Import review · {count} track(s) · e edit · A/T/L assets · Enter import · Esc cancel"
+                "Import review · {count} track(s) · p participants · e edit · A/T/L assets · Enter import · Esc cancel"
             )
         };
         self.line(out, top as u16, &title, width, true)?;
