@@ -1,4 +1,4 @@
-# Flux product design system (M25)
+# Flux product design system (M26)
 
 Status: implemented design language for the Iced GUI and the crossterm TUI.
 This document describes the shared product hierarchy. It is not a claim of
@@ -13,7 +13,7 @@ primary actions, and playback. It is not a background decoration. Icons are a
 vendored Lucide set, not typographic approximations or emoji.
 
 - Product name: **Flux**
-- Accent: `#ff66cc`
+- Accent: Flux Pink `#ff66cc` (configurable preset)
 - Foundation: dark neutral violet, not pure black
 - No gradients, glow effects, emoji application iconography, or decorative charts
 
@@ -33,6 +33,11 @@ vendored Lucide set, not typographic approximations or emoji.
 | Accent border | `rgba(255,102,204,0.38)` | Selected row and focus boundary |
 | Danger | `#ff788c` | Destructive actions and failures |
 | Success | `#7de2b4` | Completed operations |
+
+Typography baseline: hero 32, section 21, Track title 17, body 13.5, metadata
+11.5 and label 10.5. Settings offers a persisted text-only 100/110/120% scale.
+Accent presets are Pink, Violet, Blue, Teal and Amber; all use the same derived
+soft and border tokens.
 
 State must never rely on color alone. Selected rows also use a marker/background,
 current Tracks use a play glyph, active destinations use a filled surface and
@@ -194,6 +199,11 @@ library references user source paths; managed Album `tracks` folders are not
 navigation. Queue and Lyrics are player controls; the Queue stays inline on wide
 windows and overlays on narrower ones. Artist and Album pages are detail-first,
 with editing behind a discreet action.
+
+Tables: TITLE, ALBUM, RATE and TIME are clickable sort headers with a direction
+marker. A secondary advanced sort picker sits at the far right. Scrollbars are
+quiet neutral scrollers with an accent scroller only while dragged, and content
+reserves an inset so row actions are never covered.
 
 Keyboard operation: Tab/Shift+Tab cycle primary GUI destinations; ↑/↓ move
 Track focus; Enter plays; E edits; Y opens lyrics; A queues; F favorites; I

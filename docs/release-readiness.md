@@ -11,11 +11,13 @@ M21 suspended the public release pending renewed product validation. M22 added
 canonical schema 2 with explicit Album participation and an automatic schema-1
 upgrade. M23 completed a Home-first GUI/TUI visual redesign. M24 hardened import
 duplicate review, queue/context interaction, collaborative participant changes
-and keyboard operation. M25 moved navigation toward listening, added a vendored
-icon set, player-integrated Queue/Lyrics, detail-first Artist/Album pages,
-stable-ID Track entity selectors and safer embedded-artwork reuse. Human
-usability, screen-reader and native Windows/macOS interaction audits remain
-pending. Synthetic migration, rollback and commit-recovery tests pass, but
+and keyboard operation. M25 moved navigation toward listening, added a vendored icon set,
+player-integrated Queue/Lyrics, detail-first Artist/Album pages, stable-ID Track
+entity selectors and safer embedded-artwork reuse. M26 raised readability, added
+text scale and accent presets, restored Track artwork/durations, stabilized the
+player geometry, added sortable headers and refreshed identity/context menus.
+Human usability, screen-reader, motion and native Windows/macOS interaction
+audits remain pending. Synthetic migration, rollback and commit-recovery tests pass, but
 human validation of collaborative Album workflows and real user libraries is
 still required before any public artifact is authorized.
 

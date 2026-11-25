@@ -6,6 +6,33 @@ authorized release.
 
 ## [0.1.0] — 2026-11-21
 
+### M26 visual polish, playback stability and identity
+
+- Raised the GUI reading scale across titles, rows, metadata, dialogs and
+  controls. Added a persisted 100/110/120% text-scale setting in Appearance.
+- Added five curated accent presets (Flux Pink default) persisted in shared
+  settings and applied to selection, controls, sliders, scrollbars, queue and the
+  visualizer.
+- Added the canonical Flux mark to the sidebar and a local desktop-identity
+  installer for development builds. Existing Linux/Windows/macOS packaging
+  resources remain intact.
+- Tracks now show inherited Album artwork thumbnails and durations. Missing
+  artwork uses a neutral icon placeholder; missing audio remains a separate red
+  state.
+- Canonical imports persist technical duration. Older records lazily probe and
+  cache duration without catalogue writes.
+- Fixed player height jumps by reserving fixed progress-row geometry and
+  truncating Track metadata to one line.
+- Made TITLE, ALBUM, RATE and TIME column headers sortable with direction
+  indicators; the advanced sort picker remains at the far right.
+- Redesigned the Track context menu with artwork, icons, grouping, readable
+  rating labels and explicit disabled states.
+- Styled scrollbars as quiet neutral scrollers and added content insets so they
+  cannot cover row actions. Settings is now scrollable.
+- Preserved the waveform modes and curves; trace colours now follow the accent.
+- Documented typography, scale, theme, identity, sorting, scrollbar and remaining
+  motion limits in `docs/m26-visual-polish.md`.
+
 ### M25 player experience, icons and entity workflows
 
 - Moved Import music from a primary sidebar button to a subdued action above

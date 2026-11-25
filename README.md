@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: public release suspended pending M25 player-experience validation.** Signing and native/manual validation remain external.
+**Status: public release suspended pending M26 visual/playback validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -28,11 +28,15 @@ Both interfaces open on Home and follow a shared product design language documen
 [`docs/design-system.md`](docs/design-system.md): Home-first navigation, dark
 surface hierarchy, restrained pink selection and primary actions, readable type,
 one playback timeline, and explicit Artist/Album collaborative relationships.
-M25 adds a vendored Lucide icon set, player-integrated Queue/Lyrics access,
+M25 added a vendored Lucide icon set, player-integrated Queue/Lyrics access,
 detail-first Artist and Album pages, stable-ID Artist/Album selectors in Track
 editing, deterministic same-Album embedded-artwork reuse and managed-only
-Folder navigation. Details and limits are in
-[`docs/m25-player-experience.md`](docs/m25-player-experience.md).
+Folder navigation. M26 raises the reading scale, adds configurable text scale
+and accent presets, shows Track artwork and durations everywhere, stabilizes the
+player geometry, makes table headers sortable and refreshes the application
+identity and contextual menu. Details are in
+[`docs/m25-player-experience.md`](docs/m25-player-experience.md) and
+[`docs/m26-visual-polish.md`](docs/m26-visual-polish.md).
 
 Canonical schema 2 gives every Album an explicit ordered participant set in
 addition to its physical owner. Participation is independent of Track credits;
@@ -118,6 +122,13 @@ packaging/windows/build-windows.ps1 -Architecture x86_64
 packaging/macos/build-macos.sh
 ```
 
+For a development checkout, install the desktop identity once so Wayland and
+X11 launchers resolve the Flux icon:
+
+```sh
+packaging/linux/install-local-identity.sh "$CARGO_TARGET_DIR/debug/flux"
+```
+
 `flux --version` and `flux-tui --version` print
 `Flux 0.1.0 (io.github.neonmc23.flux)`. Packaged applications keep user data
 outside the install directory:
@@ -172,8 +183,9 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   performs a grouped, case-insensitive global search over canonical artists,
   albums and tracks with direct navigation. Track rows expose favorite and
   rating controls and label missing versus inaccessible audio distinctly;
-  track views keep sorting visible while favorites/lyrics/artwork/release/
-  rating filters live behind a **Filters** toggle; sorting is deterministic by
+  track views keep sortable TITLE/ALBUM/RATE/TIME headers plus an advanced sort
+  picker, while favorites/lyrics/artwork/release/rating filters live behind a
+  **Filters** toggle; sorting is deterministic by
   title/artist/album/track/rating/date-added/duration/play-count/last-played,
   and multi-selection uses stable TrackIds. **Home** summarizes canonical counts plus locally recorded
   listening history; Smart Collections provide Favorites, Highly Rated,
