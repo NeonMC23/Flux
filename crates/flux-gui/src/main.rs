@@ -3322,9 +3322,18 @@ impl FluxReady {
 
     fn set_editor_primary_artist(&mut self, choice: Option<ArtistChoice>) {
         let selected = choice.and_then(|choice| choice.id);
+        let owner = self
+            .track_editor
+            .as_ref()
+            .and_then(|editor| self.controller.track_artist_id(editor.id));
         let Some(editor) = self.track_editor.as_mut() else {
             return;
         };
+        if selected.is_none() && owner.is_some() && editor.credits.first() == owner.as_ref() {
+            editor.error =
+                Some("The physical owner must remain credited. Select another primary Artist or transfer ownership first.".to_owned());
+            return;
+        }
         editor.artist_id = selected;
         editor.credits_touched = true;
         match selected {
