@@ -123,6 +123,19 @@ impl Icon {
     }
 }
 
+/// Renders the canonical Flux application mark at a square size.
+///
+/// The mark carries its own identity colours, so it is not tinted.
+pub fn brand<'a, Message: 'a>(size: f32) -> Element<'a, Message> {
+    svg(svg::Handle::from_memory(include_bytes!(
+        "../../../assets/flux-icon.svg"
+    )))
+    .width(Length::Fixed(size))
+    .height(Length::Fixed(size))
+    .content_fit(ContentFit::Contain)
+    .into()
+}
+
 /// Renders one icon at a square size with a solid tint.
 ///
 /// The icon is decorative. Pair it with visible text or a tooltip/accessible
