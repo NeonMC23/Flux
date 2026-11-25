@@ -12672,24 +12672,6 @@ impl FluxReady {
                 .spacing(8),
             );
 
-            body = body.push(text("NEW ARTIST").size(8).color(MUTED));
-            body = body.push(
-                row![
-                    text_input("New artist name…", &editor.new_artist)
-                        .on_input(Message::EditorNewArtistChanged)
-                        .on_submit(Message::EditorCreateArtist)
-                        .style(input_style)
-                        .width(Length::Fill),
-                    button(text("Create & select").size(11))
-                        .style(ghost_style)
-                        .padding([7, 10])
-                        .on_press_maybe(
-                            (!editor.new_artist.trim().is_empty())
-                                .then_some(Message::EditorCreateArtist)
-                        ),
-                ]
-                .spacing(8),
-            );
             body = body.push(text("TRANSFER OWNERSHIP").size(8).color(MUTED));
             body = body.push(
                 row![
