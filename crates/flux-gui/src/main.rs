@@ -22526,6 +22526,53 @@ mod tests {
     }
 
     #[test]
+    fn continuous_scrolling_extends_track_group_and_queue_limits() {
+        let dir = TempDir::new("gui-continuous-scroll");
+        let root = dir.path().join("library");
+        let mut gui = open_canonical_gui(&dir, &root);
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let one = source_dir.join("one.wav");
+        let two = source_dir.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        let mut second = minimal_wav();
+        second.push(3);
+        std::fs::write(&two, second).expect("two");
+        gui.controller
+            .import_files(&[one, two], false)
+            .expect("import");
+        gui.controller
+            .create_artist("Second Identity")
+            .expect("artist");
+
+        gui.track_limit = 1;
+        send(&mut gui, Message::TrackScrolled(0.95));
+        assert!(
+            gui.track_limit >= 2,
+            "track limit grows near the scroll end"
+        );
+
+        gui.view = LibraryView::Artists;
+        gui.group_limit = 1;
+        send(&mut gui, Message::GroupScrolled(0.95));
+        assert!(
+            gui.group_limit >= 2,
+            "artist/album limit grows near the scroll end"
+        );
+
+        let id = gui.controller.tracks()[0].0;
+        gui.controller.enqueue_track(id).expect("first pending");
+        gui.controller.enqueue_track(id).expect("second pending");
+        gui.queue_limit = 1;
+        send(&mut gui, Message::QueueScrolled(0.95));
+        assert!(
+            gui.queue_limit >= 3,
+            "queue limit covers pending entries after scrolling"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
     fn global_shortcuts_ignore_events_captured_by_text_inputs() {
         use iced::keyboard::key::{Code, Physical};
         use iced::keyboard::{Event as KeyboardEvent, Location};
