@@ -76,7 +76,7 @@ mod settings;
 pub use settings::{
     Accent, CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, LoadedSettings,
     SETTINGS_SCHEMA_VERSION, SettingsError, SettingsStore, TEXT_SCALE_DEFAULT, TEXT_SCALE_LEVELS,
-    ViewMode, ViewModePreferences, ViewSurface,
+    TEXT_SCALE_MAX, TEXT_SCALE_MIN, ViewMode, ViewModePreferences, ViewSurface,
 };
 
 use flux_core::{
@@ -1730,6 +1730,35 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Where the effective artwork for an entity came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkOrigin {
+    /// Stored explicitly on the entity itself.
+    Explicit,
+    /// Inherited from the entity's Album.
+    Album,
+    /// Inherited from a Track's explicit override.
+    Track,
+    /// Inherited from the entity's Artist portrait.
+    Artist,
+    /// Inherited from an Album associated with the Artist.
+    ArtistAlbum,
+}
+
+impl ArtworkOrigin {
+    /// Concise user-facing description of the source.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit image",
+            Self::Album => "Album artwork",
+            Self::Track => "Track artwork override",
+            Self::Artist => "Artist portrait",
+            Self::ArtistAlbum => "derived from an associated Album",
+        }
+    }
+}
+
 /// The Flux application controller. See the crate-level docs for the
 /// state-ownership contract.
 pub struct Controller {
@@ -1761,6 +1790,9 @@ pub struct Controller {
     /// Stable queue entry of `engine_loaded`. TrackId alone cannot
     /// distinguish duplicate entries for the same track.
     engine_entry: Option<QueueEntryId>,
+    /// Outgoing foreground Track during a crossfade overlap. Presentation
+    /// stays on this entry until the engine reports the overlap finished.
+    foreground_transition: Option<ForegroundTransition>,
     /// The load session of `engine_loaded`. Every explicit load gets a
     /// new monotonic session from the engine, so delayed events from an
     /// older attempt (even for the same track) cannot affect the
@@ -1877,6 +1909,17 @@ struct LibrarySeed {
     playback_history: PlaybackHistory,
     history_store: Option<PlaybackHistoryStore>,
     history_write_protected: bool,
+}
+
+/// Crossfade overlap during which the outgoing Track stays in the foreground
+/// while the engine has already made the incoming source audible.
+#[derive(Debug, Clone, Copy)]
+struct ForegroundTransition {
+    from_entry: QueueEntryId,
+    from_id: TrackId,
+    to_entry: QueueEntryId,
+    to_id: TrackId,
+    from_position: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -2216,6 +2259,7 @@ impl Controller {
             audio_recovery_default: false,
             engine_loaded: None,
             engine_entry: None,
+            foreground_transition: None,
             engine_session: None,
             engine_loaded_session: None,
             stream_info: None,
@@ -3270,6 +3314,22 @@ impl Controller {
                 Duration::ZERO
             };
         }
+        if let Some(transition) = self.foreground_transition
+            && current == Some(transition.from_entry)
+            && self.engine_entry == Some(transition.to_entry)
+        {
+            // The engine clock is already relative to the incoming source.
+            // While the outgoing Track remains foregrounded, its position
+            // advances by exactly the same delivered output frames.
+            let incoming = self.engine.position();
+            let duration = self
+                .current_duration()
+                .unwrap_or(Duration::from_secs(u64::MAX / 2));
+            return transition
+                .from_position
+                .saturating_add(incoming)
+                .min(duration);
+        }
         if self.engine_loaded.is_some() && self.engine_entry == current {
             return self.engine.position();
         }
@@ -3280,6 +3340,12 @@ impl Controller {
             return Duration::from_millis(self.restored_position_ms);
         }
         Duration::ZERO
+    }
+
+    /// Drops a deferred crossfade foreground. Used whenever an explicit
+    /// seek, stop, skip or queue replacement supersedes the transition.
+    fn abort_foreground_transition(&mut self) {
+        self.foreground_transition = None;
     }
 
     fn clear_restored_position(&mut self) {
@@ -3350,6 +3416,7 @@ impl Controller {
         if self.shutdown {
             return Err("Playback is shutting down.".to_owned());
         }
+        self.abort_foreground_transition();
         let Some(id) = self.current_id() else {
             let message = "Nothing is selected to seek.".to_owned();
             self.report_error(message.clone());
@@ -3504,10 +3571,7 @@ impl Controller {
 
     /// Persists a supported interface text-scale percentage.
     pub fn set_text_scale(&mut self, percent: u16) -> Result<(), String> {
-        self.text_scale = TEXT_SCALE_LEVELS
-            .into_iter()
-            .min_by_key(|level| level.abs_diff(percent))
-            .unwrap_or(TEXT_SCALE_DEFAULT);
+        self.text_scale = percent.clamp(TEXT_SCALE_MIN, TEXT_SCALE_MAX);
         let Some(store) = self.settings_store.as_mut() else {
             return Ok(());
         };
@@ -4244,6 +4308,16 @@ impl Controller {
             StorageBackend::Canonical { root } => Some(root),
             _ => None,
         }
+    }
+
+    /// Whether the active canonical library directory has disappeared.
+    ///
+    /// The in-memory catalogue stays intact so an unmount or transient
+    /// permission failure never destroys data, but front-ends can stop
+    /// presenting it as writable/playable and require an explicit reopen.
+    #[must_use]
+    pub fn active_library_missing(&self) -> bool {
+        self.canonical_root().is_some_and(|root| !root.is_dir())
     }
 
     /// Pending backup-recovery details in portable mode: while this
@@ -5034,6 +5108,80 @@ impl Controller {
         self.canonical_store
             .as_ref()
             .and_then(|store| store.track_artwork_path(id))
+    }
+
+    /// Effective Track artwork after inheritance. Explicit Track overrides
+    /// win, then Album artwork (explicit or derived from a suitable Track).
+    #[must_use]
+    pub fn effective_track_artwork(&self, id: TrackId) -> Option<(PathBuf, ArtworkOrigin)> {
+        if let Some(path) = self.track_artwork_path(id) {
+            return Some((path, ArtworkOrigin::Explicit));
+        }
+        let album = self.track_album_id(id)?;
+        if let Some(path) = self.album_cover_path(album) {
+            return Some((path, ArtworkOrigin::Album));
+        }
+        for track in self.album_tracks(album) {
+            if let Some(path) = self.track_artwork_path(track) {
+                return Some((path, ArtworkOrigin::Track));
+            }
+        }
+        None
+    }
+
+    /// Effective Album artwork. Explicit Album art wins, then the first Track
+    /// in deterministic Album order with an explicit override, then the
+    /// physical owner's explicit Artist portrait and remaining participants.
+    #[must_use]
+    pub fn effective_album_artwork(&self, id: AlbumId) -> Option<(PathBuf, ArtworkOrigin)> {
+        if let Some(path) = self.album_cover_path(id) {
+            return Some((path, ArtworkOrigin::Explicit));
+        }
+        let album = self.album(id)?.clone();
+        for track in &album.track_order {
+            if let Some(path) = self.track_artwork_path(*track) {
+                return Some((path, ArtworkOrigin::Track));
+            }
+        }
+        if let Some(path) = self.artist_image_path(album.owner_artist_id) {
+            return Some((path, ArtworkOrigin::Artist));
+        }
+        for artist in &album.participant_artist_ids {
+            if *artist != album.owner_artist_id
+                && let Some(path) = self.artist_image_path(*artist)
+            {
+                return Some((path, ArtworkOrigin::Artist));
+            }
+        }
+        None
+    }
+
+    /// Effective Artist portrait. Explicit portraits win, then deterministic
+    /// associated Album artwork. Album artist fallbacks are deliberately not
+    /// consulted here to avoid a resolution cycle.
+    #[must_use]
+    pub fn effective_artist_artwork(&self, id: ArtistId) -> Option<(PathBuf, ArtworkOrigin)> {
+        if let Some(path) = self.artist_image_path(id) {
+            return Some((path, ArtworkOrigin::Explicit));
+        }
+        let mut albums = self.albums_owned_by(id);
+        albums.extend(self.albums_participating_for(id));
+        albums.extend(self.albums_credited_for(id));
+        albums.sort_by_key(|album| album.get());
+        albums.dedup();
+        for album_id in albums {
+            if let Some(path) = self.album_cover_path(album_id) {
+                return Some((path, ArtworkOrigin::ArtistAlbum));
+            }
+            if let Some(album) = self.album(album_id) {
+                for track in &album.track_order {
+                    if let Some(path) = self.track_artwork_path(*track) {
+                        return Some((path, ArtworkOrigin::ArtistAlbum));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Assigns or replaces a Track-specific artwork override. Album artwork is
@@ -6647,6 +6795,7 @@ impl Controller {
         if self.shutdown {
             return Err("Playback is shutting down.".to_owned());
         }
+        self.abort_foreground_transition();
         self.update_playback_history();
         if self.player.queue().entry(entry).is_none() {
             let message = format!("Queue entry {entry} is no longer in the queue.");
@@ -6671,31 +6820,49 @@ impl Controller {
         Ok(())
     }
 
-    /// Clears every queue entry and stops playback.
+    /// Clears pending queue entries while preserving active playback.
     ///
-    /// Stable entry identities are retired by the queue itself. Catalogue
+    /// The current entry is the active playback item and always remains.
+    /// When nothing is current the queue is fully cleared. Catalogue
     /// tracks, playlists, history, ratings and the current library are
-    /// untouched. Returns the number of removed entries.
+    /// untouched. Returns the number of removed pending entries.
     pub fn clear_queue(&mut self) -> usize {
-        let count = self.player.queue().len();
-        if count == 0 {
+        // Only an actively sounding (or paused) Track is protected. With
+        // playback stopped, the current selection is ordinary pending state.
+        let current =
+            if self.player.state() == PlaybackState::Stopped || self.engine_loaded.is_none() {
+                None
+            } else {
+                self.current_queue_entry_id()
+            };
+        let pending = self
+            .player
+            .queue()
+            .entries()
+            .iter()
+            .filter(|entry| Some(entry.id()) != current)
+            .map(|entry| entry.id())
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            if current.is_none() && !self.player.queue().is_empty() {
+                self.player.queue_mut().clear();
+            }
+            self.report_status("No pending queue entries to clear.".to_owned());
             return 0;
         }
+        let removed = pending.len();
         self.update_playback_history();
-        self.player.stop();
-        self.engine.stop();
-        self.player.queue_mut().clear();
-        self.engine_loaded = None;
-        self.engine_entry = None;
-        self.engine_session = None;
-        self.engine_loaded_session = None;
-        self.stream_info = None;
-        self.reset_play_session_for_current(0);
+        self.abort_foreground_transition();
+        for entry in pending {
+            let _ = self.player.queue_mut().remove_entry(entry);
+        }
         self.queue_auto_library = false;
         self.after_queue_change();
         self.outbox.push(ControllerEvent::PlaybackChanged);
-        self.report_status(format!("Cleared {count} queue entr(ies)."));
-        count
+        self.report_status(format!(
+            "Cleared {removed} pending queue entr(ies); the active Track keeps playing."
+        ));
+        removed
     }
 
     /// Appends a library track to the queue without changing playback.
@@ -6889,6 +7056,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.abort_foreground_transition();
         self.update_playback_history();
         self.player.stop();
         self.restart_recovery_position();
@@ -6902,6 +7070,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.abort_foreground_transition();
         self.update_playback_history();
         let before = self.current_queue_entry_id();
         if self.shuffle {
@@ -6932,6 +7101,7 @@ impl Controller {
         if self.shutdown {
             return;
         }
+        self.abort_foreground_transition();
         self.update_playback_history();
         if self.position() >= Duration::from_secs(3)
             && self.current_id().is_some()
@@ -7641,6 +7811,7 @@ impl Controller {
                 to_entry,
                 boundary_frame: _,
                 from_position,
+                overlap_frames,
                 info,
             } => {
                 if self.engine_session != Some(session) {
@@ -7672,6 +7843,7 @@ impl Controller {
                     // stop the pipeline and reload the model's current
                     // entry (if any) from a clean generation.
                     self.engine.stop();
+                    self.foreground_transition = None;
                     self.engine_loaded = None;
                     self.engine_entry = None;
                     self.engine_session = None;
@@ -7688,10 +7860,31 @@ impl Controller {
                     return;
                 }
 
+                if overlap_frames > 0 && from_entry != to_entry {
+                    // Keep the outgoing Track in the foreground for the
+                    // whole audible overlap. The engine is already decoding
+                    // and mixing the incoming source, so only the
+                    // presentation identity is deferred.
+                    self.foreground_transition = Some(ForegroundTransition {
+                        from_entry,
+                        from_id,
+                        to_entry,
+                        to_id,
+                        from_position,
+                    });
+                    self.engine_loaded = Some(to_id);
+                    self.engine_entry = Some(to_entry);
+                    self.stream_info = Some(info);
+                    self.preloaded_entry = None;
+                    events.push(ControllerEvent::PlaybackChanged);
+                    return;
+                }
+
                 // The engine completed the natural handoff. It remains
                 // the same load session and generation; only source
                 // identity and source-relative position reset here.
                 let _ = self.player.queue_mut().set_current_entry(to_entry);
+                self.foreground_transition = None;
                 self.engine_loaded = Some(to_id);
                 self.engine_entry = Some(to_entry);
                 self.stream_info = Some(info);
@@ -7701,6 +7894,42 @@ impl Controller {
                 } else {
                     self.set_play_session_baseline(0);
                 }
+                self.after_queue_change();
+                events.push(ControllerEvent::PlaybackChanged);
+            }
+            EngineEvent::TransitionFinished {
+                session,
+                generation: _,
+                from_entry,
+                to_entry,
+            } => {
+                if self.engine_session != Some(session) {
+                    return;
+                }
+                let Some(transition) = self.foreground_transition else {
+                    return;
+                };
+                if transition.from_entry != from_entry || transition.to_entry != to_entry {
+                    return;
+                }
+                let target_valid = self
+                    .player
+                    .queue()
+                    .entry(to_entry)
+                    .is_some_and(|entry| entry.track() == transition.to_id);
+                if self.player.current_track() != Some(transition.from_id)
+                    || self.current_queue_entry_id() != Some(from_entry)
+                    || !target_valid
+                {
+                    return;
+                }
+                let incoming_position = self.engine.position();
+                self.foreground_transition = None;
+                let _ = self.player.queue_mut().set_current_entry(to_entry);
+                self.preloaded_entry = None;
+                self.reset_play_session_for_current(
+                    incoming_position.as_millis().min(u128::from(u64::MAX)) as u64,
+                );
                 self.after_queue_change();
                 events.push(ControllerEvent::PlaybackChanged);
             }
@@ -8048,6 +8277,7 @@ impl Controller {
         if self.shutdown {
             return Err("Playback is shutting down.".to_owned());
         }
+        self.abort_foreground_transition();
         if self.audio_recovery_active() {
             return Err(
                 "Audio output is recovering; try again when the device is ready.".to_owned(),
@@ -9125,7 +9355,7 @@ fn save_library(library: &Library, path: &Path) -> Result<(), String> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -11004,6 +11234,7 @@ mod tests {
                 to_entry: entry_b,
                 boundary_frame: 1_000,
                 from_position: Duration::from_millis(1_000),
+                overlap_frames: 0,
                 info,
             },
             &mut events,
@@ -11026,6 +11257,7 @@ mod tests {
                 to_entry: entry_b,
                 boundary_frame: 1_000,
                 from_position: Duration::from_millis(1_000),
+                overlap_frames: 0,
                 info,
             },
             &mut events,
@@ -11413,6 +11645,55 @@ mod tests {
         assert!(
             advanced >= start + Duration::from_millis(150),
             "incoming position must advance from {start:?}, got {advanced:?}"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn crossfade_keeps_outgoing_foreground_until_the_overlap_finishes() {
+        let dir = TempDir::new("crossfade-foreground");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 88_200, 0.2);
+        let b_path = write_dc_wav(&root, "b.wav", 88_200, 0.8);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        let b = id_of(&controller, &b_path);
+        controller.set_crossfade_ms(100);
+        controller.play_track(a);
+        let entry_a = controller.current_queue_entry_id().expect("entry a");
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("entry b queued");
+        let _ = drive(&mut controller, &control, |c, _| {
+            c.foreground_transition.is_some()
+        });
+        let transition = controller
+            .foreground_transition
+            .expect("foreground overlap");
+        assert_eq!(transition.from_entry, entry_a);
+        assert_eq!(transition.to_entry, entry_b);
+        assert_eq!(controller.current_id(), Some(a), "outgoing stays displayed");
+        assert_eq!(controller.engine_entry, Some(entry_b));
+        assert_eq!(controller.player_state(), PlaybackState::Playing);
+        let displayed = controller.position();
+        assert!(
+            displayed > Duration::from_millis(1_500),
+            "outgoing progress approaches its own end: {displayed:?}"
+        );
+        let _ = drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id() == Some(entry_b)
+        });
+        assert_eq!(controller.current_id(), Some(b));
+        assert!(controller.foreground_transition.is_none());
+        let incoming = controller.position();
+        assert!(
+            incoming >= Duration::from_millis(60),
+            "incoming position must retain overlap playback, got {incoming:?}"
         );
         controller.shutdown();
     }
@@ -16221,6 +16502,7 @@ mod tests {
                 to_entry: new_entry,
                 boundary_frame: 0,
                 from_position: Duration::ZERO,
+                overlap_frames: 0,
                 info: old_info,
             },
             &mut events,
@@ -18576,6 +18858,17 @@ mod tests {
         fs::create_dir_all(&empty).expect("empty root");
         let created = create_canonical_library(&empty).expect("empty root creation");
         assert!(created.root().join("library.flux").is_file());
+        assert!(
+            !dir.path().join(".empty.flux-create.lock").exists(),
+            "creation leases must not leave technical files beside the user's music folder"
+        );
+        assert!(
+            fs::read_dir(dir.path())
+                .expect("temp parent")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("flux-create")),
+            "no create-lock artifact is visible in the library parent"
+        );
 
         let lock_only = dir.path().join("lock-only");
         fs::create_dir_all(&lock_only).expect("lock root");
@@ -18680,7 +18973,187 @@ mod tests {
     }
 
     #[test]
-    fn clear_queue_retires_entries_without_touching_the_catalogue() {
+    fn missing_active_library_is_reported_without_destroying_memory_state() {
+        let dir = TempDir::new("missing-active-library");
+        let (root, source) = canonical_track_fixture(&dir);
+        let (mut controller, _control) = boot_canonical_at(&root);
+        controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let id = controller.tracks()[0].0;
+        assert!(!controller.active_library_missing());
+        fs::remove_dir_all(&root).expect("remove active library");
+        assert!(
+            controller.active_library_missing(),
+            "front-ends can stop presenting a deleted library as writable"
+        );
+        assert!(
+            controller.track(id).is_some(),
+            "the in-memory catalogue is retained, not silently discarded"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn artwork_inheritance_is_deterministic_and_reactive() {
+        let dir = TempDir::new("artwork-inheritance");
+        let (root, source) = canonical_track_fixture(&dir);
+        let mut second = fs::read(&source).expect("fixture");
+        second.extend_from_slice(&[0, 1]);
+        let second_path = dir.path().join("second.wav");
+        fs::write(&second_path, second).expect("second source");
+        let (mut controller, _control) = boot_canonical_at(&root);
+        let artist = controller.create_artist("Artwork Artist").expect("artist");
+        let album = controller
+            .create_album(artist, "Inherited Album", crate::ReleaseType::Album)
+            .expect("album");
+        let target = crate::ImportAlbumTarget {
+            album_id: album,
+            owner_artist_id: artist,
+            owner_name: "Artwork Artist".to_owned(),
+            title: "Inherited Album".to_owned(),
+            release_type: crate::ReleaseType::Album,
+            cover: None,
+            track_order: Vec::new(),
+            generation: controller.generation(),
+        };
+        let request = crate::ImportRequest {
+            sources: vec![source, second_path],
+            recursive: false,
+            storage: crate::ImportStorage::Copy,
+            library_root: controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
+            existing_tracks: controller.tracks().to_vec(),
+            existing_artists: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_artist_id(*id).map(|artist| (*id, artist)))
+                .collect(),
+            existing_credits: controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| controller.track_album_id(*id).map(|album| (*id, album)))
+                .collect(),
+            target_album: Some(target),
+            generation: controller.generation(),
+            library_session: controller.library_session(),
+        };
+        let progress = Arc::new(Mutex::new(crate::import::ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let plan = crate::prepare_import_plan(request, progress.clone(), cancel.clone());
+        let prepared = crate::prepare_import_files(&plan, progress, cancel);
+        controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("import into album");
+        let ids = controller.album_tracks(album);
+        let other = controller
+            .create_album(artist, "Other Album", crate::ReleaseType::Album)
+            .expect("other");
+        let first = ids[0];
+        let second = ids[1];
+        let artwork = dir.path().join("track.png");
+        fs::write(&artwork, b"\x89PNG\r\n\x1a\nart").expect("artwork");
+        controller
+            .set_track_artwork(first, &artwork)
+            .expect("track art");
+
+        assert_eq!(
+            controller
+                .effective_track_artwork(first)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::Explicit)
+        );
+        let inherited = controller
+            .effective_album_artwork(album)
+            .map(|(_, origin)| origin);
+        assert_eq!(
+            inherited,
+            Some(crate::ArtworkOrigin::Track),
+            "Albums inherit the first suitable Track override"
+        );
+        assert_eq!(
+            controller
+                .effective_artist_artwork(artist)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::ArtistAlbum),
+            "Artists inherit deterministic associated Album artwork"
+        );
+        assert_eq!(controller.effective_album_artwork(other), None);
+
+        let second_art = dir.path().join("second.png");
+        fs::write(&second_art, b"\x89PNG\r\n\x1a\nsecond").expect("second art");
+        controller
+            .set_track_artwork(second, &second_art)
+            .expect("second art");
+        assert_eq!(
+            controller
+                .effective_track_artwork(second)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::Explicit)
+        );
+        assert_eq!(
+            controller
+                .effective_album_artwork(album)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::Track),
+            "the earliest Track in Album order wins, not whichever changed last"
+        );
+
+        controller
+            .remove_track_artwork(first)
+            .expect("remove first art");
+        assert_eq!(
+            controller
+                .effective_album_artwork(album)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::Track),
+            "removing the first source falls through to the next suitable Track"
+        );
+
+        let cover = dir.path().join("album.png");
+        fs::write(&cover, b"\x89PNG\r\n\x1a\ncover").expect("cover");
+        controller
+            .set_album_cover(album, &cover)
+            .expect("album cover");
+        assert_eq!(
+            controller
+                .effective_album_artwork(album)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::Explicit),
+            "explicit Album artwork beats inherited Track artwork"
+        );
+        assert_eq!(
+            controller
+                .effective_track_artwork(first)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::Album),
+            "Tracks without overrides inherit the explicit Album cover"
+        );
+
+        let portrait = dir.path().join("artist.png");
+        fs::write(&portrait, b"\x89PNG\r\n\x1a\nportrait").expect("portrait");
+        controller
+            .set_artist_image(artist, &portrait)
+            .expect("artist image");
+        assert_eq!(
+            controller
+                .effective_artist_artwork(artist)
+                .map(|(_, origin)| origin),
+            Some(crate::ArtworkOrigin::Explicit),
+            "explicit Artist portraits win"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn clear_queue_preserves_active_playback_and_only_removes_pending_entries() {
         let dir = TempDir::new("clear-queue");
         let (root, source) = canonical_track_fixture(&dir);
         let (mut controller, _control) = boot_canonical_at(&root);
@@ -18688,13 +19161,21 @@ mod tests {
             .import_files(std::slice::from_ref(&source), false)
             .expect("import");
         let id = controller.tracks()[0].0;
-        controller.clear_queue();
-        controller.enqueue_track(id).expect("first");
-        controller.enqueue_track(id).expect("second");
-        assert_eq!(controller.queue_len(), 2);
+        controller.play_track(id);
+        let active = controller.current_queue_entry_id().expect("active entry");
+        controller.enqueue_track(id).expect("pending one");
+        controller.enqueue_track(id).expect("pending two");
+        assert_eq!(controller.queue_len(), 3);
         assert_eq!(controller.clear_queue(), 2);
-        assert_eq!(controller.queue_len(), 0);
-        assert_eq!(controller.current_queue_entry_id(), None);
+        assert_eq!(controller.queue_len(), 1);
+        assert_eq!(controller.current_queue_entry_id(), Some(active));
+        assert_eq!(
+            controller.player_state(),
+            PlaybackState::Playing,
+            "clearing pending entries must not stop the active Track"
+        );
+        assert_eq!(controller.engine_loaded, Some(id));
+        assert_eq!(controller.engine_entry, Some(active));
         assert!(controller.track(id).is_some());
         assert_eq!(controller.clear_queue(), 0);
         controller.shutdown();

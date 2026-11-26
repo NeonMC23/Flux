@@ -147,14 +147,10 @@ impl LibraryLock {
             lock_path: None,
             error,
         })?;
-        let name = identity
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "flux-library".to_owned());
-        let lock_path = identity
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!(".{name}.flux-create.lock"));
+        // Creation leases live in a per-user runtime/cache lock directory,
+        // never beside (or inside) the user's chosen music folder. The
+        // identity hash keeps equivalent spellings on one lease.
+        let lock_path = creation_lock_path(&identity);
         acquire(identity, lock_path)
     }
 
@@ -259,6 +255,39 @@ fn legacy_identity(index_path: &Path) -> Result<PathBuf, LibraryLockError> {
     }
 }
 
+fn creation_lock_path(identity: &Path) -> PathBuf {
+    let mut hash = 0xcbf29ce484222325u64;
+    let bytes = identity.to_string_lossy();
+    for byte in bytes.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let name = identity
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "flux-library".to_owned())
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '-' | '_') {
+                value
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("flux-library-locks")
+        .join(format!("{name}-{hash:016x}.lock"))
+}
+
 fn with_lock_suffix(identity: &Path) -> PathBuf {
     let mut name = identity.as_os_str().to_os_string();
     name.push(".lock");
@@ -268,6 +297,7 @@ fn with_lock_suffix(identity: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use super::{LibraryLock, LibraryLockError};
     use crate::test_support::TempDir;
@@ -312,9 +342,25 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let creation = LibraryLock::acquire_creation(&root).expect("creation lease");
         let lock_path = creation.lock_path().to_owned();
-        assert_eq!(
-            lock_path.file_name().and_then(|name| name.to_str()),
-            Some(".FluxLibrary.flux-create.lock")
+        assert!(
+            lock_path.starts_with(
+                std::env::var_os("XDG_CACHE_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|home| home.join(".cache")))
+                    .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("flux-library-locks")
+            ),
+            "creation locks must not live beside the user's music folder: {lock_path:?}"
+        );
+        assert!(
+            lock_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".lock") && name.contains("FluxLibrary")),
+            "{lock_path:?}"
         );
         assert!(busy(
             LibraryLock::acquire_creation(&root).expect_err("one creator")

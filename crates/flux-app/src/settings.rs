@@ -20,7 +20,13 @@ pub const SETTINGS_SCHEMA_VERSION: u64 = 1;
 /// Default interface text scale percentage.
 pub const TEXT_SCALE_DEFAULT: u16 = 100;
 
-/// Supported interface text scale levels.
+/// Smallest supported interface text scale.
+pub const TEXT_SCALE_MIN: u16 = 80;
+
+/// Largest supported interface text scale.
+pub const TEXT_SCALE_MAX: u16 = 140;
+
+/// Recommended interface text scale presets.
 pub const TEXT_SCALE_LEVELS: [u16; 3] = [100, 110, 120];
 
 /// Persisted list/grid presentation for a library surface.
@@ -654,10 +660,7 @@ fn recover_audio_output_device(value: Option<&Value>) -> Option<String> {
 }
 
 fn normalize_text_scale(percent: u16) -> u16 {
-    TEXT_SCALE_LEVELS
-        .into_iter()
-        .min_by_key(|level| level.abs_diff(percent))
-        .unwrap_or(TEXT_SCALE_DEFAULT)
+    percent.clamp(TEXT_SCALE_MIN, TEXT_SCALE_MAX)
 }
 
 fn recover_reduced_motion(value: Option<&Value>) -> bool {
@@ -1108,8 +1111,8 @@ mod tests {
         .expect("seed settings");
         let loaded = SettingsStore::load(&path);
         assert_eq!(
-            loaded.text_scale, 120,
-            "unsupported levels snap to the nearest"
+            loaded.text_scale, 116,
+            "custom scale values are preserved within the supported range"
         );
         assert_eq!(loaded.accent, Accent::Violet);
         let mut store = loaded.store;

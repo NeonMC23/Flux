@@ -339,7 +339,7 @@ impl Tui {
                 "Playlist change — y confirms · any other key cancels".to_owned()
             }
             Mode::ConfirmQueueClear => {
-                "Clear queue — y confirms · any other key cancels".to_owned()
+                "Clear pending queue entries — active playback is preserved · y confirms".to_owned()
             }
             Mode::AlbumParticipants => {
                 "Album participants — ↑/↓ select · Enter opens Artist · a adds · r removes · Esc back".to_owned()

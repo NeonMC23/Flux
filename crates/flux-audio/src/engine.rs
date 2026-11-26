@@ -223,8 +223,24 @@ pub enum EngineEvent {
         boundary_frame: u64,
         /// Source-relative position of the outgoing source at the boundary.
         from_position: Duration,
+        /// Output frames of crossfade overlap after the boundary. Zero for a
+        /// gapless handoff.
+        overlap_frames: u64,
         /// Decoded facts for the new source.
         info: StreamInfo,
+    },
+    /// The crossfade overlap finished: the outgoing source has been fully
+    /// consumed by the device. Front-ends may switch the displayed Track to
+    /// the incoming source without resetting its already-played position.
+    TransitionFinished {
+        /// Load session for the active pipeline generation.
+        session: u64,
+        /// Output generation that contains the transition.
+        generation: u64,
+        /// Source that has now fully finished.
+        from_entry: QueueEntryId,
+        /// Source now foregrounded.
+        to_entry: QueueEntryId,
     },
     /// The track played to completion: every decoded sample has been
     /// consumed by the backend.
@@ -1477,6 +1493,9 @@ fn run_worker<F>(
     let mut current: Option<LoadedTrack> = None;
     let mut incoming: Option<LoadedTrack> = None;
     let mut pending_transition: Option<PendingTransition> = None;
+    // Crossfade overlap that must finish before front-ends switch the
+    // displayed foreground Track.
+    let mut finish_transition: Option<(QueueEntryId, QueueEntryId, u64)> = None;
     let mut converter: Option<FormatConverter> = None;
     let mut pending: Vec<f32> = Vec::new();
     let mut pending_sent = 0usize;
@@ -1543,6 +1562,7 @@ fn run_worker<F>(
                     current = None;
                     incoming = None;
                     pending_transition = None;
+                    finish_transition = None;
                     converter = None;
                     pending.clear();
                     pending_sent = 0;
@@ -1630,6 +1650,7 @@ fn run_worker<F>(
                     decoder = None;
                     incoming = None;
                     pending_transition = None;
+                    finish_transition = None;
                     converter = None;
                     pending.clear();
                     pending_sent = 0;
@@ -1864,6 +1885,7 @@ fn run_worker<F>(
                             eof_reached = false;
                             ended_sent = false;
                             pending_transition = None;
+                            finish_transition = None;
                             tail.clear();
                             match open_decoder(&track.path) {
                                 Ok(dec) => {
@@ -1932,6 +1954,7 @@ fn run_worker<F>(
                     current = None;
                     incoming = None;
                     pending_transition = None;
+                    finish_transition = None;
                     converter = None;
                     pending.clear();
                     pending_sent = 0;
@@ -2045,6 +2068,7 @@ fn run_worker<F>(
                                     prepared = None;
                                     incoming = None;
                                     pending_transition = None;
+                                    finish_transition = None;
                                     converter = None;
                                     pending.clear();
                                     pending_sent = 0;
@@ -2150,6 +2174,7 @@ fn run_worker<F>(
                             prepared = None;
                             incoming = None;
                             pending_transition = None;
+                            finish_transition = None;
                             converter = None;
                             pending.clear();
                             pending_sent = 0;
@@ -2231,9 +2256,31 @@ fn run_worker<F>(
                     to_entry: transition.to_entry,
                     boundary_frame: transition.boundary_frame,
                     from_position,
+                    overlap_frames: transition.crossfade_frames,
                     info: transition.info,
                 });
+                if transition.crossfade_frames > 0 {
+                    finish_transition = Some((
+                        transition.from_entry,
+                        transition.to_entry,
+                        transition
+                            .boundary_frame
+                            .saturating_add(transition.crossfade_frames),
+                    ));
+                }
             }
+        }
+
+        if let Some((from_entry, to_entry, finish_frame)) = finish_transition
+            && shared.played_frames.load(Ordering::Acquire) >= finish_frame
+        {
+            finish_transition = None;
+            send(EngineEvent::TransitionFinished {
+                session: current_session,
+                generation: current_generation,
+                from_entry,
+                to_entry,
+            });
         }
 
         // End-of-track: decoder EOF + ring fully drained (reported by
@@ -3586,6 +3633,7 @@ mod tests {
                     to_entry,
                     boundary_frame,
                     from_position,
+                    overlap_frames: _,
                     info,
                 } => Some((
                     *got_session,
@@ -4409,6 +4457,58 @@ mod tests {
             assert!(sample.is_finite());
             assert!(sample.abs() <= 1.0);
         }
+    }
+
+    #[test]
+    fn crossfade_reports_finished_once_the_outgoing_tail_is_consumed() {
+        let dir = TempDir::new("crossfade-finished");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(100);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(560), QueueEntryId::new(561));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        start_playing(&engine, &control);
+        wait_for_pushed_frames(&engine, &control, 88_200);
+        control.drain_frames(83_790);
+        let transition = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(transition.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_entry,
+                boundary_frame: 83_790,
+                overlap_frames: 4_410,
+                ..
+            } if *to_entry == entry_b
+        )));
+        control.drain_frames(4_410);
+        let finished = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::TransitionFinished { .. })
+        });
+        assert!(finished.iter().any(|event| matches!(
+            event,
+            EngineEvent::TransitionFinished {
+                from_entry,
+                to_entry,
+                ..
+            } if *from_entry == entry_a && *to_entry == entry_b
+        )));
+        let incoming = engine.position();
+        assert!(
+            (incoming.as_secs_f64() - 0.1).abs() < 0.02,
+            "incoming position must retain overlap playback: {incoming:?}"
+        );
+        engine.shutdown();
     }
 
     #[test]

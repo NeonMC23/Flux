@@ -2276,7 +2276,9 @@ impl Tui {
                     self.queue_cursor = 0;
                     self.queue_offset = 0;
                     self.mode = Mode::Normal;
-                    self.lifecycle_msg = Some(format!("Cleared {count} queue entr(ies)."));
+                    self.lifecycle_msg = Some(format!(
+                        "Cleared {count} pending queue entr(ies); active playback is preserved."
+                    ));
                 } else {
                     self.mode = Mode::QueueView;
                     self.lifecycle_msg = Some("Queue clear cancelled.".to_owned());
@@ -7027,7 +7029,12 @@ mod tests {
         );
         key(&mut tui, KeyCode::Char('C'));
         key(&mut tui, KeyCode::Char('y'));
-        assert_eq!(tui.controller.queue_len(), 0);
+        assert_eq!(
+            tui.controller.queue_len(),
+            0,
+            "with playback stopped, clearing removes the pending selection"
+        );
+        assert_eq!(tui.controller.current_id(), None);
         assert!(
             tui.controller.track(id).is_some(),
             "catalogue track remains"
