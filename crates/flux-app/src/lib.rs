@@ -76,6 +76,7 @@ mod settings;
 pub use settings::{
     Accent, CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, LoadedSettings,
     SETTINGS_SCHEMA_VERSION, SettingsError, SettingsStore, TEXT_SCALE_DEFAULT, TEXT_SCALE_LEVELS,
+    ViewMode, ViewModePreferences, ViewSurface,
 };
 
 use flux_core::{
@@ -1838,6 +1839,8 @@ pub struct Controller {
     text_scale: u16,
     /// Whether non-essential rendered motion should be suppressed.
     reduced_motion: bool,
+    /// Persisted list/grid presentation for library surfaces.
+    view_modes: ViewModePreferences,
     /// Lazily probed durations for existing catalogue records that predate
     /// technical-duration persistence.
     duration_hints: RefCell<BTreeMap<(u64, TrackId), Option<u64>>>,
@@ -2230,6 +2233,7 @@ impl Controller {
             accent: Accent::default(),
             text_scale: TEXT_SCALE_DEFAULT,
             reduced_motion: false,
+            view_modes: ViewModePreferences::default(),
             duration_hints: RefCell::new(BTreeMap::new()),
             history_generation: 0,
             shuffle: false,
@@ -3448,6 +3452,33 @@ impl Controller {
         self.reduced_motion
     }
 
+    /// Persisted list/grid presentation for library surfaces.
+    #[must_use]
+    pub fn view_modes(&self) -> ViewModePreferences {
+        self.view_modes
+    }
+
+    /// Persists and applies one library surface's view mode. The in-memory
+    /// preference still changes when settings cannot be written, so the
+    /// current session remains usable; the failure is surfaced normally.
+    pub fn set_view_mode(&mut self, surface: ViewSurface, mode: ViewMode) -> Result<(), String> {
+        self.view_modes.set(surface, mode);
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        if let Err(error) = store.save_view_modes(self.view_modes) {
+            let message = format!(
+                "Could not save the view preference to {}: {error}. It is active for this session only.",
+                path.display()
+            );
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.report_status(format!("View set to {}.", mode.label()));
+        Ok(())
+    }
+
     /// Persists the reduced-motion preference.
     pub fn set_reduced_motion(&mut self, reduced: bool) -> Result<(), String> {
         self.reduced_motion = reduced;
@@ -3533,11 +3564,13 @@ impl Controller {
             accent,
             text_scale,
             reduced_motion,
+            view_modes,
             warning,
         } = loaded;
         self.accent = accent;
         self.text_scale = text_scale;
         self.reduced_motion = reduced_motion;
+        self.view_modes = view_modes;
         self.crossfade_enabled = crossfade.enabled;
         self.crossfade_duration_ms = crossfade.duration_ms;
         self.engine.set_crossfade_ms(crossfade.effective_ms());
@@ -9107,8 +9140,9 @@ mod tests {
         Accent, AudioDiagnostics, AudioOutputDevice, AudioRecoveryFactory, AudioStatus, Controller,
         ControllerEvent, CreateLibraryError, OpenedAudioOutput, PlaybackMode, PortableOpenError,
         ResourceState, ScanOutcome, SettingsStore, StorageMode, SwitchError, TrackMetadataEdit,
-        create_canonical_library, create_portable_library, execute_legacy_migration,
-        is_track_playable, migrate_legacy_library, plan_legacy_migration, same_library_path,
+        ViewMode, ViewModePreferences, ViewSurface, create_canonical_library,
+        create_portable_library, execute_legacy_migration, is_track_playable,
+        migrate_legacy_library, plan_legacy_migration, same_library_path,
     };
 
     struct TempDir(PathBuf);
@@ -11573,6 +11607,45 @@ mod tests {
         assert_eq!(controller.accent(), Accent::Teal);
         assert!(controller.crossfade_enabled());
         assert_eq!(controller.crossfade_duration_ms(), 4_200);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn view_modes_persist_independently_without_resetting_other_settings() {
+        let dir = TempDir::new("view-mode-settings");
+        let settings = dir.path().join("config").join("settings.json");
+        fs::create_dir_all(settings.parent().expect("parent")).expect("config dir");
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        assert_eq!(
+            controller.view_modes(),
+            ViewModePreferences::default(),
+            "Tracks start as a list; Artists and Albums start as grids"
+        );
+        controller.set_crossfade_enabled(true).expect("crossfade");
+        controller.set_accent(Accent::Amber).expect("accent");
+        controller
+            .set_view_mode(ViewSurface::Tracks, ViewMode::Grid)
+            .expect("track grid");
+        controller
+            .set_view_mode(ViewSurface::Artists, ViewMode::List)
+            .expect("artist list");
+        assert_eq!(controller.view_modes().tracks, ViewMode::Grid);
+        assert_eq!(controller.view_modes().artists, ViewMode::List);
+        assert_eq!(
+            controller.view_modes().albums,
+            ViewMode::Grid,
+            "unrelated surfaces keep their preference"
+        );
+        controller.shutdown();
+
+        let (mut controller, _control) = boot(&dir);
+        assert!(controller.load_settings_from_path(&settings).is_none());
+        assert_eq!(controller.view_modes().tracks, ViewMode::Grid);
+        assert_eq!(controller.view_modes().artists, ViewMode::List);
+        assert_eq!(controller.view_modes().albums, ViewMode::Grid);
+        assert_eq!(controller.accent(), Accent::Amber);
+        assert!(controller.crossfade_enabled());
         controller.shutdown();
     }
 

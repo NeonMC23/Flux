@@ -23,6 +23,112 @@ pub const TEXT_SCALE_DEFAULT: u16 = 100;
 /// Supported interface text scale levels.
 pub const TEXT_SCALE_LEVELS: [u16; 3] = [100, 110, 120];
 
+/// Persisted list/grid presentation for a library surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Information-dense rows.
+    #[default]
+    List,
+    /// Artwork-forward cards.
+    Grid,
+}
+
+impl ViewMode {
+    /// Every mode in presentation order.
+    pub const ALL: [Self; 2] = [Self::List, Self::Grid];
+
+    /// Stable settings identifier.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Grid => "grid",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::List => "List",
+            Self::Grid => "Grid",
+        }
+    }
+
+    /// Recovers a mode from a persisted identifier.
+    #[must_use]
+    pub fn from_id(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.id().eq_ignore_ascii_case(value.trim()))
+    }
+}
+
+/// Library surface whose view mode is persisted independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSurface {
+    /// The Track table/grid.
+    Tracks,
+    /// The Artist profile grid/list.
+    Artists,
+    /// The Album discography grid/list.
+    Albums,
+}
+
+impl ViewSurface {
+    /// Settings key for this surface.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Tracks => "tracks",
+            Self::Artists => "artists",
+            Self::Albums => "albums",
+        }
+    }
+}
+
+/// Persisted view modes for the three library surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewModePreferences {
+    /// Track presentation.
+    pub tracks: ViewMode,
+    /// Artist presentation.
+    pub artists: ViewMode,
+    /// Album presentation.
+    pub albums: ViewMode,
+}
+
+impl Default for ViewModePreferences {
+    fn default() -> Self {
+        Self {
+            tracks: ViewMode::List,
+            artists: ViewMode::Grid,
+            albums: ViewMode::Grid,
+        }
+    }
+}
+
+impl ViewModePreferences {
+    /// Reads one surface preference.
+    #[must_use]
+    pub const fn get(self, surface: ViewSurface) -> ViewMode {
+        match surface {
+            ViewSurface::Tracks => self.tracks,
+            ViewSurface::Artists => self.artists,
+            ViewSurface::Albums => self.albums,
+        }
+    }
+
+    /// Replaces one surface preference.
+    pub fn set(&mut self, surface: ViewSurface, mode: ViewMode) {
+        match surface {
+            ViewSurface::Tracks => self.tracks = mode,
+            ViewSurface::Artists => self.artists = mode,
+            ViewSurface::Albums => self.albums = mode,
+        }
+    }
+}
+
 /// Sensible crossfade duration used when enabling without a prior value.
 pub const CROSSFADE_DEFAULT_MS: u64 = 3_000;
 
@@ -157,6 +263,8 @@ pub struct LoadedSettings {
     pub text_scale: u16,
     /// Whether non-essential visual motion should be suppressed.
     pub reduced_motion: bool,
+    /// Persisted library view modes.
+    pub view_modes: ViewModePreferences,
     /// A malformed/unreadable file diagnostic. The original file is left
     /// untouched and `store.write_protected()` is true.
     pub warning: Option<String>,
@@ -243,6 +351,7 @@ impl SettingsStore {
         let accent = recover_accent(root.get("theme"));
         let text_scale = recover_text_scale(root.get("interface"));
         let reduced_motion = recover_reduced_motion(root.get("interface"));
+        let view_modes = recover_view_modes(root.get("interface"));
         LoadedSettings {
             store: Self {
                 path,
@@ -254,6 +363,7 @@ impl SettingsStore {
             accent,
             text_scale,
             reduced_motion,
+            view_modes,
             warning: None,
         }
     }
@@ -274,6 +384,7 @@ impl SettingsStore {
             accent: Accent::default(),
             text_scale: TEXT_SCALE_DEFAULT,
             reduced_motion: false,
+            view_modes: ViewModePreferences::default(),
             warning,
         }
     }
@@ -290,6 +401,7 @@ impl SettingsStore {
             accent: Accent::default(),
             text_scale: TEXT_SCALE_DEFAULT,
             reduced_motion: false,
+            view_modes: ViewModePreferences::default(),
             warning: Some(warning),
         }
     }
@@ -361,6 +473,50 @@ impl SettingsStore {
             .as_object_mut()
             .expect("object inserted")
             .insert("reduced_motion".to_owned(), Value::Bool(reduced));
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+
+    /// Atomically updates only the persisted library view modes.
+    pub fn save_view_modes(&mut self, modes: ViewModePreferences) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let mut root = match self.document.clone() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let interface = root
+            .entry("interface")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !interface.is_object() {
+            *interface = Value::Object(Map::new());
+        }
+        let interface = interface.as_object_mut().expect("object inserted");
+        let view_modes = interface
+            .entry("view_modes")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !view_modes.is_object() {
+            *view_modes = Value::Object(Map::new());
+        }
+        let view_modes = view_modes.as_object_mut().expect("object inserted");
+        for (surface, mode) in [
+            (ViewSurface::Tracks, modes.tracks),
+            (ViewSurface::Artists, modes.artists),
+            (ViewSurface::Albums, modes.albums),
+        ] {
+            view_modes.insert(surface.id().to_owned(), Value::from(mode.id()));
+        }
         let document = Value::Object(root);
         let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
         bytes.push(b'\n');
@@ -512,6 +668,31 @@ fn recover_reduced_motion(value: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
+fn recover_view_modes(value: Option<&Value>) -> ViewModePreferences {
+    let mut modes = ViewModePreferences::default();
+    let Some(view_modes) = value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("view_modes"))
+        .and_then(Value::as_object)
+    else {
+        return modes;
+    };
+    for (surface, slot) in [
+        (ViewSurface::Tracks, &mut modes.tracks),
+        (ViewSurface::Artists, &mut modes.artists),
+        (ViewSurface::Albums, &mut modes.albums),
+    ] {
+        if let Some(mode) = view_modes
+            .get(surface.id())
+            .and_then(Value::as_str)
+            .and_then(ViewMode::from_id)
+        {
+            *slot = mode;
+        }
+    }
+    modes
+}
+
 fn recover_text_scale(value: Option<&Value>) -> u16 {
     value
         .and_then(Value::as_object)
@@ -589,7 +770,7 @@ mod tests {
 
     use super::{
         Accent, CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, SettingsError,
-        SettingsStore,
+        SettingsStore, ViewMode, ViewModePreferences, ViewSurface,
     };
 
     struct TempDir(PathBuf);
@@ -964,6 +1145,73 @@ mod tests {
         assert_eq!(reloaded.accent, Accent::Violet);
         assert_eq!(reloaded.crossfade.duration_ms, 4200);
         assert_eq!(reloaded.audio_output_device.as_deref(), Some("alsa:test"));
+    }
+
+    #[test]
+    fn view_modes_round_trip_and_preserve_every_other_setting() {
+        let dir = TempDir::new("view-modes");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"crossfade":{"enabled":true,"duration_ms":4200},"theme":{"accent":"teal"},"interface":{"text_scale":110,"reduced_motion":true,"view_modes":{"tracks":"grid"}},"future":{"kept":true}}"#,
+        )
+        .expect("seed settings");
+        let loaded = SettingsStore::load(&path);
+        assert_eq!(loaded.view_modes.tracks, ViewMode::Grid);
+        assert_eq!(
+            loaded.view_modes.artists,
+            ViewMode::Grid,
+            "missing surfaces use their defaults"
+        );
+        assert_eq!(loaded.view_modes.albums, ViewMode::Grid);
+        let mut store = loaded.store;
+        let mut modes = loaded.view_modes;
+        modes.set(ViewSurface::Tracks, ViewMode::List);
+        modes.set(ViewSurface::Artists, ViewMode::List);
+        modes.set(ViewSurface::Albums, ViewMode::List);
+        store.save_view_modes(modes).expect("save view modes");
+        let saved: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(saved["interface"]["view_modes"]["tracks"], "list");
+        assert_eq!(saved["interface"]["view_modes"]["artists"], "list");
+        assert_eq!(saved["interface"]["view_modes"]["albums"], "list");
+        assert_eq!(saved["interface"]["text_scale"], 110);
+        assert_eq!(saved["interface"]["reduced_motion"], true);
+        assert_eq!(saved["crossfade"]["duration_ms"], 4200);
+        assert_eq!(saved["theme"]["accent"], "teal");
+        assert_eq!(saved["future"]["kept"], true);
+        let reloaded = SettingsStore::load(&path);
+        assert_eq!(reloaded.view_modes, modes);
+        assert_eq!(
+            reloaded.view_modes,
+            ViewModePreferences {
+                tracks: ViewMode::List,
+                artists: ViewMode::List,
+                albums: ViewMode::List,
+            }
+        );
+        assert_eq!(reloaded.text_scale, 110);
+        assert!(reloaded.reduced_motion);
+    }
+
+    #[test]
+    fn invalid_view_modes_fall_back_to_defaults() {
+        let dir = TempDir::new("view-modes-invalid");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"interface":{"view_modes":{"tracks":"mosaic","artists":7,"albums":"GRID"}}}"#,
+        )
+        .expect("settings");
+        let loaded = SettingsStore::load(&path);
+        assert_eq!(loaded.view_modes.tracks, ViewMode::List);
+        assert_eq!(loaded.view_modes.artists, ViewMode::Grid);
+        assert_eq!(
+            loaded.view_modes.albums,
+            ViewMode::Grid,
+            "identifiers are matched case-insensitively"
+        );
+        assert!(!loaded.store.write_protected());
     }
 
     #[test]
