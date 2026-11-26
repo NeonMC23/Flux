@@ -64,6 +64,8 @@ pub enum Icon {
     ArtworkMissing,
     Queue,
     Success,
+    LayoutList,
+    LayoutGrid,
 }
 
 impl Icon {
@@ -119,6 +121,8 @@ impl Icon {
             Self::ArtworkMissing => include_bytes!("../assets/icons/image-off.svg"),
             Self::Queue => include_bytes!("../assets/icons/list-ordered.svg"),
             Self::Success => include_bytes!("../assets/icons/circle-check.svg"),
+            Self::LayoutList => include_bytes!("../assets/icons/layout-list.svg"),
+            Self::LayoutGrid => include_bytes!("../assets/icons/layout-grid.svg"),
         }
     }
 }
