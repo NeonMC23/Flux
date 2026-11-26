@@ -4,6 +4,46 @@ All notable changes to Flux are documented here. Flux uses semantic versioning
 for release artifacts while the workspace remains at `0.1.0` until the first
 authorized release.
 
+## Unreleased — M29 product redesign and reliability
+
+### Critical playback fixes
+
+- Artwork now loads automatically for visible Track rows, Home shelves, the
+  queue page, Artist profile cards and Album relations. Requests are bounded,
+  cache-aware, progressively filled and invalidated by cover content changes.
+- Fixed incoming Track position after seeking near the end and allowing a
+  crossfade: the engine now sums the seek baseline and delivered frames before
+  subtracting the source start, so the active Track's progress starts at zero
+  and follows its own decoder. Gapless handoffs and repeated seeks are covered
+  by deterministic engine and Controller tests.
+
+### Interaction and workflow
+
+- Added persisted Tracks/Artists/Albums list and grid modes.
+- Redesigned the Tracks toolbar around search, filters, sorting and view mode.
+  Added an artwork-forward Track grid and distinct row hover/selection/focus/
+  playing states.
+- Redesigned Settings as a centered, width-capped two-column composition with
+  keycap-based shortcut groups.
+- Added native folder selection for the library location.
+- Replaced the expanded audio-device list with a compact collapsible selector;
+  explicit selection, unavailable devices and recovery reporting are preserved.
+- Split the import workflow into Source, Analyze, Organize, Review and Import
+  steps with preserved state and safe cancellation.
+- Hosted Import Music in a real secondary native window using `iced::daemon`,
+  with per-window input routing and shared Controller state.
+- Added Artist profile cards, Album discography cards, Smart Collection cards,
+  responsive Home shelves and an accent-aware in-app logo.
+- Anchored Track action menus to the invoking row, fitted them to their
+  contents, and added restrained menu/queue transitions that respect Reduce
+  motion.
+
+### Documentation
+
+- Added `docs/m29-product-redesign.md` covering artwork loading, crossfade
+  position semantics, view modes, import architecture, the native window and
+  platform limitations.
+
 ## [0.1.0] — 2026-11-21
 
 ### M28 product consistency and playback reliability

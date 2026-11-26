@@ -31,8 +31,8 @@ use flux_app::{
     ImportItemState, ImportPlan, ImportProgress, ImportRequest, ImportStage, ImportStorage,
     LyricLine, LyricsDocument, LyricsKind, PlaybackMode, PlaylistId, PreparedImport,
     ReconcileReport, RelPath, ReleaseType, ResourceState, StorageMode, TrackAudioReplacementPlan,
-    TrackDeletionPlan, TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, format_duration,
-    is_track_playable, prepare_import_files, prepare_import_plan,
+    TrackDeletionPlan, TrackMetadataEdit, TrackMetadataUpdatePlan, TrackMovePlan, ViewMode,
+    ViewSurface, format_duration, is_track_playable, prepare_import_files, prepare_import_plan,
 };
 use flux_core::{
     APP_ID, APP_NAME, APP_VERSION, ArtistId, PlaybackState, QueueEntry, QueueEntryId, Track,
@@ -544,13 +544,19 @@ fn danger_button_style(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-fn track_row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+fn track_row_style(
+    checked: bool,
+    focused: bool,
+    current: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        let background = if selected {
+        let background = if checked {
             accent_soft()
         } else if hovered {
             SURFACE_HI
+        } else if focused {
+            SURFACE
         } else {
             Color::TRANSPARENT
         };
@@ -558,8 +564,10 @@ fn track_row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button:
             background: Some(background.into()),
             text_color: TEXT,
             border: Border {
-                color: if selected {
-                    Color::from_rgba8(0xff, 0x66, 0xcc, 0.16)
+                color: if checked || current {
+                    accent_border()
+                } else if focused {
+                    BORDER
                 } else {
                     Color::TRANSPARENT
                 },
@@ -728,8 +736,12 @@ where
 
         // A wider translucent pass gives the one-pixel Flow line a soft
         // neon halo without changing the underlying measured samples.
-        draw_trace(osc_glow(), 3.0, 1.0);
-        draw_trace(osc_color(), OSC_LINE_WIDTH, 0.0);
+        // Silence (idle, paused or no audio yet) keeps only the quiet guide
+        // line so the transport does not look like it is playing.
+        if !self.samples.iter().all(|sample| sample.abs() < 1e-5) {
+            draw_trace(osc_glow(), 3.0, 1.0);
+            draw_trace(osc_color(), OSC_LINE_WIDTH, 0.0);
+        }
     }
 }
 
@@ -742,9 +754,12 @@ impl<'a, Message> From<FlowOscilloscope<'a>> for Element<'a, Message> {
 fn global_input_events(
     event: iced::Event,
     _status: iced::event::Status,
-    _window: window::Id,
+    window: window::Id,
 ) -> Option<Message> {
     match event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            Some(Message::KeyPressedIn(window, key, modifiers))
+        }
         iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
             Some(Message::QueueDragRelease)
         }
@@ -1511,6 +1526,57 @@ fn track_list_empty_copy(
     }
 }
 
+fn import_step_indicator(stage: ImportUiStage) -> Element<'static, Message> {
+    const STEPS: [&str; 5] = ["Source", "Analyze", "Organize", "Review", "Import"];
+    let current = match stage {
+        ImportUiStage::Choose => 0,
+        ImportUiStage::Scanning => 1,
+        ImportUiStage::Review => 2,
+        ImportUiStage::Confirm => 3,
+        ImportUiStage::Importing
+        | ImportUiStage::Completed
+        | ImportUiStage::Cancelled
+        | ImportUiStage::Failed => 4,
+    };
+    let mut steps = row![].spacing(5).align_y(Alignment::Center);
+    for (index, label) in STEPS.iter().enumerate() {
+        let active = index == current;
+        let complete = index < current;
+        let fg = if active || complete { accent() } else { MUTED };
+        let border = if active || complete {
+            accent_border()
+        } else {
+            BORDER
+        };
+        let background = if active {
+            accent_soft()
+        } else {
+            Color::TRANSPARENT
+        };
+        steps = steps.push(
+            container(
+                text(format!("{}. {label}", index + 1))
+                    .size(ts(9.5))
+                    .color(fg),
+            )
+            .padding([2, 6])
+            .style(move |_| {
+                container::Style::default()
+                    .background(background)
+                    .border(Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    })
+            }),
+        );
+        if index + 1 < STEPS.len() {
+            steps = steps.push(text("›").size(ts(9.5)).color(MUTED));
+        }
+    }
+    steps.into()
+}
+
 fn import_outcome_heading(report: &ImportApplyReport) -> &'static str {
     let committed = report.imported + report.updated;
     if report.failed > 0 && committed == 0 {
@@ -1971,6 +2037,7 @@ enum ImportUiStage {
     Choose,
     Scanning,
     Review,
+    Confirm,
     Importing,
     Completed,
     Cancelled,
@@ -2256,6 +2323,9 @@ struct FluxReady {
     track_editor: Option<TrackEditor>,
     track_editor_advanced_open: bool,
     import_manager: Option<ImportManager>,
+    /// True while the Import workflow is hosted in a real secondary window.
+    /// The main window then omits the in-app overlay.
+    import_window_active: bool,
     import_request_seq: u64,
     deletion_manager: Option<DeletionManager>,
     album_transfer: Option<AlbumTransferManager>,
@@ -2308,6 +2378,7 @@ struct FluxReady {
     crossfade_preview: Option<u64>,
     audio_devices: Vec<flux_app::AudioOutputDevice>,
     audio_devices_loading: bool,
+    audio_devices_open: bool,
     audio_devices_error: Option<String>,
     audio_switch_token: u64,
     audio_switch_pending: Option<String>,
@@ -2319,6 +2390,8 @@ struct FluxReady {
     lyrics_overlay_open: bool,
     track_menu: Option<TrackId>,
     track_menu_index: usize,
+    menu_motion: iced::Animation<bool>,
+    queue_motion: iced::Animation<bool>,
     window_width: f32,
     window_height: f32,
     close_confirm: bool,
@@ -2329,6 +2402,8 @@ struct FluxReady {
 #[derive(Debug, Clone)]
 enum Message {
     LibInputChanged(String),
+    ChooseLibraryFolder,
+    LibraryFolderPicked(Result<Option<PathBuf>, String>),
     EditTrack(TrackId),
     EditorTitleChanged(String),
     EditorTransferTitleChanged(String),
@@ -2518,6 +2593,8 @@ enum Message {
     ImportFileHovered,
     ImportFileHoverLeft,
     ImportApply,
+    ImportReviewConfirm,
+    ImportReviewBack,
     ImportCancel,
     ImportAdvancedToggled,
     OpenLibraryPressed,
@@ -2547,6 +2624,9 @@ enum Message {
     FilterArtworkCycle,
     FilterReleaseChanged(ReleaseFilter),
     SortTracksChanged(TrackSort),
+    TrackViewModeChanged(ViewMode),
+    ArtistViewModeChanged(ViewMode),
+    AlbumViewModeChanged(ViewMode),
     SortColumn(TrackSort),
     SortDirectionToggled,
     FilterRatingChanged(RatingFilter),
@@ -2634,6 +2714,7 @@ enum Message {
     QueueClearCancel,
     PlayTrack(TrackId),
     PlayAlbum(AlbumId),
+    PlayArtist(ArtistId),
     EnqueueTrack(TrackId),
     PlayNextTrack(TrackId),
     TrackMenuOpen(TrackId),
@@ -2651,6 +2732,7 @@ enum Message {
     RetryAudioOutput,
     DismissNotice,
     RefreshAudioDevices,
+    ToggleAudioDevices,
     AudioDevicesLoaded(u64, Result<Vec<flux_app::AudioOutputDevice>, String>),
     SelectAudioDevice(Option<String>),
     AudioOutputOpened(
@@ -2672,9 +2754,13 @@ enum Message {
     CrossfadeDurationPreview(f32),
     CrossfadeDurationCommit,
     KeyPressed(Key, Modifiers),
+    KeyPressedIn(window::Id, Key, Modifiers),
+    ImportKeyPressed(Key, Modifiers),
     Tick,
+    MotionTick,
     WaveTick,
     WindowResized(f32, f32),
+    WindowResizedIn(window::Id, f32, f32),
     WindowCloseRequested(window::Id),
 }
 
@@ -2732,6 +2818,134 @@ impl Message {
     }
 }
 
+struct ShortcutEntry {
+    action: &'static str,
+    keys: &'static [&'static str],
+}
+
+struct ShortcutGroup {
+    title: &'static str,
+    entries: &'static [ShortcutEntry],
+}
+
+/// Display source for the in-app keyboard reference. Every entry mirrors a
+/// binding handled by `Message::KeyPressed`; the regression test
+/// `documented_shortcuts_still_dispatch` keeps the primary bindings honest.
+const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
+    ShortcutGroup {
+        title: "Playback",
+        entries: &[
+            ShortcutEntry {
+                action: "Play / pause",
+                keys: &["Space"],
+            },
+            ShortcutEntry {
+                action: "Next / previous",
+                keys: &["N", "P"],
+            },
+            ShortcutEntry {
+                action: "Stop",
+                keys: &["S"],
+            },
+            ShortcutEntry {
+                action: "Seek 5 s",
+                keys: &["←/→"],
+            },
+            ShortcutEntry {
+                action: "Seek 30 s",
+                keys: &["Shift", "←/→"],
+            },
+        ],
+    },
+    ShortcutGroup {
+        title: "Library",
+        entries: &[
+            ShortcutEntry {
+                action: "Search",
+                keys: &["/"],
+            },
+            ShortcutEntry {
+                action: "Tracks · Artists · Albums",
+                keys: &["1", "2", "3"],
+            },
+            ShortcutEntry {
+                action: "Playlists · Collections · Lyrics",
+                keys: &["4", "5", "6"],
+            },
+            ShortcutEntry {
+                action: "Home · Recently Added · Recently Played",
+                keys: &["7", "8", "9"],
+            },
+            ShortcutEntry {
+                action: "Most Played · Folders",
+                keys: &["0", "G"],
+            },
+            ShortcutEntry {
+                action: "Settings · Library setup · Import",
+                keys: &["K", "L", "I"],
+            },
+        ],
+    },
+    ShortcutGroup {
+        title: "Track actions",
+        entries: &[
+            ShortcutEntry {
+                action: "Focus next / previous Track",
+                keys: &["↑/↓"],
+            },
+            ShortcutEntry {
+                action: "Play focused Track",
+                keys: &["Enter"],
+            },
+            ShortcutEntry {
+                action: "Actions menu",
+                keys: &["M"],
+            },
+            ShortcutEntry {
+                action: "Edit Track",
+                keys: &["E"],
+            },
+            ShortcutEntry {
+                action: "Add to queue",
+                keys: &["A"],
+            },
+            ShortcutEntry {
+                action: "Favorite",
+                keys: &["F"],
+            },
+            ShortcutEntry {
+                action: "Lyrics",
+                keys: &["Y"],
+            },
+        ],
+    },
+    ShortcutGroup {
+        title: "Queue and navigation",
+        entries: &[
+            ShortcutEntry {
+                action: "Toggle queue",
+                keys: &["Q"],
+            },
+            ShortcutEntry {
+                action: "Reorder queue entry",
+                keys: &["Ctrl", "↑/↓"],
+            },
+            ShortcutEntry {
+                action: "Next / previous destination",
+                keys: &["Ctrl", "Tab"],
+            },
+            ShortcutEntry {
+                action: "Move form focus",
+                keys: &["Tab"],
+            },
+            ShortcutEntry {
+                action: "Cancel / clear / back",
+                keys: &["Esc"],
+            },
+        ],
+    },
+];
+
 impl FluxReady {
     fn new(controller: Controller) -> Self {
         set_accent_color(controller.accent());
@@ -2783,6 +2997,7 @@ impl FluxReady {
             track_editor: None,
             track_editor_advanced_open: false,
             import_manager: None,
+            import_window_active: false,
             import_request_seq: 0,
             deletion_manager: None,
             album_transfer: None,
@@ -2835,6 +3050,7 @@ impl FluxReady {
             crossfade_preview: None,
             audio_devices: Vec::new(),
             audio_devices_loading: false,
+            audio_devices_open: false,
             audio_devices_error: None,
             audio_switch_token: 0,
             audio_switch_pending: None,
@@ -2846,6 +3062,8 @@ impl FluxReady {
             lyrics_overlay_open: false,
             track_menu: None,
             track_menu_index: 0,
+            menu_motion: motion_animation(false),
+            queue_motion: motion_animation(false),
             window_width: 1_180.0,
             window_height: 760.0,
             close_confirm: false,
@@ -2854,20 +3072,22 @@ impl FluxReady {
         }
     }
 
-    fn subscription(&self) -> Subscription<Message> {
+    fn subscription(&self, _main_window: window::Id) -> Subscription<Message> {
         let mut subscriptions = vec![
             iced::time::every(Duration::from_millis(150)).map(|_| Message::Tick),
             window::close_requests().map(Message::WindowCloseRequested),
             window::resize_events()
-                .map(|(_, size)| Message::WindowResized(size.width, size.height)),
-            iced::keyboard::listen().filter_map(|event| match event {
-                iced::keyboard::Event::KeyPressed { key, modifiers, .. } => {
-                    Some(Message::KeyPressed(key, modifiers))
-                }
-                _ => None,
-            }),
+                .map(|(id, size)| Message::WindowResizedIn(id, size.width, size.height)),
             iced::event::listen_with(global_input_events),
         ];
+        if !self.controller.reduced_motion() {
+            let now = Instant::now();
+            if self.menu_motion.is_animating(now) || self.queue_motion.is_animating(now) {
+                subscriptions.push(
+                    iced::time::every(Duration::from_millis(16)).map(|_| Message::MotionTick),
+                );
+            }
+        }
         if self.controller.player_state() == PlaybackState::Playing
             && self.controller.audio_status().is_ready()
             && !self.controller.reduced_motion()
@@ -2890,7 +3110,8 @@ impl FluxReady {
         self.migrated_dest = None;
         self.lifecycle_msg = None;
         self.queue_drag = None;
-        self.track_menu = None;
+        self.reset_track_menu();
+        self.queue_motion = motion_animation(false);
         self.seek_preview = None;
         self.track_editor = None;
         self.selected_lyrics = None;
@@ -4143,6 +4364,13 @@ impl FluxReady {
             }
             return Task::none();
         }
+        if manager.stage == ImportUiStage::Confirm {
+            match key {
+                Key::Named(Named::Escape) => return self.update(Message::ImportReviewBack),
+                Key::Named(Named::Enter) => return self.update(Message::ImportApply),
+                _ => return Task::none(),
+            }
+        }
         if matches!(key, Key::Named(Named::Escape)) {
             return self.update(Message::ImportCancel);
         }
@@ -4183,7 +4411,10 @@ impl FluxReady {
                 }
             }
             if modifiers.contains(Modifiers::CTRL) && matches!(key, Key::Named(Named::Enter)) {
-                return self.start_import_copy();
+                return self.update(Message::ImportReviewConfirm);
+            }
+            if matches!(key, Key::Named(Named::Enter)) {
+                return self.update(Message::ImportReviewConfirm);
             }
         }
         Task::none()
@@ -4544,6 +4775,73 @@ impl FluxReady {
         }
     }
 
+    fn open_track_menu(&mut self, id: TrackId) {
+        self.track_menu = Some(id);
+        self.track_menu_index = 0;
+        self.menu_motion.go_mut(true, Instant::now());
+    }
+
+    fn close_track_menu(&mut self) {
+        if self.track_menu.is_some() {
+            self.menu_motion.go_mut(false, Instant::now());
+        }
+    }
+
+    fn reset_track_menu(&mut self) {
+        self.track_menu = None;
+        self.menu_motion = motion_animation(false);
+    }
+
+    fn track_menu_anchor(&self, id: TrackId) -> (f32, f32) {
+        const PANEL_WIDTH: f32 = 310.0;
+        let rows = self.visible_track_ids();
+        let index = rows
+            .iter()
+            .position(|candidate| *candidate == id)
+            .unwrap_or(0);
+        let x = (self.window_width - PANEL_WIDTH - 16.0).max(12.0);
+        let header = 24.0
+            + 64.0
+            + 18.0
+            + if self.shows_library_controls() {
+                44.0
+            } else {
+                0.0
+            }
+            + if self.search.trim().is_empty() {
+                26.0
+            } else {
+                92.0
+            };
+        let y = (header + index as f32 * 58.0).clamp(64.0, (self.window_height - 390.0).max(64.0));
+        (x, y)
+    }
+
+    fn menu_progress(&self) -> f32 {
+        if self.controller.reduced_motion() {
+            return if self.menu_motion.value() { 1.0 } else { 0.0 };
+        }
+        self.menu_motion.interpolate(0.0, 1.0, Instant::now())
+    }
+
+    fn queue_progress(&self) -> f32 {
+        if self.controller.reduced_motion() {
+            return if self.queue_placement() != QueuePlacement::Hidden {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        self.queue_motion.interpolate(0.0, 1.0, Instant::now())
+    }
+
+    /// Keeps the queue transition target in sync with every path that can
+    /// open, close or relocate the panel (keyboard, resize, library switch).
+    fn sync_queue_motion(&mut self) {
+        let open = self.queue_placement() != QueuePlacement::Hidden;
+        self.queue_motion.go_mut(open, Instant::now());
+    }
+
     fn toggle_queue(&mut self) -> bool {
         self.cancel_queue_drag();
         if !self.queue_overlay_open {
@@ -4717,6 +5015,32 @@ impl FluxReady {
         }
         match message {
             Message::LibInputChanged(value) => self.lib_input = value,
+            Message::ChooseLibraryFolder => {
+                let start = self
+                    .active_library_path()
+                    .map(Path::to_path_buf)
+                    .or_else(|| {
+                        let typed = PathBuf::from(self.lib_input.trim());
+                        typed.is_dir().then_some(typed)
+                    });
+                return Task::perform(
+                    async move { flux_platform::pick_folder_in(start.as_deref()) },
+                    Message::LibraryFolderPicked,
+                );
+            }
+            Message::LibraryFolderPicked(result) => match result {
+                Ok(Some(path)) => {
+                    self.lib_input = path.display().to_string();
+                    self.lifecycle_msg = Some(format!(
+                        "Selected {}. Nothing has changed yet; choose Open to use an existing library or Create to initialise a new one.",
+                        path.display()
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.lifecycle_msg = Some(format!("Folder selection failed: {error}"))
+                }
+            },
             Message::EditTrack(id) => self.start_track_editor(id),
             Message::EditorTitleChanged(value) => {
                 if let Some(editor) = self.track_editor.as_mut() {
@@ -6943,6 +7267,21 @@ impl FluxReady {
                 }
             }
             Message::ImportApply => return self.start_import_copy(),
+            Message::ImportReviewConfirm => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Review
+                    && manager.plan.as_ref().is_some_and(ImportPlan::can_import)
+                {
+                    manager.stage = ImportUiStage::Confirm;
+                }
+            }
+            Message::ImportReviewBack => {
+                if let Some(manager) = self.import_manager.as_mut()
+                    && manager.stage == ImportUiStage::Confirm
+                {
+                    manager.stage = ImportUiStage::Review;
+                }
+            }
             Message::ImportAdvancedToggled => {
                 if let Some(manager) = self.import_manager.as_mut() {
                     manager.advanced_open = !manager.advanced_open;
@@ -7194,6 +7533,21 @@ impl FluxReady {
             Message::SortTracksChanged(sort) => {
                 self.sort_tracks = sort;
                 self.page = 0;
+            }
+            Message::TrackViewModeChanged(mode) => {
+                if let Err(error) = self.controller.set_view_mode(ViewSurface::Tracks, mode) {
+                    self.lifecycle_msg = Some(error);
+                }
+            }
+            Message::ArtistViewModeChanged(mode) => {
+                if let Err(error) = self.controller.set_view_mode(ViewSurface::Artists, mode) {
+                    self.lifecycle_msg = Some(error);
+                }
+            }
+            Message::AlbumViewModeChanged(mode) => {
+                if let Err(error) = self.controller.set_view_mode(ViewSurface::Albums, mode) {
+                    self.lifecycle_msg = Some(error);
+                }
             }
             Message::SortColumn(sort) => {
                 if self.sort_tracks == sort {
@@ -8078,16 +8432,15 @@ impl FluxReady {
             }
             Message::TrackMenuOpen(id) => {
                 if self.controller.track(id).is_some() {
-                    self.track_menu = Some(id);
-                    self.track_menu_index = 0;
+                    self.open_track_menu(id);
                 }
             }
             Message::TrackMenuClose => {
-                self.track_menu = None;
+                self.close_track_menu();
                 return iced::widget::operation::focus(iced::widget::Id::new("flux-search"));
             }
             Message::TrackMenu(id, action) => {
-                self.track_menu = None;
+                self.reset_track_menu();
                 return self.update(match action {
                     TrackMenuAction::PlayNext => Message::PlayNextTrack(id),
                     TrackMenuAction::AddToQueue => Message::EnqueueTrack(id),
@@ -8132,6 +8485,25 @@ impl FluxReady {
                     }
                     self.follow_queue_current();
                 }
+            }
+            Message::PlayArtist(artist_id) => {
+                let tracks = self
+                    .controller
+                    .tracks()
+                    .iter()
+                    .filter(|(id, _)| {
+                        self.controller.track_artist_id(*id) == Some(artist_id)
+                            || self.controller.track_credits(*id).contains(&artist_id)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                for track in &tracks {
+                    let _ = self.controller.enqueue_track(*track);
+                }
+                if let Some(first) = tracks.first().copied() {
+                    self.controller.play_track(first);
+                }
+                self.follow_queue_current();
             }
             Message::PlayNextTrack(id) => {
                 let _ = self.controller.play_next_track(id);
@@ -8246,6 +8618,9 @@ impl FluxReady {
                 self.lifecycle_msg = None;
             }
             Message::RefreshAudioDevices => return self.refresh_audio_devices(),
+            Message::ToggleAudioDevices => {
+                self.audio_devices_open = !self.audio_devices_open;
+            }
             Message::AudioDevicesLoaded(_, result) => {
                 self.audio_devices_loading = false;
                 match result {
@@ -8323,6 +8698,14 @@ impl FluxReady {
             }
             Message::CycleRepeat => self.controller.cycle_repeat_mode(),
             Message::VolumeChanged(volume) => self.controller.set_volume(volume),
+            Message::ImportKeyPressed(key, modifiers) => {
+                if self.import_manager.is_some() {
+                    return self.handle_import_key(&key, &modifiers);
+                }
+            }
+            Message::KeyPressedIn(_, key, modifiers) => {
+                return self.update(Message::KeyPressed(key, modifiers));
+            }
             Message::KeyPressed(key, modifiers) => {
                 if self.batch_review.is_some() {
                     if matches!(key, Key::Named(Named::Escape)) {
@@ -8400,13 +8783,13 @@ impl FluxReady {
                     }
                     return iced::widget::operation::focus_next();
                 }
-                if self.import_manager.is_some() {
+                if self.import_manager.is_some() && !self.import_window_active {
                     return self.handle_import_key(&key, &modifiers);
                 }
                 if let Some(menu_track) = self.track_menu {
                     match key.as_ref() {
                         Key::Named(Named::Escape) => {
-                            self.track_menu = None;
+                            self.close_track_menu();
                             return iced::widget::operation::focus(iced::widget::Id::new(
                                 "flux-search",
                             ));
@@ -8492,8 +8875,7 @@ impl FluxReady {
                     }
                     Key::Character("m") => {
                         if let Some(id) = self.keyboard_track() {
-                            self.track_menu = Some(id);
-                            self.track_menu_index = 0;
+                            self.open_track_menu(id);
                         }
                     }
                     Key::Character("e") => {
@@ -8627,6 +9009,15 @@ impl FluxReady {
                     _ => {}
                 }
             }
+            Message::MotionTick => {
+                let now = Instant::now();
+                if self.track_menu.is_some()
+                    && !self.menu_motion.value()
+                    && !self.menu_motion.is_animating(now)
+                {
+                    self.track_menu = None;
+                }
+            }
             Message::Tick => {
                 self.controller.poll();
                 self.follow_queue_current();
@@ -8672,6 +9063,9 @@ impl FluxReady {
                     self.scope.update(&waveform);
                 }
             }
+            Message::WindowResizedIn(_, width, height) => {
+                return self.update(Message::WindowResized(width, height));
+            }
             Message::WindowResized(width, height) => {
                 self.cancel_queue_drag();
                 self.seek_preview = None;
@@ -8710,6 +9104,7 @@ impl FluxReady {
                 return window::close(id);
             }
         }
+        self.sync_queue_motion();
         self.ensure_artwork_tasks()
     }
 
@@ -8717,15 +9112,23 @@ impl FluxReady {
 
     fn view(&self) -> Element<'_, Message> {
         let queue_placement = self.queue_placement();
+        let queue_progress = self.queue_progress();
+        let queue_animating = queue_progress > 0.01;
         let mut body = row![self.sidebar(), rule(), self.central()]
             .height(Length::Fill)
             .width(Length::Fill);
-        if queue_placement == QueuePlacement::Inline {
-            body = body.push(rule()).push(self.queue_panel(false));
+        if queue_placement == QueuePlacement::Inline && queue_animating {
+            body = body.push(rule()).push(
+                container(self.queue_panel(false))
+                    .width(Length::Fixed(322.0 * queue_progress))
+                    .clip(true),
+            );
         }
 
         let body: Element<'_, Message> = body.into();
-        let mut base: Element<'_, Message> = if queue_placement == QueuePlacement::Overlay {
+        let mut base: Element<'_, Message> = if queue_placement == QueuePlacement::Overlay
+            || (queue_placement == QueuePlacement::Hidden && queue_animating)
+        {
             modal_stack(body, self.queue_overlay())
         } else {
             body
@@ -8745,7 +9148,7 @@ impl FluxReady {
             modal_stack(base, self.deletion_overlay())
         } else if self.track_menu.is_some() {
             modal_stack(base, self.track_menu_overlay())
-        } else if self.import_manager.is_some() {
+        } else if self.import_manager.is_some() && !self.import_window_active {
             modal_stack(base, self.import_overlay())
         } else if self.external_drag_hover {
             modal_stack(base, self.drop_hint())
@@ -9196,7 +9599,7 @@ impl FluxReady {
                 )
                 .width(Length::Fill)
                 .padding([7, 9])
-                .style(track_row_style(is_selected))
+                .style(track_row_style(is_selected, false, false))
                 .on_press(Message::ArtistDeletionSelect(track.track_id)),
             );
         }
@@ -9796,7 +10199,7 @@ impl FluxReady {
                 .spacing(10)
                 .align_y(Alignment::Center),
                 horizontal_rule(),
-                scrollable(list).height(Length::Fixed(372.0)),
+                list,
             ]
             .spacing(8),
         )
@@ -9815,12 +10218,21 @@ impl FluxReady {
             .style(modal_backdrop_style),
         )
         .on_press(Message::TrackMenuClose);
+        let (anchor_x, anchor_y) = self.track_menu_anchor(id);
+        let rise = (1.0 - self.menu_progress()).clamp(0.0, 1.0) * 8.0;
         stack([
             backdrop.into(),
             container(
-                row![iced::widget::Space::new().width(Length::Fill), panel,].height(Length::Fill),
+                column![
+                    iced::widget::Space::new().height(Length::Fixed(anchor_y + rise)),
+                    row![
+                        iced::widget::Space::new().width(Length::Fixed(anchor_x)),
+                        panel,
+                    ],
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill),
             )
-            .padding(24)
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
@@ -9829,7 +10241,7 @@ impl FluxReady {
         .into()
     }
 
-    fn import_overlay(&self) -> Element<'_, Message> {
+    fn import_panel(&self, windowed: bool) -> Element<'_, Message> {
         let Some(manager) = self.import_manager.as_ref() else {
             return iced::widget::Space::new().into();
         };
@@ -9843,6 +10255,7 @@ impl FluxReady {
                 ImportUiStage::Review | ImportUiStage::Importing => {
                     self.import_review_body(manager)
                 }
+                ImportUiStage::Confirm => self.import_confirm_body(manager),
                 ImportUiStage::Completed | ImportUiStage::Cancelled | ImportUiStage::Failed => {
                     self.import_result_body(manager)
                 }
@@ -9858,11 +10271,13 @@ impl FluxReady {
                 | ImportUiStage::Cancelled
                 | ImportUiStage::Failed
         ) && manager.browser.is_none();
-        let panel = container(panel)
+        container(panel)
             .padding(16)
             .width(Length::Fill)
             .max_width(if compact_panel { 720.0 } else { 1_040.0 })
-            .height(if compact_panel {
+            .height(if windowed {
+                Length::Fill
+            } else if compact_panel {
                 Length::Fixed(if manager.stage == ImportUiStage::Choose {
                     470.0
                 } else {
@@ -9872,7 +10287,14 @@ impl FluxReady {
                 Length::Fill
             })
             .max_height(680.0)
-            .style(import_panel_style);
+            .style(import_panel_style)
+            .into()
+    }
+
+    fn import_overlay(&self) -> Element<'_, Message> {
+        if self.import_manager.is_none() {
+            return iced::widget::Space::new().into();
+        }
         let backdrop = mouse_area(
             container(
                 iced::widget::Space::new()
@@ -9886,7 +10308,7 @@ impl FluxReady {
         .on_press(Message::ImportNoop);
         stack([
             backdrop.into(),
-            container(panel)
+            container(self.import_panel(false))
                 .padding(18)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -9895,6 +10317,18 @@ impl FluxReady {
         ])
         .height(Length::Fill)
         .into()
+    }
+
+    /// Content for the native Import window. It shares the exact same panel
+    /// and Controller state as the in-app overlay used on single-window
+    /// fallbacks and tests.
+    fn import_window_view(&self) -> Element<'_, Message> {
+        container(self.import_panel(true))
+            .padding(18)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(app_style)
+            .into()
     }
 
     fn import_header(&self, manager: &ImportManager) -> Element<'_, Message> {
@@ -9915,14 +10349,18 @@ impl FluxReady {
                     "Nothing in your library is changed yet.".to_owned(),
                 ),
                 ImportUiStage::Review => (
-                    "Review music".to_owned(),
+                    "Organize music".to_owned(),
                     format!(
-                        "{} track(s). Edit anything that needs attention.",
+                        "{} track(s). Edit anything that needs attention before the final review.",
                         manager
                             .plan
                             .as_ref()
                             .map_or(0, |plan| plan.candidates.len())
                     ),
+                ),
+                ImportUiStage::Confirm => (
+                    "Review import".to_owned(),
+                    "Confirm exactly what Flux will add, reuse or skip.".to_owned(),
                 ),
                 ImportUiStage::Importing => (
                     "Importing…".to_owned(),
@@ -9957,10 +10395,11 @@ impl FluxReady {
         .delay(Duration::from_millis(250));
         row![
             column![
+                import_step_indicator(manager.stage),
                 text(title).size(ts(26.0)).color(TEXT),
                 text(subtitle).size(ts(12.5)).color(MUTED),
             ]
-            .spacing(2)
+            .spacing(4)
             .width(Length::Fill),
             close,
         ]
@@ -10202,7 +10641,7 @@ impl FluxReady {
                     )
                     .width(Length::Fill)
                     .padding([5, 8])
-                    .style(track_row_style(false))
+                    .style(track_row_style(false, false, false))
                     .on_press(Message::ImportBrowserEnter(entry.path.clone())),
                 );
             } else {
@@ -10235,7 +10674,7 @@ impl FluxReady {
                 let button = button(row)
                     .width(Length::Fill)
                     .padding([5, 8])
-                    .style(track_row_style(selected));
+                    .style(track_row_style(selected, false, false));
                 let item: Element<'_, Message> = if entry.supported {
                     button
                         .on_press(Message::ImportBrowserToggle(entry.path.clone()))
@@ -10537,7 +10976,7 @@ impl FluxReady {
         button(row)
             .width(Length::Fill)
             .padding([7, 8])
-            .style(track_row_style(selected))
+            .style(track_row_style(selected, false, false))
             .on_press(Message::ImportSelect(index))
             .into()
     }
@@ -11352,7 +11791,7 @@ impl FluxReady {
     fn import_footer<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
         let mut footer = row![].spacing(8).align_y(Alignment::Center);
         let summary = match manager.stage {
-            ImportUiStage::Review => manager.plan.as_ref().map_or_else(
+            ImportUiStage::Review | ImportUiStage::Confirm => manager.plan.as_ref().map_or_else(
                 || "Nothing selected".to_owned(),
                 |plan| {
                     let ready = plan.new_count() + plan.update_count();
@@ -11395,6 +11834,21 @@ impl FluxReady {
                         .style(ghost_style)
                         .padding([6, 10])
                         .on_press(Message::ImportCancel),
+                );
+                let can_import = manager.plan.as_ref().is_some_and(ImportPlan::can_import);
+                footer = footer.push(
+                    button(text("Continue to review").size(ts(12.5)))
+                        .style(accent_button_style)
+                        .padding([7, 12])
+                        .on_press_maybe(can_import.then_some(Message::ImportReviewConfirm)),
+                );
+            }
+            ImportUiStage::Confirm => {
+                footer = footer.push(
+                    button(text("Back to organize").size(ts(11.5)))
+                        .style(ghost_style)
+                        .padding([6, 10])
+                        .on_press(Message::ImportReviewBack),
                 );
                 let can_import = manager.plan.as_ref().is_some_and(ImportPlan::can_import);
                 footer = footer.push(
@@ -11451,6 +11905,111 @@ impl FluxReady {
             }
         }
         container(footer).padding([4, 2]).width(Length::Fill).into()
+    }
+
+    fn import_confirm_body<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
+        let Some(plan) = manager.plan.as_ref() else {
+            return text("The import plan is no longer available. Start the scan again.")
+                .size(ts(12.5))
+                .color(MUTED)
+                .into();
+        };
+        let mut body = column![].spacing(12);
+        body = body.push(
+            text("Nothing has been written yet. Confirm what Flux will do; you can go back and change decisions.")
+                .size(ts(12.5))
+                .color(MUTED),
+        );
+        if let Some(target) = &plan.target_album {
+            body = body.push(
+                text(format!(
+                    "Destination album: “{}” · owner {} · {} existing Track(s)",
+                    target.title,
+                    target.owner_name,
+                    target.track_order.len()
+                ))
+                .size(ts(11.5))
+                .color(accent()),
+            );
+        } else {
+            body = body.push(
+                text(format!(
+                    "Storage: {} · library {}",
+                    match plan.storage {
+                        ImportStorage::Copy => "copy files into the library",
+                        ImportStorage::Reference => "reference files in place",
+                    },
+                    plan.library_root.display()
+                ))
+                .size(ts(11.5))
+                .color(MUTED),
+            );
+        }
+
+        let summary = |label: &'static str, count: usize, color: Color| -> Element<'a, Message> {
+            container(
+                column![
+                    text(count.to_string()).size(ts(28.0)).color(color),
+                    text(label).size(ts(FONT_LABEL)).color(MUTED),
+                ]
+                .spacing(2)
+                .align_x(Alignment::Center),
+            )
+            .padding(12)
+            .width(Length::FillPortion(1))
+            .style(card_style)
+            .into()
+        };
+        body = body.push(
+            row![
+                summary("New Tracks", plan.new_count(), SUCCESS),
+                summary("Existing updated", plan.update_count(), accent()),
+                summary("Skipped", plan.skip_count(), MUTED),
+                summary("Unreadable files", plan.issues.len(), DANGER),
+            ]
+            .spacing(10),
+        );
+
+        let conflicts = plan
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.status(),
+                    CandidateStatus::SameTitleDifferentAudio(_)
+                        | CandidateStatus::AmbiguousAudio(_)
+                )
+            })
+            .count();
+        if conflicts > 0 {
+            body = body.push(
+                text(format!(
+                    "{conflicts} candidate(s) still have ambiguous titles or audio. They remain selected unless you changed them; review the Organize step if that is not intended."
+                ))
+                .size(ts(11.5))
+                .color(Color::from_rgb8(0xff, 0xc2, 0x66)),
+            );
+        }
+        if !plan.issues.is_empty() {
+            body = body.push(
+                text(format!(
+                    "{} file(s) could not be read and will be skipped, not published.",
+                    plan.issues.len()
+                ))
+                .size(ts(11.5))
+                .color(MUTED),
+            );
+        }
+        body = body.push(horizontal_rule());
+        body = body.push(
+            text("Artist, Album, Track and Queue identities are preserved. Collaborative Album ownership, participants and Track credits are applied through the existing catalogue transaction. Audio files are never modified and metadata tags are never written.")
+                .size(ts(11.5))
+                .color(MUTED),
+        );
+        if let Some(error) = &manager.error {
+            body = body.push(text(error).size(ts(11.5)).color(DANGER));
+        }
+        scrollable(body).height(Length::Fill).into()
     }
 
     fn import_result_body<'a>(&'a self, manager: &'a ImportManager) -> Element<'a, Message> {
@@ -11598,7 +12157,7 @@ impl FluxReady {
 
     fn sidebar(&self) -> Element<'_, Message> {
         let brand = row![
-            icons::brand::<Message>(32.0),
+            icons::brand_tinted::<Message>(32.0, accent()),
             column![
                 text("Flux").size(ts(24.0)).color(TEXT),
                 text("local music").size(ts(FONT_LABEL)).color(MUTED),
@@ -11749,23 +12308,7 @@ impl FluxReady {
         if let Some(banner) = self.error_banner() {
             content = content.push(banner);
         }
-        if !self.show_setup
-            && self.track_editor.is_none()
-            && self.search.trim().is_empty()
-            && !self.controller.tracks().is_empty()
-            && self.selected_artist_id().is_none()
-            && self.selected_album_id().is_none()
-            && self.selected_playlist.is_none()
-            && self.selected_lyrics.is_none()
-            && (self.view == LibraryView::Tracks
-                || self.collection.is_some()
-                || matches!(
-                    self.view,
-                    LibraryView::RecentlyAdded
-                        | LibraryView::RecentlyPlayed
-                        | LibraryView::MostPlayed
-                ))
-        {
+        if self.shows_library_controls() {
             content = content.push(self.library_controls());
         }
         content = content.push(
@@ -11958,7 +12501,7 @@ impl FluxReady {
             .width(Length::Fill),
         );
 
-        if !self.show_setup && self.track_editor.is_none() {
+        if !self.show_setup && self.track_editor.is_none() && !self.shows_library_controls() {
             bar = bar.push(icons::icon::<Message>(Icon::Search, 14.0, MUTED));
             bar = bar.push(
                 text_input("Search", &self.search)
@@ -12141,7 +12684,6 @@ impl FluxReady {
         )
         .padding(20)
         .width(Length::Fill)
-        .max_width(680.0)
         .style(card_style);
 
         let active_output = self.controller.active_audio_device().map_or_else(
@@ -12176,42 +12718,16 @@ impl FluxReady {
         )
         .padding(16)
         .width(Length::Fill)
-        .max_width(680.0)
         .style(card_style);
 
-        let shortcut_card = container(
-            column![
-                text("Space · play/pause    N/P · next/previous    S · stop")
-                    .size(ts(11.5))
-                    .color(TEXT),
-                text("←/→ · seek 5 s    Shift+←/→ · seek 30 s    Q · queue")
-                    .size(ts(11.5))
-                    .color(TEXT),
-                text("1–0 · primary views    K · settings    L · library setup    / · search")
-                    .size(ts(11.5))
-                    .color(TEXT),
-                text(
-                    "Tab/Shift+Tab · move form focus    Ctrl+Tab · next/previous destination    ↑/↓ · move Track focus    Enter · play"
-                )
-                .size(ts(11.5))
-                .color(TEXT),
-                text(
-                    "E · edit    M · Track actions    Y · lyrics    A · queue    F · favorite    I · import"
-                )
-                .size(ts(11.5))
-                .color(TEXT),
-                text(
-                    "Esc · cancel/clear    Ctrl+↑/↓ · reorder queue entry"
-                )
-                .size(ts(11.5))
-                .color(TEXT),
-            ]
-            .spacing(5),
-        )
-        .padding(16)
-        .width(Length::Fill)
-        .max_width(680.0)
-        .style(card_style);
+        let mut shortcut_column = column![].spacing(14);
+        for group in SHORTCUT_GROUPS {
+            shortcut_column = shortcut_column.push(shortcut_group(group));
+        }
+        let shortcut_card = container(shortcut_column)
+            .padding(16)
+            .width(Length::Fill)
+            .style(card_style);
 
         let mut accent_elements: Vec<Element<'_, Message>> = Vec::new();
         for preset in Accent::ALL {
@@ -12269,7 +12785,7 @@ impl FluxReady {
         let reduced_motion_row = row![
             column![
                 text("Reduce motion").size(ts(FONT_BODY)).color(TEXT),
-                text("Freezes the continuously moving waveform visualization. Playback, timing and controls are unchanged.")
+                text("Suppresses non-essential transitions and keeps the waveform static. Playback, timing and controls are unchanged.")
                     .size(ts(11.5))
                     .color(MUTED),
             ]
@@ -12292,7 +12808,7 @@ impl FluxReady {
                     .color(MUTED),
                 scale_buttons,
                 text("Accent colour").size(ts(FONT_BODY)).color(TEXT),
-                text("The default Flux Pink is unchanged for existing libraries. The choice is stored in the shared settings file and applies to selection, focus and playback highlights.")
+                text("The default Flux Pink is unchanged for existing libraries. The choice is stored in the shared settings file and applies to selection, focus, playback highlights and the in-app logo.")
                     .size(ts(11.5))
                     .color(MUTED),
                 accents,
@@ -12301,30 +12817,54 @@ impl FluxReady {
         )
         .padding(16)
         .width(Length::Fill)
-        .max_width(680.0)
         .style(card_style);
 
-        scrollable(
-            column![
-                text("PLAYBACK").size(ts(10.5)).color(MUTED),
-                card,
-                text("AUDIO OUTPUT").size(ts(10.5)).color(MUTED),
-                audio_card,
-                text("APPEARANCE").size(ts(10.5)).color(MUTED),
-                appearance_card,
-                text("KEYBOARD").size(ts(10.5)).color(MUTED),
-                shortcut_card,
-                text(format!(
-                    "{APP_NAME} {APP_VERSION} · {APP_ID} · local-first; no network services"
-                ))
-                .size(ts(10.5))
-                .color(MUTED),
-            ]
-            .spacing(10)
-            .width(Length::Fill),
-        )
-        .height(Length::Fill)
-        .into()
+        fn section<'a>(label: &'static str, content: Element<'a, Message>) -> Element<'a, Message> {
+            column![text(label).size(ts(10.5)).color(MUTED), content,]
+                .spacing(6)
+                .width(Length::Fill)
+                .into()
+        }
+
+        let mut content = column![].spacing(14).width(Length::Fill);
+        if self.window_width >= 1_040.0 {
+            content = content.push(
+                row![
+                    section("PLAYBACK", card.into()),
+                    section("AUDIO OUTPUT", audio_card.into()),
+                ]
+                .spacing(16),
+            );
+            content = content.push(
+                row![
+                    section("APPEARANCE", appearance_card.into()),
+                    section("KEYBOARD", shortcut_card.into()),
+                ]
+                .spacing(16),
+            );
+        } else {
+            content = content.push(section("PLAYBACK", card.into()));
+            content = content.push(section("AUDIO OUTPUT", audio_card.into()));
+            content = content.push(section("APPEARANCE", appearance_card.into()));
+            content = content.push(section("KEYBOARD", shortcut_card.into()));
+        }
+        content = content.push(
+            text(format!(
+                "{APP_NAME} {APP_VERSION} · {APP_ID} · local-first; no network services"
+            ))
+            .size(ts(10.5))
+            .color(MUTED),
+        );
+
+        let page = container(content)
+            .width(Length::Fill)
+            .max_width(1_080.0)
+            .padding([8, 20]);
+        container(scrollable(page).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .into()
     }
 
     fn library_view(&self) -> Element<'_, Message> {
@@ -12463,6 +13003,37 @@ impl FluxReady {
             Some(handle) => artwork_image(handle, size, ContentFit::Cover),
             None => fallback_artwork(size, Icon::Artists),
         }
+    }
+
+    /// Circular Artist portrait for profile cards. Falls back to a neutral
+    /// circular tile so identity and layout stay stable without artwork.
+    fn artist_avatar<'a>(&'a self, artist_id: ArtistId, size: f32) -> Element<'a, Message> {
+        if let Some(handle) = self
+            .artist_artwork
+            .get(&artist_id)
+            .and_then(|entry| entry.handle.as_ref())
+        {
+            return iced::widget::image(handle.clone())
+                .width(size)
+                .height(size)
+                .content_fit(ContentFit::Cover)
+                .border_radius(size / 2.0)
+                .into();
+        }
+        container(icons::icon::<Message>(Icon::Artists, size * 0.38, MUTED))
+            .width(size)
+            .height(size)
+            .center(size)
+            .style(move |_| {
+                container::Style::default()
+                    .background(SURFACE_HI)
+                    .border(Border {
+                        color: BORDER,
+                        width: 1.0,
+                        radius: (size / 2.0).into(),
+                    })
+            })
+            .into()
     }
 
     fn track_artwork<'a>(
@@ -13605,6 +14176,267 @@ impl FluxReady {
         groups.into_iter().collect()
     }
 
+    fn group_view_mode_selector(&self) -> Element<'_, Message> {
+        match self.view {
+            LibraryView::Artists => view_mode_selector(
+                self.controller.view_modes().artists,
+                Message::ArtistViewModeChanged(ViewMode::List),
+                Message::ArtistViewModeChanged(ViewMode::Grid),
+            ),
+            LibraryView::Albums => view_mode_selector(
+                self.controller.view_modes().albums,
+                Message::AlbumViewModeChanged(ViewMode::List),
+                Message::AlbumViewModeChanged(ViewMode::Grid),
+            ),
+            _ => iced::widget::Space::new().width(Length::Fill).into(),
+        }
+    }
+
+    fn artist_group_grid(&self, groups: Vec<(String, usize)>) -> Element<'_, Message> {
+        let total = groups.len();
+        let pages = total.div_ceil(GROUP_PAGE_SIZE).max(1);
+        let page = self.page.min(pages - 1);
+        let start = page * GROUP_PAGE_SIZE;
+        let end = (start + GROUP_PAGE_SIZE).min(total);
+        let columns = self.track_grid_columns();
+
+        let mut grid = column![].spacing(10);
+        for chunk in groups[start..end].chunks(columns) {
+            let mut grid_row = row![].spacing(10);
+            for (key, count) in chunk {
+                let (_, raw) = artist_key_parts(key);
+                let artist_id = raw.parse::<u64>().ok().map(ArtistId::new);
+                let name = artist_id
+                    .and_then(|id| self.controller.artist(id))
+                    .map(|artist| artist.name().to_owned())
+                    .unwrap_or_else(|| artist_key_parts(key).0.to_owned());
+                let duplicates = artist_id.is_some_and(|id| {
+                    self.controller
+                        .artists()
+                        .into_iter()
+                        .filter(|candidate| {
+                            self.controller
+                                .artist(id)
+                                .is_some_and(|artist| artist.name() == candidate.name())
+                        })
+                        .count()
+                        > 1
+                });
+                let display_name = if duplicates {
+                    format!("{name} · ID {raw}")
+                } else {
+                    name
+                };
+                let subtitle = if artist_id.is_some() {
+                    format!("{} · artist {}", pluralize(*count, "track"), raw)
+                } else {
+                    format!("{} · no stable artist", pluralize(*count, "track"))
+                };
+                let avatar: Element<'_, Message> = match artist_id {
+                    Some(id) => self.artist_avatar(id, 96.0),
+                    None => fallback_artwork(96.0, Icon::Artists),
+                };
+                let open_key = key.clone();
+                let mut body = column![
+                    button(
+                        column![
+                            container(avatar).width(Length::Fill).center_x(Length::Fill),
+                            text(display_name)
+                                .size(ts(FONT_TITLE))
+                                .color(TEXT)
+                                .width(Length::Fill),
+                            text(subtitle)
+                                .size(ts(FONT_LABEL))
+                                .color(MUTED)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(7)
+                        .width(Length::Fill),
+                    )
+                    .width(Length::Fill)
+                    .padding(0)
+                    .style(ghost_style)
+                    .on_press(Message::SelectGroup(Some(open_key))),
+                ]
+                .spacing(7)
+                .width(Length::Fill);
+                body = body.push(
+                    row![
+                        text(if *count == 0 {
+                            "Empty".to_owned()
+                        } else {
+                            format!("{} tracks", count)
+                        })
+                        .size(ts(FONT_LABEL))
+                        .color(MUTED)
+                        .width(Length::Fill),
+                        button(text("Play").size(ts(FONT_LABEL)))
+                            .style(accent_button_style)
+                            .padding([4, 9])
+                            .on_press_maybe(
+                                (*count > 0)
+                                    .then_some(artist_id)
+                                    .flatten()
+                                    .map(Message::PlayArtist),
+                            ),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                );
+                grid_row = grid_row.push(
+                    container(body)
+                        .width(Length::FillPortion(1))
+                        .padding(10)
+                        .style(card_style),
+                );
+            }
+            for _ in chunk.len()..columns {
+                grid_row = grid_row.push(iced::widget::Space::new().width(Length::FillPortion(1)));
+            }
+            grid = grid.push(grid_row);
+        }
+
+        let mut content = column![].spacing(10);
+        content = content.push(
+            row![
+                text(format!("{} artists", total))
+                    .size(ts(FONT_LABEL))
+                    .color(MUTED)
+                    .width(Length::Fill),
+                self.group_view_mode_selector(),
+            ]
+            .align_y(Alignment::Center),
+        );
+        content = content.push(scrollable(grid).height(Length::Fill));
+        content = content.push(pagination_footer(page, pages, start, end, total));
+        container(content)
+            .padding([0, 12])
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn album_group_grid(&self, groups: Vec<(String, usize)>) -> Element<'_, Message> {
+        let total = groups.len();
+        let pages = total.div_ceil(GROUP_PAGE_SIZE).max(1);
+        let page = self.page.min(pages - 1);
+        let start = page * GROUP_PAGE_SIZE;
+        let end = (start + GROUP_PAGE_SIZE).min(total);
+        let columns = self.track_grid_columns();
+
+        let mut grid = column![].spacing(10);
+        for chunk in groups[start..end].chunks(columns) {
+            let mut grid_row = row![].spacing(10);
+            for (key, count) in chunk {
+                let (_, raw) = album_key_parts(key);
+                let album_id = raw.parse::<u64>().ok().map(AlbumId::new);
+                let Some(album_id) = album_id else {
+                    let card = container(
+                        column![
+                            icon_tile(Icon::Albums, 150.0, SURFACE_HI, MUTED),
+                            text("Standalone tracks").size(ts(FONT_TITLE)).color(TEXT),
+                            text(pluralize(*count, "track"))
+                                .size(ts(FONT_LABEL))
+                                .color(MUTED),
+                        ]
+                        .spacing(7)
+                        .width(Length::Fill),
+                    )
+                    .width(Length::FillPortion(1))
+                    .padding(10)
+                    .style(card_style);
+                    grid_row = grid_row.push(card);
+                    continue;
+                };
+                let Some(album) = self.controller.album(album_id) else {
+                    continue;
+                };
+                let owner = self.artist_label(album.owner_artist_id);
+                let participants = album
+                    .participant_artist_ids
+                    .iter()
+                    .filter(|artist| **artist != album.owner_artist_id)
+                    .count();
+                let relation = if participants > 0 {
+                    format!("{owner} + {participants} participant(s)")
+                } else {
+                    owner
+                };
+                let open_key = key.clone();
+                let body = column![
+                    button(
+                        column![
+                            container(
+                                self.album_artwork(Some(album_id), 150.0, ContentFit::Cover,)
+                            )
+                            .width(Length::Fill)
+                            .center_x(Length::Fill),
+                            text(truncate_label(&album.title, 32))
+                                .size(ts(FONT_TITLE))
+                                .color(TEXT)
+                                .width(Length::Fill),
+                            text(relation)
+                                .size(ts(FONT_LABEL))
+                                .color(MUTED)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(7)
+                        .width(Length::Fill),
+                    )
+                    .width(Length::Fill)
+                    .padding(0)
+                    .style(ghost_style)
+                    .on_press(Message::SelectGroup(Some(open_key))),
+                    row![
+                        text(format!(
+                            "{} · {}",
+                            release_type_label(album.release_type),
+                            pluralize(*count, "track")
+                        ))
+                        .size(ts(FONT_LABEL))
+                        .color(MUTED)
+                        .width(Length::Fill),
+                        button(text("Play").size(ts(FONT_LABEL)))
+                            .style(accent_button_style)
+                            .padding([4, 9])
+                            .on_press_maybe((*count > 0).then_some(Message::PlayAlbum(album_id))),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(7)
+                .width(Length::Fill);
+                grid_row = grid_row.push(
+                    container(body)
+                        .width(Length::FillPortion(1))
+                        .padding(10)
+                        .style(card_style),
+                );
+            }
+            for _ in chunk.len()..columns {
+                grid_row = grid_row.push(iced::widget::Space::new().width(Length::FillPortion(1)));
+            }
+            grid = grid.push(grid_row);
+        }
+
+        let mut content = column![].spacing(10);
+        content = content.push(
+            row![
+                text(format!("{} albums", total))
+                    .size(ts(FONT_LABEL))
+                    .color(MUTED)
+                    .width(Length::Fill),
+                self.group_view_mode_selector(),
+            ]
+            .align_y(Alignment::Center),
+        );
+        content = content.push(scrollable(grid).height(Length::Fill));
+        content = content.push(pagination_footer(page, pages, start, end, total));
+        container(content)
+            .padding([0, 12])
+            .height(Length::Fill)
+            .into()
+    }
+
     fn group_list(&self) -> Element<'_, Message> {
         let groups = self.groups_for(self.view);
         if groups.is_empty() {
@@ -13617,6 +14449,15 @@ impl FluxReady {
             .height(Length::Fill)
             .center(Length::Fill)
             .into();
+        }
+        if self.view == LibraryView::Artists
+            && self.controller.view_modes().artists == ViewMode::Grid
+        {
+            return self.artist_group_grid(groups);
+        }
+        if self.view == LibraryView::Albums && self.controller.view_modes().albums == ViewMode::Grid
+        {
+            return self.album_group_grid(groups);
         }
 
         let total = groups.len();
@@ -13732,13 +14573,22 @@ impl FluxReady {
             );
         }
 
-        column![
-            scrollable(list).height(Length::Fill),
-            pagination_footer(page, pages, start, end, total),
-        ]
-        .spacing(8)
-        .height(Length::Fill)
-        .into()
+        let mut content = column![].spacing(8);
+        if matches!(self.view, LibraryView::Artists | LibraryView::Albums) {
+            content = content.push(
+                row![
+                    text(format!("{} {}", total, self.view.label().to_lowercase()))
+                        .size(ts(FONT_LABEL))
+                        .color(MUTED)
+                        .width(Length::Fill),
+                    self.group_view_mode_selector(),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+        content = content.push(scrollable(list).height(Length::Fill));
+        content = content.push(pagination_footer(page, pages, start, end, total));
+        content.height(Length::Fill).into()
     }
 
     fn search_snapshot(&self) -> std::cell::RefMut<'_, SearchCache> {
@@ -14122,11 +14972,40 @@ impl FluxReady {
         )
     }
 
+    fn shows_library_controls(&self) -> bool {
+        !self.show_setup
+            && self.track_editor.is_none()
+            && self.search.trim().is_empty()
+            && !self.controller.tracks().is_empty()
+            && self.selected_artist_id().is_none()
+            && self.selected_album_id().is_none()
+            && self.selected_playlist.is_none()
+            && self.selected_lyrics.is_none()
+            && (self.view == LibraryView::Tracks
+                || self.collection.is_some()
+                || matches!(
+                    self.view,
+                    LibraryView::RecentlyAdded
+                        | LibraryView::RecentlyPlayed
+                        | LibraryView::MostPlayed
+                ))
+    }
+
     fn library_controls(&self) -> Element<'_, Message> {
         let album_mode = self.selected_album_id().is_some();
         let active = self.filters_active();
         let active_filters = self.filter_count();
-        let mut header = row![
+        let compact = self.window_width < COMPACT_SHELL_WIDTH;
+
+        // Search is the visual centre of the library toolbar rather than a
+        // small field pushed into the page corner.
+        let mut toolbar = row![
+            icons::icon::<Message>(Icon::Search, 14.0, MUTED),
+            text_input("Search tracks, albums and artists", &self.search)
+                .id(iced::widget::Id::new("flux-search"))
+                .on_input(Message::SearchChanged)
+                .style(input_style)
+                .width(Length::Fill),
             button(
                 row![
                     icons::icon::<Message>(
@@ -14149,7 +15028,7 @@ impl FluxReady {
                 .align_y(Alignment::Center),
             )
             .style(nav_style(self.filters_open || active_filters > 0))
-            .padding([4, 7])
+            .padding([4, 8])
             .on_press(Message::ToggleFilters),
         ]
         .spacing(6)
@@ -14157,35 +15036,35 @@ impl FluxReady {
 
         if !self.filters_open {
             if self.filter_favorites {
-                header = header.push(filter_chip("Favorites"));
+                toolbar = toolbar.push(filter_chip("Favorites"));
             }
             if self.filter_lyrics != TriFilter::Any {
-                header = header.push(filter_chip(format!("Lyrics {}", self.filter_lyrics)));
+                toolbar = toolbar.push(filter_chip(format!("Lyrics {}", self.filter_lyrics)));
             }
             if self.filter_artwork != TriFilter::Any {
-                header = header.push(filter_chip(format!("Artwork {}", self.filter_artwork)));
+                toolbar = toolbar.push(filter_chip(format!("Artwork {}", self.filter_artwork)));
             }
             if self.filter_release != ReleaseFilter::Any {
-                header = header.push(filter_chip(self.filter_release.to_string()));
+                toolbar = toolbar.push(filter_chip(self.filter_release.to_string()));
             }
             if self.filter_rating != RatingFilter::Any {
-                header = header.push(filter_chip(self.filter_rating.to_string()));
+                toolbar = toolbar.push(filter_chip(self.filter_rating.to_string()));
             }
         }
-        header = header.push(iced::widget::Space::new().width(Length::Fill));
         if active {
-            header = header.push(
+            toolbar = toolbar.push(
                 button(text("Reset").size(ts(10.5)))
                     .style(ghost_style)
                     .padding([4, 7])
                     .on_press(Message::ResetLibraryFilters),
             );
         }
+        toolbar = toolbar.push(iced::widget::Space::new().width(Length::Fill));
         if album_mode {
-            header = header.push(text("Album order").size(ts(FONT_LABEL)).color(MUTED));
+            toolbar = toolbar.push(text("Album order").size(ts(FONT_LABEL)).color(MUTED));
         } else {
-            header = header.push(icons::icon::<Message>(Icon::Sort, 12.0, MUTED));
-            header = header.push(
+            toolbar = toolbar.push(icons::icon::<Message>(Icon::Sort, 12.0, MUTED));
+            toolbar = toolbar.push(
                 pick_list(
                     vec![
                         TrackSort::Default,
@@ -14205,9 +15084,9 @@ impl FluxReady {
                 )
                 .text_size(FONT_LABEL)
                 .padding([3, 6])
-                .width(Length::Fixed(132.0)),
+                .width(Length::Fixed(if compact { 108.0 } else { 132.0 })),
             );
-            header = header.push(
+            toolbar = toolbar.push(
                 button(icons::icon::<Message>(
                     if self.sort_descending {
                         Icon::Down
@@ -14226,8 +15105,15 @@ impl FluxReady {
                 .on_press(Message::SortDirectionToggled),
             );
         }
+        if !album_mode {
+            toolbar = toolbar.push(view_mode_selector(
+                self.controller.view_modes().tracks,
+                Message::TrackViewModeChanged(ViewMode::List),
+                Message::TrackViewModeChanged(ViewMode::Grid),
+            ));
+        }
 
-        let mut bar = column![header.wrap()].spacing(6);
+        let mut bar = column![toolbar.wrap()].spacing(6);
         if self.filters_open {
             let filters = row![
                 button(text("Favorites").size(ts(11.5)))
@@ -14283,7 +15169,7 @@ impl FluxReady {
     }
 
     fn modals_visible(&self) -> bool {
-        self.import_manager.is_some()
+        (self.import_manager.is_some() && !self.import_window_active)
             || self.batch_review.is_some()
             || self.album_transfer.is_some()
             || self.deletion_manager.is_some()
@@ -16369,7 +17255,7 @@ impl FluxReady {
         let album = self.controller.track_album_id(id);
         button(
             column![
-                self.track_artwork(id, album, 62.0, ContentFit::Cover),
+                self.track_artwork(id, album, 84.0, ContentFit::Cover),
                 text(track.title())
                     .size(ts(FONT_BODY))
                     .color(TEXT)
@@ -16383,9 +17269,9 @@ impl FluxReady {
             .width(Length::Fill),
         )
         .width(Length::Fixed(if self.window_width < 1_120.0 {
-            148.0
+            156.0
         } else {
-            166.0
+            176.0
         }))
         .padding(9)
         .style(group_style)
@@ -16746,9 +17632,9 @@ impl FluxReady {
         let mut body = column![
             hero,
             text("RECENTLY PLAYED").size(ts(FONT_LABEL)).color(accent()),
-            recent_cards,
+            recent_cards.wrap(),
             text("RECENTLY ADDED").size(ts(FONT_LABEL)).color(accent()),
-            added_cards,
+            added_cards.wrap(),
             lower,
             row![
                 button(text("Open Smart Collections").size(ts(FONT_BODY)))
@@ -16780,57 +17666,82 @@ impl FluxReady {
     }
 
     fn collections_view(&self) -> Element<'_, Message> {
+        let columns = if self.window_width >= 1_240.0 {
+            3
+        } else if self.window_width >= 820.0 {
+            2
+        } else {
+            1
+        };
         let mut body = column![
             text("Smart Collections").size(ts(24.0)).color(TEXT),
             text("Saved dynamic views. Membership updates automatically; these are not editable playlists.")
                 .size(ts(11.5))
                 .color(MUTED),
         ]
-        .spacing(9);
-        let mut list = column![].spacing(6);
-        for collection in SmartCollection::ALL {
-            let ids = self.smart_collection_ids(collection);
-            let preview = ids
-                .iter()
-                .take(3)
-                .filter_map(|id| self.controller.track(*id).map(Track::title))
-                .collect::<Vec<_>>()
-                .join(" · ");
-            let subtitle = if preview.is_empty() {
-                collection.description().to_owned()
-            } else {
-                format!("{} track(s) · {preview}", ids.len())
-            };
-            list = list.push(
-                button(
-                    row![
-                        icon_tile(
-                            smart_collection_icon(collection),
-                            38.0,
-                            SURFACE_HI,
-                            accent()
-                        ),
+        .spacing(4);
+        let mut grid = column![].spacing(10);
+        let collections = SmartCollection::ALL;
+        for chunk in collections.chunks(columns) {
+            let mut grid_row = row![].spacing(10);
+            for collection in chunk {
+                let ids = self.smart_collection_ids(*collection);
+                let preview = ids
+                    .iter()
+                    .take(3)
+                    .filter_map(|id| self.controller.track(*id).map(Track::title))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let subtitle = if preview.is_empty() {
+                    collection.description().to_owned()
+                } else {
+                    preview
+                };
+                grid_row = grid_row.push(
+                    button(
                         column![
-                            text(collection.label()).size(ts(15.5)).color(TEXT),
-                            text(subtitle).size(ts(10.5)).color(MUTED),
+                            row![
+                                icon_tile(
+                                    smart_collection_icon(*collection),
+                                    40.0,
+                                    SURFACE_HI,
+                                    accent()
+                                ),
+                                iced::widget::Space::new().width(Length::Fill),
+                                text(format!("{}", ids.len()))
+                                    .size(ts(FONT_SECTION))
+                                    .color(accent()),
+                            ]
+                            .align_y(Alignment::Center),
+                            text(collection.label()).size(ts(FONT_TITLE)).color(TEXT),
+                            text(subtitle)
+                                .size(ts(FONT_META))
+                                .color(MUTED)
+                                .width(Length::Fill),
+                            row![
+                                text(format!("{} tracks", ids.len()))
+                                    .size(ts(FONT_LABEL))
+                                    .color(MUTED)
+                                    .width(Length::Fill),
+                                icons::icon::<Message>(Icon::Forward, 15.0, MUTED),
+                            ]
+                            .align_y(Alignment::Center),
                         ]
-                        .spacing(2)
-                        .width(Length::Fill),
-                        text(format!("{}", ids.len()))
-                            .size(ts(13.5))
-                            .color(accent()),
-                        icons::icon::<Message>(Icon::Forward, 16.0, MUTED),
-                    ]
-                    .spacing(9)
-                    .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding(8)
-                .style(group_style)
-                .on_press(Message::CollectionSelect(collection)),
-            );
+                        .spacing(8)
+                        .width(Length::Fill)
+                        .padding(12),
+                    )
+                    .width(Length::FillPortion(1))
+                    .style(group_style)
+                    .on_press(Message::CollectionSelect(*collection)),
+                );
+            }
+            for _ in chunk.len()..columns {
+                grid_row = grid_row.push(iced::widget::Space::new().width(Length::FillPortion(1)));
+            }
+            grid = grid.push(grid_row);
         }
-        body = body.push(scrollable(container(list).padding([0, 12])).height(Length::Fill));
+        body = body.push(scrollable(container(grid).padding([0, 12])).height(Length::Fill));
         body.height(Length::Fill).into()
     }
 
@@ -17729,6 +18640,140 @@ impl FluxReady {
             .into()
     }
 
+    fn track_grid_columns(&self) -> usize {
+        let available = self.window_width - self.sidebar_width() - 96.0;
+        ((available / 178.0).floor() as usize).clamp(2, 8)
+    }
+
+    fn track_grid<'a>(&'a self, rows: Rc<Vec<TrackId>>) -> Element<'a, Message> {
+        let total = rows.len();
+        let pages = total.div_ceil(TRACK_PAGE_SIZE).max(1);
+        let page = self.page.min(pages - 1);
+        let start = page * TRACK_PAGE_SIZE;
+        let end = (start + TRACK_PAGE_SIZE).min(total);
+        let current = self.controller.current_id();
+        let columns = self.track_grid_columns();
+
+        let mut content = column![].spacing(GAP_SM);
+        if let Some(batch) = self.batch_action_bar() {
+            content = content.push(batch);
+        }
+        if let Some(album_id) = self.selected_album_id()
+            && let Some(album) = self
+                .controller
+                .albums()
+                .into_iter()
+                .find(|album| album.id == album_id)
+        {
+            let owner = self
+                .controller
+                .artist(album.owner_artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_else(|| format!("Artist {}", album.owner_artist_id));
+            content = content.push(
+                container(
+                    row![
+                        column![
+                            text(format!("Album · {}", album.title))
+                                .size(ts(13.5))
+                                .color(TEXT),
+                            text(format!(
+                                "owner {owner} · {} track(s) · AlbumId {}",
+                                album.track_order.len(),
+                                album.id
+                            ))
+                            .size(ts(10.5))
+                            .color(MUTED),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(text("Transfer album…").size(ts(11.5)))
+                            .style(accent_button_style)
+                            .padding([6, 10])
+                            .on_press(Message::AlbumTransferOpen),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding(9)
+                .style(card_style),
+            );
+        }
+
+        let mut grid = column![].spacing(10);
+        for chunk in rows[start..end].chunks(columns) {
+            let mut grid_row = row![].spacing(10);
+            for id in chunk {
+                let Some(track) = self.controller.track(*id) else {
+                    continue;
+                };
+                let album = self.controller.track_album_id(*id);
+                let selected = self.selected_tracks.contains(id);
+                let playing = current == Some(*id);
+                let favorite = self
+                    .controller
+                    .rating(*id)
+                    .is_some_and(|rating| rating.favorite);
+                let duration = self
+                    .controller
+                    .track_duration_hint(*id)
+                    .map(format_duration)
+                    .unwrap_or_else(|| "--:--".to_owned());
+                let mut footer = row![
+                    text(duration).size(ts(FONT_LABEL)).color(MUTED),
+                    iced::widget::Space::new().width(Length::Fill),
+                ]
+                .align_y(Alignment::Center);
+                footer = footer.push(icons::icon::<Message>(
+                    Icon::Favorite,
+                    11.0,
+                    if favorite { accent() } else { MUTED },
+                ));
+                if playing {
+                    footer = footer.push(text("PLAYING").size(ts(9.5)).color(accent()));
+                }
+                grid_row = grid_row.push(
+                    button(
+                        column![
+                            container(self.track_artwork(*id, album, 150.0, ContentFit::Cover,))
+                                .width(Length::Fill)
+                                .center_x(Length::Fill),
+                            text(track.title().to_owned())
+                                .size(ts(FONT_TITLE))
+                                .color(if playing { accent() } else { TEXT })
+                                .width(Length::Fill),
+                            text(display_artist(track))
+                                .size(ts(FONT_META))
+                                .color(MUTED)
+                                .width(Length::Fill),
+                            text(display_album(track))
+                                .size(ts(FONT_LABEL))
+                                .color(MUTED)
+                                .width(Length::Fill),
+                            footer,
+                        ]
+                        .spacing(5)
+                        .width(Length::Fill)
+                        .padding(9),
+                    )
+                    .width(Length::FillPortion(1))
+                    .style(track_card_style(selected, playing))
+                    .on_press(Message::PlayTrack(*id)),
+                );
+            }
+            for _ in chunk.len()..columns {
+                grid_row = grid_row.push(iced::widget::Space::new().width(Length::FillPortion(1)));
+            }
+            grid = grid.push(grid_row);
+        }
+        content = content.push(scrollable(grid).height(Length::Fill));
+        content = content.push(pagination_footer(page, pages, start, end, total));
+        container(content)
+            .padding([0, 12])
+            .height(Length::Fill)
+            .into()
+    }
+
     fn track_list<'a>(&'a self, rows: Rc<Vec<TrackId>>) -> Element<'a, Message> {
         if let Some(album_id) = self.selected_album_id() {
             return self.album_detail_view(album_id);
@@ -17752,6 +18797,9 @@ impl FluxReady {
             .height(Length::Fill)
             .center(Length::Fill)
             .into();
+        }
+        if self.controller.view_modes().tracks == ViewMode::Grid {
+            return self.track_grid(rows);
         }
 
         let pages = total.div_ceil(TRACK_PAGE_SIZE).max(1);
@@ -18043,82 +19091,140 @@ impl FluxReady {
         }
         let switch_enabled = self.audio_switch_pending.is_none()
             && !matches!(self.controller.audio_status(), AudioStatus::Recovering(_));
+        let selected_label = selected_id
+            .and_then(|id| {
+                self.audio_devices
+                    .iter()
+                    .find(|device| device.id.as_deref() == Some(id))
+            })
+            .or(active)
+            .map_or_else(|| "System default".to_owned(), |device| device.name.clone());
         audio_status = audio_status.push(
-            row![
-                button(text("Use system default").size(ts(11.5)))
-                    .style(nav_style(selected_id.is_none()))
-                    .padding([6, 9])
-                    .on_press_maybe(switch_enabled.then_some(Message::SelectAudioDevice(None))),
-                text(if selected_id.is_none() {
-                    "current"
-                } else {
-                    "switch"
-                })
-                .size(ts(9.5))
-                .color(MUTED),
-            ]
-            .spacing(7)
-            .align_y(Alignment::Center),
-        );
-        if self.audio_devices.is_empty() {
-            if !self.audio_devices_loading {
-                audio_status =
-                    audio_status.push(text("No audio devices found.").size(ts(10.5)).color(MUTED));
-            }
-        } else {
-            let mut name_counts = BTreeMap::new();
-            for device in &self.audio_devices {
-                *name_counts.entry(device.name.clone()).or_insert(0usize) += 1;
-            }
-            let mut list = column![].spacing(3);
-            for device in &self.audio_devices {
-                let duplicate = name_counts.get(&device.name).copied().unwrap_or(0) > 1;
-                let label = format!(
-                    "{}{}{}{}",
-                    device.name,
-                    if duplicate {
-                        device
-                            .id
-                            .as_deref()
-                            .map_or_else(String::new, |id| format!(" · {id}"))
-                    } else {
-                        String::new()
-                    },
-                    if device.is_default { " · default" } else { "" },
-                    if device.id.as_deref() == active_id {
-                        " · active"
-                    } else {
-                        ""
-                    }
-                );
-                let label = if device.id.is_none() {
-                    format!("{label} · no stable device id")
-                } else {
-                    label
-                };
-                let selectable = switch_enabled
-                    && device.can_open
-                    && device.id.is_some()
-                    && device.id.as_deref() != selected_id;
-                let select_id = device.id.clone();
-                list = list.push(
-                    button(
-                        text(if device.can_open {
-                            label
+            button(
+                row![
+                    icons::icon::<Message>(
+                        Icon::Volume,
+                        13.0,
+                        if self.audio_devices_open {
+                            accent()
                         } else {
-                            format!("{label} · unavailable")
+                            MUTED
+                        },
+                    ),
+                    column![
+                        text(selected_label).size(ts(11.5)).color(TEXT),
+                        text(if selected_id.is_some() {
+                            "Explicit device · choose to change"
+                        } else {
+                            "System default · choose to change"
                         })
-                        .size(ts(11.5)),
-                    )
-                    .width(Length::Fill)
-                    .style(nav_style(
-                        device.id.as_deref() == active_id || device.id.as_deref() == selected_id,
-                    ))
-                    .padding([6, 8])
-                    .on_press_maybe(selectable.then_some(Message::SelectAudioDevice(select_id))),
-                );
+                        .size(ts(9.5))
+                        .color(MUTED),
+                    ]
+                    .spacing(1)
+                    .width(Length::Fill),
+                    text(format!("{} available", self.audio_devices.len()))
+                        .size(ts(9.5))
+                        .color(MUTED),
+                    icons::icon::<Message>(
+                        if self.audio_devices_open {
+                            Icon::Up
+                        } else {
+                            Icon::Down
+                        },
+                        13.0,
+                        MUTED,
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .style(nav_style(self.audio_devices_open))
+            .padding([7, 9])
+            .on_press(Message::ToggleAudioDevices),
+        );
+        if self.audio_devices_open {
+            audio_status = audio_status.push(
+                row![
+                    button(text("Use system default").size(ts(11.5)))
+                        .style(nav_style(selected_id.is_none()))
+                        .padding([6, 9])
+                        .on_press_maybe(switch_enabled.then_some(Message::SelectAudioDevice(None))),
+                    text(if selected_id.is_none() {
+                        "current"
+                    } else {
+                        "switch"
+                    })
+                    .size(ts(9.5))
+                    .color(MUTED),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            );
+            if self.audio_devices.is_empty() {
+                if !self.audio_devices_loading {
+                    audio_status = audio_status
+                        .push(text("No audio devices found.").size(ts(10.5)).color(MUTED));
+                }
+            } else {
+                let mut name_counts = BTreeMap::new();
+                for device in &self.audio_devices {
+                    *name_counts.entry(device.name.clone()).or_insert(0usize) += 1;
+                }
+                let mut list = column![].spacing(3);
+                for device in &self.audio_devices {
+                    let duplicate = name_counts.get(&device.name).copied().unwrap_or(0) > 1;
+                    let label = format!(
+                        "{}{}{}{}",
+                        device.name,
+                        if duplicate {
+                            device
+                                .id
+                                .as_deref()
+                                .map_or_else(String::new, |id| format!(" · {id}"))
+                        } else {
+                            String::new()
+                        },
+                        if device.is_default { " · default" } else { "" },
+                        if device.id.as_deref() == active_id {
+                            " · active"
+                        } else {
+                            ""
+                        }
+                    );
+                    let label = if device.id.is_none() {
+                        format!("{label} · no stable device id")
+                    } else {
+                        label
+                    };
+                    let selectable = switch_enabled
+                        && device.can_open
+                        && device.id.is_some()
+                        && device.id.as_deref() != selected_id;
+                    let select_id = device.id.clone();
+                    list = list.push(
+                        button(
+                            text(if device.can_open {
+                                label
+                            } else {
+                                format!("{label} · unavailable")
+                            })
+                            .size(ts(11.5)),
+                        )
+                        .width(Length::Fill)
+                        .style(nav_style(
+                            device.id.as_deref() == active_id
+                                || device.id.as_deref() == selected_id,
+                        ))
+                        .padding([6, 8])
+                        .on_press_maybe(
+                            selectable.then_some(Message::SelectAudioDevice(select_id)),
+                        ),
+                    );
+                }
+                audio_status = audio_status.push(list);
             }
-            audio_status = audio_status.push(list);
         }
         setup = setup.push(setup_card(
             "AUDIO OUTPUT",
@@ -18144,6 +19250,10 @@ impl FluxReady {
                     .on_submit(Message::OpenLibraryPressed)
                     .style(input_style)
                     .width(Length::Fill),
+                button(text("Choose folder…").size(ts(12.5)))
+                    .style(ghost_style)
+                    .padding([7, 12])
+                    .on_press(Message::ChooseLibraryFolder),
                 button(text("Open").size(ts(12.5)))
                     .style(ghost_style)
                     .padding([7, 12])
@@ -18562,6 +19672,8 @@ impl FluxReady {
     }
 
     fn queue_overlay(&self) -> Element<'_, Message> {
+        let progress = self.queue_progress();
+        let slide = (1.0 - progress).clamp(0.0, 1.0) * 28.0;
         let backdrop = mouse_area(
             container(
                 iced::widget::Space::new()
@@ -18579,6 +19691,7 @@ impl FluxReady {
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     self.queue_panel(true),
+                    iced::widget::Space::new().width(Length::Fixed(slide)),
                 ]
                 .height(Length::Fill),
             )
@@ -18997,7 +20110,9 @@ impl FluxReady {
     /// Flow's real-time oscilloscope, fed by post-gain output samples
     /// captured through the engine's lock-free waveform tap.
     fn oscilloscope(&self) -> Element<'_, Message> {
-        if self.controller.reduced_motion() {
+        if self.controller.reduced_motion()
+            || self.controller.player_state() != PlaybackState::Playing
+        {
             FlowOscilloscope { samples: &[] }.into()
         } else {
             FlowOscilloscope {
@@ -19013,6 +20128,8 @@ impl FluxReady {
 /// leaves the catalogue untouched.
 struct Flux {
     state: FluxState,
+    main_window: window::Id,
+    import_window: Option<window::Id>,
 }
 
 enum FluxState {
@@ -19021,8 +20138,9 @@ enum FluxState {
 }
 
 impl Flux {
-    fn boot() -> Self {
-        match Controller::open_default() {
+    fn boot() -> (Self, Task<Message>) {
+        let (main_window, open) = window::open(window_settings());
+        let state = match Controller::open_default() {
             Ok(controller) => {
                 let created = controller.default_library_created();
                 let root = controller
@@ -19036,38 +20154,98 @@ impl Flux {
                         root.unwrap_or_else(|| "the per-user data directory".to_owned())
                     ));
                 }
-                Self {
-                    state: FluxState::Ready(Box::new(ready)),
-                }
+                FluxState::Ready(Box::new(ready))
             }
-            Err(error) => Self {
-                state: FluxState::Blocked(error.to_string()),
+            Err(error) => FluxState::Blocked(error.to_string()),
+        };
+        (
+            Self {
+                state,
+                main_window,
+                import_window: None,
             },
+            open.discard(),
+        )
+    }
+
+    fn title(state: &Self, window: window::Id) -> String {
+        if Some(window) == state.import_window {
+            format!("Import music — {APP_NAME}")
+        } else {
+            APP_NAME.to_owned()
         }
     }
 
-    fn theme(&self) -> Theme {
-        flux_theme()
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        match &self.state {
-            FluxState::Ready(app) => app.subscription(),
+    fn subscription(state: &Self) -> Subscription<Message> {
+        match &state.state {
+            FluxState::Ready(app) => app.subscription(state.main_window),
             FluxState::Blocked(_) => window::close_requests().map(Message::WindowCloseRequested),
         }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Resolve window-scoped input before delegating to shared state.
+        let message = match message {
+            Message::KeyPressedIn(window, key, modifiers) => {
+                if window == self.main_window {
+                    Message::KeyPressed(key, modifiers)
+                } else if Some(window) == self.import_window {
+                    Message::ImportKeyPressed(key, modifiers)
+                } else {
+                    return Task::none();
+                }
+            }
+            Message::WindowResizedIn(window, width, height) => {
+                if window == self.main_window {
+                    Message::WindowResized(width, height)
+                } else {
+                    return Task::none();
+                }
+            }
+            Message::WindowCloseRequested(window) if Some(window) == self.import_window => {
+                if let FluxState::Ready(app) = &mut self.state {
+                    app.close_import_manager();
+                    app.import_window_active = false;
+                }
+                self.import_window = None;
+                return window::close::<Message>(window);
+            }
+            other => other,
+        };
+
         match &mut self.state {
-            FluxState::Ready(app) => app.update(message),
+            FluxState::Ready(app) => {
+                let mut tasks = vec![app.update(message)];
+                if app.import_manager.is_some() && self.import_window.is_none() {
+                    let (id, open) = window::open(import_window_settings());
+                    self.import_window = Some(id);
+                    app.import_window_active = true;
+                    tasks.push(open.map(|_| Message::ImportNoop));
+                    tasks.push(window::gain_focus::<Message>(id).map(|_| Message::ImportNoop));
+                } else if app.import_manager.is_none() && self.import_window.is_some() {
+                    let id = self.import_window.take().expect("import window tracked");
+                    app.import_window_active = false;
+                    tasks.push(window::close::<Message>(id).map(|_| Message::ImportNoop));
+                }
+                if app.closed {
+                    tasks.push(iced::exit());
+                }
+                Task::batch(tasks)
+            }
             FluxState::Blocked(_) => match message {
-                Message::WindowCloseRequested(id) => window::close(id),
+                Message::WindowCloseRequested(id) => Task::batch([window::close(id), iced::exit()]),
                 _ => Task::none(),
             },
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self, window: window::Id) -> Element<'_, Message> {
+        if Some(window) == self.import_window {
+            return match &self.state {
+                FluxState::Ready(app) => app.import_window_view(),
+                FluxState::Blocked(message) => blocked_library_view(message),
+            };
+        }
         match &self.state {
             FluxState::Ready(app) => app.view(),
             FluxState::Blocked(message) => blocked_library_view(message),
@@ -19202,6 +20380,142 @@ fn filter_chip(label: impl Into<String>) -> Element<'static, Message> {
                 })
         })
         .into()
+}
+
+fn motion_animation(state: bool) -> iced::Animation<bool> {
+    iced::Animation::new(state)
+        .duration(Duration::from_millis(120))
+        .easing(iced::animation::Easing::EaseOutCubic)
+}
+
+fn keycap(label: &str) -> Element<'static, Message> {
+    container(text(label.to_owned()).size(ts(10.5)).color(TEXT))
+        .padding([2, 7])
+        .style(|_| {
+            container::Style::default()
+                .background(SURFACE_HI)
+                .border(Border {
+                    color: BORDER,
+                    width: 1.0,
+                    radius: 5.0.into(),
+                })
+        })
+        .into()
+}
+
+fn shortcut_row(entry: &'static ShortcutEntry) -> Element<'static, Message> {
+    let mut keys = row![].spacing(4).align_y(Alignment::Center);
+    for key in entry.keys {
+        keys = keys.push(keycap(key));
+    }
+    row![
+        text(entry.action)
+            .size(ts(FONT_META))
+            .color(TEXT)
+            .width(Length::Fill),
+        keys,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn shortcut_group(group: &'static ShortcutGroup) -> Element<'static, Message> {
+    let mut body = column![text(group.title).size(ts(FONT_LABEL)).color(accent())].spacing(4);
+    for entry in group.entries {
+        body = body.push(shortcut_row(entry));
+    }
+    body.into()
+}
+
+fn segmented_container_style(_: &Theme) -> container::Style {
+    container::Style::default()
+        .background(SURFACE)
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 9.0.into(),
+        })
+}
+
+fn view_mode_button<'a>(
+    mode: ViewMode,
+    current: ViewMode,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let selected = mode == current;
+    button(
+        row![
+            icons::icon::<Message>(
+                match mode {
+                    ViewMode::List => Icon::Tracks,
+                    ViewMode::Grid => Icon::Albums,
+                },
+                11.0,
+                if selected { accent() } else { MUTED },
+            ),
+            text(mode.label())
+                .size(ts(FONT_LABEL))
+                .color(if selected { accent() } else { MUTED }),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center),
+    )
+    .style(nav_style(selected))
+    .padding([3, 7])
+    .on_press(on_press)
+    .into()
+}
+
+/// Shared List/Grid segmented control used by Tracks, Artists and Albums.
+fn view_mode_selector<'a>(
+    current: ViewMode,
+    on_list: Message,
+    on_grid: Message,
+) -> Element<'a, Message> {
+    container(
+        row![
+            view_mode_button(ViewMode::List, current, on_list),
+            view_mode_button(ViewMode::Grid, current, on_grid),
+        ]
+        .spacing(2),
+    )
+    .padding(2)
+    .style(segmented_container_style)
+    .into()
+}
+
+fn track_card_style(
+    selected: bool,
+    current: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(
+                if selected {
+                    accent_soft()
+                } else if hovered {
+                    SURFACE_HI
+                } else {
+                    SURFACE
+                }
+                .into(),
+            ),
+            text_color: TEXT,
+            border: Border {
+                color: if selected || current {
+                    accent_border()
+                } else {
+                    BORDER
+                },
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        }
+    }
 }
 
 fn sidebar_section(label: &'static str) -> Element<'static, Message> {
@@ -19366,7 +20680,6 @@ fn track_row<'a>(
     compact: bool,
 ) -> Element<'a, Message> {
     let is_current = state.current == Some(id);
-    let selected = is_current || state.focused;
     let marker: Element<'a, Message> = if is_current {
         icons::icon(Icon::Play, 10.0, accent())
     } else if state.focused {
@@ -19463,7 +20776,7 @@ fn track_row<'a>(
     let main = button(content)
         .width(Length::Fill)
         .padding([9, 10])
-        .style(track_row_style(selected || state.checked))
+        .style(track_row_style(state.checked, state.focused, is_current))
         .on_press(Message::PlayTrack(id));
     let favorite = button(icons::icon::<Message>(
         Icon::Favorite,
@@ -19689,7 +21002,11 @@ fn queue_row<'a>(
         .width(Length::Fill)
         .height(Length::Fixed(QUEUE_ROW_HEIGHT))
         .padding([3, 5])
-        .style(track_row_style(is_current || dragging || focused))
+        .style(track_row_style(
+            dragging,
+            focused && !is_current,
+            is_current,
+        ))
         .on_press(Message::PlayQueueEntry(entry.id()));
     let remove = button(icons::icon::<Message>(Icon::Close, 12.0, MUTED))
         .style(ghost_style)
@@ -19924,13 +21241,10 @@ pub fn main() -> iced::Result {
     if handle_cli() {
         return Ok(());
     }
-    iced::application(Flux::boot, Flux::update, Flux::view)
-        .title(APP_NAME)
-        .theme(Flux::theme)
+    iced::daemon(Flux::boot, Flux::update, Flux::view)
+        .title(Flux::title)
+        .theme(flux_theme())
         .subscription(Flux::subscription)
-        .window(window_settings())
-        .window_size((1_180.0, 760.0))
-        .exit_on_close_request(false)
         .run()
 }
 
@@ -20015,8 +21329,28 @@ fn window_icon() -> Option<window::Icon> {
 fn window_settings() -> window::Settings {
     #[allow(unused_mut)]
     let mut settings = window::Settings {
+        size: iced::Size::new(1_180.0, 760.0),
         min_size: Some(iced::Size::new(920.0, 620.0)),
+        position: window::Position::Centered,
         icon: window_icon(),
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        settings.platform_specific.application_id = APP_ID.to_owned();
+    }
+    settings
+}
+
+fn import_window_settings() -> window::Settings {
+    #[allow(unused_mut)]
+    let mut settings = window::Settings {
+        size: iced::Size::new(1_000.0, 740.0),
+        min_size: Some(iced::Size::new(720.0, 520.0)),
+        position: window::Position::Centered,
+        icon: window_icon(),
+        exit_on_close_request: false,
         ..window::Settings::default()
     };
     #[cfg(target_os = "linux")]
@@ -20117,6 +21451,7 @@ mod tests {
             track_editor: None,
             track_editor_advanced_open: false,
             import_manager: None,
+            import_window_active: false,
             import_request_seq: 0,
             deletion_manager: None,
             album_transfer: None,
@@ -20169,6 +21504,7 @@ mod tests {
             crossfade_preview: None,
             audio_devices: Vec::new(),
             audio_devices_loading: false,
+            audio_devices_open: false,
             audio_devices_error: None,
             audio_switch_token: 0,
             audio_switch_pending: None,
@@ -20180,6 +21516,8 @@ mod tests {
             lyrics_overlay_open: false,
             track_menu: None,
             track_menu_index: 0,
+            menu_motion: motion_animation(false),
+            queue_motion: motion_animation(false),
             window_width: 1_180.0,
             window_height: 760.0,
             close_confirm: false,
@@ -20531,6 +21869,149 @@ mod tests {
         send(&mut gui, Message::OpenAlbum(AlbumId::new(1)));
         assert_eq!(gui.view, view, "dirty lyrics block entity navigation");
         assert!(gui.lyrics_editor.is_some());
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn view_mode_toggles_persist_and_render_both_layouts() {
+        let dir = TempDir::new("gui-view-modes");
+        let settings = dir.path().join("config").join("settings.json");
+        std::fs::create_dir_all(settings.parent().expect("parent")).expect("config dir");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui_with_settings(&dir, &settings);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).expect("source");
+        let one = source_dir.join("one.wav");
+        let two = source_dir.join("two.wav");
+        std::fs::write(&one, minimal_wav()).expect("one");
+        let mut second = minimal_wav();
+        second.push(1);
+        std::fs::write(&two, second).expect("two");
+        gui.controller
+            .import_files(&[one, two], false)
+            .expect("import");
+        let artist = gui
+            .controller
+            .create_artist("Layout Artist")
+            .expect("artist");
+        let album = gui
+            .controller
+            .create_album(artist, "Layout Album", ReleaseType::Album)
+            .expect("album");
+
+        send(&mut gui, Message::TrackViewModeChanged(ViewMode::Grid));
+        assert_eq!(gui.controller.view_modes().tracks, ViewMode::Grid);
+        gui.view = LibraryView::Tracks;
+        let _ = gui.library_view();
+        send(&mut gui, Message::TrackViewModeChanged(ViewMode::List));
+        assert_eq!(gui.controller.view_modes().tracks, ViewMode::List);
+        let _ = gui.library_view();
+        send(&mut gui, Message::TrackViewModeChanged(ViewMode::Grid));
+
+        send(&mut gui, Message::ArtistViewModeChanged(ViewMode::List));
+        assert_eq!(gui.controller.view_modes().artists, ViewMode::List);
+        gui.view = LibraryView::Artists;
+        gui.selected_group = None;
+        let _ = gui.group_list();
+        send(&mut gui, Message::ArtistViewModeChanged(ViewMode::Grid));
+        let _ = gui.group_list();
+
+        send(&mut gui, Message::AlbumViewModeChanged(ViewMode::List));
+        assert_eq!(gui.controller.view_modes().albums, ViewMode::List);
+        gui.view = LibraryView::Albums;
+        gui.selected_group = None;
+        let _ = gui.group_list();
+        send(&mut gui, Message::AlbumViewModeChanged(ViewMode::Grid));
+        let _ = gui.group_list();
+        assert_eq!(
+            gui.controller.album(album).map(|album| album.title.clone()),
+            Some("Layout Album".to_owned())
+        );
+        gui.controller.shutdown();
+
+        let restarted = gui_with_settings(&dir, &settings);
+        assert_eq!(restarted.controller.view_modes().tracks, ViewMode::Grid);
+        assert_eq!(restarted.controller.view_modes().artists, ViewMode::Grid);
+        assert_eq!(restarted.controller.view_modes().albums, ViewMode::Grid);
+        restarted.controller.shutdown();
+    }
+
+    #[test]
+    fn play_artist_uses_the_existing_queue_and_controller_path() {
+        let dir = TempDir::new("gui-play-artist");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let source = dir.path().join("source/artist.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        gui.controller
+            .import_files(std::slice::from_ref(&source), false)
+            .expect("import");
+        let track = gui.controller.tracks()[0].0;
+        let artist = gui.controller.track_artist_id(track).expect("artist");
+        let before = gui.controller.queue_len();
+        send(&mut gui, Message::PlayArtist(artist));
+        assert_eq!(gui.controller.current_id(), Some(track));
+        assert!(gui.controller.queue_len() >= before);
+        assert_eq!(
+            gui.controller
+                .current_queue_entry()
+                .map(|entry| entry.track()),
+            Some(track)
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn native_import_window_mode_keeps_main_shortcuts_and_owns_import_keys() {
+        let dir = TempDir::new("gui-import-window-mode");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        gui.open_import_manager();
+        gui.import_window_active = true;
+        let _ = gui.view();
+        let _ = gui.import_window_view();
+        assert!(gui.import_manager.is_some());
+
+        // Main-window shortcuts keep working while the Import window is open.
+        send(
+            &mut gui,
+            Message::KeyPressed(Key::Character("k".into()), Modifiers::default()),
+        );
+        assert_eq!(gui.view, LibraryView::Settings);
+        assert!(
+            gui.import_manager.is_some(),
+            "main navigation must not discard the import draft"
+        );
+
+        // Import-window keys are routed separately.
+        send(
+            &mut gui,
+            Message::ImportKeyPressed(Key::Named(Named::Escape), Modifiers::default()),
+        );
+        assert!(
+            gui.import_manager.is_none(),
+            "Escape in the Import window closes only that workflow"
+        );
+        gui.import_window_active = false;
         gui.controller.shutdown();
     }
 
@@ -24631,6 +26112,34 @@ mod tests {
             Message::ImportPlanReady(0, 0, Box::new(plan.clone())),
         );
         send(&mut gui, Message::ImportCheckAll);
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").stage,
+            ImportUiStage::Review
+        );
+        let candidate_count = gui
+            .import_manager
+            .as_ref()
+            .and_then(|manager| manager.plan.as_ref())
+            .map_or(0, |plan| plan.candidates.len());
+        send(&mut gui, Message::ImportReviewConfirm);
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").stage,
+            ImportUiStage::Confirm,
+            "the review step must follow organization"
+        );
+        send(&mut gui, Message::ImportReviewBack);
+        assert_eq!(
+            gui.import_manager.as_ref().expect("manager").stage,
+            ImportUiStage::Review
+        );
+        assert_eq!(
+            gui.import_manager
+                .as_ref()
+                .and_then(|manager| manager.plan.as_ref())
+                .map_or(0, |plan| plan.candidates.len()),
+            candidate_count,
+            "navigating between steps preserves the plan and decisions"
+        );
         send(
             &mut gui,
             Message::ImportBulkAlbumChanged("Wrong target".to_owned()),
@@ -24951,7 +26460,14 @@ mod tests {
     #[test]
     fn artist_grid_requests_visible_portraits_without_selection() {
         let dir = TempDir::new("gui-artwork-artist-grid");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
         let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
         let with_image = gui
             .controller
             .create_artist("Portrait Artist")

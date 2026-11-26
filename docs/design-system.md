@@ -181,16 +181,27 @@ TUI:
 
 ## Motion and accessibility
 
-Motion is limited to real playback visualization. There is no perpetual
-decorative animation, and no animation delays input or playback. The GUI cannot
-honor OS reduced-motion settings for the waveform without replacing the audio
-visualization contract, so the visualizer is opt-in in the TUI and reflects real
-audio only.
+Motion is purposeful and short. Playback visualization is driven only by real
+audio. Interface transitions use a 120 ms ease-out progress for the anchored
+Track menu and the queue panel; Reduce motion resolves every transition
+immediately and removes non-essential movement. No transition delays input or
+playback, and Iced 0.14 provides no arbitrary opacity/transform wrapper, so
+transitions are expressed through supported layout progress rather than custom
+rendering. There is no perpetual decorative animation.
+
+View modes: Tracks, Artists and Albums each expose one shared segmented
+List/Grid control with distinct icons and labels. Tracks default to List for
+density; Artists and Albums default to Grid so artwork leads. Grid cards use a
+12 px radius, a single border, artwork at the visual focus, and a footer row for
+playback and metadata. List rows remain the dense management surface. Each
+preference persists independently.
 
 Icons: the GUI uses one vendored Lucide SVG family at 9–20 px with a consistent
 stroke weight. Navigation, transport, row actions, filters and Smart Collections
 share it. Icon-only controls require a tooltip or adjacent label; tooltips are
-not screen-reader names.
+not screen-reader names. The in-app Flux mark keeps its geometry and dark
+surface while its symbol bars follow the selected accent; native application
+icons remain unchanged.
 
 Navigation hierarchy: Home, Tracks, Artists and Albums lead the sidebar.
 Playlists, Smart Collections and Lyrics follow. Import is a secondary action
@@ -203,15 +214,27 @@ with editing behind a discreet action.
 Tables: TITLE, ALBUM, RATE and TIME are clickable sort headers with a direction
 marker. A secondary advanced sort picker sits at the far right. Scrollbars are
 quiet neutral scrollers with an accent scroller only while dragged, and content
-reserves an inset so row actions are never covered.
+reserves an inset so row actions are never covered. Row hover uses a raised
+surface; keyboard focus uses a neutral outline; selection uses an accent tint;
+the playing Track keeps the accent title and border. These states can coexist
+without collapsing into one visual treatment.
+
+Scrolling: every page and panel uses the shared `scrollable` helper. Lists,
+grids, lyrics and review bodies scroll inside the remaining content area while
+headers, toolbars, pagination and player controls stay fixed. Long forms use one
+outer scroll container rather than nested scroll regions. Overlay lists are
+bounded by their panel and clipped during transitions; page content keeps
+horizontal insets so the scrollbar never covers text or actions.
 
 Keyboard operation: Tab/Shift+Tab move between focusable form controls;
 Ctrl+Tab/Shift+Ctrl+Tab cycle primary GUI destinations; ↑/↓ move Track focus;
 Enter plays; E edits; M opens the Track action menu; Y opens lyrics; A queues;
 F favorites; I imports; / focuses Search; Q toggles queue. Open queue overlays
-use ↑/↓, Enter, Delete and Escape. Settings can freeze the waveform for reduced
-motion. Global shortcuts are suppressed
-while editors, Setup, import and other modal workflows own input. Queue close and
+use ↑/↓, Enter, Delete and Escape. Settings can freeze the waveform and
+interface transitions for reduced motion. Global shortcuts are suppressed
+while editors, Setup and in-app modal workflows own input. Import Music opens in
+a separate native window with its own key routing, so main-window shortcuts stay
+available; Escape in the Import window cancels that workflow. Queue close and
 Track-action close restore focus to Search where available.
 
 Known accessibility gaps: no screen-reader audit, no complete GUI button

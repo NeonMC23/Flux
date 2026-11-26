@@ -6,7 +6,7 @@ while replacing the implementation with a native architecture: an Iced
 graphical application and a dedicated terminal application sharing the
 same core logic, library, and playback engine.
 
-**Status: public release suspended pending M28 playback/UX validation.** Signing and native/manual validation remain external.
+**Status: public release suspended pending native/manual UX validation.** Signing and native/manual validation remain external.
 Both applications open, create and switch canonical self-contained Flux
 libraries. The GUI and TUI share the same application controller; audio is
 copied into the library, metadata is inferred from filenames and folders and
@@ -46,6 +46,18 @@ player geometry, makes table headers sortable and refreshes the application
 identity and contextual menu. Details are in
 [`docs/m25-player-experience.md`](docs/m25-player-experience.md) and
 [`docs/m26-visual-polish.md`](docs/m26-visual-polish.md).
+
+M29 makes artwork load automatically for every visible Track, shelf, queue row
+and Artist profile without requiring playback, and fixes crossfade progress
+after a near-end seek so the incoming Track starts at zero. It adds persisted
+Track/Artist/Album list and grid modes, a redesigned Tracks toolbar and grid,
+a centered two-column Settings page with keycap shortcuts, native library
+folder selection, a compact audio-device selector, a five-step import review,
+Artist profile cards, Album discography cards, Smart Collection cards, anchored
+contextual menus, restrained reduced-motion-aware transitions, an accent-aware
+in-app logo and a real native secondary window for Import Music. Platform
+limitations and implemented behavior are documented in
+[`docs/m29-product-redesign.md`](docs/m29-product-redesign.md).
 
 Canonical schema 2 gives every Album an explicit ordered participant set in
 addition to its physical owner. Participation is independent of Track credits;
@@ -94,7 +106,7 @@ selects or writes those backends.
 | `flux-app` | library | The shared application controller: owns the canonical library, playback model, engine, volume and queue persistence; implements canonical create/open/switch, filename-only import inference, enriched import review, duplicate decisions, copy-only publication, artist/album/track edits, owned/participating/credited relationships, playlist management, lyrics parsing/editing/import/export APIs, playlists/ratings/lyrics persistence, and the canonical migration workflow. Both front-ends use this one controller. |
 | `flux-providers` | library | Data-only provider descriptors and capability vocabulary for future legally supported streaming integrations. Nothing networked exists yet. |
 | `flux-platform` | library | OS integration: per-user data/config directory resolution and dependency-free native audio/image file and folder pickers for Linux/XDG, macOS, and Windows (standard library plus the platform's own dialog commands). Dialog output preserves spaces and Unix non-UTF-8 path bytes; Windows PowerShell output is forced to UTF-8. |
-| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) application over the canonical controller: Home-first responsive shell, shared design tokens, review-first copy-only Import Manager (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, enriched artwork/lyrics attachment, duplicate decisions, progress/cancel), canonical library setup and migration workflow, searchable track/artist/album views, dedicated Artist and Album detail pages, metadata/relationship/artwork editing, reviewed track move/audio replacement, decoded managed Album/Artist/Track artwork with override semantics, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart collections/rating controls, native artwork/audio/lyrics pickers, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
+| `flux-gui` | binary `flux` | Native [Iced](https://iced.rs) daemon application over the canonical controller: Home-first responsive shell, shared design tokens, persisted Track/Artist/Album list-or-grid modes, redesigned Tracks toolbar and grid, review-first copy-only Import Manager hosted in a real secondary native window (native pickers, Flux Browser, drag-and-drop, name-inferred metadata, enriched artwork/lyrics attachment, duplicate decisions, progress/cancel), canonical library setup with native folder selection and a compact audio-device selector, searchable track/artist/album views, dedicated Artist profile cards and Album detail/discography pages, metadata/relationship/artwork editing, reviewed track move/audio replacement, automatic decoded managed Album/Artist/Track artwork with override semantics, dedicated playlist management/playback, lyrics library/editor/karaoke, dashboard/smart-collection cards and rating controls, native artwork/audio/lyrics pickers, anchored contextual menus, reduced-motion-aware queue/menu transitions, queue, transport, volume, repeat, status/errors, and the real-time oscilloscope. |
 | `flux-tui` | binary `flux-tui` | Complete keyboard-first terminal player (crossterm): persistent destination sidebar on wide terminals, one primary playback timeline, Home/Artists/Albums/Tracks/Playlists/Collections/Lyrics/Settings destinations, structured metadata forms, canonical create/open/migration, review-first import, playlist and queue management, ratings/favorites/history, lyrics reader with follow, audio-device settings, five persisted layout presets, and a real waveform/bars/pulse visualizer over the shared Controller. Genuine GUI-only review workflows are documented in `docs/m16-tui-parity.md`. |
 
 Dependency direction: `flux-gui → flux-app + flux-core + flux-platform + iced`,
@@ -161,7 +173,8 @@ cargo run -p flux-gui --features cpal            # binary name: flux
 cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import review
 ```
 
-- **GUI:** create or open a canonical library in *Library setup*. Each
+- **GUI:** create or open a canonical library in *Library setup*, using the
+  native **Choose folder…** dialog or by typing a path. Each
   successful open or same-path reopen establishes a fresh in-memory library
   session; failed opens leave the active library untouched, and scans must
   finish before switching. Stale import, artwork, lyrics and file-picker
@@ -180,9 +193,13 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   motion. The TUI now reports `no audio backend`, `audio unavailable` or
   `audio recovering` alongside playback intent instead of implying audible
   output without a device. Queue rows play on activation; the drag handle reorders
-  and the remove control is explicit. Track actions open a modal action sheet
-  with full labels. Use Import for the review-first copy-only Import Manager: native file or folder picker, Flux Browser, drag-and-drop,
-  name-inferred review, duplicate decisions, and real progress/cancel. Final
+  and the remove control is explicit. Track actions open an anchored contextual
+  menu near the invoking row with full labels and keyboard navigation. Use Import
+  for the review-first copy-only Import Manager in a real secondary native
+  window: native file or folder picker, Flux Browser, drag-and-drop,
+  name-inferred review, duplicate decisions, and real progress/cancel. The
+  workflow is split into Source, Analyze, Organize, Review and Import steps;
+  navigating back preserves the plan and decisions. Final
   result rows retain per-item failure details; Flux Browser warns when entries
   vanish or symbolic links are skipped instead of silently omitting them. Artist, Album
   and Track image editors preview a chosen replacement before assignment, and
@@ -195,13 +212,18 @@ cargo run -p flux-tui --features cpal -- ~/Music # optional folder opens import 
   without leaving the current page; **Open full lyrics** and **Edit lyrics**
   remain available. The search box
   performs a grouped, case-insensitive global search over canonical artists,
-  albums and tracks with direct navigation. Track rows expose favorite and
+  albums and tracks with direct navigation. Tracks has a unified toolbar with
+  search, filters, sorting direction and a persisted List/Grid selector; grid
+  cards keep artwork, title, artist, album, duration and favorite/playing state.
+  Track rows expose favorite and
   rating controls and label missing versus inaccessible audio distinctly;
   track views keep sortable TITLE/ALBUM/RATE/TIME headers plus an advanced sort
   picker, while favorites/lyrics/artwork/release/rating filters live behind a
   **Filters** toggle; sorting is deterministic by
   title/artist/album/track/rating/date-added/duration/play-count/last-played,
-  and multi-selection uses stable TrackIds. **Home** summarizes canonical counts plus locally recorded
+  and multi-selection uses stable TrackIds. Artists and Albums offer persisted
+  profile-card/discography grids and dense list modes. **Home** summarizes
+  canonical counts plus locally recorded
   listening history; Smart Collections provide Favorites, Highly Rated,
   Recently Added, Recently Played, Most Played, Without Lyrics, Synchronized
   Lyrics and Without Artwork views. Play counts/history begin only after this

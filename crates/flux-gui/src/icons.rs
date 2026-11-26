@@ -123,17 +123,25 @@ impl Icon {
     }
 }
 
-/// Renders the canonical Flux application mark at a square size.
-///
-/// The mark carries its own identity colours, so it is not tinted.
-pub fn brand<'a, Message: 'a>(size: f32) -> Element<'a, Message> {
-    svg(svg::Handle::from_memory(include_bytes!(
-        "../../../assets/flux-icon.svg"
-    )))
-    .width(Length::Fixed(size))
-    .height(Length::Fixed(size))
-    .content_fit(ContentFit::Contain)
-    .into()
+/// Renders the canonical Flux mark with the selected accent while keeping the
+/// same geometry, proportions and dark surface. Only the symbol bars change.
+pub fn brand_tinted<'a, Message: 'a>(size: f32, accent: Color) -> Element<'a, Message> {
+    let source = brand_mark_source(accent);
+    svg(svg::Handle::from_memory(source.into_bytes()))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .content_fit(ContentFit::Contain)
+        .into()
+}
+
+fn brand_mark_source(accent: Color) -> String {
+    let (red, green, blue) = (
+        (accent.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (accent.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (accent.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    );
+    include_str!("../../../assets/flux-icon.svg")
+        .replace("#ff66cc", &format!("#{red:02x}{green:02x}{blue:02x}"))
 }
 
 /// Renders one icon at a square size with a solid tint.
@@ -147,4 +155,28 @@ pub fn icon<'a, Message: 'a>(kind: Icon, size: f32, color: Color) -> Element<'a,
         .content_fit(ContentFit::Contain)
         .style(move |_theme, _status| svg::Style { color: Some(color) })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tinted_brand_keeps_geometry_and_applies_the_accent() {
+        let violet = brand_mark_source(Color::from_rgb8(0xa7, 0x8b, 0xfa));
+        assert!(violet.contains(r##"fill="#a78bfa""##));
+        assert!(!violet.contains("#ff66cc"));
+        assert_eq!(
+            violet.matches("<rect").count(),
+            include_str!("../../../assets/flux-icon.svg")
+                .matches("<rect")
+                .count(),
+            "accent tinting must not change the mark geometry"
+        );
+        assert!(violet.contains(r#"viewBox="0 0 1024 1024""#));
+        assert!(
+            violet.contains(r##"fill="#161018""##),
+            "the dark identity surface is preserved"
+        );
+    }
 }

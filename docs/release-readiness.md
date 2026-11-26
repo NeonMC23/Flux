@@ -63,6 +63,61 @@ for a **public signed release**, not for development validation:
 - Terminal emulator/font coverage beyond the captured Linux PTY sessions.
 - Accessibility, screen-reader and high-contrast validation.
 
+### M29 redesign and native-window checks
+
+Artwork:
+
+- Open Home, Tracks, Artists, Albums and Queue and confirm artwork appears
+  without playing or clicking the associated Track.
+- Scroll large collections and confirm progressive loading without stalls.
+- Navigate away and back; confirm cached covers are reused.
+- Replace an Album cover while it is visible and confirm the new image appears.
+- Observe memory and responsiveness during prolonged scrolling.
+
+Crossfade:
+
+- Seek close to the end of a Track and allow crossfade into the next Track.
+- Confirm the next Track's progress starts near zero and advances normally.
+- Confirm the displayed Track identity and queue entry stay consistent.
+- Repeat with gapless mode and with a seek inside the final crossfade window.
+
+Tracks and view modes:
+
+- Compare List and Grid modes, filters, sorting and hover/focus/selection.
+- Restart Flux and confirm each view preference persists.
+
+Import:
+
+- Run the five steps with a varied directory; navigate backwards and forwards.
+- Change duplicate decisions, Artist/Album organization and artwork between
+  steps; confirm the plan is preserved.
+- Cancel during analysis and during copy; confirm no partial catalogue publish.
+- Verify partial failures and the final result summary.
+
+Settings and configuration:
+
+- Resize Settings at small, medium and large window sizes; confirm the
+  centered two-column composition and stacked fallback.
+- Use the native library folder picker and confirm Open/Create remains explicit.
+- Collapse and expand the audio-device selector; verify explicit selection,
+  unavailable devices and recovery reporting.
+
+Visual and interaction quality:
+
+- Verify anchored Track menus open near the invoking row and flip/fit near
+  window edges.
+- Review queue open/close transitions with Reduce motion both enabled and
+  disabled.
+- Review every scroll area at small and large window sizes.
+- Confirm the in-app logo follows each accent preset with adequate contrast.
+
+Native Import window:
+
+- Move, resize, minimize, maximize and close the Import window.
+- Verify focus, keyboard routing and that main-window shortcuts remain usable.
+- Confirm closing Import or the main window leaves no inconsistent state.
+- Validate on Linux, Windows and macOS when those environments are available.
+
 ## Optional future enhancements
 
 - Configurable TUI keybindings.
