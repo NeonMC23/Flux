@@ -12491,25 +12491,201 @@ impl FluxReady {
             .and_then(|entry| entry.error.as_deref())
     }
 
-    fn artwork_targets(&self) -> Vec<AlbumId> {
+    fn push_track_album_target(&self, track: TrackId, targets: &mut Vec<AlbumId>) {
+        if let Some(album) = self.controller.track_album_id(track) {
+            targets.push(album);
+        }
+    }
+
+    /// Albums whose cover is rendered by rows and cards that are actually on
+    /// screen. Track rows fall back to Album artwork whenever they have no
+    /// Track override, so these Albums must be requested as soon as the rows
+    /// exist — not after the user plays or clicks the associated Track.
+    fn visible_album_targets(&self) -> Vec<AlbumId> {
         let mut targets = Vec::new();
+        if self.track_editor.is_some() {
+            return targets;
+        }
+        if !self.search.trim().is_empty() {
+            for track in self
+                .search_snapshot()
+                .track_ids
+                .iter()
+                .take(SEARCH_RESULT_LIMIT)
+            {
+                self.push_track_album_target(*track, &mut targets);
+            }
+            return targets;
+        }
+        match self.view {
+            LibraryView::Dashboard => {
+                let summary = self.dashboard_summary();
+                for track in summary
+                    .recently_played
+                    .iter()
+                    .chain(summary.recently_added.iter())
+                    .chain(summary.most_played.iter())
+                {
+                    self.push_track_album_target(*track, &mut targets);
+                }
+            }
+            LibraryView::Artists => {
+                if let Some(artist) = self.selected_artist_id() {
+                    targets.extend(self.controller.albums_owned_by(artist));
+                    targets.extend(self.controller.albums_participating_for(artist));
+                    targets.extend(self.controller.albums_credited_for(artist));
+                    for (track, _) in self
+                        .controller
+                        .tracks()
+                        .iter()
+                        .filter(|(id, _)| {
+                            self.controller.track_artist_id(*id) == Some(artist)
+                                || self.controller.track_credits(*id).contains(&artist)
+                        })
+                        .take(64)
+                    {
+                        self.push_track_album_target(*track, &mut targets);
+                    }
+                }
+            }
+            LibraryView::Albums => {
+                if self.selected_group.is_none() {
+                    let groups = self.groups_for(LibraryView::Albums);
+                    let total = groups.len();
+                    let page = self.page.min(total.div_ceil(GROUP_PAGE_SIZE).max(1) - 1);
+                    let start = page * GROUP_PAGE_SIZE;
+                    let end = (start + GROUP_PAGE_SIZE).min(total);
+                    for (key, _) in &groups[start..end] {
+                        let (_, raw) = album_key_parts(key);
+                        if let Ok(id) = raw.parse::<u64>() {
+                            targets.push(AlbumId::new(id));
+                        }
+                    }
+                } else {
+                    for track in self.visible_track_ids() {
+                        self.push_track_album_target(track, &mut targets);
+                    }
+                }
+            }
+            LibraryView::Collections => {
+                if self.collection.is_some() {
+                    for track in self.visible_track_ids() {
+                        self.push_track_album_target(track, &mut targets);
+                    }
+                }
+            }
+            LibraryView::Playlists | LibraryView::Lyrics | LibraryView::Settings => {}
+            LibraryView::Tracks
+            | LibraryView::Folders
+            | LibraryView::RecentlyAdded
+            | LibraryView::RecentlyPlayed
+            | LibraryView::MostPlayed => {
+                for track in self.visible_track_ids() {
+                    self.push_track_album_target(track, &mut targets);
+                }
+            }
+        }
+        targets
+    }
+
+    /// Artist ids whose portrait is visible in the Artists grid.
+    fn visible_artist_image_targets(&self) -> Vec<ArtistId> {
+        if self.view != LibraryView::Artists || self.selected_artist_id().is_some() {
+            return Vec::new();
+        }
+        let groups = self.groups_for(LibraryView::Artists);
+        let total = groups.len();
+        let page = self.page.min(total.div_ceil(GROUP_PAGE_SIZE).max(1) - 1);
+        let start = page * GROUP_PAGE_SIZE;
+        let end = (start + GROUP_PAGE_SIZE).min(total);
+        groups[start..end]
+            .iter()
+            .filter_map(|(key, _)| {
+                let (_, raw) = artist_key_parts(key);
+                raw.parse::<u64>().ok().map(ArtistId::new)
+            })
+            .collect()
+    }
+
+    /// Tracks whose rows/cards are visible and may carry a Track artwork
+    /// override. This mirrors [`Self::visible_album_targets`] so prefetching
+    /// follows what is on screen instead of the whole library.
+    fn visible_track_targets(&self) -> Vec<TrackId> {
+        let mut tracks = Vec::new();
+        if self.track_editor.is_some() {
+            return tracks;
+        }
+        if !self.search.trim().is_empty() {
+            tracks.extend(
+                self.search_snapshot()
+                    .track_ids
+                    .iter()
+                    .take(SEARCH_RESULT_LIMIT)
+                    .copied(),
+            );
+            return tracks;
+        }
+        match self.view {
+            LibraryView::Dashboard => {
+                let summary = self.dashboard_summary();
+                tracks.extend(summary.recently_played.iter().copied());
+                tracks.extend(summary.recently_added.iter().copied());
+                tracks.extend(summary.most_played.iter().copied());
+            }
+            LibraryView::Artists => {
+                if let Some(artist) = self.selected_artist_id() {
+                    tracks.extend(
+                        self.controller
+                            .tracks()
+                            .iter()
+                            .filter(|(id, _)| {
+                                self.controller.track_artist_id(*id) == Some(artist)
+                                    || self.controller.track_credits(*id).contains(&artist)
+                            })
+                            .map(|(id, _)| *id)
+                            .take(64),
+                    );
+                }
+            }
+            LibraryView::Albums => {
+                if self.selected_group.is_some() {
+                    tracks.extend(self.visible_track_ids());
+                }
+            }
+            LibraryView::Collections => {
+                if self.collection.is_some() {
+                    tracks.extend(self.visible_track_ids());
+                }
+            }
+            LibraryView::Playlists | LibraryView::Lyrics | LibraryView::Settings => {}
+            LibraryView::Tracks
+            | LibraryView::Folders
+            | LibraryView::RecentlyAdded
+            | LibraryView::RecentlyPlayed
+            | LibraryView::MostPlayed => {
+                tracks.extend(self.visible_track_ids());
+            }
+        }
+        if self.queue_placement() != QueuePlacement::Hidden {
+            let entries = self.controller.queue_entries();
+            let total = entries.len();
+            let pages = total.div_ceil(QUEUE_PAGE_SIZE).max(1);
+            let page = self.queue_page.min(pages - 1);
+            let start = page * QUEUE_PAGE_SIZE;
+            let end = (start + QUEUE_PAGE_SIZE).min(total);
+            tracks.extend(entries[start..end].iter().map(|entry| entry.track()));
+        }
+        tracks
+    }
+
+    fn artwork_targets(&self) -> Vec<AlbumId> {
+        let mut targets = self.visible_album_targets();
         if let Some(artist_id) = self.selected_artist_id() {
             targets.extend(self.controller.albums_owned_by(artist_id));
+            targets.extend(self.controller.albums_participating_for(artist_id));
             targets.extend(self.controller.albums_credited_for(artist_id));
         } else if let Some(album_id) = self.selected_album_id() {
             targets.push(album_id);
-        } else if self.view == LibraryView::Albums && self.selected_group.is_none() {
-            let groups = self.groups_for(LibraryView::Albums);
-            let total = groups.len();
-            let page = self.page.min(total.div_ceil(GROUP_PAGE_SIZE).max(1) - 1);
-            let start = page * GROUP_PAGE_SIZE;
-            let end = (start + GROUP_PAGE_SIZE).min(total);
-            for (key, _) in &groups[start..end] {
-                let (_, raw) = album_key_parts(key);
-                if let Ok(id) = raw.parse::<u64>() {
-                    targets.push(AlbumId::new(id));
-                }
-            }
         }
         if !self.search.trim().is_empty() {
             targets.extend(self.search_snapshot().albums.iter().map(|(id, _)| *id));
@@ -12520,6 +12696,17 @@ impl FluxReady {
             .and_then(|id| self.controller.track_album_id(id))
         {
             targets.push(album_id);
+        }
+        if self.queue_placement() != QueuePlacement::Hidden {
+            let entries = self.controller.queue_entries();
+            let total = entries.len();
+            let pages = total.div_ceil(QUEUE_PAGE_SIZE).max(1);
+            let page = self.queue_page.min(pages - 1);
+            let start = page * QUEUE_PAGE_SIZE;
+            let end = (start + QUEUE_PAGE_SIZE).min(total);
+            for entry in &entries[start..end] {
+                self.push_track_album_target(entry.track(), &mut targets);
+            }
         }
         targets.sort_by_key(|id| id.get());
         targets.dedup();
@@ -12567,15 +12754,20 @@ impl FluxReady {
             }
         }
         let mut extra_targets: Vec<(ArtworkOwner, PathBuf)> = Vec::new();
-        for track in self.visible_track_ids().into_iter().take(64) {
-            if let Some(path) = self.controller.track_artwork_path(track) {
-                extra_targets.push((ArtworkOwner::Track(track), path));
-            }
-        }
         if let Some(artist) = self.selected_artist_id()
             && let Some(path) = self.controller.artist_image_path(artist)
         {
             extra_targets.push((ArtworkOwner::Artist(artist), path));
+        }
+        for artist in self.visible_artist_image_targets() {
+            if let Some(path) = self.controller.artist_image_path(artist) {
+                extra_targets.push((ArtworkOwner::Artist(artist), path));
+            }
+        }
+        for track in self.visible_track_targets().into_iter().take(64) {
+            if let Some(path) = self.controller.track_artwork_path(track) {
+                extra_targets.push((ArtworkOwner::Track(track), path));
+            }
         }
         if let Some(track) = self.controller.current_id()
             && let Some(path) = self.controller.track_artwork_path(track)
@@ -12626,7 +12818,7 @@ impl FluxReady {
                 async move { decode_artwork(&key) },
                 move |result| Message::ArtworkLoaded(session, message_key, result),
             ));
-            if tasks.len() >= 8 {
+            if tasks.len() >= 12 {
                 break;
             }
         }
@@ -24619,6 +24811,250 @@ mod tests {
         write_test_png(&path, 33, 33);
         let second = artwork_key(ArtworkOwner::Album(AlbumId::new(1)), path);
         assert_ne!(first, second);
+    }
+
+    /// Imports files into an existing Album through the reviewed import
+    /// pipeline, so tests exercise the same canonical membership semantics as
+    /// the application.
+    fn import_wavs_into_album(gui: &mut FluxReady, sources: &[PathBuf], album: AlbumId) {
+        let album_row = gui.controller.album(album).expect("album exists");
+        let target = ImportAlbumTarget {
+            album_id: album,
+            owner_artist_id: album_row.owner_artist_id,
+            owner_name: gui
+                .controller
+                .artist(album_row.owner_artist_id)
+                .map(|artist| artist.name().to_owned())
+                .unwrap_or_default(),
+            title: album_row.title.clone(),
+            release_type: album_row.release_type,
+            cover: album_row.cover.clone(),
+            track_order: album_row.track_order.clone(),
+            generation: gui.controller.generation(),
+        };
+        let request = ImportRequest {
+            sources: sources.to_vec(),
+            recursive: false,
+            storage: ImportStorage::Copy,
+            library_root: gui
+                .controller
+                .canonical_root()
+                .expect("canonical root")
+                .to_path_buf(),
+            existing_tracks: gui.controller.tracks().to_vec(),
+            existing_artists: gui
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| {
+                    gui.controller
+                        .track_artist_id(*id)
+                        .map(|artist| (*id, artist))
+                })
+                .collect(),
+            existing_credits: gui
+                .controller
+                .tracks()
+                .iter()
+                .map(|(id, _)| (*id, gui.controller.track_credits(*id)))
+                .collect(),
+            existing_album_ids: gui
+                .controller
+                .tracks()
+                .iter()
+                .filter_map(|(id, _)| gui.controller.track_album_id(*id).map(|album| (*id, album)))
+                .collect(),
+            target_album: Some(target),
+            generation: gui.controller.generation(),
+            library_session: gui.controller.library_session(),
+        };
+        let progress = Arc::new(Mutex::new(ImportProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let plan = prepare_import_plan(request, progress.clone(), cancel.clone());
+        let prepared = prepare_import_files(&plan, progress, cancel);
+        gui.controller
+            .apply_import_plan(&plan, &prepared)
+            .expect("import publishes into the album");
+    }
+
+    #[test]
+    fn visible_track_rows_request_album_and_override_artwork_without_interaction() {
+        let dir = TempDir::new("gui-artwork-visible-rows");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let artist = gui
+            .controller
+            .create_artist("Visible Artist")
+            .expect("artist");
+        let album = gui
+            .controller
+            .create_album(artist, "Visible Album", ReleaseType::Album)
+            .expect("album");
+        let source = dir.path().join("source/visible.wav");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("dirs");
+        std::fs::write(&source, minimal_wav()).expect("wav");
+        import_wavs_into_album(&mut gui, std::slice::from_ref(&source), album);
+        let track = *gui
+            .controller
+            .album_tracks(album)
+            .first()
+            .expect("track in album");
+        let cover = dir.path().join("cover.png");
+        write_test_png(&cover, 24, 24);
+        gui.controller
+            .set_album_cover(album, &cover)
+            .expect("album cover");
+        let override_image = dir.path().join("override.png");
+        write_test_png(&override_image, 20, 20);
+        gui.controller
+            .set_track_artwork(track, &override_image)
+            .expect("track artwork");
+
+        gui.view = LibraryView::Tracks;
+        gui.selected_group = None;
+        gui.page = 0;
+        gui.controller.clear_queue();
+        gui.controller.stop();
+        assert!(
+            gui.controller.current_id().is_none(),
+            "the test must not rely on a playing Track"
+        );
+
+        let targets = gui.artwork_targets();
+        assert!(
+            targets.contains(&album),
+            "visible Track rows must request the Album cover even before playback"
+        );
+
+        let _ = gui.ensure_artwork_tasks();
+        assert!(
+            gui.artwork_loading
+                .iter()
+                .any(|key| key.owner == ArtworkOwner::Album(album)),
+            "the visible Album cover must be queued for decoding"
+        );
+        assert!(
+            gui.artwork_loading
+                .iter()
+                .any(|key| key.owner == ArtworkOwner::Track(track)),
+            "the visible Track override must be queued for decoding"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn artist_grid_requests_visible_portraits_without_selection() {
+        let dir = TempDir::new("gui-artwork-artist-grid");
+        let mut gui = gui(&dir);
+        let with_image = gui
+            .controller
+            .create_artist("Portrait Artist")
+            .expect("artist");
+        let _without_image = gui.controller.create_artist("Text Artist").expect("artist");
+        let image = dir.path().join("portrait.png");
+        write_test_png(&image, 28, 28);
+        gui.controller
+            .set_artist_image(with_image, &image)
+            .expect("artist image");
+
+        gui.view = LibraryView::Artists;
+        gui.selected_group = None;
+        gui.page = 0;
+        let _ = gui.ensure_artwork_tasks();
+        assert!(
+            gui.artwork_loading
+                .iter()
+                .any(|key| key.owner == ArtworkOwner::Artist(with_image)),
+            "visible Artist cards must request their portrait immediately"
+        );
+        gui.controller.shutdown();
+    }
+
+    #[test]
+    fn artwork_requests_are_bounded_reuse_cache_and_invalidate_replaced_covers() {
+        let dir = TempDir::new("gui-artwork-lifecycle");
+        let root = dir.path().join("library");
+        flux_app::create_canonical_library(&root).expect("canonical");
+        let mut gui = gui(&dir);
+        send(
+            &mut gui,
+            Message::LibInputChanged(root.display().to_string()),
+        );
+        send(&mut gui, Message::OpenLibraryPressed);
+        let artist = gui.controller.create_artist("Covers").expect("artist");
+        let mut albums = Vec::new();
+        for index in 0..14 {
+            let album = gui
+                .controller
+                .create_album(artist, &format!("Album {index}"), ReleaseType::Album)
+                .expect("album");
+            let cover = dir.path().join(format!("cover-{index}.png"));
+            write_test_png(&cover, 16, 16);
+            gui.controller
+                .set_album_cover(album, &cover)
+                .expect("album cover");
+            albums.push(album);
+        }
+
+        gui.view = LibraryView::Albums;
+        gui.selected_group = None;
+        gui.page = 0;
+        let targets = gui.artwork_targets();
+        for album in &albums {
+            assert!(
+                targets.contains(album),
+                "every cover on the visible Albums page is a target"
+            );
+        }
+
+        let _ = gui.ensure_artwork_tasks();
+        assert_eq!(
+            gui.artwork_loading.len(),
+            6,
+            "decoding stays bounded to six Album covers per update"
+        );
+
+        // A cached entry for the current cover must not be decoded again.
+        let cached = albums[0];
+        let cached_path = gui.controller.album_cover_path(cached).expect("cover path");
+        let cached_key = artwork_key(ArtworkOwner::Album(cached), cached_path.clone());
+        gui.artwork_loading.clear();
+        gui.artwork.insert(
+            cached,
+            ArtworkEntry {
+                key: cached_key.clone(),
+                handle: Some(ImageHandle::from_rgba(2, 2, vec![0u8; 16])),
+                error: None,
+            },
+        );
+        let _ = gui.ensure_artwork_tasks();
+        assert!(
+            !gui.artwork_loading
+                .iter()
+                .any(|key| key.owner == ArtworkOwner::Album(cached)),
+            "a cached cover is reused instead of decoded again"
+        );
+        assert!(gui.artwork_loading.len() <= 6);
+
+        // Replacing the managed cover changes the key: the stale entry must be
+        // dropped and the new file requested.
+        std::thread::sleep(Duration::from_millis(5));
+        write_test_png(&cached_path, 17, 17);
+        let replaced_key = artwork_key(ArtworkOwner::Album(cached), cached_path);
+        assert_ne!(cached_key, replaced_key);
+        let _ = gui.ensure_artwork_tasks();
+        assert!(!gui.artwork.contains_key(&cached));
+        assert!(
+            gui.artwork_loading.iter().any(|key| *key == replaced_key),
+            "replaced cover content is requested again"
+        );
+        gui.controller.shutdown();
     }
 
     #[test]

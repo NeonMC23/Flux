@@ -11320,6 +11320,70 @@ mod tests {
     }
 
     #[test]
+    fn near_end_seek_then_crossfade_keeps_the_incoming_position_and_entry_identity() {
+        let dir = TempDir::new("crossfade-seek-position-controller");
+        let root = dir.path().join("music");
+        fs::create_dir_all(&root).expect("music dir");
+        let a_path = write_dc_wav(&root, "a.wav", 132_300, 0.2);
+        let b_path = write_dc_wav(&root, "b.wav", 132_300, 0.8);
+        let (mut controller, control) = boot(&dir);
+        scanned(&mut controller, &control, root);
+        let a = id_of(&controller, &a_path);
+        let b = id_of(&controller, &b_path);
+        controller.set_crossfade_ms(500);
+        controller.play_track(a);
+        let entry_a = controller.current_queue_entry_id().expect("entry a");
+        let entry_b = controller
+            .queue_entries()
+            .iter()
+            .find(|entry| entry.track() == b)
+            .map(|entry| entry.id())
+            .expect("entry b queued");
+        assert_ne!(entry_a, entry_b);
+        // Let playback establish a normal position before seeking.
+        let _ = drive(&mut controller, &control, |c, _| {
+            c.position() > Duration::from_millis(300)
+        });
+
+        controller
+            .seek(Duration::from_millis(1_800))
+            .expect("seek near the end");
+        let events = drive(&mut controller, &control, |c, _| {
+            c.current_queue_entry_id() == Some(entry_b)
+        });
+        assert!(
+            events.contains(&ControllerEvent::PlaybackChanged),
+            "the crossfade must be visible to front-ends: {events:?}"
+        );
+        assert_eq!(controller.current_id(), Some(b), "active Track identity");
+        assert_eq!(
+            controller.current_queue_entry_id(),
+            Some(entry_b),
+            "stable QueueEntryId follows the incoming Track"
+        );
+        assert_eq!(controller.engine_entry, Some(entry_b));
+        assert_eq!(controller.engine_loaded, Some(b));
+        let position = controller.position();
+        assert!(
+            position < Duration::from_secs(1),
+            "the incoming progress must start near zero, not at the seek base: {position:?}"
+        );
+
+        // Progress then advances against the incoming source, not the
+        // outgoing decoder or the mixed crossfade timeline.
+        let start = controller.position();
+        let _ = drive(&mut controller, &control, |c, _| {
+            c.position() >= start + Duration::from_millis(200)
+        });
+        let advanced = controller.position();
+        assert!(
+            advanced >= start + Duration::from_millis(150),
+            "incoming position must advance from {start:?}, got {advanced:?}"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn gapless_handoff_distinguishes_duplicate_entries_for_the_same_track() {
         let dir = TempDir::new("gapless-controller-duplicate");
         let root = dir.path().join("music");

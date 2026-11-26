@@ -964,7 +964,12 @@ impl EngineHandle {
         } else {
             let played = self.shared.played_frames.load(Ordering::Relaxed);
             let source_start = self.shared.source_start_frame.load(Ordering::Relaxed);
-            base.saturating_add(played.saturating_sub(source_start))
+            // `source_start_frame` is an offset in the same generation as
+            // `played_frames` and already includes the seek baseline. Add
+            // the baseline *before* subtracting so a seek followed by a
+            // natural transition cannot clamp the incoming position to the
+            // old seek target.
+            base.saturating_add(played).saturating_sub(source_start)
         };
         Duration::from_secs_f64(frames as f64 / f64::from(self.config.sample_rate))
     }
@@ -1315,12 +1320,11 @@ fn resume_current_after_invalidation(
 ) -> Result<(), DecodeError> {
     let output_rate = f64::from(config.sample_rate);
     let source_rate = f64::from(current.info.sample_rate);
-    let position_frames = shared.base_frames.load(Ordering::Acquire).saturating_add(
-        shared
-            .played_frames
-            .load(Ordering::Acquire)
-            .saturating_sub(shared.source_start_frame.load(Ordering::Acquire)),
-    );
+    let position_frames = shared
+        .base_frames
+        .load(Ordering::Acquire)
+        .saturating_add(shared.played_frames.load(Ordering::Acquire))
+        .saturating_sub(shared.source_start_frame.load(Ordering::Acquire));
     let position = Duration::from_secs_f64(position_frames as f64 / output_rate);
     let target = current
         .info
@@ -6212,6 +6216,259 @@ mod tests {
             &[0.3, -0.3, 0.4],
             "stereo is averaged to mono in output order"
         );
+    }
+
+    #[test]
+    fn incoming_position_starts_at_zero_after_a_near_end_seek_crossfade() {
+        let dir = TempDir::new("crossfade-position-after-seek");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 132_300, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(500), QueueEntryId::new(501));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b.clone());
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        start_playing(&engine, &control);
+        wait_for_pushed_frames(&engine, &control, 4_096);
+        control.drain_frames(4_096);
+
+        // Seek to 1.8 s of a 3 s source. 79_380 output frames are
+        // skipped, 52_920 remain, and the final 22_050 (500 ms) form the
+        // crossfade tail. The mixer therefore begins at frame 30_870 of
+        // the post-seek generation.
+        let seek_target = Duration::from_millis(1_800);
+        let _ = engine.seek(seek_target);
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        wait_for_pushed_frames(&engine, &control, 52_920);
+        wait_for_gate_open(&engine, &control);
+        control.drain_frames(30_870);
+
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        let (boundary, from_position) = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::Transitioned {
+                    to_entry,
+                    boundary_frame,
+                    from_position,
+                    ..
+                } if *to_entry == entry_b => Some((*boundary_frame, *from_position)),
+                _ => None,
+            })
+            .expect("crossfade transition event");
+        assert_eq!(
+            boundary, 30_870,
+            "the mixer must start at the post-seek tail boundary"
+        );
+        assert!(
+            (from_position.as_secs_f64() - 2.5).abs() < 0.01,
+            "outgoing position must remain source-relative: {from_position:?}"
+        );
+        let incoming = engine.position();
+        assert!(
+            incoming < Duration::from_millis(50),
+            "the incoming source must start at zero, got {incoming:?}"
+        );
+
+        // Progress then follows the incoming source, not the outgoing one
+        // or the mixed timeline.
+        control.drain_frames(44_100);
+        let later = engine.position();
+        assert!(
+            (later.as_secs_f64() - 1.0).abs() < 0.1,
+            "one second into the incoming source: {later:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn gapless_handoff_after_a_near_end_seek_starts_the_incoming_source_at_zero() {
+        let dir = TempDir::new("gapless-position-after-seek");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 132_300, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        assert_eq!(engine.set_crossfade_ms(0), 0);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(510), QueueEntryId::new(511));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b.clone());
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        start_playing(&engine, &control);
+        wait_for_pushed_frames(&engine, &control, 4_096);
+        control.drain_frames(4_096);
+
+        let _ = engine.seek(Duration::from_millis(1_800));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        wait_for_pushed_frames(&engine, &control, 52_920);
+        wait_for_gate_open(&engine, &control);
+        control.drain_frames(52_920);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_entry,
+                boundary_frame: 52_920,
+                ..
+            } if *to_entry == entry_b
+        )));
+        assert!(
+            engine.position() < Duration::from_millis(50),
+            "gapless handoff after a seek must reset the incoming position"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn near_end_seek_inside_the_crossfade_window_hands_off_at_the_track_end() {
+        let dir = TempDir::new("crossfade-position-inside-tail");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 132_300, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.8);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(500);
+        let (id_a, id_b) = (TrackId::new(1), TrackId::new(2));
+        let (entry_a, entry_b) = (QueueEntryId::new(520), QueueEntryId::new(521));
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b.clone());
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        start_playing(&engine, &control);
+        wait_for_pushed_frames(&engine, &control, 4_096);
+        control.drain_frames(4_096);
+
+        // 2.9 s is already inside the final 500 ms tail window, so no
+        // frames can be held; the handoff happens at the exact end.
+        let _ = engine.seek(Duration::from_millis(2_900));
+        engine.preload_entry(id_b, entry_b, b);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_b),
+        );
+        wait_for_pushed_frames(&engine, &control, 4_410);
+        wait_for_gate_open(&engine, &control);
+        control.drain_frames(4_410);
+        let events = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Transitioned { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned {
+                to_entry,
+                boundary_frame: 4_410,
+                ..
+            } if *to_entry == entry_b
+        )));
+        assert!(
+            engine.position() < Duration::from_millis(50),
+            "an end-of-track handoff after a late seek must start at zero"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn second_crossfade_after_a_seek_tracks_the_incoming_source_position() {
+        let dir = TempDir::new("crossfade-position-second-hop");
+        let a = write_dc_wav(&dir, "a.wav", 44_100, 88_200, 0.2);
+        let b = write_dc_wav(&dir, "b.wav", 44_100, 88_200, 0.5);
+        let c = write_dc_wav(&dir, "c.wav", 44_100, 88_200, 0.9);
+        let (engine, control) = EngineHandle::spawn_null(44_100, 1);
+        engine.set_crossfade_ms(200);
+        let (id_a, id_b, id_c) = (TrackId::new(1), TrackId::new(2), TrackId::new(3));
+        let (entry_a, entry_b, entry_c) = (
+            QueueEntryId::new(530),
+            QueueEntryId::new(531),
+            QueueEntryId::new(532),
+        );
+
+        engine.load_entry(id_a, entry_a, a);
+        let _ = collect_events_until(&engine, |event| matches!(event, EngineEvent::Loaded { .. }));
+        engine.preload_entry(id_b, entry_b, b.clone());
+        let _ = collect_events_until(&engine, |event| {
+            matches!(event, EngineEvent::Preloaded { .. })
+        });
+        engine.play();
+        start_playing(&engine, &control);
+        let first = drive_until(&engine, &control, |event| {
+            matches!(
+                event,
+                EngineEvent::Transitioned { to_entry, .. } if *to_entry == entry_b
+            )
+        });
+        assert!(first.iter().any(|event| matches!(
+            event,
+            EngineEvent::Transitioned { to_entry, .. } if *to_entry == entry_b
+        )));
+
+        // Seek the second source near its end and crossfade into a third.
+        let _ = engine.seek(Duration::from_millis(1_500));
+        engine.preload_entry(id_c, entry_c, c);
+        let _ = collect_events_until(
+            &engine,
+            |event| matches!(event, EngineEvent::Preloaded { id, .. } if *id == id_c),
+        );
+        // 66_150 skipped, 22_050 remain, 8_820 of those form the tail.
+        wait_for_pushed_frames(&engine, &control, 22_050);
+        wait_for_gate_open(&engine, &control);
+        control.drain_frames(13_230);
+        let second = collect_events_until(&engine, |event| {
+            matches!(
+                event,
+                EngineEvent::Transitioned { to_entry, .. } if *to_entry == entry_c
+            )
+        });
+        let from_position = second
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::Transitioned {
+                    to_entry,
+                    from_position,
+                    ..
+                } if *to_entry == entry_c => Some(*from_position),
+                _ => None,
+            })
+            .expect("second transition");
+        assert!(
+            (from_position.as_secs_f64() - 1.8).abs() < 0.01,
+            "outgoing B position at the second handoff: {from_position:?}"
+        );
+        assert!(
+            engine.position() < Duration::from_millis(50),
+            "the third source must start at zero"
+        );
+        control.drain_frames(22_050);
+        let later = engine.position();
+        assert!(
+            (later.as_secs_f64() - 0.5).abs() < 0.1,
+            "progress follows the third source: {later:?}"
+        );
+        engine.shutdown();
     }
 
     #[test]
