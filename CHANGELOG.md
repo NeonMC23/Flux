@@ -4,6 +4,68 @@ All notable changes to Flux are documented here. Flux uses semantic versioning
 for release artifacts while the workspace remains at `0.1.0` until the first
 authorized release.
 
+## Unreleased — M30 product transformation
+
+### Library lifecycle
+
+- Moved canonical creation leases into a per-user cache lock directory, so no
+  technical `.flux-create.lock` file is left beside the user's music library.
+  Cross-process exclusion and crash release are preserved.
+- Added active-library availability detection. A deleted/unmounted library
+  stops presentation and opens setup instead of showing stale catalogue data as
+  writable.
+
+### Artwork inheritance
+
+- Added deterministic effective artwork: explicit Track → Album → fallback;
+  explicit Album → first suitable Track in Album order → owner/participant
+  portrait; explicit Artist → stable associated Album artwork.
+- Effective paths drive GUI caching and invalidate naturally on artwork,
+  membership and ordering changes. Editors show the effective source.
+
+### Import
+
+- Redesigned Import as a full native workspace with no popup close control,
+  popup border, dead right margin or fixed popup height.
+- Replaced primary free-text Artist association with searchable stable-ID
+  selection and an immediate Create Artist surface (name, portrait, validation,
+  duplicate rejection).
+- Added an immediate Create Album surface with owner, release type, participants
+  and artwork. New entities are reusable in the same import session.
+- Added visible bulk organization, progressive artwork/lyrics disclosure,
+  clear **No Album** semantics and deterministic collaborative Album
+  duplicate prevention.
+
+### Catalogue and interaction
+
+- Fixed global shortcuts stealing input from focused text fields at the shared
+  event-routing layer.
+- Rebuilt the Tracks toolbar into one aligned row with a fixed-width search
+  field and a separate active-filter row.
+- Added proper List and Grid icons, wider Track cards, larger artwork,
+  single-line truncation, distinct row states and shared Artist/Album Track
+  rows.
+- Replaced catalogue/queue/playlist pagination with continuous incremental
+  loading and quiet progress footers.
+
+### Playback and queue
+
+- Crossfade now keeps the outgoing Track foregrounded and its progress moving
+  until the overlap has fully finished; the incoming Track then takes over with
+  its actual already-played position.
+- Paused oscilloscope freezes in place; Reduce Motion removes the visualizer
+  area; silent/stopped playback no longer draws an idle glowing bar.
+- Clear Queue now clears pending entries while preserving active playback and
+  the active QueueEntryId; stopped/unloaded selections clear normally.
+
+### Settings and visual polish
+
+- Custom display scale from 80% to 140%, with slider preview, commit and
+  persistence.
+- Setup moved into the sidebar between Import Music and Settings.
+- Improved filter chips, scrollbar contrast, card geometry, queue width,
+  import layout and idle player composition.
+
 ## Unreleased — M29 product redesign and reliability
 
 ### Critical playback fixes

@@ -118,6 +118,65 @@ Native Import window:
 - Confirm closing Import or the main window leaves no inconsistent state.
 - Validate on Linux, Windows and macOS when those environments are available.
 
+
+### M30 transformation checks
+
+Library lifecycle:
+
+- Create a library in an existing empty music folder and confirm no
+  `.flux-create.lock` or other technical file appears beside/in it.
+- Cancel creation, induce a creation failure, and kill the process during
+  creation; confirm the next creation can acquire the lease.
+- Delete or unmount the active library while Flux is open; confirm playback
+  stops, setup opens and no stale tracks remain navigable.
+- Reopen the restored library and verify catalogue, queue and duplicates.
+
+Artwork:
+
+- Verify Track override, Album cover, Album-from-Track, Artist portraiture and
+  Artist-from-Album inheritance in each view and editor source label.
+- Change/remove the winning artwork, reorder Album tracks, add/remove
+  membership and participants; confirm the effective image updates.
+- Confirm derived images are not copied into explicit overrides.
+
+Import:
+
+- Create an Artist with/without portrait; reject a duplicate name; reuse the
+  new Artist for later Tracks in the same session.
+- Create an Album with owner, release type and participants; confirm immediate
+  availability and no duplicate Album for case/whitespace variants.
+- Bulk-assign Artist/Album across checked Tracks; verify different physical
+  owners are skipped with a warning rather than partially published.
+- Resize the native Import window and verify the full-workspace layout.
+
+Catalogue:
+
+- Type into Search, filters and every editor field; confirm Q/digits/E/M etc do
+  not trigger global actions or lose focus.
+- Verify Tracks toolbar stays on one row at supported desktop widths.
+- Scroll Tracks/Artists/Albums/Queue/Playlist until the end; confirm incremental
+  loading reaches the complete collection.
+- Review long titles at 80%, 100%, 133% and 140% display scale and at narrow
+  window sizes.
+
+Playback and queue:
+
+- Allow a crossfade to start; confirm the outgoing title/progress remain until
+  the overlap ends, then the incoming Track appears at its actual position.
+- Seek near the end before crossfade; repeat with gapless playback.
+- Pause during playback and confirm the oscilloscope freezes; resume.
+- Enable Reduce Motion and confirm the visualizer area disappears.
+- With a Track playing, add pending entries and Clear pending; confirm playback
+  and the active QueueEntryId continue. With playback stopped, confirm clear
+  removes the selection.
+
+Native window and TUI:
+
+- Move/resize/minimize/maximize/close the Import window on Linux, Windows and
+  macOS; verify focus, Escape and main-window shortcuts.
+- Run the TUI at 120x36, 80x24 and 40x12; verify active/pending clear labels and
+  shared settings remain coherent.
+
 ## Optional future enhancements
 
 - Configurable TUI keybindings.

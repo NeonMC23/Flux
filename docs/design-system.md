@@ -190,10 +190,12 @@ transitions are expressed through supported layout progress rather than custom
 rendering. There is no perpetual decorative animation.
 
 View modes: Tracks, Artists and Albums each expose one shared segmented
-List/Grid control with distinct icons and labels. Tracks default to List for
-density; Artists and Albums default to Grid so artwork leads. Grid cards use a
-12 px radius, a single border, artwork at the visual focus, and a footer row for
-playback and metadata. List rows remain the dense management surface. Each
+List/Grid control with dedicated layout icons and labels. Tracks default to List
+for density; Artists and Albums default to Grid so artwork leads. Track grid
+cards use 216 px artwork, a 248 px minimum column, 2–6 responsive columns and
+single-line truncated metadata. Artist cards use a 128 px circular portrait;
+Album cards use 216 px square artwork. All cards use a 12 px radius, one border,
+artwork at the visual focus and a compact footer for playback/metadata. List rows remain the dense management surface. Each
 preference persists independently.
 
 Icons: the GUI uses one vendored Lucide SVG family at 9–20 px with a consistent
@@ -211,8 +213,15 @@ navigation. Queue and Lyrics are player controls; the Queue stays inline on wide
 windows and overlays on narrower ones. Artist and Album pages are detail-first,
 with editing behind a discreet action.
 
+Toolbars: the Tracks toolbar is one desktop row — search (fixed, not
+space-filling), Filters, sort picker, direction and List/Grid. Active filters
+form a second chip row; the expanded filter panel is a third row. Search never
+pushes the sort/view controls onto an accidental extra line. Global shortcuts
+do not fire while a text input owns the key event.
+
 Tables: TITLE, ALBUM, RATE and TIME are clickable sort headers with a direction
-marker. A secondary advanced sort picker sits at the far right. Scrollbars are
+marker. A secondary advanced sort picker sits at the right. Row artwork is 48 px
+and text is single-line truncated so long titles cannot change row height. Scrollbars are
 quiet neutral scrollers with an accent scroller only while dragged, and content
 reserves an inset so row actions are never covered. Row hover uses a raised
 surface; keyboard focus uses a neutral outline; selection uses an accent tint;
@@ -221,10 +230,21 @@ without collapsing into one visual treatment.
 
 Scrolling: every page and panel uses the shared `scrollable` helper. Lists,
 grids, lyrics and review bodies scroll inside the remaining content area while
-headers, toolbars, pagination and player controls stay fixed. Long forms use one
+headers, toolbars and player controls stay fixed. Catalogue, queue and playlist
+lists load incrementally near the scroll end rather than exposing Prev/Next
+pages. Scrollbars use a higher-contrast neutral scroller with an accent drag
+state. Long forms use one
 outer scroll container rather than nested scroll regions. Overlay lists are
 bounded by their panel and clipped during transitions; page content keeps
 horizontal insets so the scrollbar never covers text or actions.
+
+Queue: the Now Playing card is the active playback item. **Up Next** excludes it
+and owns drag, keyboard and clear actions. **Clear pending** never stops loaded
+playback; with playback stopped the current selection is treated as pending.
+
+Display scale: any value from 80% to 140% scales interface typography and
+player text while artwork proportions stay fixed. The slider previews live and
+commits on release; presets remain available.
 
 Keyboard operation: Tab/Shift+Tab move between focusable form controls;
 Ctrl+Tab/Shift+Ctrl+Tab cycle primary GUI destinations; ↑/↓ move Track focus;
