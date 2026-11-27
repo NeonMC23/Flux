@@ -24520,15 +24520,20 @@ mod tests {
         std::fs::write(&inside, minimal_wav()).expect("inside");
         std::fs::write(&outside, minimal_wav()).expect("outside");
         let mut sources = vec![inside.clone()];
+        let folder_identity = std::fs::canonicalize(&folder).expect("canonical folder");
         let (added, skipped) = merge_import_sources(&mut sources, vec![folder.clone()]);
         assert_eq!((added, skipped), (1, 1));
-        assert_eq!(sources, vec![folder.clone()]);
+        assert_eq!(sources, vec![folder_identity]);
         let (added, skipped) = merge_import_sources(&mut sources, vec![folder.clone()]);
         assert_eq!((added, skipped), (0, 1));
         let (added, skipped) = merge_import_sources(&mut sources, vec![outside.clone()]);
         assert_eq!((added, skipped), (1, 0));
         assert_eq!(sources.len(), 2);
-        assert!(sources.iter().any(|source| source == &outside));
+        assert!(
+            sources
+                .iter()
+                .any(|source| source == &std::fs::canonicalize(&outside).expect("canonical"))
+        );
     }
 
     #[test]
