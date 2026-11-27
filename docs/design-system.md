@@ -246,6 +246,23 @@ Display scale: any value from 80% to 140% scales interface typography and
 player text while artwork proportions stay fixed. The slider previews live and
 commits on release; presets remain available.
 
+Theme tokens: runtime functions resolve background, sidebar, surface, raised
+surface, border, primary text and muted text from one persisted surface preset
+(Flux, Midnight, Slate, Wine). Accent is either a curated preset or a validated
+custom `#rrggbb`. Widgets, cards, menus, queue, import, player and visualizers
+must use these tokens rather than fixed literals. Custom accents below the
+contrast threshold are rejected.
+
+Visualizers: Wave, Ambient Orbs and Pixel Wave share the same bounded waveform
+tap. Orbs and pixels respond to smoothed RMS/low/high energy and freeze when
+paused; Reduce Motion removes the visualizer area. The Home Audio Atmosphere
+card is the large presentation; the player strip is the compact one.
+
+Playlists: collection cards use a deterministic 2×2 artwork composition,
+track count, known total duration and a direct Play action. Detail view repeats
+the composition and duration. Duplicate Track entries and stable ordering remain
+model semantics.
+
 Keyboard operation: Tab/Shift+Tab move between focusable form controls;
 Ctrl+Tab/Shift+Ctrl+Tab cycle primary GUI destinations; ↑/↓ move Track focus;
 Enter plays; E edits; M opens the Track action menu; Y opens lyrics; A queues;

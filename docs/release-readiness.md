@@ -177,6 +177,58 @@ Native window and TUI:
 - Run the TUI at 120x36, 80x24 and 40x12; verify active/pending clear labels and
   shared settings remain coherent.
 
+
+### M31 import, theme and visualizer checks
+
+Import reliability:
+
+- Create multiple Artists and Albums, assign types/artwork/participants, then
+  import; confirm the batch publishes instead of failing as stale.
+- Force a missing source, deleted Artist, deleted participant, missing artwork
+  and ambiguous Album title; confirm preflight lists every issue and preserves
+  the draft.
+- Trigger a commit failure; confirm Back to Organize, Retry Import and Discard
+  draft behave without losing metadata or source selections.
+- Restart the application mid-draft; document that in-memory drafts are lost
+  (disk recovery is not implemented).
+
+Multi-source:
+
+- Add files, folders, another folder and dropped files in one session; confirm
+  nothing auto-advances.
+- Select overlapping parent/child folders and duplicate files; confirm skips.
+- Remove sources, clear all, analyze, go back and add more sources.
+
+Selectors and collaboration:
+
+- Verify Artist/Album selected values replace placeholders, filtering preserves
+  the selected value, and creation appears immediately.
+- Confirm Track credits and Album participants remain distinct and a
+  different-owner Track is skipped with a warning when applying an Album.
+
+Theme and visualizers:
+
+- Switch every surface preset and custom accent; verify contrast, logo,
+  controls, queue, menus and visualizers update.
+- Reject a too-dark custom accent.
+- Switch Wave/Ambient Orbs/Pixel Wave and verify persistence.
+- Play music and confirm real energy drives size/alpha/quantization; pause and
+  confirm freeze; stop and confirm idle; enable Reduce Motion and confirm no
+  visualizer area.
+- Inspect at 900×650, 700×500 and minimum supported sizes.
+
+Playlists:
+
+- Verify card artwork composition, count, duration, Play, detail header and row
+  artwork.
+- Test empty, duplicate, missing-Track, reordered, renamed and deleted playlists
+  before and after restart.
+
+Typography/cards:
+
+- Inspect monospace durations, long titles, card clipping and themed surfaces at
+  80/100/133/140% scale.
+
 ## Optional future enhancements
 
 - Configurable TUI keybindings.

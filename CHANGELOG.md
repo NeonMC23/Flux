@@ -4,6 +4,71 @@ All notable changes to Flux are documented here. Flux uses semantic versioning
 for release artifacts while the workspace remains at `0.1.0` until the first
 authorized release.
 
+## Unreleased — M31 import reliability, personalization and audio-reactive UI
+
+### Import reliability
+
+- Fixed the critical lost-import defect: Artist/Album creation during Organize
+  advanced the canonical generation while the reviewed batch retained the old
+  generation, so Flux rejected its own prepared work as stale.
+- Import-time entity/artwork mutations now refresh the reviewed generation.
+- Added structured preflight validation for library identity, destination
+  Album snapshots, sources, Artists, credits, participants, artwork and
+  ambiguous Album titles.
+- Failed validation/preparation/commit retains the complete draft and offers
+  Back to Organize, Retry Import, Discard draft or Close. Metadata edits, source
+  selections and decisions are preserved.
+- Added a deterministic failure/retry regression.
+
+### Multi-source import
+
+- Source selection accumulates folders/files from native pickers, Flux Browser,
+  drag-and-drop and manual paths instead of auto-starting analysis.
+- Added selected-source list, per-source removal, Clear all and explicit
+  Analyze.
+- Duplicate sources and overlapping parent/child folder selections are skipped
+  without duplicate Track discovery.
+
+### Organization UX
+
+- Artist and Album selectors show their selected entities, support filtering and
+  searchable stable-ID selection, and use shared Flux select styling.
+- Album creation retains owner, participants, release type and artwork; Album
+  assignment skips Tracks with a different physical owner with a clear warning.
+- Pick lists no longer retain misleading placeholders after selection.
+
+### Theme and personalization
+
+- Added centralized runtime surface/text/border tokens used by the shell,
+  cards, menus, queue, import and player.
+- Added Flux, Midnight, Slate and Wine surface presets.
+- Added persisted custom `#rrggbb` accent with contrast rejection and migration
+  from curated accents.
+- Added persisted Wave, Ambient Orbs and Pixel Wave visualizer modes.
+
+### Audio-reactive UI
+
+- Derived smoothed RMS, peak, low/high estimates and phase from the existing
+  bounded waveform tap without touching the real-time callback.
+- Added Ambient Orbs and Pixel Wave renderers using supported renderer
+  primitives.
+- Added a Home Audio Atmosphere card plus selected visualizer in the player.
+- Pause freezes the visualization; stop/silence resets it; Reduce Motion hides
+  it.
+
+### Playlists and presentation
+
+- Playlist collection now uses artwork-composition cards with count, duration
+  and direct Play.
+- Playlist detail shows composition and total duration; rows show artwork.
+- Numeric durations use monospace; cards and list/grid controls remain coherent
+  across themed surfaces.
+
+### Documentation
+
+- Added `docs/m31-transformation.md` with the import root cause, guarantees,
+  theme/visualizer architecture and limitations.
+
 ## Unreleased — M30 product transformation
 
 ### Library lifecycle
