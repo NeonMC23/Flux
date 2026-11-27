@@ -213,6 +213,100 @@ impl Accent {
     }
 }
 
+/// Curated surface palettes for the Flux shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemePreset {
+    /// Established neutral-violet Flux surfaces.
+    #[default]
+    Flux,
+    /// Deep blue-black night palette.
+    Midnight,
+    /// Cool graphite palette.
+    Slate,
+    /// Dark wine-plum palette.
+    Wine,
+}
+
+impl ThemePreset {
+    /// Every preset in presentation order.
+    pub const ALL: [Self; 4] = [Self::Flux, Self::Midnight, Self::Slate, Self::Wine];
+
+    /// Stable settings identifier.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Flux => "flux",
+            Self::Midnight => "midnight",
+            Self::Slate => "slate",
+            Self::Wine => "wine",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Flux => "Flux",
+            Self::Midnight => "Midnight",
+            Self::Slate => "Slate",
+            Self::Wine => "Wine",
+        }
+    }
+
+    /// Recovers a preset from a persisted identifier.
+    #[must_use]
+    pub fn from_id(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.id().eq_ignore_ascii_case(value.trim()))
+    }
+}
+
+/// Audio visualizer presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisualizerMode {
+    /// Refined waveform line (existing Flow-inspired scope).
+    #[default]
+    Wave,
+    /// Soft audio-reactive ambient orbs.
+    Orbs,
+    /// Quantized water-like pixel wave.
+    PixelWave,
+}
+
+impl VisualizerMode {
+    /// Every mode in presentation order.
+    pub const ALL: [Self; 3] = [Self::Wave, Self::Orbs, Self::PixelWave];
+
+    /// Stable settings identifier.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Wave => "wave",
+            Self::Orbs => "orbs",
+            Self::PixelWave => "pixel_wave",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Wave => "Wave",
+            Self::Orbs => "Ambient orbs",
+            Self::PixelWave => "Pixel wave",
+        }
+    }
+
+    /// Recovers a mode from a persisted identifier.
+    #[must_use]
+    pub fn from_id(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.id().eq_ignore_ascii_case(value.trim()))
+    }
+}
+
 /// User-facing crossfade configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossfadeSettings {
@@ -265,6 +359,12 @@ pub struct LoadedSettings {
     pub audio_output_device: Option<String>,
     /// Persisted accent preset.
     pub accent: Accent,
+    /// Persisted custom accent RGB, or `None` when a curated preset is active.
+    pub custom_accent: Option<(u8, u8, u8)>,
+    /// Persisted surface palette.
+    pub theme_preset: ThemePreset,
+    /// Persisted audio visualizer mode.
+    pub visualizer: VisualizerMode,
     /// Persisted interface text-scale percentage.
     pub text_scale: u16,
     /// Whether non-essential visual motion should be suppressed.
@@ -355,6 +455,9 @@ impl SettingsStore {
         let crossfade = recover_crossfade(root.get("crossfade"));
         let audio_output_device = recover_audio_output_device(root.get("audio_output"));
         let accent = recover_accent(root.get("theme"));
+        let custom_accent = recover_custom_accent(root.get("theme"));
+        let theme_preset = recover_theme_preset(root.get("theme"));
+        let visualizer = recover_visualizer(root.get("interface"));
         let text_scale = recover_text_scale(root.get("interface"));
         let reduced_motion = recover_reduced_motion(root.get("interface"));
         let view_modes = recover_view_modes(root.get("interface"));
@@ -367,6 +470,9 @@ impl SettingsStore {
             crossfade,
             audio_output_device,
             accent,
+            custom_accent,
+            theme_preset,
+            visualizer,
             text_scale,
             reduced_motion,
             view_modes,
@@ -388,6 +494,9 @@ impl SettingsStore {
             crossfade,
             audio_output_device: None,
             accent: Accent::default(),
+            custom_accent: None,
+            theme_preset: ThemePreset::default(),
+            visualizer: VisualizerMode::default(),
             text_scale: TEXT_SCALE_DEFAULT,
             reduced_motion: false,
             view_modes: ViewModePreferences::default(),
@@ -405,6 +514,9 @@ impl SettingsStore {
             crossfade,
             audio_output_device: None,
             accent: Accent::default(),
+            custom_accent: None,
+            theme_preset: ThemePreset::default(),
+            visualizer: VisualizerMode::default(),
             text_scale: TEXT_SCALE_DEFAULT,
             reduced_motion: false,
             view_modes: ViewModePreferences::default(),
@@ -588,10 +700,120 @@ impl SettingsStore {
         if !theme.is_object() {
             *theme = Value::Object(Map::new());
         }
+        let theme = theme.as_object_mut().expect("object inserted");
+        theme.insert("accent".to_owned(), Value::from(accent.id()));
+        theme.remove("custom_accent");
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+
+    /// Atomically stores a custom accent as `#rrggbb`, or clears it when
+    /// restoring a curated preset.
+    pub fn save_custom_accent(
+        &mut self,
+        accent: Option<(u8, u8, u8)>,
+    ) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let mut root = match self.document.clone() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let theme = root
+            .entry("theme")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !theme.is_object() {
+            *theme = Value::Object(Map::new());
+        }
+        let theme = theme.as_object_mut().expect("object inserted");
+        match accent {
+            Some((red, green, blue)) => {
+                theme.insert(
+                    "custom_accent".to_owned(),
+                    Value::from(format!("#{red:02x}{green:02x}{blue:02x}")),
+                );
+            }
+            None => {
+                theme.remove("custom_accent");
+            }
+        }
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+
+    /// Atomically updates only the audio visualizer mode.
+    pub fn save_visualizer(&mut self, mode: VisualizerMode) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let mut root = match self.document.clone() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let interface = root
+            .entry("interface")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !interface.is_object() {
+            *interface = Value::Object(Map::new());
+        }
+        interface
+            .as_object_mut()
+            .expect("object inserted")
+            .insert("visualizer".to_owned(), Value::from(mode.id()));
+        let document = Value::Object(root);
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
+        bytes.push(b'\n');
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(SettingsError::Io)?;
+        }
+        write_atomic(&self.path, &bytes).map_err(SettingsError::Io)?;
+        self.document = document;
+        Ok(())
+    }
+
+    /// Atomically updates only the surface palette.
+    pub fn save_theme_preset(&mut self, preset: ThemePreset) -> Result<(), SettingsError> {
+        if self.write_protected {
+            return Err(SettingsError::Protected(self.path.clone()));
+        }
+        let mut root = match self.document.clone() {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        root.insert("version".to_owned(), Value::from(SETTINGS_SCHEMA_VERSION));
+        let theme = root
+            .entry("theme")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !theme.is_object() {
+            *theme = Value::Object(Map::new());
+        }
         theme
             .as_object_mut()
             .expect("object inserted")
-            .insert("accent".to_owned(), Value::from(accent.id()));
+            .insert("preset".to_owned(), Value::from(preset.id()));
         let document = Value::Object(root);
         let mut bytes = serde_json::to_vec_pretty(&document).map_err(SettingsError::Serialize)?;
         bytes.push(b'\n');
@@ -705,6 +927,41 @@ fn recover_text_scale(value: Option<&Value>) -> u16 {
         .unwrap_or(TEXT_SCALE_DEFAULT)
 }
 
+fn recover_visualizer(value: Option<&Value>) -> VisualizerMode {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("visualizer"))
+        .and_then(Value::as_str)
+        .and_then(VisualizerMode::from_id)
+        .unwrap_or_default()
+}
+
+fn recover_theme_preset(value: Option<&Value>) -> ThemePreset {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("preset"))
+        .and_then(Value::as_str)
+        .and_then(ThemePreset::from_id)
+        .unwrap_or_default()
+}
+
+fn recover_custom_accent(value: Option<&Value>) -> Option<(u8, u8, u8)> {
+    let value = value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("custom_accent"))
+        .and_then(Value::as_str)?
+        .trim()
+        .strip_prefix('#')?;
+    if value.len() != 6 {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ))
+}
+
 fn recover_accent(value: Option<&Value>) -> Accent {
     value
         .and_then(Value::as_object)
@@ -773,7 +1030,7 @@ mod tests {
 
     use super::{
         Accent, CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, SettingsError,
-        SettingsStore, ViewMode, ViewModePreferences, ViewSurface,
+        SettingsStore, ThemePreset, ViewMode, ViewModePreferences, ViewSurface,
     };
 
     struct TempDir(PathBuf);
@@ -1214,6 +1471,60 @@ mod tests {
             ViewMode::Grid,
             "identifiers are matched case-insensitively"
         );
+        assert!(!loaded.store.write_protected());
+    }
+
+    #[test]
+    fn theme_presets_and_custom_accent_round_trip_without_losing_other_settings() {
+        let dir = TempDir::new("theme-presets");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br##"{"version":1,"crossfade":{"enabled":true,"duration_ms":4200},"theme":{"accent":"teal","custom_accent":"#60a5fa"},"future":{"kept":true}}"##,
+        )
+        .expect("settings");
+        let loaded = SettingsStore::load(&path);
+        assert_eq!(loaded.custom_accent, Some((0x60, 0xa5, 0xfa)));
+        assert_eq!(loaded.theme_preset, ThemePreset::Flux);
+        let mut store = loaded.store;
+        store
+            .save_theme_preset(ThemePreset::Midnight)
+            .expect("save preset");
+        store
+            .save_custom_accent(Some((0x7d, 0xe2, 0xb4)))
+            .expect("save custom accent");
+        let saved: Value =
+            serde_json::from_slice(&fs::read(&path).expect("settings")).expect("json");
+        assert_eq!(saved["theme"]["preset"], "midnight");
+        assert_eq!(saved["theme"]["custom_accent"], "#7de2b4");
+        assert_eq!(saved["theme"]["accent"], "teal");
+        assert_eq!(saved["crossfade"]["duration_ms"], 4200);
+        assert_eq!(saved["future"]["kept"], true);
+        let reloaded = SettingsStore::load(&path);
+        assert_eq!(reloaded.theme_preset, ThemePreset::Midnight);
+        assert_eq!(reloaded.custom_accent, Some((0x7d, 0xe2, 0xb4)));
+        // Selecting a curated accent clears the custom override without
+        // touching the surface preset.
+        let mut store = reloaded.store;
+        store.save_accent(Accent::Amber).expect("save accent");
+        let reloaded = SettingsStore::load(&path);
+        assert_eq!(reloaded.custom_accent, None);
+        assert_eq!(reloaded.theme_preset, ThemePreset::Midnight);
+        assert_eq!(reloaded.accent, Accent::Amber);
+    }
+
+    #[test]
+    fn invalid_custom_accent_and_theme_values_fall_back_safely() {
+        let dir = TempDir::new("theme-invalid");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"theme":{"preset":"neon","custom_accent":"blue"}}"#,
+        )
+        .expect("settings");
+        let loaded = SettingsStore::load(&path);
+        assert_eq!(loaded.theme_preset, ThemePreset::Flux);
+        assert_eq!(loaded.custom_accent, None);
         assert!(!loaded.store.write_protected());
     }
 

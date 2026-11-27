@@ -76,7 +76,8 @@ mod settings;
 pub use settings::{
     Accent, CROSSFADE_DEFAULT_MS, CROSSFADE_MAX_MS, CrossfadeSettings, LoadedSettings,
     SETTINGS_SCHEMA_VERSION, SettingsError, SettingsStore, TEXT_SCALE_DEFAULT, TEXT_SCALE_LEVELS,
-    TEXT_SCALE_MAX, TEXT_SCALE_MIN, ViewMode, ViewModePreferences, ViewSurface,
+    TEXT_SCALE_MAX, TEXT_SCALE_MIN, ThemePreset, ViewMode, ViewModePreferences, ViewSurface,
+    VisualizerMode,
 };
 
 use flux_core::{
@@ -1867,6 +1868,12 @@ pub struct Controller {
     crossfade_duration_ms: u64,
     /// Persisted accent preset for this user.
     accent: Accent,
+    /// Persisted custom accent RGB, when selected.
+    custom_accent: Option<(u8, u8, u8)>,
+    /// Persisted surface palette.
+    theme_preset: ThemePreset,
+    /// Persisted audio visualizer mode.
+    visualizer: VisualizerMode,
     /// Persisted interface text-scale percentage.
     text_scale: u16,
     /// Whether non-essential rendered motion should be suppressed.
@@ -2275,6 +2282,9 @@ impl Controller {
             crossfade_enabled: false,
             crossfade_duration_ms: CROSSFADE_DEFAULT_MS,
             accent: Accent::default(),
+            custom_accent: None,
+            theme_preset: ThemePreset::default(),
+            visualizer: VisualizerMode::default(),
             text_scale: TEXT_SCALE_DEFAULT,
             reduced_motion: false,
             view_modes: ViewModePreferences::default(),
@@ -3507,6 +3517,43 @@ impl Controller {
         self.accent
     }
 
+    /// Persisted custom accent RGB, or `None` for a curated preset.
+    #[must_use]
+    pub fn custom_accent(&self) -> Option<(u8, u8, u8)> {
+        self.custom_accent
+    }
+
+    /// Persisted surface palette.
+    #[must_use]
+    pub fn theme_preset(&self) -> ThemePreset {
+        self.theme_preset
+    }
+
+    /// Persisted audio visualizer mode.
+    #[must_use]
+    pub fn visualizer(&self) -> VisualizerMode {
+        self.visualizer
+    }
+
+    /// Persists and applies an audio visualizer mode.
+    pub fn set_visualizer(&mut self, mode: VisualizerMode) -> Result<(), String> {
+        self.visualizer = mode;
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        if let Err(error) = store.save_visualizer(mode) {
+            let message = format!(
+                "Could not save the visualizer preference to {}: {error}. It is active for this session only.",
+                path.display()
+            );
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.report_status(format!("Visualizer set to {}.", mode.label()));
+        Ok(())
+    }
+
     /// The persisted interface text-scale percentage.
     #[must_use]
     pub fn text_scale(&self) -> u16 {
@@ -3591,6 +3638,7 @@ impl Controller {
     /// Persists and applies a new accent preset.
     pub fn set_accent(&mut self, accent: Accent) -> Result<(), String> {
         self.accent = accent;
+        self.custom_accent = None;
         let Some(store) = self.settings_store.as_mut() else {
             return Ok(());
         };
@@ -3604,6 +3652,61 @@ impl Controller {
             return Err(message);
         }
         self.report_status(format!("Accent set to {}.", accent.label()));
+        Ok(())
+    }
+
+    /// Selects a custom accent color. Very dark colors are rejected because
+    /// accent text/icons must remain legible on Flux's dark surfaces.
+    pub fn set_custom_accent(&mut self, rgb: Option<(u8, u8, u8)>) -> Result<(), String> {
+        if let Some((red, green, blue)) = rgb {
+            let luma = 0.2126 * f32::from(red) / 255.0
+                + 0.7152 * f32::from(green) / 255.0
+                + 0.0722 * f32::from(blue) / 255.0;
+            if luma < 0.22 {
+                let message =
+                    "Choose a brighter accent; this color is too dark to stay readable on Flux surfaces."
+                        .to_owned();
+                self.report_error(message.clone());
+                return Err(message);
+            }
+        }
+        self.custom_accent = rgb;
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        if let Err(error) = store.save_custom_accent(rgb) {
+            let message = format!(
+                "Could not save the custom accent to {}: {error}. It is active for this session only.",
+                path.display()
+            );
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.report_status(if rgb.is_some() {
+            "Custom accent applied.".to_owned()
+        } else {
+            format!("Accent restored to {}.", self.accent.label())
+        });
+        Ok(())
+    }
+
+    /// Selects and persists a surface palette.
+    pub fn set_theme_preset(&mut self, preset: ThemePreset) -> Result<(), String> {
+        self.theme_preset = preset;
+        let Some(store) = self.settings_store.as_mut() else {
+            return Ok(());
+        };
+        let path = store.path().to_path_buf();
+        if let Err(error) = store.save_theme_preset(preset) {
+            let message = format!(
+                "Could not save the theme preset to {}: {error}. It is active for this session only.",
+                path.display()
+            );
+            self.report_error(message.clone());
+            return Err(message);
+        }
+        self.report_status(format!("Theme set to {}.", preset.label()));
         Ok(())
     }
 
@@ -3626,12 +3729,18 @@ impl Controller {
             crossfade,
             audio_output_device: _,
             accent,
+            custom_accent,
+            theme_preset,
+            visualizer,
             text_scale,
             reduced_motion,
             view_modes,
             warning,
         } = loaded;
         self.accent = accent;
+        self.custom_accent = custom_accent;
+        self.theme_preset = theme_preset;
+        self.visualizer = visualizer;
         self.text_scale = text_scale;
         self.reduced_motion = reduced_motion;
         self.view_modes = view_modes;
